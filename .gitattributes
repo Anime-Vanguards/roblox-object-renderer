@@ -1,0 +1,8 @@
+* text=auto eol=lf
+*.rbxm binary
+*.rbxl binary
+*.png binary
+*.mesh binary
+*.dds binary
+*.ktx2 binary
+*.lib binary

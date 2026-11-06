@@ -1,0 +1,28 @@
+[package]
+name = "ror-assets"
+description = "Roblox content resolution: rbxasset://, rbxassetid://, asset URLs, local files; download + disk cache"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# rustls (ring provider) + bundled webpki roots: no OpenSSL, no system TLS
+ureq = { version = "3.4", default-features = false, features = ["rustls", "gzip"] }
+# CDN bodies sometimes arrive gzip-compressed without a Content-Encoding header
+flate2 = "1.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Registry"] }
+
+[dev-dependencies]
+# asset_ids example: content references inside .rbxm / .rbxmx models
+rbx_binary = "3.0.1"
+rbx_dom_weak = "4.2.0"
+rbx_xml = "3.0.1"

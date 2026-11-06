@@ -1,0 +1,21 @@
+[package]
+name = "ror-image"
+description = "Texture decoding for Roblox content: PNG, JPEG, WebP, GIF, BMP, TGA, DDS, KTX2 (zstd + BCn)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+image = { version = "0.25.8", default-features = false, features = ["png", "jpeg", "gif", "bmp", "tga", "webp"] }
+zstd = { version = "0.13.3", default-features = false }
+# KTX2 zlib supercompression (already in the tree through png)
+flate2 = "1.1"
+
+[dev-dependencies]
+# Reference BCn decoder (port of bcdec) for differential tests of our own decoders
+bcdec_rs = "0.2.0"
+rayon.workspace = true

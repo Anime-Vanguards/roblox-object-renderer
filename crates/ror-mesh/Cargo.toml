@@ -1,0 +1,24 @@
+[package]
+name = "ror-mesh"
+description = "Roblox mesh decoding: FileMesh assets (1.00-7.00, Draco), union/CSG mesh data"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+# Pure-Rust Draco decoder for `COREMESH` v2 (FileMesh 7.00). Decoder paths only.
+draco-core = { version = "2.2.1", default-features = false, features = ["decoder", "edgebreaker_valence_decode", "legacy_bitstream_decode", "point_cloud_decode"] }
+# Binary-model chunk compression, for union assets (`PartOperationAsset` models). Same versions as
+# rbx_binary uses, so the workspace builds them once.
+lz4_flex = { version = "0.13.1", default-features = false, features = ["std", "safe-decode", "checked-decode"] }
+zstd = { version = "0.13.3", default-features = false }
+
+[dev-dependencies]
+# Tests build their own Draco test vectors.
+draco-core = { version = "2.2.1", default-features = false, features = ["decoder", "encoder"] }
+# The scan tool and the cache test read the blobs Roblox keeps inline in `rbx-storage.db`.
+rusqlite = { version = "0.37", features = ["bundled"] }

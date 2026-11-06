@@ -1,0 +1,23 @@
+# Build output
+/target/
+**/target/
+
+# State dir (asset cache, Studio captures, service logs) and render output
+/.cache/
+/out/
+
+# x264 built for the `x264` feature by vendor/x264/build.py (GPL-2.0-or-later; never commit)
+/vendor/x264/x86_64-pc-windows-msvc/
+
+# Account cookie for authenticated asset downloads (never commit)
+.env
+.env.*
+!.env.example
+
+# Agent worktrees and local tool state
+/.claude/
+/node_modules/
+*.log
+*.tmp
+__pycache__/
+/target-*

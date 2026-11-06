@@ -1,0 +1,64 @@
+[package]
+name = "ror"
+description = "Roblox object renderer: renders Roblox 3D models offline, fast, close to Studio at max graphics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "ror"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ror"
+path = "src/main.rs"
+
+[dependencies]
+foldhash = "0.2"
+ror-mesh.workspace = true
+ror-image.workspace = true
+ror-assets.workspace = true
+
+anyhow.workspace = true
+bytemuck.workspace = true
+glam.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
+rayon.workspace = true
+
+blake3 = "1.8"
+clap = { version = "4.5.50", features = ["derive"] }
+png = "0.18"
+lz4_flex = { version = "0.13.1", default-features = false, features = ["std"] }
+zstd = { version = "0.13.3", default-features = false }
+pollster = "0.4.0"
+rbx_binary = "3.0.1"
+rbx_dom_weak = "4.2.0"
+rbx_reflection = "7.0.0"
+rbx_reflection_database = "3.0.1"
+rbx_xml = "3.0.1"
+wgpu = { version = "27.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "dx12", "vulkan", "counters"] }
+# Vulkan's memory budget (render::gpu::Gpu::vram): the ash wgpu-hal is built on
+ash = { version = "0.38", default-features = false }
+dhat = { version = "0.3", optional = true }
+
+[features]
+default = []
+# MP4s encoded by x264 in the process (src/x264.rs) instead of through ffmpeg: links ror_x264.lib, which
+# vendor/x264/build.py builds, from the folder ROR_X264_LIB_DIR names (build.rs). x264 is
+# GPL-2.0-or-later, like ror (THIRD_PARTY_NOTICES.md).
+x264 = []
+dhat-heap = ["dhat"]
+
+[target.'cfg(windows)'.dependencies]
+mimalloc = { version = "0.1.52", default-features = false }
+# mi_collect: the allocator's free pages given back once the service goes quiet (release_free_memory)
+libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_Storage_FileSystem", "Win32_Storage_Xps", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Kernel", "Win32_System_Memory", "Win32_System_Performance", "Win32_System_Pipes", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+wgpu = { version = "27.0.1", default-features = false, features = ["metal"] }
