@@ -17,7 +17,7 @@ shaders in `crates/ror/shaders`.
 - `scene::playback` applies a playback (what is emitted, switched, set, tweened and moved when) to
   the document at a moment, so a scene is that moment's state ([playback.md](playback.md)).
 - Content (`rbxasset://`, `rbxassetid://`, asset URLs, local files) is resolved by `ror-assets`:
-  built-in files from the local Studio install, the rest downloaded once and cached.
+  built-in files from the local Roblox install (Studio's, else the Player's), the rest downloaded once and cached.
 
 ## What draws
 
@@ -85,7 +85,7 @@ The rules every shader shares (`shaders/common.wgsl`):
 
 ## Clouds
 
-Terrain Clouds are marched through the cloud volumes of the user's Studio install
+Terrain Clouds are marched through the cloud volumes of the user's Roblox install
 (`content/sky/clouds.dds` for their shape, `cloudDetail3D.dds` eating into its edges), cut where
 Cover puts its threshold, lit by the sun, the sky and the flat ambient, and laid over the sky. They
 also dim the sun on what stands near the camera (`render::clouds::sun_cover`).

@@ -1,9 +1,9 @@
 # Third-party notices
 
 ror is licensed under the GNU General Public License, version 2 or (at your option) any later version
-([LICENSE](LICENSE)), GPL-2.0-or-later for short. It builds on the third-party components below, each under its own license. Nothing from Roblox is bundled: Studio's built-in
-textures, meshes, skies, cloud volumes and fonts are read from the user's own Studio install at run
-time, and assets are downloaded from Roblox on demand into the user's cache.
+([LICENSE](LICENSE)), GPL-2.0-or-later for short. It builds on the third-party components below, each under its own license. Nothing from Roblox is bundled: Roblox's built-in
+textures, meshes, skies, cloud volumes and fonts are read from the user's own Roblox install (the Player or
+Studio) at run time, and assets are downloaded from Roblox on demand into the user's cache.
 
 ## x264 (only with the `x264` feature)
 

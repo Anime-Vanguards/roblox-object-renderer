@@ -51,10 +51,13 @@ the Neon ring's bloom follow the camera. [MP4](docs/media/unit-turntable.mp4).
 
 ## Quick start
 
-You need Rust 1.90 or later, a GPU (Vulkan, Direct3D 12 or Metal) and a local Roblox Studio install,
-whose built-in textures, sky, avatar meshes and fonts ror reads at run time. ffmpeg, rur, ree and a
-Roblox cookie are optional; [docs/building.md](docs/building.md) has the full list and the Cargo
-features.
+You need Rust 1.90 or later and a GPU (Vulkan, Direct3D 12 or Metal). You don't need Roblox Studio to
+render: ror reads Roblox's built-in textures, sky, avatar meshes and fonts from an installed Roblox, the
+Player or Studio, without running it (`ROR_ROBLOX_CONTENT` names a `content` folder anywhere else).
+With neither it still renders, without those built-ins: no default sky or sun, studs or default particle
+texture. Studio itself is only for exporting from an open place (`--studio`) and for comparing ror with
+Studio (`ror compare`, `ror studio`). ffmpeg, rur, ree and a Roblox cookie are optional;
+[docs/building.md](docs/building.md) has the full list and the Cargo features.
 
 ```sh
 cargo build --release                                         # target/release/ror

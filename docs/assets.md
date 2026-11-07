@@ -10,7 +10,7 @@ store, the Studio install, the cookie), `crates/ror-image` and `crates/ror/src/r
 Assets download from Roblox on first use and are cached in `.cache/assets`: a render or clip fetches
 what a scene lacks ahead of drawing, many at a time through assetdelivery's batch endpoint (a
 19.7k-part map's 615 files in ~4 s against ~40 s one at a time). Built-in textures, sky and avatar
-meshes come from the local Studio install. `--offline` uses only what is cached.
+meshes come from the local Roblox install (Studio's, else the Player's). `--offline` uses only what is cached.
 
 An asset Roblox refuses is listed as missing with the reason assetdelivery gives: `HTTP 403, rejected
 by Roblox moderation`, `archived by its creator` and `not yet reviewed by Roblox moderation` are

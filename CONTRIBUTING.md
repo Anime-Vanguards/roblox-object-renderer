@@ -28,7 +28,7 @@ Search existing issues before filing. A thumbs-up on an existing issue helps mor
      and most of ror's scene, playback, lint, budget and cost tests;
    - a GPU, or a software adapter (WARP on Windows, which ror falls back to): ror's render, video,
      service and job tests;
-   - a local Roblox Studio install: one ror-assets test, which skips without it, and renders that use
+   - an installed Roblox (the Player or Studio): one ror-assets test, which skips without it, and renders that use
      built-in content (skies, avatar meshes, fonts);
    - the Roblox client's local cache: ror-mesh's `local_cache` test, which skips without it;
    - Roblox Studio running with a Studio MCP bridge: nothing in `cargo test`, only parity work

@@ -9,8 +9,12 @@ toolchain is the main platform; macOS builds render through Metal and read built
 - Rust 1.90 or later. On Windows, the MSVC toolchain; `.cargo/config.toml` links with rust-lld,
   which comes with the toolchain.
 - A GPU with Vulkan, Direct3D 12 or Metal, or a software adapter for tests.
-- A local Roblox Studio install: built-in textures, sky and avatar meshes and fonts are read from it
-  at run time (`ROR_ROBLOX_CONTENT` names its `content` folder if it is not found).
+- An installed Roblox, the Player or Studio: ror reads the built-in textures, sky, avatar meshes and
+  fonts from it at run time without running it, looking for Studio's newest install, then the Player's
+  (`ROR_ROBLOX_CONTENT` names a `content` folder anywhere else). Without one, renders lack those
+  built-ins: no default sky or sun, studs or default particle texture.
+- Roblox Studio only to export instances from an open place (`--studio`) and for the parity work
+  (`ror compare`, `ror studio`).
 - Optional: ffmpeg for WebM, GIF and MP4 without the `x264` feature (`ROR_FFMPEG`, else the PATH,
   else winget's `Gyan.FFmpeg`).
 - Optional, for SurfaceGuis, BillboardGuis and ScreenGuis: a checkout of
