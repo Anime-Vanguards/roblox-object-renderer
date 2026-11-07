@@ -237,7 +237,8 @@ impl Weighed for GuiTexture {
 /// What a ViewportFrame's world adds to a GUI draw (`shaders/gui.wgsl` GuiWindow): the frame's rect in
 /// the quad's uv (left, top, right, bottom) and the image's tint (ImageColor3, and its opacity in w; 0:
 /// no world); for a framed one (`mode` x 1) its UIGradient: `plane` gives t over the frame, `mode` y
-/// and z count `colors` (t, r, g, b) and `transparency` (t, value) keypoints.
+/// and z count `colors` (t, r, g, b) and `transparency` (t, value) keypoints; `corner` xy its UICorner's
+/// radius in the quad's uv (0: square corners).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 struct WindowUniform {
@@ -247,6 +248,7 @@ struct WindowUniform {
 	plane: [f32; 4],
 	colors: [[f32; 4]; GRADIENT_KEYS],
 	transparency: [[f32; 4]; GRADIENT_KEYS],
+	corner: [f32; 4],
 }
 
 /// The GUI pipelines: in the scene (per MSAA sample count) and over the finished image.
@@ -654,6 +656,8 @@ pub(super) struct Window {
 	share_view: Option<wgpu::TextureView>,
 	rect: [f32; 4],
 	tint: [f32; 4],
+	/// Its corners' radius in canvas fractions (scene::guis::Viewport::corner).
+	corner: [f32; 2],
 }
 
 /// A framed ViewportFrame's picture, drawn by its own camera (given back once the view is drawn), and
@@ -1364,7 +1368,7 @@ impl Renderer {
 					{
 						let view = texture.create_view(&Default::default());
 						let share_view = image.opaque_share.as_ref().map(|share| share.create_view(&Default::default()));
-						worlds.entry(index).or_default().window = Some(Window { texture, view, share: image.opaque_share, share_view, rect: viewport.rect(surface.canvas), tint: viewport.tint });
+						worlds.entry(index).or_default().window = Some(Window { texture, view, share: image.opaque_share, share_view, rect: viewport.rect(surface.canvas), tint: viewport.tint, corner: viewport.corner(surface.canvas) });
 					}
 				}
 				Err(error) => warnings.push(format!("{}: its window's world not drawn ({error:#})", gui.path)),
@@ -1395,6 +1399,7 @@ impl Renderer {
 				let to_v = |fraction: f32| (fraction - top) / (bottom - top).max(1e-6) * v;
 				[to_u(x0), to_v(y0), to_u(x1), to_v(y1)]
 			};
+			let corner_uv = |[across, down]: [f32; 2]| [across / (right - left).max(1e-6) * u, down / (bottom - top).max(1e-6) * v, 0.0, 0.0];
 			let world_group = |label: &str, uniform: &WindowUniform, view: &wgpu::TextureView, share: Option<&wgpu::TextureView>| {
 				let buffer = lease.buffer("gui window", wgpu::BufferUsages::UNIFORM, bytemuck::bytes_of(uniform));
 				self.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1410,8 +1415,7 @@ impl Renderer {
 			};
 			let shown = worlds.get(&index);
 			let window = shown.and_then(|worlds| worlds.window.as_ref()).map(|window| {
-				let uniform = WindowUniform { rect: to_uv(window.rect), tint: window.tint, ..Default::default() };
-				world_group("gui window", &uniform, &window.view, window.share_view.as_ref())
+				let uniform = WindowUniform { rect: to_uv(window.rect), tint: window.tint, corner: corner_uv(window.corner), ..Default::default() };				world_group("gui window", &uniform, &window.view, window.share_view.as_ref())
 			});
 			// each framed ViewportFrame's picture with what draws over it, in the order the GUI draws them
 			let mut layers = Vec::new();
@@ -1420,7 +1424,8 @@ impl Renderer {
 				let Some(viewport) = scene.guis.get(draw.gui).and_then(|gui| gui.viewports.get(framed.viewport)) else {
 					continue;
 				};
-				let mut uniform = WindowUniform { rect: to_uv(framed.rect), tint: viewport.tint, plane: [framed.plane[0], framed.plane[1], framed.plane[2], 0.0], mode: [1.0, 0.0, 0.0, 0.0], ..Default::default() };
+				let corner = corner_uv(viewport.corner(draw.key.canvas()));
+				let mut uniform = WindowUniform { rect: to_uv(framed.rect), tint: viewport.tint, plane: [framed.plane[0], framed.plane[1], framed.plane[2], 0.0], mode: [1.0, 0.0, 0.0, 0.0], corner, ..Default::default() };
 				if let ViewportKind::Framed(crate::scene::guis::Framed { gradient: Some(gradient), .. }) = &viewport.kind {
 					uniform.mode = [1.0, gradient.colors.len() as f32, gradient.transparency.len() as f32, 0.0];
 					for (slot, (time, color)) in uniform.colors.iter_mut().zip(&gradient.colors) {
@@ -1678,7 +1683,7 @@ mod tests {
 			max_distance: 0.0,
 			clips: false,
 			z_index_behavior: 1,
-			viewports: vec![Viewport { placement: vec![frame], tint: [1.0; 4], scene: Arc::new(Scene::default()), kind: ViewportKind::Framed(framed) }],
+			viewports: vec![Viewport { placement: vec![frame], tint: [1.0; 4], scene: Arc::new(Scene::default()), kind: ViewportKind::Framed(framed), corner_radius: None }],
 		};
 		let scene = Scene { guis: vec![gui], ..Default::default() };
 		let request = ViewRequest { width: 1280, height: 720, camera: CameraSpec::LookAt { eye: [0.0, 0.0, -20.0], target: [0.0; 3], fov: 40.0 }, ..Default::default() };

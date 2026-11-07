@@ -133,6 +133,8 @@ and `<view>.diff.png` (changed pixels in orange over the render in gray). `--jso
   renderer. ror finds rur through `ROR_RUR` (a checkout) or beside this checkout
   (`../roblox-ui-renderer`), and Node through `ROR_NODE` or the PATH; without them GUIs are skipped
   with a warning in the job's `warnings`.
+- A ViewportFrame's world, framed or a window, is clipped to the frame's rect and rounded by its
+  UICorner as rur rounds the frame's background.
 - A view's `guiScale` sets the device pixels per GUI pixel for BillboardGui offsets and text
   (default: the image height / 744, Studio's 1.5 at a 1116 px tall image).
 - GUI images are cached by content in memory and in `.cache/guis` (per rur build); `ROR_NO_GUIS=1`
