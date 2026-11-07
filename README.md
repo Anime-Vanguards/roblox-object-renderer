@@ -7,6 +7,11 @@ captures from a dedicated Studio instance, and it is built to be called by many 
 warm render service keeps the GPU device, pipelines, meshes, textures and parsed models loaded and
 renders requests in parallel.
 
+> [!NOTE]
+> Almost all of the code here was written by AI: Claude, Anthropic's model, at its maintainers' direction. A lot of
+> work went into making it correct, usable and fast for real projects (its renders are measured against Roblox Studio
+> captures and checked by tests), but in the end Claude wrote nearly all of it.
+
 [![A unit's attack effect playing in a match map, rendered by ror](docs/media/effect-in-a-map.webp)](docs/media/effect-in-a-map.mp4)
 
 A unit's attack in a match map, drawn by ror from a recording of the game's own attack code run in
