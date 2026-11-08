@@ -3429,13 +3429,11 @@ impl Renderer {
 					let head = if mesh_uv { glam::Vec2::new(part.size.x.min(part.size.z), part.size.y).max(glam::Vec2::splat(1e-4)) } else { glam::Vec2::ONE };
 					tiling = [t.studs_per_tile_u / head.x, t.studs_per_tile_v / head.y, t.offset_studs_u / head.x, t.offset_studs_v / head.y];
 				} else if decal.uv_offset != [0.0; 2] || decal.uv_scale != [1.0; 2] {
-					// a Decal's UVOffset and UVScale: its image at (uv + offset) / scale (notes/render.md
-					// "Decals": an effect's rocks and rift walls at (0, 0.5) and (1, 0.75), their
-					// glow rising from the image's bottom edge filling the faces' lower three quarters; a
-					// scale of 0 held off)
+					// a Decal's UVOffset and UVScale: its image at uv * scale + offset (notes/render.md
+					// "Decals": 4-stud blocks with one Front decal, the image at half size in the face's
+					// top-left quarter at scale 2, moved left by a quarter of the face at offset 0.25)
 					decal_flags |= TEX_DECAL_UV;
-					let scale = decal.uv_scale.map(|value| if value.abs() < 1e-4 { 1e-4f32.copysign(value) } else { value });
-					tiling = [scale[0], scale[1], decal.uv_offset[0], decal.uv_offset[1]];
+					tiling = [decal.uv_scale[0], decal.uv_scale[1], decal.uv_offset[0], decal.uv_offset[1]];
 				}
 				let instance_index = instances.len() as u32;
 				let world = part.cframe * local;
@@ -5754,6 +5752,61 @@ mod gate_tests {
 		drop(drawing);
 		let (after, _) = renderer.render(&scene, &views).unwrap();
 		assert!(before.iter().zip(&after).all(|(before, after)| before.rgba == after.rgba), "other pixels once what relieve let go of was made again");
+		let _ = std::fs::remove_dir_all(&state);
+	}
+}
+
+#[cfg(test)]
+mod decal_uv_tests {
+	use super::*;
+
+	/// A Decal's UVOffset and UVScale map the face's uv to its image's as uv * UVScale + UVOffset (Studio,
+	/// 4-stud blocks with one Front decal at these five pairs): a red square over the middle of an
+	/// otherwise clear image, on an 8-stud plate's front seen head-on, lands where that puts it, the face
+	/// still bounding it.
+	#[test]
+	fn a_decals_uv_offset_and_scale_map_the_face_to_its_image() {
+		let state = std::env::temp_dir().join(format!("ror-decal-uv-test-{}", std::process::id()));
+		std::fs::create_dir_all(&state).unwrap();
+		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		// a 64-texel image, clear but for an opaque red square from 0.375 to 0.625 on both axes
+		let (side, low, high) = (64u32, 0.375f32, 0.625f32);
+		let inside = |texel: u32| (low..high).contains(&((texel as f32 + 0.5) / side as f32));
+		let rgba: Vec<u8> = (0..side * side).flat_map(|index| if inside(index % side) && inside(index / side) { [255, 0, 0, 255] } else { [0; 4] }).collect();
+		let mut image = ror_image::Image::from_rgba8(side, side, rgba);
+		ror_image::generate_mips_with(&mut image, ror_image::MipFilter::Triangle, true);
+		let path = state.join("square.tex");
+		assert!(texture_files::write(&path, &image, TextureUse::Color));
+		let uri = "rbxassetid://454545";
+		let key = transcode::image_key(uri);
+		let texture = renderer.textures.get_or_load(&(content_key(&key), TextureUse::Color), || texture_files::open(&path, &key).ok_or_else(|| anyhow!("the texture file"))).unwrap();
+		// the plate's front 9.5 studs from the camera: its half width in pixels
+		let (size, distance) = (128u32, 10.0f32);
+		let half = 4.0 / ((distance - 0.5) * 35f32.to_radians().tan()) * size as f32 * 0.5;
+		let face = |pixel: u32| (pixel as f32 + 0.5 - (size as f32 * 0.5 - half)) / (2.0 * half);
+		let request = ViewRequest { width: size, height: size, camera: CameraSpec::LookAt { eye: [0.0, 0.0, -distance], target: [0.0; 3], fov: 70.0 }, background: Background::Color([0.0; 3]), bloom: false, ..Default::default() };
+		for (offset, scale) in [([0.0, 0.0], [1.0, 1.0]), ([0.0, 0.0], [2.0, 2.0]), ([0.25, 0.0], [1.0, 1.0]), ([0.0, 0.5], [1.0, 0.75]), ([-0.37, -0.22], [1.5, 1.5])] {
+			let mut model = crate::scene::build::ModelBuilder::new("Plate");
+			model.part(&crate::scene::build::PartSpec { name: "Plate".into(), size: Vec3::new(8.0, 8.0, 1.0), ..Default::default() });
+			let mut scene = crate::scene::extract::extract(&model.into_document());
+			Arc::make_mut(&mut scene.parts[0]).decals.push(crate::scene::Decal { face: 5, texture: uri.into(), color: Vec3::ONE, transparency: 0.0, z_index: 1, tiling: None, uv_offset: offset, uv_scale: scale });
+			let (images, _) = renderer.render(&scene, std::slice::from_ref(&request)).unwrap();
+			// the red pixels' extent in the face's uv (u to the right, v down): min u, min v, max u, max v
+			let mut extent = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+			for (index, pixel) in images[0].rgba.chunks(4).enumerate() {
+				let (red, rest) = (pixel[0] as f32, pixel[1].max(pixel[2]) as f32);
+				if red > 60.0 && red > 2.0 * rest {
+					let (u, v) = (face(index as u32 % size), face(index as u32 / size));
+					extent = [extent[0].min(u), extent[1].min(v), extent[2].max(u), extent[3].max(v)];
+				}
+			}
+			let expected: [f32; 4] = std::array::from_fn(|i| ((if i < 2 { low } else { high } - offset[i % 2]) / scale[i % 2]).clamp(0.0, 1.0));
+			assert!(extent.iter().zip(expected).all(|(got, want)| (got - want).abs() < 0.04), "UVOffset {offset:?} UVScale {scale:?}: the square over {extent:?} of the face, expected {expected:?}");
+		}
+		drop(texture);
+		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
 	}
 }

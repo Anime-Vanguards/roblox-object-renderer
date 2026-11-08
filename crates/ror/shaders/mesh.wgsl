@@ -707,11 +707,13 @@ fn material_coordinates(input: VertexOutput, instance: Instance, is_decal: bool)
 		}
 		decal_uv = (position + instance.tiling.zw) / max(instance.tiling.xy, vec2<f32>(1e-3));
 	}
-	// a Decal's UVOffset and UVScale move and stretch its image over the face (the face's own extent
-	// still bounds it, the image's edges held past its own: an effect's glows)
+	// a Decal's UVOffset and UVScale map the face's uv to its image's: uv * UVScale + UVOffset (decals on
+	// 4-stud blocks: at scale 2 the image shows at half size in the face's top-left quarter, at offset
+	// 0.25 it moves left by a quarter of the face); the face's own extent still bounds it, the image's
+	// edges held past its own
 	var image_uv = decal_uv;
 	if ((flags & TEX_DECAL_UV) != 0u) {
-		image_uv = (decal_uv + instance.tiling.zw) / instance.tiling.xy;
+		image_uv = decal_uv * instance.tiling.xy + instance.tiling.zw;
 	}
 	uv = select(uv, image_uv, is_decal);
 	let organic = organic_layers(uv, tiles, instance);
