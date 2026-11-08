@@ -23,7 +23,7 @@ use parking_lot::Mutex;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::job::{Lent, SceneCache, ViewResult, input_bytes, input_name};
+use crate::job::{SceneCache, ViewResult, input_bytes, input_name};
 use crate::output;
 use crate::render::camera::CameraSpec;
 use crate::render::guis::FrameGuis;
@@ -764,8 +764,8 @@ struct Builder<'a> {
 	map: Option<&'a crate::job::MapSetting>,
 	/// Another place's MaterialService and Lighting (the map's own unless others are named)
 	lend: (Option<&'a str>, Option<&'a str>),
-	/// That place's Lighting as the documents were given it, for a playback that changes it
-	lent: Option<Lent>,
+	/// Whether the documents hold that place's Lighting and Terrain's Clouds, for a playback that changes them
+	lent: bool,
 	/// What every moment draws, extracted once with its document, for a playback that changes no
 	/// property (`fixed`) or only the Lighting (`lit`: each moment reads the Lighting of a copy of
 	/// that document, changed, into it; the copies keep its referents, which the scene names)
@@ -793,7 +793,7 @@ impl<'a> Builder<'a> {
 			relative_to: job.relative_to.as_deref(),
 			map: job.map.as_ref(),
 			lend: scenes.lenders(job.map.as_ref(), job.materials_from.as_deref(), job.lighting_from.as_deref())?,
-			lent: None,
+			lent: false,
 			fixed: None,
 			lit: None,
 			documents: Mutex::new(Vec::new()),
@@ -833,7 +833,7 @@ impl<'a> Builder<'a> {
 	}
 
 	/// The input as a document, with the map drawn around it and the Lighting the playback changes.
-	fn document(&self) -> Result<(Document, Option<Lent>)> {
+	fn document(&self) -> Result<(Document, bool)> {
 		let mut document = scene::load::read_bytes(&self.bytes)?;
 		document.play = self.playback.play;
 		document.salt = self.playback.salt.clone();
@@ -883,13 +883,7 @@ impl<'a> Builder<'a> {
 
 	/// The other places' MaterialService and Lighting (unless the documents carry that Lighting).
 	fn finish(&self, scene: &mut Scene) -> Result<()> {
-		match &self.lent {
-			Some(lent) => {
-				lent.finish(scene);
-				self.scenes.lend(scene, self.lend.0, None)
-			}
-			None => self.scenes.lend(scene, self.lend.0, self.lend.1),
-		}
+		self.scenes.lend(scene, self.lend.0, self.lend.1.filter(|_| !self.lent))
 	}
 
 	/// The scene `time` seconds after the playback's start, on a document of its own.
@@ -948,9 +942,6 @@ impl<'a> Builder<'a> {
 				let mut scene = base.clone();
 				if self.playback.touches_lighting() {
 					scene.environment = scene::extract::environment(&document).unwrap_or_default();
-					if let Some(lent) = &self.lent {
-						lent.finish(&mut scene);
-					}
 				}
 				scene
 			}
@@ -2780,6 +2771,85 @@ mod tests {
 		let late = builder.scene_at(0.9).unwrap();
 		assert!(held.is_some() && emits(&late));
 		assert!(late.environment.exposure_compensation < early.environment.exposure_compensation);
+	}
+
+	/// A recording's writes to the Terrain's Clouds (target `Workspace.Terrain.Clouds`) play on the
+	/// clouds ror draws, frame by frame: the stage's (`--lighting-from`) when there is one, else none
+	/// until the playback switches them on. A playback that changes only the Lighting keeps the stage's.
+	#[test]
+	fn a_clip_plays_the_terrain_clouds_on_the_stages() {
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use rbx_dom_weak::{InstanceBuilder, WeakDom, types::Color3};
+		let folder = std::env::temp_dir().join(format!("ror-terrain-clouds-{}", std::process::id()));
+		std::fs::create_dir_all(&folder).unwrap();
+		let mut place = WeakDom::new(InstanceBuilder::new("DataModel"));
+		let root = place.root_ref();
+		let workspace = place.insert(root, InstanceBuilder::new("Workspace").with_name("Workspace"));
+		let terrain = place.insert(workspace, InstanceBuilder::new("Terrain").with_name("Terrain"));
+		let stage_clouds = InstanceBuilder::new("Clouds").with_name("Clouds").with_property("Cover", 0.84f32).with_property("Density", 0.03f32).with_property("Color", Color3::new(2.5, 3.49, 4.98)).with_property("Enabled", true);
+		place.insert(terrain, stage_clouds);
+		let lighting = place.insert(root, InstanceBuilder::new("Lighting").with_name("Lighting"));
+		let stage = folder.join("stage.rbxl");
+		let mut bytes = Vec::new();
+		rbx_binary::to_writer(&mut bytes, &place, &[workspace, lighting]).unwrap();
+		std::fs::write(&stage, bytes).unwrap();
+		let stage = stage.display().to_string();
+		let mut model = ModelBuilder::new("Model");
+		model.part(&PartSpec::default());
+		let bytes = model.to_rbxm().unwrap();
+		let job = |playback: serde_json::Value, lighting_from: Option<&str>| VideoJob {
+			input: "model.rbxm".into(),
+			select: None,
+			out: None,
+			view: ViewRequest::default(),
+			name: default_name(),
+			playback: Some(serde_json::from_value(playback).unwrap()),
+			playback_file: None,
+			start: 0.0,
+			duration: 1.0,
+			fps: 10.0,
+			speed: 1.0,
+			times: None,
+			orbit: 0.0,
+			format: VideoFormat::Png,
+			sheet: 0,
+			materials_from: None,
+			lighting_from: lighting_from.map(str::to_string),
+			map: None,
+			frame: None,
+			focus: None,
+			ffmpeg: None,
+			camera_track: None,
+			sheet_first: false,
+			copies: Vec::new(),
+			relative_to: None,
+		};
+		let scenes = SceneCache::default();
+		let clouds_at = |job: &VideoJob, times: &[f32]| -> Vec<Option<crate::scene::environment::Clouds>> {
+			let builder = Builder::new(|| Ok(bytes.clone()), job, &scenes).unwrap();
+			assert!(builder.lit.is_some(), "only the look changes: one scene for the clip");
+			times.iter().map(|&time| builder.scene_at(time).unwrap().environment.clouds).collect()
+		};
+		let storm = serde_json::json!({
+			"play": true,
+			"actions": [{"at": 0, "target": "Workspace.Terrain.Clouds", "set": {"Color": [0.27451, 0.2902, 0.3451]}}],
+			"tweens": [{"target": "Workspace.Terrain.Clouds", "property": "Cover", "keys": [{"at": 0, "value": 0.95}, {"at": 1, "value": 0.84}]}],
+		});
+		let storm = clouds_at(&job(storm, Some(&stage)), &[0.0, 0.5, 1.0]);
+		let [start, middle, end] = [storm[0].unwrap(), storm[1].unwrap(), storm[2].unwrap()];
+		assert!((start.cover - 0.95).abs() < 1e-4 && (end.cover - 0.84).abs() < 1e-4 && middle.cover < start.cover && middle.cover > end.cover, "{storm:?}");
+		assert!(start.color.abs_diff_eq(Vec3::new(0.27451, 0.2902, 0.3451), 1e-4) && end.color == start.color, "{storm:?}");
+		assert!((start.density - 0.03).abs() < 1e-6, "the stage's own Density stays: {storm:?}");
+		// the Lighting alone: the stage's clouds as they are
+		let dim = serde_json::json!({"tweens": [{"target": "Lighting", "property": "ExposureCompensation", "keys": [{"at": 0, "value": 0}, {"at": 1, "value": -1}]}]});
+		let dim = clouds_at(&job(dim, Some(&stage)), &[0.5]);
+		assert_eq!(dim[0].map(|clouds| (clouds.cover, clouds.density, clouds.color)), Some((0.84, 0.03, Vec3::new(2.5, 3.49, 4.98))));
+		// no stage: ror's default environment draws none until the playback switches them on
+		let own = serde_json::json!({"actions": [{"at": 0, "target": "Workspace.Terrain.Clouds", "set": {"Cover": 0.9}}, {"at": 0.5, "target": "Workspace.Terrain.Clouds", "set": {"Enabled": true}}]});
+		let own = clouds_at(&job(own, None), &[0.2, 0.7]);
+		assert!(own[0].is_none(), "{own:?}");
+		assert_eq!(own[1].map(|clouds| (clouds.cover, clouds.density, clouds.color)), Some((0.9, 0.7, Vec3::ONE)));
+		let _ = std::fs::remove_dir_all(&folder);
 	}
 
 	#[test]

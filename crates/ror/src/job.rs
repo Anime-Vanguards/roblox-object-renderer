@@ -219,18 +219,6 @@ struct PlaceSettings {
 	lighting: Option<scene::load::LightingCopy>,
 }
 
-/// A place's Lighting given to a playback's document ([`SceneCache::give_lighting`]): its scene
-/// takes the place's Clouds too (the Terrain's, which the copy leaves behind).
-pub(crate) struct Lent {
-	clouds: Option<scene::environment::Clouds>,
-}
-
-impl Lent {
-	pub(crate) fn finish(&self, scene: &mut Scene) {
-		scene.environment.clouds = self.clouds;
-	}
-}
-
 /// Parsed scenes, kept while their file is unchanged (the service reuses them across requests).
 #[derive(Default)]
 pub struct SceneCache {
@@ -429,21 +417,21 @@ impl SceneCache {
 		Ok(())
 	}
 
-	/// Gives a playback's document the Lighting it changes, when it names one: `lighting_from`'s (a
-	/// copy), else the document's own, else ror's default ([`scene::load::Document::give_lighting`]).
-	/// What it lent from `lighting_from` is for the scene ([`Lent::finish`]), which then takes no
-	/// Lighting from [`SceneCache::lend`].
-	pub(crate) fn give_lighting(&self, document: &mut scene::load::Document, playback: &scene::Playback, lighting_from: Option<&str>) -> Result<Option<Lent>> {
+	/// Gives a playback's document the Lighting and the Terrain's Clouds it changes, when it names
+	/// either: `lighting_from`'s (a copy), else the document's own, else ror's default
+	/// ([`scene::load::Document::give_lighting`]). True when the document holds `lighting_from`'s: its
+	/// scene then takes no Lighting from [`SceneCache::lend`].
+	pub(crate) fn give_lighting(&self, document: &mut scene::load::Document, playback: &scene::Playback, lighting_from: Option<&str>) -> Result<bool> {
 		if !playback.touches_lighting() {
-			return Ok(None);
+			return Ok(false);
 		}
 		let Some(path) = lighting_from else {
 			document.give_lighting(None);
-			return Ok(None);
+			return Ok(false);
 		};
 		let place = self.place(Path::new(path))?;
 		document.give_lighting(Some(place.lighting.as_ref().with_context(|| format!("{path} has no Lighting"))?));
-		Ok(Some(Lent { clouds: place.environment.as_ref().and_then(|environment| environment.clouds) }))
+		Ok(true)
 	}
 
 	/// A scene at a moment of a playback (not cached: every job has its own).
@@ -597,7 +585,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 	let path = Path::new(&job.input);
 	// the places lending MaterialService and Lighting: those named, else a map's own
 	let (materials_from, lighting_from) = scenes.lenders(job.map.as_ref(), job.materials_from.as_deref(), job.lighting_from.as_deref())?;
-	// a playback that changes the Lighting has `lighting_from`'s in its document already
+	// a playback that changes the Lighting or the Terrain's Clouds has `lighting_from`'s in its document already
 	let mut lent_lighting = false;
 	// the cost model reads the document the scene came from (its parts' referents point into it)
 	let mut cost_document = None;
@@ -627,8 +615,8 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 				}
 				document.play = playback.play;
 				document.salt = playback.salt.clone();
-				let lent = scenes.give_lighting(&mut document, playback, lighting_from)?;
-				let mut scene = if job.cost.is_some() {
+				lent_lighting = scenes.give_lighting(&mut document, playback, lighting_from)?;
+				let scene = if job.cost.is_some() {
 					let resolved = playback.resolve(&document)?;
 					resolved.apply_state(&mut document)?;
 					let mut scene = scene::extract::extract(&document);
@@ -638,10 +626,6 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 				} else {
 					scenes.load_playback(document, playback)?
 				};
-				if let Some(lent) = &lent {
-					lent.finish(&mut scene);
-				}
-				lent_lighting = lent.is_some();
 				(Arc::new(scene), false)
 			}
 			None => {
@@ -907,5 +891,36 @@ mod tests {
 			assert!(no_quad(&missing) && unmeshed != by_path, "{name} read from here: {missing:?}");
 		}
 		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	/// A still of a playback that sets the Terrain's Clouds draws the stage's clouds as it leaves them.
+	#[test]
+	fn a_still_draws_the_stages_clouds_as_the_playback_leaves_them() {
+		use rbx_dom_weak::{InstanceBuilder, WeakDom, types::Color3};
+		let folder = std::env::temp_dir().join(format!("ror-still-clouds-{}", std::process::id()));
+		std::fs::create_dir_all(&folder).unwrap();
+		let mut place = WeakDom::new(InstanceBuilder::new("DataModel"));
+		let root = place.root_ref();
+		let workspace = place.insert(root, InstanceBuilder::new("Workspace").with_name("Workspace"));
+		let terrain = place.insert(workspace, InstanceBuilder::new("Terrain").with_name("Terrain"));
+		place.insert(terrain, InstanceBuilder::new("Clouds").with_name("Clouds").with_property("Cover", 0.84f32).with_property("Density", 0.03f32).with_property("Color", Color3::new(2.5, 3.49, 4.98)));
+		let lighting = place.insert(root, InstanceBuilder::new("Lighting").with_name("Lighting"));
+		let stage = folder.join("stage.rbxl");
+		let mut bytes = Vec::new();
+		rbx_binary::to_writer(&mut bytes, &place, &[workspace, lighting]).unwrap();
+		std::fs::write(&stage, bytes).unwrap();
+		let mut model = crate::scene::build::ModelBuilder::new("Model");
+		model.part(&crate::scene::build::PartSpec::default());
+		let playback: scene::Playback = serde_json::from_value(serde_json::json!({
+			"time": 0.5,
+			"actions": [{"at": 0.2, "target": "Workspace.Terrain.Clouds", "set": {"Cover": 0.95, "Color": [0.27451, 0.2902, 0.3451]}}],
+		}))
+		.unwrap();
+		let scenes = SceneCache::default();
+		let mut document = model.into_document();
+		assert!(scenes.give_lighting(&mut document, &playback, Some(&stage.display().to_string())).unwrap(), "the stage's look is in the document");
+		let clouds = scenes.load_playback(document, &playback).unwrap().environment.clouds.expect("the stage's clouds");
+		assert!((clouds.cover - 0.95).abs() < 1e-6 && (clouds.density - 0.03).abs() < 1e-6 && clouds.color.abs_diff_eq(glam::Vec3::new(0.27451, 0.2902, 0.3451), 1e-5), "{clouds:?}");
+		let _ = std::fs::remove_dir_all(&folder);
 	}
 }

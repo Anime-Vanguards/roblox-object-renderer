@@ -816,12 +816,7 @@ pub fn environment(document: &Document) -> Option<Environment> {
 	let lighting = document.lighting.and_then(|lighting| document.dom.get_by_ref(lighting))?;
 	let mut environment = Environment::from_lighting(&document.dom, lighting);
 	// the Terrain's Clouds belong to the place's look too
-	let dom = &document.dom;
-	let child = |parent: &Instance, class: &str| parent.children().iter().filter_map(|&child| dom.get_by_ref(child)).find(|child| child.class == class);
-	environment.clouds = child(dom.root(), "Workspace")
-		.and_then(|workspace| child(workspace, "Terrain"))
-		.and_then(|terrain| child(terrain, "Clouds"))
-		.and_then(crate::scene::environment::Clouds::read);
+	environment.clouds = document.clouds().and_then(|clouds| document.dom.get_by_ref(clouds)).and_then(crate::scene::environment::Clouds::read);
 	Some(environment)
 }
 
