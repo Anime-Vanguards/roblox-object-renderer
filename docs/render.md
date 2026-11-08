@@ -82,8 +82,9 @@ view's camera and its RenderFidelity, and leaves out the parts the graphics qual
 `--collision [collide|query|touch|all]` draws each part as Roblox's physics sees it
 (`scene/collision.rs`): a MeshPart or union as its saved collision data (its convex hulls, each its
 own colour; Box fidelity a warm grey box), a Part as its shape (a SpecialMesh changes what it draws,
-not what it collides with), invisible parts too, effects and textures left out. The filter keeps the
-parts with CanCollide (the default), CanQuery, CanTouch, or all. Decoding saved collision data needs
+not what it collides with), invisible parts too (a wall at Transparency 1 draws as the same wall
+seen), effects and textures left out. The filter keeps the parts with CanCollide (the default),
+CanQuery, CanTouch, or all, whatever their Transparency. Decoding saved collision data needs
 a decoder that is not part of this repository: a public build refuses the view.
 
 ## Output

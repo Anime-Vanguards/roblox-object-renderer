@@ -35,6 +35,9 @@ pub struct Document {
 	/// The folder its content's relative local paths are read from ([`Document::read_relative_to`]);
 	/// `None`: the process's working directory.
 	pub relative_to: Option<PathBuf>,
+	/// Drawn as the collisions-only view ([`super::collision`]): its scene keeps the parts that draw
+	/// nothing (Transparency 1 or more, no decals) among its parts, since they often are the collision.
+	pub keep_invisible: bool,
 }
 
 /// A place's Lighting and what is in it, and its Terrain's Clouds, copied out of the place to give to
@@ -283,7 +286,7 @@ impl Document {
 				.unwrap_or_default(),
 			None => root.children().to_vec(),
 		};
-		Self { dom, salt: String::new(), is_place, roots, lighting, material_service, setting: None, seeds: HashMap::new(), play: false, relative_to: None }
+		Self { dom, salt: String::new(), is_place, roots, lighting, material_service, setting: None, seeds: HashMap::new(), play: false, relative_to: None, keep_invisible: false }
 	}
 
 	/// Reads its content's relative local paths from `folder` (a job's caller's working directory: a
@@ -390,7 +393,7 @@ impl Document {
 				queue.extend(instance.children().iter().copied());
 			}
 		}
-		Document { dom, salt: self.salt.clone(), is_place: self.is_place, roots: self.roots.clone(), lighting: self.lighting, material_service: self.material_service, setting: self.setting.clone(), seeds: self.seeds.clone(), play: self.play, relative_to: self.relative_to.clone() }
+		Document { dom, salt: self.salt.clone(), is_place: self.is_place, roots: self.roots.clone(), lighting: self.lighting, material_service: self.material_service, setting: self.setting.clone(), seeds: self.seeds.clone(), play: self.play, relative_to: self.relative_to.clone(), keep_invisible: self.keep_invisible }
 	}
 
 	/// Gives the document a Lighting for a playback to change, in place of its own: a copy of

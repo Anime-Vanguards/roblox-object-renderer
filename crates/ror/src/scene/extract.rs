@@ -599,7 +599,7 @@ pub(super) fn current_seed(instance: &Instance) -> Option<u64> {
 }
 
 /// Adds a part to the scene; returns it instead when it is an invisible Glass part (only a Highlight
-/// draws it).
+/// draws it) and the document does not keep invisible parts ([`Document::keep_invisible`]).
 fn extract_part(document: &Document, referent: Ref, instance: &Instance, skeletons: &mut Skeletons, characters: &mut Characters, scene: &mut Scene) -> Option<Part> {
 	let path = document.path_of(referent);
 	let Some(cframe) = props::cframe(instance, "CFrame") else {
@@ -785,7 +785,7 @@ fn extract_part(document: &Document, referent: Ref, instance: &Instance, skeleto
 	}
 
 	let visible = part.transparency < 1.0 || !part.decals.is_empty();
-	if visible {
+	if visible || document.keep_invisible {
 		scene.parts.push(Arc::new(part));
 		return None;
 	}

@@ -222,8 +222,9 @@ struct PlaceSettings {
 /// Parsed scenes, kept while their file is unchanged (the service reuses them across requests).
 #[derive(Default)]
 pub struct SceneCache {
-	/// By file, selection and the folder its relative local paths are read from
-	entries: Mutex<HashMap<(PathBuf, Option<String>, Option<PathBuf>), (SystemTime, u64, Arc<Scene>)>>,
+	/// By file, selection, the folder its relative local paths are read from and whether it keeps the
+	/// invisible parts (the collisions-only view's: [`scene::load::Document::keep_invisible`])
+	entries: Mutex<HashMap<(PathBuf, Option<String>, Option<PathBuf>, bool), (SystemTime, u64, Arc<Scene>)>>,
 	places: Mutex<HashMap<PathBuf, (SystemTime, u64, Arc<PlaceSettings>)>>,
 	maps: Mutex<HashMap<PathBuf, (SystemTime, u64, Arc<scene::load::Document>)>>,
 	/// Videos' inputs ([`crate::video::FixedInput`]) by [`SceneCache::video_key`], the last used last
@@ -444,10 +445,10 @@ impl SceneCache {
 		Ok(scene)
 	}
 
-	fn load(&self, path: &Path, select: Option<&str>, relative_to: Option<&Path>) -> Result<(Arc<Scene>, bool)> {
+	fn load(&self, path: &Path, select: Option<&str>, relative_to: Option<&Path>, keep_invisible: bool) -> Result<(Arc<Scene>, bool)> {
 		let metadata = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
 		let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-		let key = (path.to_path_buf(), select.map(str::to_string), relative_to.map(Path::to_path_buf));
+		let key = (path.to_path_buf(), select.map(str::to_string), relative_to.map(Path::to_path_buf), keep_invisible);
 		let cached = || self.entries.lock().get(&key).filter(|(time, size, _)| *time == modified && *size == metadata.len()).map(|(_, _, scene)| (scene.clone(), true));
 		if let Some(hit) = cached() {
 			return Ok(hit);
@@ -456,6 +457,7 @@ impl SceneCache {
 			// the parse and the extraction within the machine's free memory, as one load
 			let _budget = crate::budget::reserve(metadata.len());
 			let mut document = scene::load::read_file(path)?;
+			document.keep_invisible = keep_invisible;
 			if let Some(select) = select {
 				document.select(select)?;
 			}
@@ -599,6 +601,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 			let fetched = renderer.assets.fetch(&uri).map_err(|error| anyhow::anyhow!("{} is not a file, and as an asset: {error}", job.input))?;
 			scene::load::read_bytes(&fetched.bytes)?
 		};
+		document.keep_invisible = job.collision.is_some();
 		if let Some(select) = &job.select {
 			document.select(select)?;
 		}
@@ -637,11 +640,12 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 			}
 		}
 	} else if path.is_file() {
-		scenes.load(path, job.select.as_deref(), job.relative_to.as_deref())?
+		scenes.load(path, job.select.as_deref(), job.relative_to.as_deref(), job.collision.is_some())?
 	} else {
 		let uri = if job.input.chars().all(|c| c.is_ascii_digit()) { format!("rbxassetid://{}", job.input) } else { job.input.clone() };
 		let fetched = renderer.assets.fetch(&uri).map_err(|error| anyhow::anyhow!("{} is not a file, and as an asset: {error}", job.input))?;
 		let mut document = scene::load::read_bytes(&fetched.bytes)?;
+		document.keep_invisible = job.collision.is_some();
 		if let Some(select) = &job.select {
 			document.select(select)?;
 		}
@@ -922,5 +926,67 @@ mod tests {
 		let clouds = scenes.load_playback(document, &playback).unwrap().environment.clouds.expect("the stage's clouds");
 		assert!((clouds.cover - 0.95).abs() < 1e-6 && (clouds.density - 0.03).abs() < 1e-6 && clouds.color.abs_diff_eq(glam::Vec3::new(0.27451, 0.2902, 0.3451), 1e-5), "{clouds:?}");
 		let _ = std::fs::remove_dir_all(&folder);
+	}
+
+	/// The collisions-only view draws an invisible wall that collides as it draws the same wall seen, and
+	/// leaves out one that does not collide; a render without the view still draws nothing of either.
+	#[test]
+	fn the_collision_view_draws_invisible_parts_that_collide() {
+		if !scene::collision::AVAILABLE {
+			return;
+		}
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use crate::scene::collision::Filter;
+		let state = std::env::temp_dir().join(format!("ror-collision-invisible-{}", std::process::id()));
+		std::fs::create_dir_all(&state).unwrap();
+		// a floor and, in front of the camera, a wall (its Transparency and CanCollide) or none
+		let model = |name: &str, wall: Option<(f32, bool)>| {
+			let mut model = ModelBuilder::new("Model");
+			model.part(&PartSpec { name: "Floor".into(), cframe: glam::Affine3A::from_translation(Vec3::new(0.0, -3.0, 0.0)), size: Vec3::new(12.0, 1.0, 12.0), ..Default::default() });
+			if let Some((transparency, can_collide)) = wall {
+				let part = model.part(&PartSpec { name: "Wall".into(), size: Vec3::new(6.0, 4.0, 1.0), color: [40, 120, 220], transparency, ..Default::default() });
+				model.set(part, "CanCollide", can_collide);
+			}
+			let input = state.join(format!("{name}.rbxm"));
+			std::fs::write(&input, model.to_rbxm().unwrap()).unwrap();
+			input
+		};
+		let inputs = [("none", None), ("seen", Some((0.0, true))), ("invisible", Some((1.0, true))), ("ghost", Some((1.0, false)))].map(|(name, wall)| (name, model(name, wall)));
+		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(state.join("cache")) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let scenes = SceneCache::default();
+		let drawn = |name: &str, collision: Option<Filter>| {
+			let input = &inputs.iter().find(|(wall, _)| *wall == name).unwrap().1;
+			let camera = CameraSpec::LookAt { eye: [0.0, 1.0, -10.0], target: [0.0; 3], fov: 50.0 };
+			let job = Job {
+				input: input.display().to_string(),
+				select: None,
+				out: Some(state.join(format!("{name}-{}", if collision.is_some() { "collision" } else { "plain" }))),
+				views: vec![NamedView { name: "front".into(), view: ViewRequest { width: 64, height: 64, camera, ..Default::default() } }],
+				no_png: false,
+				compact_png: false,
+				materials_from: None,
+				lighting_from: None,
+				playback: None,
+				frame: None,
+				focus: None,
+				collision,
+				map: None,
+				cost: None,
+				relative_to: None,
+			};
+			let result = run(&renderer, &scenes, &job).unwrap();
+			(result.parts, std::fs::read(result.views[0].file.as_ref().unwrap()).unwrap())
+		};
+		let plain = |name: &str| drawn(name, None);
+		let collision = |name: &str| drawn(name, Some(Filter::Collide));
+		assert!(plain("seen") != plain("none"), "the camera sees the wall");
+		assert!(plain("invisible") == plain("none") && plain("ghost") == plain("none"), "an invisible wall draws nothing");
+		assert!(collision("seen") != collision("none"), "the view sees the wall");
+		let (invisible, seen) = (collision("invisible"), collision("seen"));
+		assert!(invisible == seen, "an invisible wall collides as the wall seen ({} parts drawn, {} with the wall seen)", invisible.0, seen.0);
+		assert!(collision("ghost") == collision("none"), "a wall that does not collide is left out");
+		let _ = std::fs::remove_dir_all(&state);
 	}
 }
