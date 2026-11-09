@@ -23,10 +23,23 @@ export function args(argv = process.argv.slice(2)) {
 	return options;
 }
 
+/**
+ * Whether two paths are the same file once links are followed. The real paths are compared because one script can
+ * be reached by two names: on macOS the temp folder /var is a link to /private/var. A path that cannot be resolved
+ * is compared as written.
+ */
+function sameFile(first, second) {
+	try {
+		return fs.realpathSync(first) === fs.realpathSync(second);
+	} catch {
+		return first === second;
+	}
+}
+
 /** Runs `action` with the command line options when the script was started directly, not imported (by the tests). */
 export async function main(url, action) {
-	const startedDirectly = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(url);
-	if (!startedDirectly) return;
+	const entryPoint = process.argv[1];
+	if (!entryPoint || !sameFile(path.resolve(entryPoint), fileURLToPath(url))) return;
 	try {
 		await action(args());
 	} catch (error) {

@@ -353,6 +353,22 @@ main(import.meta.url, async () => { await Promise.resolve(); throw new Error("as
 	assert.equal(child.stderr.trim(), "asynchronous failure");
 });
 
+test("release entry points run when started through a symlinked folder", (t) => {
+	const root = temporaryFolder(t);
+	const folder = path.join(root, "scripts");
+	const link = path.join(root, "linked");
+	fs.mkdirSync(folder);
+	fs.symlinkSync(folder, link, process.platform === "win32" ? "junction" : "dir");
+	const common = pathToFileURL(path.join(ROOT, "tools/release/common.mjs")).href;
+	fs.writeFileSync(path.join(folder, "entry.mjs"), `import { main } from ${JSON.stringify(common)};
+main(import.meta.url, () => console.log("started directly"));
+`);
+	const child = spawnSync(process.execPath, [path.join(link, "entry.mjs")], { encoding: "utf8", windowsHide: true });
+	assert.equal(child.status, 0);
+	assert.equal(child.stdout.trim(), "started directly");
+	assert.equal(child.stderr, "");
+});
+
 test("smoke accepts the redirected low-integrity driver cache and rejects nearby paths", (t) => {
 	const home = temporaryFolder(t);
 	const cache = path.join(home, "ror");
