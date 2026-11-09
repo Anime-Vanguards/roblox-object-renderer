@@ -109,14 +109,19 @@ jobs:
           $tests = @($uniqueNames)
           if ($tests.Count -eq 0) { throw 'No tests were listed' }
 
-          # 2. A test's shard is the first byte of its name's SHA-256, modulo the number of jobs. Every
-          #    name has exactly one hash, so it falls in exactly one shard and the shards cover all
-          #    names. The shard depends on the name alone, so adding a test moves no other test.
+          # 2. A test's shard is the first byte of the SHA-256 of "710:<name>", modulo the number of jobs.
+          #    Every name has exactly one hash, so it falls in exactly one shard and the shards cover all
+          #    names. The shard depends on the name alone, so adding a test moves no other test. The 710 is
+          #    a salt, picked from 0 to 1999 to spread the 12 slow tests (30 to 101 seconds each) evenly
+          #    over three jobs: with the times measured in run 42680788675 they would sum to 203/204/207
+          #    seconds per job, where the bare name gave 94/195/325. A new or changed test lands by its
+          #    hash, so the balance drifts over time; pick a new salt from fresh test times when it does,
+          #    or when the number of jobs changes.
           $selected = @()
           $sha256 = [Security.Cryptography.SHA256]::Create()
           try {
             foreach ($test in $tests) {
-              $firstByte = $sha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($test))[0]
+              $firstByte = $sha256.ComputeHash([Text.Encoding]::UTF8.GetBytes("710:${test}"))[0]
               if ($firstByte % [int]$env:SHARDS -eq [int]$env:SHARD) {
                 $selected += $test
               }
