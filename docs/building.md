@@ -24,10 +24,10 @@ entry and its only executable, stored with Unix mode 0755.
 | Linux x86_64 | `ubuntu-22.04` | glibc 2.35 or later |
 | macOS arm64 | `macos-15` | renders through Metal and reads built-in content from `RobloxStudio.app` |
 
-Other architectures have no release job. The maintainers build on Windows only, so the release
-workflow's first run on GitHub is the first build and smoke test of the Linux and macOS binaries. A
-release is published only after every platform passes. Studio parity needs Windows, and the
-system-memory admission and GPU budget checks are off outside Windows.
+Other architectures have no release job. A release is published only after every platform builds and
+passes its smoke test. The maintainers develop on Windows. Studio parity and system-memory admission
+need Windows. The GPU budget checks need a Vulkan driver with `VK_EXT_memory_budget`, so they run on
+Windows and Linux but not on Direct3D 12 or Metal.
 
 ### How releases are built
 

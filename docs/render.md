@@ -5,8 +5,11 @@ is the command's reference; what draws and the rules each thing follows are in
 [rendering.md](rendering.md), and where content comes from and how it is cached in
 [assets.md](assets.md).
 
+`<state dir>` is the [state folder](building.md#standalone-commands-and-state); a checkout defaults
+to `<checkout>/.cache`.
+
 ```sh
-ror render path/to/Model.rbxm                  # .cache/out/Model/render.png
+ror render path/to/Model.rbxm                  # <state dir>/out/Model/render.png
 ror render Model.rbxm --views front,iso,turntable:8 --size 1024x1024 --out out/model
 ror render 1234567890                          # a model asset id
 ror render ReplicatedStorage.Models.Character --studio "My Place"   # export (read-only), render
@@ -138,11 +141,11 @@ and `<view>.diff.png` (changed pixels in orange over the render in gray). `--jso
   UICorner as rur rounds the frame's background.
 - A view's `guiScale` sets the device pixels per GUI pixel for BillboardGui offsets and text
   (default: the image height / 744, Studio's 1.5 at a 1116 px tall image).
-- GUI images are cached by content in memory and in `.cache/guis` (per rur build); `ROR_NO_GUIS=1`
-  renders without them. ror sends rur its GUI atlases through rur's render service, straight to it
-  once a `rur render` through Node has started it (`ROR_RUR_DIRECT=0`: always through Node), and a
-  video finds its frames' GUI images ahead of their draws, outside the GPU slots: an animated GUI is
-  a new image every frame.
+- GUI images are cached by content in memory and in `<state dir>/guis` (per rur build);
+  `ROR_NO_GUIS=1` renders without them. ror sends rur its GUI atlases through rur's render service,
+  straight to it once a `rur render` through Node has started it (`ROR_RUR_DIRECT=0`: always through
+  Node), and a video finds its frames' GUI images ahead of their draws, outside the GPU slots: an
+  animated GUI is a new image every frame.
 - A SurfaceGui's ViewportFrame whose camera looks through its face (a window, as EgoMoose's
   ViewportWindow builds one: a rift, a portal) shows its world as the view's camera sees it, its
   meshes' vertex alpha cutting holes through the frame's background as in Studio; any other

@@ -65,8 +65,9 @@ ror = "Anime-Vanguards/roblox-object-renderer@0.1.0"
 
 Use rokit 1.0 or later on Linux and macOS: rokit 0.2.x cannot pick `ror` there because its name
 differs from the repository's. Aftman and foreman work with the same zip. A release binary keeps its
-state in your user cache; [docs/building.md](docs/building.md) lists the paths, the platforms and how
-to verify a download.
+state dir (`<state dir>` below) in your user cache; a build in a checkout uses `<checkout>/.cache`.
+[docs/building.md](docs/building.md#standalone-commands-and-state) lists the state paths, the
+platforms and how to verify a download.
 
 To build from source you need Rust 1.90 or later. Rendering needs a GPU (Vulkan, Direct3D 12 or
 Metal). You don't need Roblox Studio to render: ror reads Roblox's built-in textures, sky, avatar meshes and fonts from an installed Roblox, the
@@ -78,7 +79,7 @@ Studio (`ror compare`, `ror studio`). ffmpeg, rur, ree and a Roblox cookie are o
 
 ```sh
 cargo build --release                                         # target/release/ror
-target/release/ror render path/to/Model.rbxm                  # .cache/out/Model/render.png
+target/release/ror render path/to/Model.rbxm                  # <state dir>/out/Model/render.png
 target/release/ror render Model.rbxm --views front,iso,turntable:8 --size 1024x1024 --out out/model
 target/release/ror render 1234567890                          # a model asset id
 target/release/ror render ReplicatedStorage.Models.Character --studio "My Place"   # export (read-only), render

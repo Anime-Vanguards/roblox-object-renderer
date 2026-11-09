@@ -36,10 +36,12 @@ ror video Effect.rbxm --playback effect.json --start 0.2 --fps 60
   `{"at": <s>, "cframe": [x, y, z, R00 ... R22], "fov": <deg>}` (ree's `camera.json`), each held from
   its moment until the next and the first before its own. Emitters that camera could not draw stand
   still meanwhile, neither emitting nor ageing, as Studio leaves them.
-- Output, in `--out` (default `.cache/out/<input>-video`), at `--size WxH` (default 1920x1080, even
-  for mp4 and webm): `video.mp4` (H.264), or another of the [formats](#formats) with `--format`
-  (`webm`, `gif`, `apng`, `png`). The summary's `views` hold the
-  first frame's camera: `ror render <input> --views <view> --camera-from <out>` draws a still from it.
+- Output, in `--out` (default `<state dir>/out/<input>-video`: the
+  [state folder](building.md#standalone-commands-and-state), `<checkout>/.cache` in a checkout), at
+  `--size WxH` (default 1920x1080, even for mp4 and webm): `video.mp4` (H.264), or another of the
+  [formats](#formats) with `--format` (`webm`, `gif`, `apng`, `png`). The summary's `views` hold the
+  first frame's camera: `ror render <input> --views <view> --camera-from <out>` draws a still from
+  it.
 
 ### The sheet first
 

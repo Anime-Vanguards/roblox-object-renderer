@@ -1,8 +1,8 @@
 # Rendering
 
 ror draws what Roblox Studio shows at the highest graphics quality (quality level 21, `Future`
-lighting) with wgpu: Vulkan or Direct3D 12 on Windows, Metal on macOS. The code is in
-`crates/ror/src/scene` (reading files into a scene) and `crates/ror/src/render` (drawing it), the
+lighting) with wgpu: Vulkan or Direct3D 12 on Windows, Vulkan on Linux, Metal on macOS. The code is
+in `crates/ror/src/scene` (reading files into a scene) and `crates/ror/src/render` (drawing it), the
 shaders in `crates/ror/shaders`.
 
 ## From a file to a scene
