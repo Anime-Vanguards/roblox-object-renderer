@@ -22,7 +22,7 @@ pub fn is_script(input: &str) -> bool {
 pub fn locate() -> Option<PathBuf> {
 	let checkout = match std::env::var_os("ROR_REE") {
 		Some(path) if !path.is_empty() => PathBuf::from(path),
-		_ => crate::output::repo_dir().join("..").join("roblox-engine-emulator"),
+		_ => crate::output::checkout_dir()?.join("..").join("roblox-engine-emulator"),
 	};
 	let binary = crate::output::plain_path(&checkout).join("target").join("release").join(if cfg!(windows) { "ree.exe" } else { "ree" });
 	binary.is_file().then_some(binary)

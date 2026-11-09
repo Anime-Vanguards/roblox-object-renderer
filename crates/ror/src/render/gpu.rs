@@ -539,10 +539,11 @@ impl Gpu {
 			&& let Some(key) = wgpu::util::pipeline_cache_key(&adapter_info)
 		{
 			let name = format!("pipelines/{key}");
-			let file = crate::output::state_dir().join(&name);
+			let state = crate::output::state_dir();
+			let file = state.join(&name);
 			// a state dir without one starts from the content store's (what another build or checkout
 			// made on this machine: the driver checks it is its own)
-			let data = crate::output::read_state_file(&crate::output::state_dir(), &name).filter(|data| data.len() <= MAX_PIPELINE_CACHE);
+			let data = crate::output::read_state_file(&state, &name).filter(|data| data.len() <= MAX_PIPELINE_CACHE);
 			read_len = data.as_ref().map_or(0, Vec::len);
 			// SAFETY: the data is what `get_data` wrote for an adapter with the same key (the file name);
 			// `fallback` makes a corrupt or foreign file an empty cache

@@ -964,7 +964,8 @@ impl Renderer {
 		// them under)
 		let revision = rur::revision(&rur);
 		let folder = images_folder(&revision);
-		let directory = crate::output::state_dir().join("guis").join(&folder);
+		let guis_dir = crate::output::state_dir().join("guis");
+		let directory = guis_dir.join(&folder);
 		let from_disk: Vec<Option<GuiImage>> = missing
 			.par_iter()
 			.map(|(_, key, _, _)| {
@@ -1027,7 +1028,7 @@ impl Renderer {
 								// rur may have rebuilt itself for these: its images go with its new build's (a folder
 								// that may not be there yet)
 								let revision = rur::revision(&rur);
-								let directory = crate::output::state_dir().join("guis").join(images_folder(&revision));
+								let directory = guis_dir.join(images_folder(&revision));
 								let mut found = report.warnings;
 								if let Err(error) = std::fs::create_dir_all(&directory) {
 									found.push(format!("caching GUI textures in {}: {error}", directory.display()));
@@ -1076,7 +1077,7 @@ impl Renderer {
 		for (key, image) in finished {
 			images.insert(key, Arc::new(image));
 		}
-		prune_disk_cache(&crate::output::state_dir().join("guis").join(images_folder(&rur::revision(&rur))));
+		prune_disk_cache(&guis_dir.join(images_folder(&rur::revision(&rur))));
 		if profile {
 			eprintln!("profile: {drawn} GUI images from rur in {calls} calls {:.1} ms", rur_start.elapsed().as_secs_f64() * 1000.0);
 		}

@@ -51,8 +51,25 @@ the Neon ring's bloom follow the camera. [MP4](docs/media/unit-turntable.mp4).
 
 ## Quick start
 
-You need Rust 1.90 or later and a GPU (Vulkan, Direct3D 12 or Metal). You don't need Roblox Studio to
-render: ror reads Roblox's built-in textures, sky, avatar meshes and fonts from an installed Roblox, the
+Download the zip for your platform from
+[Releases](https://github.com/Anime-Vanguards/roblox-object-renderer/releases) and extract `ror.exe`
+(Windows) or `ror` (Linux and macOS). Then run `ror --version` and
+`ror render path/to/Model.rbxm --views iso --out out/model`.
+
+Or add ror to `rokit.toml`:
+
+```toml
+[tools]
+ror = "Anime-Vanguards/roblox-object-renderer@0.1.0"
+```
+
+Use rokit 1.0 or later on Linux and macOS: rokit 0.2.x cannot pick `ror` there because its name
+differs from the repository's. Aftman and foreman work with the same zip. A release binary keeps its
+state in your user cache; [docs/building.md](docs/building.md) lists the paths, the platforms and how
+to verify a download.
+
+To build from source you need Rust 1.90 or later. Rendering needs a GPU (Vulkan, Direct3D 12 or
+Metal). You don't need Roblox Studio to render: ror reads Roblox's built-in textures, sky, avatar meshes and fonts from an installed Roblox, the
 Player or Studio, without running it (`ROR_ROBLOX_CONTENT` names a `content` folder anywhere else).
 With neither it still renders, without those built-ins: no default sky or sun, studs or default particle
 texture. Studio itself is only for exporting from an open place (`--studio`) and for comparing ror with
@@ -74,7 +91,7 @@ target/release/ror cost Map.rbxm --sweep 5                    # what a map costs
 
 | page | what it covers |
 |---|---|
-| [docs/building.md](docs/building.md) | requirements, building, Cargo features and the x264 encoder |
+| [docs/building.md](docs/building.md) | release installs, verification, state paths, building, Cargo features and the x264 encoder |
 | [docs/render.md](docs/render.md) | `ror render`: inputs, cameras, levels of detail, maps, collision view, output, lints, inspect and diff, GUIs |
 | [docs/playback.md](docs/playback.md) | effects over time: the playback flags and JSON, emit modes, the Lighting while an effect plays |
 | [docs/video.md](docs/video.md) | `ror video`: cameras, formats, encoders, the contact sheet, copies, summary metrics and lints |
@@ -91,10 +108,10 @@ target/release/ror cost Map.rbxm --sweep 5                    # what a map costs
 ## Status and limitations
 
 ror is used every day by its maintainers, and its rules are measured against Studio captures (see
-[docs/parity.md](docs/parity.md)). It is not a published crate and has no releases: build it from
-source. Windows with the MSVC toolchain is the main platform; macOS builds render through Metal;
-Linux is not tested ([docs/building.md](docs/building.md)). Interfaces (flags, the job JSON,
-`summary.json`) change as the rules do; read the docs of the commit you build.
+[docs/parity.md](docs/parity.md)). It is not a published crate. Release builds target Windows x86_64,
+Linux x86_64 and macOS arm64 ([docs/building.md](docs/building.md)); Windows with MSVC is the main
+development platform. Interfaces (flags, the job JSON, `summary.json`) change as the rules do; read
+the docs of the commit you build.
 
 - Terrain is not drawn: a place's smooth terrain, water and grass are skipped, only its Clouds are
   drawn. Layered clothing (WrapLayer / WrapTarget) draws as its authored mesh, not fitted to the body
