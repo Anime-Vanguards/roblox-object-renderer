@@ -76,6 +76,16 @@ pub struct Job {
 	/// process's own.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub relative_to: Option<PathBuf>,
+	/// With `ids`: how much of this instance (dotted path from the file's root) each view shows ([`Alone`]).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub alone: Option<String>,
+}
+
+/// How much of an instance a view shows (`--alone`): its parts' pixels in the view, and drawn with nothing else.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct Alone {
+	pub shown: u32,
+	pub whole: u32,
 }
 
 /// A world drawn around the model (`--map`, [`scene::load::Document::add_setting`]): never framed, and
@@ -134,6 +144,8 @@ pub struct ViewResult {
 	/// With the view's `lod`: the levels its meshes drew at and the parts left out (render::LodView)
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub lod: Option<crate::render::LodView>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub alone: Option<Alone>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -546,6 +558,29 @@ pub fn run(renderer: &Renderer, scenes: &SceneCache, job: &Job) -> Result<JobRes
 	run_gated(renderer, scenes, job, None)
 }
 
+/// Each view's [`Alone`] for the instance at `path`: its parts' ids counted in `images`, and in the same views
+/// drawn again from the same cameras with only those parts.
+fn alone(renderer: &Renderer, scene: &Scene, path: &str, requests: &[ViewRequest], images: &[crate::render::ViewImage], gpu: Option<&crate::budget::GpuGate>) -> Result<Vec<Alone>> {
+	let under = format!("{path}.");
+	let mine: Vec<usize> = scene.parts.iter().enumerate().filter(|(_, part)| part.path == path || part.path.starts_with(&under)).map(|(index, _)| index).collect();
+	if mine.is_empty() {
+		bail!("--alone {path:?}: no part is at or under it");
+	}
+	let only = Scene { parts: mine.iter().map(|&index| scene.parts[index].clone()).collect(), environment: scene.environment.clone(), ..Default::default() };
+	let again: Vec<ViewRequest> = requests
+		.iter()
+		.zip(images)
+		.map(|(request, image)| ViewRequest { camera: CameraSpec::CFrame { components: image.camera.cframe_components(), fov: image.camera.fov, near: Some(image.camera.near) }, bloom: false, ..request.clone() })
+		.collect();
+	let (drawn, _) = render_in_groups(renderer, &only, &again, gpu)?;
+	let mut is_mine = vec![false; scene.parts.len() + 1];
+	for &index in &mine {
+		is_mine[index + 1] = true;
+	}
+	let count = |ids: Option<&[u32]>, of: &dyn Fn(u32) -> bool| ids.unwrap_or(&[]).iter().filter(|&&id| of(id)).count() as u32;
+	Ok(images.iter().zip(&drawn).map(|(image, alone)| Alone { shown: count(image.ids.as_deref(), &|id| is_mine[id as usize]), whole: count(alone.ids.as_deref(), &|id| id > 0) }).collect())
+}
+
 /// [`run`], each draw admitted within the GPU's free memory by `gpu` (loading, readbacks and PNG encoding
 /// run outside it).
 pub fn run_gated(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option<&crate::budget::GpuGate>) -> Result<JobResult> {
@@ -718,6 +753,10 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 	} else {
 		render_in_groups(renderer, &scene, &requests, gpu)?
 	};
+	let alone = match &job.alone {
+		Some(path) if images.iter().any(|image| image.ids.is_some()) => alone(renderer, &scene, path, &requests, &images, gpu)?,
+		_ => Vec::new(),
+	};
 	let bounds = if cameras_only {
 		let subject = scene.framing_subject();
 		renderer.framing_bounds(subject.as_ref().unwrap_or(&scene))
@@ -804,6 +843,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 			fov: camera.fov,
 			near: camera.near,
 			lod: images.get(index).and_then(|image| image.lod.clone()),
+			alone: alone.get(index).copied(),
 		});
 	}
 	let cost = match (&job.cost, &cost_document) {
@@ -873,6 +913,7 @@ mod tests {
 				map: None,
 				cost: None,
 				relative_to: relative_to.map(Path::to_path_buf),
+				alone: None,
 			}
 		};
 		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
@@ -975,6 +1016,7 @@ mod tests {
 				map: None,
 				cost: None,
 				relative_to: None,
+				alone: None,
 			};
 			let result = run(&renderer, &scenes, &job).unwrap();
 			(result.parts, std::fs::read(result.views[0].file.as_ref().unwrap()).unwrap())
@@ -987,6 +1029,48 @@ mod tests {
 		let (invisible, seen) = (collision("invisible"), collision("seen"));
 		assert!(invisible == seen, "an invisible wall collides as the wall seen ({} parts drawn, {} with the wall seen)", invisible.0, seen.0);
 		assert!(collision("ghost") == collision("none"), "a wall that does not collide is left out");
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	#[test]
+	fn alone_counts_what_hides_an_instance_in_each_view() {
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		let state = std::env::temp_dir().join(format!("ror-alone-{}", std::process::id()));
+		std::fs::create_dir_all(&state).unwrap();
+		// a block, and between it and the front camera a wall over its left half
+		let mut model = ModelBuilder::new("Model");
+		model.part(&PartSpec { name: "Subject".into(), size: Vec3::new(2.0, 2.0, 2.0), ..Default::default() });
+		model.part(&PartSpec { name: "Wall".into(), cframe: glam::Affine3A::from_translation(Vec3::new(3.0, 0.0, -4.0)), size: Vec3::new(6.0, 6.0, 0.5), ..Default::default() });
+		let input = state.join("model.rbxm");
+		std::fs::write(&input, model.to_rbxm().unwrap()).unwrap();
+		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(state.join("cache")) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let view = |name: &str, z: f32| NamedView { name: name.into(), view: ViewRequest { width: 96, height: 96, ids: true, camera: CameraSpec::LookAt { eye: [0.0, 0.0, z], target: [0.0; 3], fov: 40.0 }, ..Default::default() } };
+		let job = |alone: &str| Job {
+			input: input.display().to_string(),
+			select: None,
+			out: Some(state.join("out")),
+			views: vec![view("front", -12.0), view("back", 12.0)],
+			no_png: true,
+			compact_png: false,
+			materials_from: None,
+			lighting_from: None,
+			playback: None,
+			frame: None,
+			focus: None,
+			collision: None,
+			map: None,
+			cost: None,
+			relative_to: None,
+			alone: Some(alone.into()),
+		};
+		let result = run(&renderer, &SceneCache::default(), &job("Model.Subject")).unwrap();
+		let [front, back] = [result.views[0].alone.unwrap(), result.views[1].alone.unwrap()];
+		assert!(front.whole > 100 && back.whole == front.whole, "the block alone fills the same pixels from both sides: {front:?} {back:?}");
+		assert_eq!(back.shown, back.whole, "nothing hides it from behind");
+		assert!(front.shown * 3 > front.whole && front.shown * 3 < front.whole * 2, "the wall hides about half of it from the front: {front:?}");
+		assert!(run(&renderer, &SceneCache::default(), &job("Model.Nothing")).is_err(), "an instance with no part is an error");
 		let _ = std::fs::remove_dir_all(&state);
 	}
 }

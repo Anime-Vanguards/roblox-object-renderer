@@ -164,6 +164,10 @@ pub struct VideoJob {
 	/// Other files made from the same frames while the clip encodes ([`VideoCopy`]): an MP4 clip's.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub copies: Vec<VideoCopy>,
+	/// An MP4 encoded by the GPU's hardware encoder in the process ([`crate::nvenc`]) at this quality and
+	/// ceiling, in place of x264; the clip fails where there is none.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub nvenc: Option<crate::nvenc::Rate>,
 	/// The folder a relative local path in the input's content is read from (as
 	/// [`crate::job::Job::relative_to`]).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -305,32 +309,35 @@ fn nv12_brightness(nv12: &[u8], width: usize, height: usize) -> Brightness {
 	}
 	use rayon::prelude::*;
 	let (luma, chroma) = nv12.split_at(pixels);
-	// bands of rows on the thread pool: whole-number sums, so the same however the rows are split
+	// bands of rows, on the thread pool unless a clip's own thread measures: whole-number sums, so the same
+	// however the rows are split
 	const BAND: usize = 64;
-	let (sum, bright, near_white) = luma
-		.par_chunks(width * BAND)
-		.enumerate()
-		.map(|(band, rows)| {
-			let (mut sum, mut bright, mut near_white) = (0u64, 0u64, 0u64);
-			for (offset, line) in rows.chunks_exact(width).enumerate() {
-				let row = band * BAND + offset;
-				// u32 sums of a row cannot overflow below 18 million pixels across
-				let (mut total, mut lit, mut light) = (0u32, 0u32, 0u32);
-				for &y in line {
-					total += y.clamp(16, 235) as u32;
-					lit += (y >= BRIGHT_Y) as u32;
-					light += (y >= NEAR_WHITE_Y) as u32;
-				}
-				(sum, bright) = (sum + total as u64, bright + lit as u64);
-				// only rows with a pixel light enough are decoded
-				if light > 0 {
-					let pairs = &chroma[row / 2 * width..(row / 2 + 1) * width];
-					near_white += line.iter().enumerate().filter(|&(column, &y)| y >= NEAR_WHITE_Y && near_white_yuv(y, pairs[column & !1], pairs[column | 1])).count() as u64;
-				}
+	let measure = |(band, rows): (usize, &[u8])| {
+		let (mut sum, mut bright, mut near_white) = (0u64, 0u64, 0u64);
+		for (offset, line) in rows.chunks_exact(width).enumerate() {
+			let row = band * BAND + offset;
+			// u32 sums of a row cannot overflow below 18 million pixels across
+			let (mut total, mut lit, mut light) = (0u32, 0u32, 0u32);
+			for &y in line {
+				total += y.clamp(16, 235) as u32;
+				lit += (y >= BRIGHT_Y) as u32;
+				light += (y >= NEAR_WHITE_Y) as u32;
 			}
-			(sum, bright, near_white)
-		})
-		.reduce(|| (0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
+			(sum, bright) = (sum + total as u64, bright + lit as u64);
+			// only rows with a pixel light enough are decoded
+			if light > 0 {
+				let pairs = &chroma[row / 2 * width..(row / 2 + 1) * width];
+				near_white += line.iter().enumerate().filter(|&(column, &y)| y >= NEAR_WHITE_Y && near_white_yuv(y, pairs[column & !1], pairs[column | 1])).count() as u64;
+			}
+		}
+		(sum, bright, near_white)
+	};
+	let add = |a: (u64, u64, u64), b: (u64, u64, u64)| (a.0 + b.0, a.1 + b.1, a.2 + b.2);
+	let (sum, bright, near_white) = if crate::par::spread(0, usize::MAX) {
+		luma.par_chunks(width * BAND).enumerate().map(measure).reduce(|| (0, 0, 0), add)
+	} else {
+		luma.chunks(width * BAND).enumerate().map(measure).fold((0, 0, 0), add)
+	};
 	let mean = sum as f64 / pixels as f64;
 	Brightness { near_white, bright, luma: ((mean - 16.0) / 219.0).clamp(0.0, 1.0) }
 }
@@ -995,26 +1002,31 @@ impl<'a> Builder<'a> {
 		std::thread::scope(|scope| {
 			let (mut helpers, mut unblocked) = (0, 0);
 			let most = rayon::current_num_threads().clamp(2, 16) - 1;
+			let mut second = f64::INFINITY;
 			for index in 0..times.len() {
 				let started = Instant::now();
 				let built = ahead.take(index, &build);
-				// a slow second frame (the first reads the untouched roots once): helpers from now, as
+				// slow second and third frames (the first reads the untouched roots once, and the second
+				// alone may still settle: an attack clip's took 12 ms, its others 2.4): helpers from now, as
 				// many as it takes for scenes to come about as fast as the draws take them, rather than
 				// one at a time each after the draws ran dry (a 5,053-part map sim's frames take ~25 ms to
 				// make, a helper's own document ~130 ms before its first)
-				if index == 1 && helpers == 0 {
-					let ms = started.elapsed().as_secs_f64() * 1000.0;
+				if index == 1 {
+					second = started.elapsed().as_secs_f64() * 1000.0;
+				}
+				if index == 2 && helpers == 0 {
+					let ms = second.min(started.elapsed().as_secs_f64() * 1000.0);
 					let (free, others) = (crate::available_memory(), PRODUCING.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(1));
 					let roomy = others == 0 && free.is_some_and(|free| free > EARLY_HELPERS_FREE);
 					if std::env::var_os("ROR_PROFILE").is_some() {
-						eprintln!("profile: the producer's second frame {ms:.1} ms; {} GB free, {others} other clips making scenes: {}", free.map_or(0, |free| free >> 30), if roomy { "helpers now" } else { "helpers only as the draws wait" });
+						eprintln!("profile: the producer's second and third frames {ms:.1} ms or more; {} GB free, {others} other clips making scenes: {}", free.map_or(0, |free| free >> 30), if roomy { "helpers now" } else { "helpers only as the draws wait" });
 					}
 					if ms > EARLY_HELPERS_FROM_MS && roomy {
 						for _ in 0..((ms / EARLY_HELPERS_FROM_MS).ceil() as usize).min(EARLY_HELPERS).min(most) {
 							let Some(slot) = HelperSlot::take(most) else { break };
 							helpers += 1;
 							scope.spawn(|| {
-								let _slot = slot;
+								let (_slot, _clip) = (slot, crate::par::ClipThread::enter());
 								ahead.help(&build)
 							});
 						}
@@ -1040,7 +1052,7 @@ impl<'a> Builder<'a> {
 					helpers += 1;
 					unblocked = 0;
 					scope.spawn(|| {
-						let _slot = slot;
+						let (_slot, _clip) = (slot, crate::par::ClipThread::enter());
 						ahead.help(&build)
 					});
 				}
@@ -1223,8 +1235,8 @@ const FOUND_FRAMES: usize = 4;
 /// Scenes made ahead of the GUI stage: as many as it finds together for a clip with GUIs, a few
 /// otherwise (each cosmetic's 2-3 MB; the producer outpaces the draws).
 const SCENES_AHEAD: usize = 4;
-/// A clip's second frame taking longer than this to make starts a helper for every such stretch of its
-/// time, up to [`EARLY_HELPERS`] ([`Builder::produce`]): a cosmetic's take 2-4 ms and start none.
+/// A clip's second and third frames both taking longer than this to make start a helper for every such
+/// stretch of the quicker one's time, up to [`EARLY_HELPERS`] ([`Builder::produce`]): a cosmetic's take 2-4 ms and start none.
 /// Only with more than [`EARLY_HELPERS_FREE`] of memory free and no other clip making scenes in this
 /// process: their documents sooner cost a map sim ~200 MB more at its peak.
 const EARLY_HELPERS_FROM_MS: f64 = 8.0;
@@ -1506,6 +1518,7 @@ fn follow_playback<'s>(builder: &'s Builder, held: &Mutex<Vec<Kept<'s>>>, job: &
 enum Encoder {
 	#[cfg(ror_x264)]
 	X264 { encoder: crate::x264::Encoder, mp4: crate::mp4::Mp4Writer, sei: Vec<u8>, temporary: PathBuf, target: PathBuf },
+	Nvenc { encoder: crate::nvenc::Encoder, mp4: crate::mp4::Mp4Writer, temporary: PathBuf, target: PathBuf },
 	Ffmpeg { child: std::process::Child, input: Option<std::fs::File>, errors: std::thread::JoinHandle<String>, temporary: PathBuf, target: PathBuf, name: String, nv12: bool },
 	Apng { writer: Box<png::Writer<std::io::BufWriter<std::fs::File>>>, temporary: PathBuf, target: PathBuf },
 	Frames { dir: PathBuf, width: u32, height: u32 },
@@ -1536,6 +1549,10 @@ impl Drop for EncoderStarted {
 			}
 			#[cfg(ror_x264)]
 			Some(Encoder::X264 { encoder, mp4, temporary, .. }) => {
+				drop((encoder, mp4));
+				let _ = std::fs::remove_file(&temporary);
+			}
+			Some(Encoder::Nvenc { encoder, mp4, temporary, .. }) => {
 				drop((encoder, mp4));
 				let _ = std::fs::remove_file(&temporary);
 			}
@@ -1708,6 +1725,7 @@ impl Encoder {
 		match self {
 			#[cfg(ror_x264)]
 			Encoder::X264 { .. } => "x264".into(),
+			Encoder::Nvenc { .. } => "nvenc".into(),
 			Encoder::Ffmpeg { name, .. } => name.clone(),
 			Encoder::Apng { .. } => "apng".into(),
 			Encoder::Frames { .. } => "png".into(),
@@ -1719,13 +1737,23 @@ impl Encoder {
 		match self {
 			#[cfg(ror_x264)]
 			Encoder::X264 { .. } => true,
+			Encoder::Nvenc { .. } => true,
 			Encoder::Ffmpeg { nv12, .. } => *nv12,
 			_ => false,
 		}
 	}
 
-	fn new(format: VideoFormat, ffmpeg: Option<&Path>, out: &Path, (width, height): (u32, u32), fps: f32, frames: usize) -> Result<Encoder> {
+	fn new(format: VideoFormat, ffmpeg: Option<&Path>, out: &Path, (width, height): (u32, u32), fps: f32, frames: usize, nvenc: Option<crate::nvenc::Rate>) -> Result<Encoder> {
 		match format {
+			VideoFormat::Mp4 if nvenc.is_some() => {
+				let target = out.join(format.file_name());
+				let temporary = target.with_extension(format!("tmp{}", std::process::id()));
+				let rate = crate::mp4::frame_rate(fps);
+				let mut encoder = crate::nvenc::Encoder::open(&crate::nvenc::Settings { width, height, fps: rate, rate: nvenc.expect("checked") })?;
+				let headers = encoder.headers()?;
+				let mp4 = crate::mp4::Mp4Writer::create(&temporary, width, height, rate, &headers.sps, &headers.pps, frames, "ror nvenc", true)?;
+				Ok(Encoder::Nvenc { encoder, mp4, temporary, target })
+			}
 			VideoFormat::Png => {
 				let dir = out.join(format.file_name());
 				if dir.is_dir() {
@@ -1755,7 +1783,7 @@ impl Encoder {
 				let settings = crate::x264::Settings { width, height, fps: rate, preset: X264_PRESET.into(), crf: X264_CRF, threads: x264_threads(width, height) };
 				let mut encoder = crate::x264::Encoder::open(&settings)?;
 				let headers = encoder.headers()?;
-				let mp4 = crate::mp4::Mp4Writer::create(&temporary, width, height, rate, &headers.sps, &headers.pps, frames)?;
+				let mp4 = crate::mp4::Mp4Writer::create(&temporary, width, height, rate, &headers.sps, &headers.pps, frames, "ror x264", false)?;
 				Ok(Encoder::X264 { encoder, mp4, sei: headers.sei, temporary, target })
 			}
 			_ => {
@@ -1810,10 +1838,10 @@ impl Encoder {
 		let mut kept = Vec::new();
 		let mut brightness = Vec::new();
 		let (tile_width, tile_height) = thumbnail_size(width, height);
-		#[cfg(ror_x264)]
-		let nv12 = matches!(&self, Encoder::Ffmpeg { nv12: true, .. } | Encoder::X264 { .. });
-		#[cfg(not(ror_x264))]
-		let nv12 = matches!(&self, Encoder::Ffmpeg { nv12: true, .. });
+		let nv12 = self.takes_nv12();
+		// NVENC takes a frame in the time of a copy: its thread measures the frame itself, where x264's
+		// hands that to the pool to encode meanwhile
+		let inline = matches!(&self, Encoder::Nvenc { .. }) && copies.is_empty();
 		// the last drawn frame's pixels, while a frame may repeat it
 		let mut held: Option<crate::render::Held<'r>> = None;
 		let mut consume = |frame: OutputFrame<'r>, write: &mut dyn FnMut(&[u8], &mut OutputProfile) -> Result<()>| -> Result<()> {
@@ -1846,24 +1874,36 @@ impl Encoder {
 				// takes it: on this thread they held up the next frame (a 1440p clip's brightness took
 				// 0.93 ms a frame, 234 of its 564 ms, with a free encoder no less)
 				let (mut measured, mut thumbnail, mut measure_ms, mut thumbnail_ms) = (Brightness::default(), None, 0.0, 0.0);
-				let written = rayon::in_place_scope(|scope| {
-					scope.spawn(|_| {
-						let started = Instant::now();
-						measured = if nv12 { nv12_brightness(pixels, width as usize, height as usize) } else { rgba_brightness(pixels) };
-						measure_ms = started.elapsed().as_secs_f64() * 1000.0;
-					});
+				let written = if inline {
+					let started = Instant::now();
+					measured = nv12_brightness(pixels, width as usize, height as usize);
+					measure_ms = started.elapsed().as_secs_f64() * 1000.0;
 					if let Some(rgba) = sheet {
-						scope.spawn(|_| {
-							let started = Instant::now();
-							thumbnail = Some(downscale(rgba, width, height, tile_width, tile_height));
-							thumbnail_ms = started.elapsed().as_secs_f64() * 1000.0;
-						});
-					}
-					if !copies.is_empty() {
-						scope.spawn(|_| copies.write(pixels));
+						let started = Instant::now();
+						thumbnail = Some(downscale(rgba, width, height, tile_width, tile_height));
+						thumbnail_ms = started.elapsed().as_secs_f64() * 1000.0;
 					}
 					write(pixels, &mut profile)
-				});
+				} else {
+					rayon::in_place_scope(|scope| {
+						scope.spawn(|_| {
+							let started = Instant::now();
+							measured = if nv12 { nv12_brightness(pixels, width as usize, height as usize) } else { rgba_brightness(pixels) };
+							measure_ms = started.elapsed().as_secs_f64() * 1000.0;
+						});
+						if let Some(rgba) = sheet {
+							scope.spawn(|_| {
+								let started = Instant::now();
+								thumbnail = Some(downscale(rgba, width, height, tile_width, tile_height));
+								thumbnail_ms = started.elapsed().as_secs_f64() * 1000.0;
+							});
+						}
+						if !copies.is_empty() {
+							scope.spawn(|_| copies.write(pixels));
+						}
+						write(pixels, &mut profile)
+					})
+				};
 				profile.measure_ms += measure_ms;
 				profile.thumbnail_ms += thumbnail_ms;
 				if let (Some(index), Some(thumbnail)) = (sheet_index, thumbnail) {
@@ -1931,6 +1971,33 @@ impl Encoder {
 				}
 				std::fs::rename(&temporary, &target).with_context(|| format!("writing {}", target.display()))?;
 				"x264".into()
+			}
+			Encoder::Nvenc { mut encoder, mut mp4, temporary, target } => {
+				let written = (|| -> Result<()> {
+					for frame in receiver {
+						consume(frame, &mut |nv12, profile| {
+							let started = Instant::now();
+							encoder.send(nv12)?;
+							while let Some(packet) = encoder.receive()? {
+								mp4.write_at(packet.data, packet.keyframe, packet.display)?;
+							}
+							profile.pipe_ms += started.elapsed().as_secs_f64() * 1000.0;
+							Ok(())
+						})?;
+					}
+					encoder.finish()?;
+					while let Some(packet) = encoder.receive()? {
+						mp4.write_at(packet.data, packet.keyframe, packet.display)?;
+					}
+					drop(encoder);
+					mp4.finish()
+				})();
+				if let Err(error) = written {
+					let _ = std::fs::remove_file(&temporary);
+					return Err(error);
+				}
+				std::fs::rename(&temporary, &target).with_context(|| format!("writing {}", target.display()))?;
+				"nvenc".into()
 			}
 			Encoder::Frames { dir, width, height } => {
 				for (index, frame) in receiver.into_iter().enumerate() {
@@ -2159,7 +2226,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 	let _ = std::fs::remove_file(out.join(FAILED_FILE));
 	// started now, while the input loads and the camera is fitted (its process's start, a cold
 	// executable's first launch among it, off the clip's path); let go of if the clip fails first
-	let encoder = EncoderStarted(Some(Encoder::new(format, ffmpeg.as_deref(), &out, (view.width, view.height), job.fps, count)?));
+	let encoder = EncoderStarted(Some(Encoder::new(format, ffmpeg.as_deref(), &out, (view.width, view.height), job.fps, count, job.nvenc)?));
 	let copies = if job.copies.is_empty() || encoder.0.as_ref().is_some_and(Encoder::takes_nv12) {
 		CopyRuns::start(&job.copies, ffmpeg.as_deref(), (view.width, view.height), job.fps)?
 	} else {
@@ -2282,12 +2349,22 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 		let (builder, held) = (&builder, &held);
 		let times_ref = &times;
 		let (view_ref, cameras_ref) = (&view, &cameras);
-		scope.spawn(move || builder.produce(renderer, times_ref, held, batch_sender));
-		scope.spawn(move || find_guis(renderer, view_ref, cameras_ref, batch_receiver, found_sender));
-		scope.spawn(move || upload_guis(renderer, found_receiver, scene_sender));
+		scope.spawn(move || {
+			let _clip = crate::par::ClipThread::enter();
+			builder.produce(renderer, times_ref, held, batch_sender)
+		});
+		scope.spawn(move || {
+			let _clip = crate::par::ClipThread::enter();
+			find_guis(renderer, view_ref, cameras_ref, batch_receiver, found_sender)
+		});
+		scope.spawn(move || {
+			let _clip = crate::par::ClipThread::enter();
+			upload_guis(renderer, found_receiver, scene_sender)
+		});
 		let size = (view.width, view.height);
 		let encoding = scope.spawn(move || {
 			thread_below_normal();
+			let _clip = crate::par::ClipThread::enter();
 			encoder.consume(frame_receiver, size, copies)
 		});
 		// the authoring lints and effects' counts, and dropping each frame's scene, off the drawing
@@ -2308,6 +2385,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 		let clip_kept = crate::render::ClipKept::new();
 		let reuse = frame_reuse();
 		let drawn = (|| -> Result<()> {
+			let _clip = crate::par::ClipThread::enter();
 			let mut scene_start = Instant::now();
 			// the frame before's scene while the next may repeat it (to the lints once it is compared), and
 			// whether the encoder kept its pixels
@@ -2399,6 +2477,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 						fov: image.camera.fov,
 						near: image.camera.near,
 						lod: image.lod.clone(),
+						alone: None,
 					});
 				}
 				let encoder_start = Instant::now();
@@ -2543,7 +2622,7 @@ fn sheet_first<'s>(renderer: &Renderer, builder: &'s Builder, held: &Mutex<Vec<K
 		let pending = images.pop().context("the render gave no image")?;
 		if first.view.is_none() {
 			let image = pending.image();
-			first.view = Some(ViewResult { name: String::new(), file: None, ids_file: None, width: image.width, height: image.height, camera: image.camera.cframe_components(), fov: image.camera.fov, near: image.camera.near, lod: image.lod.clone() });
+			first.view = Some(ViewResult { name: String::new(), file: None, ids_file: None, width: image.width, height: image.height, camera: image.camera.cframe_components(), fov: image.camera.fov, near: image.camera.near, lod: image.lod.clone(), alone: None });
 		}
 		first.particles.push(frame_stats.particles);
 		for missing in frame_stats.missing {
@@ -2758,6 +2837,7 @@ mod tests {
 			sheet_first: false,
 			copies: Vec::new(),
 			relative_to: None,
+			nvenc: None,
 		};
 		let scenes = SceneCache::default();
 		let builder = Builder::new(|| Ok(bytes.clone()), &job, &scenes).unwrap();
@@ -2823,6 +2903,7 @@ mod tests {
 			sheet_first: false,
 			copies: Vec::new(),
 			relative_to: None,
+			nvenc: None,
 		};
 		let scenes = SceneCache::default();
 		let clouds_at = |job: &VideoJob, times: &[f32]| -> Vec<Option<crate::scene::environment::Clouds>> {
@@ -2902,6 +2983,7 @@ mod tests {
 			sheet_first: false,
 			copies: Vec::new(),
 			relative_to: None,
+			nvenc: None,
 		};
 		let scenes = SceneCache::default();
 		let builder = Builder::new(|| Ok(bytes.clone()), &job, &scenes).unwrap();
@@ -2961,6 +3043,7 @@ mod tests {
 			sheet_first,
 			copies: Vec::new(),
 			relative_to: None,
+			nvenc: None,
 		};
 		let scenes = SceneCache::default();
 		let plain = run(&renderer, &scenes, &job("plain", true), None).unwrap();
@@ -3032,6 +3115,7 @@ mod tests {
 				VideoCopy { file: bad.clone(), args: ["-c:v", "no_such_encoder"].map(String::from).to_vec() },
 			],
 			relative_to: None,
+			nvenc: None,
 		};
 		let result = run(&renderer, &SceneCache::default(), &job, None).unwrap();
 		assert!(result.video.is_file(), "the clip is written whatever its copies do");
@@ -3103,6 +3187,7 @@ mod tests {
 			sheet_first: false,
 			copies: Vec::new(),
 			relative_to: None,
+			nvenc: None,
 		};
 		let scenes = SceneCache::default();
 		let read = |dir: &str, frame: usize| std::fs::read(state.join(dir).join(format!("frames/{frame:04}.png"))).unwrap();

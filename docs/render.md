@@ -31,7 +31,8 @@ read-only through `SerializationService`, with the place's MaterialVariants; nee
 `{"mode":"lookAt","eye":[0,5,-10],"target":[0,2,0],"fov":40}` or
 `{"mode":"orbit","yaw":25,"pitch":10,"fov":35}` (orbits frame the model's bounds as its parts
 draw; a model drawing no part, an effect whose parts are invisible, by what its effects draw at
-the moment drawn).
+the moment drawn). A JSON list of cameras draws a view each (`camera1`, `camera2`, ...) from one
+load of the input: many candidate cameras of one scene in one command.
 
 - `--focus <instance>` frames what is at or under one instance (a dotted path, or its last names:
   `Head`), the rest drawn around it.
@@ -101,6 +102,12 @@ green and blue, low byte first; 0 for none), `parts.json` (each part's path, cla
 transparency, position) and `visible.json` (per view, each part index and the pixels it owns: with
 `--no-png` the only output, for visibility sweeps over thousands of views); a job sets `"ids": true`
 per view.
+
+`--alone <instance>` (with `--ids`; a job's `alone`) says how much of one instance each view shows:
+the view's `alone` in the result holds the pixels its parts own in the view (`shown`) and the pixels
+they own drawn from the same camera with nothing else (`whole`), so `shown / whole` is the share of
+it that nothing hides. Choosing among cameras by what hides a subject takes one command so, where
+drawing the instance by itself in a second job per camera took 20 of them for 10 cameras.
 
 ## Authoring lint
 

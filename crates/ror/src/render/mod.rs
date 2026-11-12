@@ -3006,7 +3006,7 @@ impl Renderer {
 				})
 				.collect();
 			let load = |uri: &&String| self.load_whole(uri, TextureUse::Color).ok();
-			if scene.live || wanted.len() < 2 {
+			if scene.live || wanted.len() < 2 || !crate::par::spread(wanted.len(), 8) {
 				held.extend(wanted.iter().filter_map(load));
 			} else {
 				held.par_extend(wanted.par_iter().filter_map(load));
@@ -3143,7 +3143,7 @@ impl Renderer {
 				}
 			};
 			// as each_part
-			if scene.live {
+			if scene.live || !crate::par::spread(unique.len(), 8) {
 				unique.iter().for_each(load);
 			} else {
 				unique.par_iter().for_each(load);
@@ -3169,7 +3169,7 @@ impl Renderer {
 			Arc::new(self.prepare_part(plain.as_ref().unwrap_or(&scene.parts[position]), mesh, material, flags[position], &context))
 		};
 		// as each_part
-		let prepared: Vec<Arc<prepared::PreparedPart>> = if scene.live { inputs.into_iter().map(&prepare).collect() } else { inputs.into_par_iter().map(&prepare).collect() };
+		let prepared: Vec<Arc<prepared::PreparedPart>> = if scene.live || !crate::par::spread(inputs.len(), CLIP_PARTS) { inputs.into_iter().map(&prepare).collect() } else { inputs.into_par_iter().map(&prepare).collect() };
 		for part in &prepared {
 			stats.missing.extend(part.missing.iter().cloned());
 		}
@@ -5570,12 +5570,18 @@ fn effect_bounds(scene: &Scene, particles: &particles::PreparedParticles) -> Opt
 	})
 }
 
+/// The parts a clip's frame prepares on its own thread ([`crate::par`]): a map's 250 tufts of grass swaying on
+/// their bones, prepared again every frame, took 1.3 ms there and as long on the pool's eight threads, which
+/// spent 12 ms of CPU on them waiting for the texture cache's lock and each other.
+const CLIP_PARTS: usize = 1024;
+
 /// `f` of each part of `scene`, in order: on the calling thread for a live scene (`Scene::live`),
 /// across rayon's threads otherwise. A live scene's files are loaded by its first render (or a
 /// prefetch), so each later lookup is a cache hit: handing a character's 51 parts to
 /// rayon's threads took ~0.2 ms a pass against 0.01-0.03 here, its preview's frames 2.2 ms against 1.3.
+/// A clip's frames keep the few parts that changed to their thread too ([`crate::par`]).
 fn each_part<T: Send>(scene: &Scene, f: impl Fn(usize, &Part) -> T + Sync) -> Vec<T> {
-	if scene.live {
+	if scene.live || !crate::par::spread(scene.parts.len(), CLIP_PARTS) {
 		scene.parts.iter().enumerate().map(|(index, part)| f(index, part)).collect()
 	} else {
 		scene.parts.par_iter().enumerate().map(|(index, part)| f(index, part)).collect()
@@ -5584,7 +5590,7 @@ fn each_part<T: Send>(scene: &Scene, f: impl Fn(usize, &Part) -> T + Sync) -> Ve
 
 /// `f` of the parts of `scene` at `positions`, in their order, as [`each_part`].
 fn each_of<T: Send>(scene: &Scene, positions: &[usize], f: impl Fn(usize, &Part) -> T + Sync) -> Vec<T> {
-	if scene.live {
+	if scene.live || !crate::par::spread(positions.len(), CLIP_PARTS) {
 		positions.iter().map(|&index| f(index, &scene.parts[index])).collect()
 	} else {
 		positions.par_iter().map(|&index| f(index, &scene.parts[index])).collect()

@@ -418,7 +418,8 @@ struct RenderArgs {
 	/// Vertical field of view in degrees
 	#[arg(long)]
 	fov: Option<f32>,
-	/// Camera JSON (see CameraSpec), e.g. '{"mode":"lookAt","eye":[0,5,-10],"target":[0,2,0]}'
+	/// Camera JSON (see CameraSpec), e.g. '{"mode":"lookAt","eye":[0,5,-10],"target":[0,2,0]}'; a JSON
+	/// list of them draws a view each (camera1, camera2, ...) from one load
 	#[arg(long)]
 	camera: Option<String>,
 	/// Orbit views frame this box instead of the model: minX,minY,minZ,maxX,maxY,maxZ, or as
@@ -463,6 +464,11 @@ struct RenderArgs {
 	/// material, transparency)
 	#[arg(long)]
 	ids: bool,
+	/// With --ids: how much of this instance (dotted path from the file's root) each view shows: the
+	/// view's `alone` in the result gives its parts' pixels in the view (`shown`) and drawn from the
+	/// same camera with nothing else (`whole`)
+	#[arg(long, value_name = "PATH", requires = "ids")]
+	alone: Option<String>,
 	/// Draw what Roblox draws at a graphics quality level: each MeshPart at the level of detail its
 	/// distance and RenderFidelity give from each view's camera, and none of the parts the quality's
 	/// view distance and size cull leave out: roblox (quality 21) or roblox:<1-21> (notes/cost.md
@@ -655,6 +661,12 @@ struct VideoArgs {
 	/// named by the extension; repeat for more. The summary's copies say which were written
 	#[arg(long, value_name = "JSON")]
 	copy: Vec<String>,
+	/// Encode the mp4 on the GPU's hardware encoder (NVIDIA's NVENC, in the process) instead of x264:
+	/// constant quality QUALITY (1-51, lower is better), spending at most KBPS kbit/s, so a clip
+	/// of a known length fits a size. The frames cost the CPU no encoding; the clip fails where the
+	/// machine has no such encoder
+	#[arg(long, value_name = "QUALITY[:KBPS]")]
+	nvenc: Option<String>,
 	/// Draw what Roblox draws at a graphics quality level: each MeshPart at the level of detail its
 	/// distance and RenderFidelity give from the camera in each frame, and none of the parts the quality's
 	/// view distance and size cull leave out: roblox (quality 21) or roblox:<1-21> (notes/cost.md
@@ -936,8 +948,14 @@ fn render(mut args: RenderArgs) -> Result<()> {
 	let (width, height) = parse_size(&args.size)?;
 	let background = parse_background(&args.background)?;
 	let mut views = if let Some(camera) = &args.camera {
-		let camera: CameraSpec = serde_json::from_str(camera).context("--camera JSON")?;
-		vec![job::NamedView { name: "render".into(), view: ror::render::ViewRequest { width, height, camera, background, ..Default::default() } }]
+		// a list of cameras: a view each, camera1 on
+		let named = |name: String, camera: CameraSpec| job::NamedView { name, view: ror::render::ViewRequest { width, height, camera, background, ..Default::default() } };
+		if camera.trim_start().starts_with('[') {
+			let cameras: Vec<CameraSpec> = serde_json::from_str(camera).context("--camera JSON")?;
+			cameras.into_iter().enumerate().map(|(index, camera)| named(format!("camera{}", index + 1), camera)).collect()
+		} else {
+			vec![named("render".into(), serde_json::from_str(camera).context("--camera JSON")?)]
+		}
 	} else if let Some(yaw) = args.yaw {
 		let camera = CameraSpec::Orbit { yaw, pitch: args.pitch, distance: None, padding: 0.08, target: None, fov: args.fov.unwrap_or(70.0) };
 		vec![job::NamedView { name: "render".into(), view: ror::render::ViewRequest { width, height, camera, background, ..Default::default() } }]
@@ -997,6 +1015,7 @@ fn render(mut args: RenderArgs) -> Result<()> {
 		map: map_setting(args.map.as_deref(), args.map_origin.as_deref())?,
 		cost: None,
 		relative_to: std::env::current_dir().ok(),
+		alone: args.alone.filter(|_| args.ids),
 	};
 	let mut result = if args.no_service || std::env::var_os("ROR_NO_SERVICE").is_some() {
 		ror::memory_checkpoint("start");
@@ -1157,6 +1176,7 @@ fn video(mut args: VideoArgs) -> Result<()> {
 			})
 			.collect::<Result<_>>()?,
 		relative_to: std::env::current_dir().ok(),
+		nvenc: args.nvenc.as_deref().map(ror::nvenc::Rate::parse).transpose()?,
 	};
 	let mut result = if args.no_service || std::env::var_os("ROR_NO_SERVICE").is_some() {
 		let gpu = Arc::new(Gpu::new()?);
@@ -1673,6 +1693,7 @@ fn cost(mut args: CostArgs) -> Result<()> {
 			all_emitters: args.all_emitters,
 		}),
 		relative_to: std::env::current_dir().ok(),
+		alone: None,
 	};
 	let result = if args.no_service || std::env::var_os("ROR_NO_SERVICE").is_some() {
 		let gpu = Arc::new(Gpu::new()?);

@@ -51,6 +51,12 @@ Studio) at run time, and assets are downloaded from Roblox on demand into the us
 > IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 > DEALINGS IN THE SOFTWARE.
 
+- `crates/ror/src/nvenc.rs`: the structure layouts, constants and identifiers of NVIDIA's encoder
+  interface follow `nvEncodeAPI.h` (NVENC API 12.0, as
+  [nv-codec-headers](https://github.com/FFmpeg/nv-codec-headers) n12.0.16.1 carries it), Copyright (c)
+  2010-2022 NVIDIA Corporation, under the MIT license above. The encoder itself is the installed
+  driver's; none of it is distributed with ror.
+
 - `crates/ror-image/src/bc.rs`: the BCn decoders follow the arithmetic of
   [bcdec](https://github.com/iOrange/bcdec) by iOrange, licensed MIT OR Unlicense; used here
   under the Unlicense. The tests compare against the `bcdec_rs` crate (MIT), a dev-dependency.

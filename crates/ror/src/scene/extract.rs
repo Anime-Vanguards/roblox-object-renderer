@@ -301,14 +301,13 @@ fn extract_with(document: &Document, roots: &[Ref], reuse: Option<(&mut RootReus
 		plan.push((index, kept));
 	}
 	// the emitters' reads, most of a walk through an effect, on every core ahead of it
-	let mut emitters: std::collections::HashMap<Ref, (Option<super::particles::ParticleEmitter>, Vec<String>)> = order
-		.par_iter()
-		.filter_map(|&referent| {
-			let instance = document.dom.get_by_ref(referent).filter(|instance| instance.class == "ParticleEmitter")?;
-			let mut warnings = Vec::new();
-			Some((referent, (super::particles::read(document, referent, instance, &mut warnings), warnings)))
-		})
-		.collect();
+	let read = |&referent: &Ref| {
+		let instance = document.dom.get_by_ref(referent).filter(|instance| instance.class == "ParticleEmitter")?;
+		let mut warnings = Vec::new();
+		Some((referent, (super::particles::read(document, referent, instance, &mut warnings), warnings)))
+	};
+	let mut emitters: std::collections::HashMap<Ref, (Option<super::particles::ParticleEmitter>, Vec<String>)> =
+		if crate::par::spread(order.len(), 4096) { order.par_iter().filter_map(read).collect() } else { order.iter().filter_map(read).collect() };
 	scene.particles.reserve_exact(emitters.len());
 	let mut spans = spans.into_iter().peekable();
 	// the kept pieces' parts' indices, wanted only by Highlights (finish_walk): a map's thousands of
@@ -477,7 +476,8 @@ fn finish_walk(document: &Document, scene: &mut Scene, mut part_indices: std::co
 	for (path, referent) in effects.chain(scene.beams.iter().map(|beam| (&beam.path, beam.referent))).chain(scene.trails.iter().map(|trail| (&trail.path, trail.referent))) {
 		named.entry(path.clone()).or_insert(referent);
 	}
-	scene.lineage = named.into_par_iter().map(|(path, referent)| (path, document.lineage(referent))).collect();
+	let lineage = |(path, referent): (String, Ref)| (path, document.lineage(referent));
+	scene.lineage = if crate::par::spread(named.len(), 1024) { named.into_par_iter().map(lineage).collect() } else { named.into_iter().map(lineage).collect() };
 }
 
 /// The instances at or under `roots` in the order a walk through them meets them: depth first, each

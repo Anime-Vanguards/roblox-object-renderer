@@ -1896,7 +1896,7 @@ impl Resolved<'_> {
 			trail.dropped_length = dropped;
 		}
 		// each emitter's particles on every core: what one emits depends on no other
-		scene.particles.par_iter_mut().for_each(|emitter| {
+		let play = |emitter: &mut super::particles::ParticleEmitter| {
 			let Some(referent) = emitter.referent else {
 				return;
 			};
@@ -2033,7 +2033,12 @@ impl Resolved<'_> {
 			births.retain(|birth| birth.age >= 0.0);
 			emitter.cframe = parent_now;
 			emitter.births = Some(births);
-		});
+		};
+		if crate::par::spread(scene.particles.len(), 64) {
+			scene.particles.par_iter_mut().for_each(play);
+		} else {
+			scene.particles.iter_mut().for_each(play);
+		}
 		// beams: TextureSpeed scrolls the texture frame by frame, each frame by its step times the speed
 		// set in that frame, from the frame the beam is enabled in; a disabled beam starts again at 0
 		// (beam-scroll: within 0.003 of a repeat in every mode, late, toggle and tween)
