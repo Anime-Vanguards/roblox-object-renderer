@@ -918,8 +918,9 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 	if ((flags & TEX_NORMAL) != 0u || surface_group != 0u) {
 		var t = normalize(input.world_tangent.xyz - n * dot(n, input.world_tangent.xyz));
 		var b = cross(n, t) * input.world_tangent.w;
-		if ((flags & TEX_MATERIAL) != 0u && dot(material.u_axis, material.u_axis) > 0.5) {
-			// projected material textures: the projection face's axes, onto the surface
+		if (((flags & TEX_MATERIAL) != 0u || surface_group != 0u) && dot(material.u_axis, material.u_axis) > 0.5) {
+			// projected material textures and surface tiles (laid in the same face frame, also on a Plastic
+			// without textures): the projection face's axes, onto the surface
 			let u_world = (instance.model * vec4<f32>(material.u_axis, 0.0)).xyz;
 			let up_world = (instance.model * vec4<f32>(material.up_axis, 0.0)).xyz;
 			t = normalize(u_world - n * dot(n, u_world) + vec3<f32>(1e-6, 0.0, 0.0));

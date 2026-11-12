@@ -104,6 +104,11 @@ pub enum Background {
 	Transparent,
 	/// A flat sRGB colour (0..1).
 	Color([f32; 3]),
+	/// A ViewportFrame's target: cleared to its background, an sRGB colour (0..1) at an opacity (1 -
+	/// BackgroundTransparency), and written as a PNG with straight alpha. Studio averages its samples'
+	/// colours as they are, so a part's edge mixes the clear colour in at full strength whatever its
+	/// opacity, and clips the mean at 1 (notes/render.md "ViewportFrames").
+	Frame { color: [f32; 3], alpha: f32 },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -825,6 +830,23 @@ fn surface_groups(part: &Part) -> u32 {
 		packed |= group << (4 * face);
 	}
 	packed
+}
+
+/// How a part's material textures and surface types map onto the drawn shape: planar per face on
+/// primitives, projected on balls and meshes, the mesh's own uv without either. Surface types tile the
+/// face's frame also on a Plastic without a texture pack (the pre-2022 Plastic: Studio 0.747 puts its studs
+/// where the 2022 Plastic's are, rur's viewport-models in a place without Use2022Materials; with the mesh's
+/// uv a cylinder's and a ball's studs came out larger and shifted).
+fn uv_mode(flags: u32, is_mesh: bool, geometry: &Geometry, surfaces: u32) -> u32 {
+	if flags & TEX_MATERIAL == 0 && surfaces == 0 {
+		UV_MESH
+	} else if is_mesh {
+		UV_BOX
+	} else if matches!(geometry, Geometry::Ball) {
+		UV_BALL
+	} else {
+		UV_PLANAR
+	}
 }
 
 /// How material textures map onto the drawn shape (`UV_*` in shaders/common.wgsl).
@@ -3497,16 +3519,8 @@ impl Renderer {
 			let model = Mat4::from(world);
 			let normal_matrix = Mat4::from_mat3(glam::Mat3::from(world.matrix3).inverse().transpose());
 			let mut flags = flags;
-			// material textures: planar per face on primitives, projected on balls and meshes
-			let uv_mode = if flags & TEX_MATERIAL == 0 {
-				UV_MESH
-			} else if is_mesh {
-				UV_BOX
-			} else if matches!(part.geometry, Geometry::Ball) {
-				UV_BALL
-			} else {
-				UV_PLANAR
-			};
+			let surfaces = if context.surface_maps { surface_groups(part) } else { 0 };
+			let uv_mode = uv_mode(flags, is_mesh, &part.geometry, surfaces);
 			// the drawn shape's size (a ball's diameter, a cylinder's length and diameter); meshes
 			// project onto the part's box
 			let drawn_size = if is_mesh { part.size } else { Vec3::new(local.matrix3.x_axis.length(), local.matrix3.y_axis.length(), local.matrix3.z_axis.length()) };
@@ -3566,7 +3580,7 @@ impl Renderer {
 				color: [base.x, base.y, base.z, opacity],
 				params: [tune_spec().filter(|_| params.metalness == 0.0 && flags & TEX_MATERIAL == 0 && params.shading == materials::SHADING_STANDARD).map(|(roughness, ..)| roughness).unwrap_or(params.roughness), params.metalness, reflectance, emissive],
 				size: [drawn_size.x, drawn_size.y, drawn_size.z, studs_per_tile],
-				flags: [params.shading, flags, if context.surface_maps { surface_groups(part) } else { 0 }, uv_mode],
+				flags: [params.shading, flags, surfaces, uv_mode],
 				// parts: the material texture offset in tiles and the Organic noise's (decals use these for
 				// their tiling)
 				tiling: [offset[0], offset[1], noise_offset[0], noise_offset[1]],
@@ -4240,6 +4254,10 @@ impl Renderer {
 		let (sky_on, background) = match request.background {
 			Background::Sky => (1.0, [0.0, 0.0, 0.0, 1.0]),
 			Background::Transparent => (0.0, [0.0, 0.0, 0.0, 0.0]),
+			Background::Frame { color, alpha } => {
+				let color = linear(Vec3::from(color));
+				(0.0, [color.x, color.y, color.z, alpha.clamp(0.0, 1.0)])
+			}
 			Background::Color(color) => {
 				let color = linear(Vec3::from(color));
 				(0.0, [color.x, color.y, color.z, 1.0])
@@ -4247,7 +4265,7 @@ impl Renderer {
 		};
 		let bodies = self.celestial_bodies(environment, &mut stats.missing);
 		let mut sky_uniform = SkyUniform::zeroed().with(|uniform| {
-			uniform.params = [1.0, sky_on, 0.0, 0.0];
+			uniform.params = [1.0, sky_on, if matches!(request.background, Background::Frame { .. }) { 1.0 } else { 0.0 }, 0.0];
 			uniform.background = background;
 			uniform.sun = bodies.sun;
 			uniform.moon = bodies.moon;
@@ -4594,7 +4612,11 @@ impl Renderer {
 			None => (frame.environment[2], tone_curve(environment)),
 		};
 		let resolve_uniform = ResolveUniform {
-			params: [exposure, tonemapper, supersample as f32, if request.background == Background::Transparent { 1.0 } else { 0.0 }],
+			params: [exposure, tonemapper, supersample as f32, match request.background {
+				Background::Transparent => 1.0,
+				Background::Frame { .. } => 2.0,
+				_ => 0.0,
+			}],
 			correction,
 			tint,
 			bloom: [bloom_weight, bloom_texel, if bloom_on { 1.0 } else { 0.0 }, 0.0],
@@ -5816,6 +5838,55 @@ mod decal_uv_tests {
 		}
 		drop(texture);
 		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+}
+
+#[cfg(test)]
+mod viewport_frame_tests {
+	use super::*;
+
+	/// Surface types without a material texture (the pre-2022 Plastic) still take the face's frame.
+	#[test]
+	fn surface_types_tile_the_face_frame_without_a_texture_pack() {
+		assert_eq!(uv_mode(0, false, &Geometry::Cylinder, 1 << 4), UV_PLANAR);
+		assert_eq!(uv_mode(0, false, &Geometry::Ball, 1 << 4), UV_BALL);
+		assert_eq!(uv_mode(0, false, &Geometry::Block, 0), UV_MESH);
+		assert_eq!(uv_mode(TEX_MATERIAL, false, &Geometry::Block, 0), UV_PLANAR);
+	}
+
+	/// A ViewportFrame's target (`Background::Frame`) is cleared to the frame's background colour at its
+	/// opacity, and a part's anti-aliased edge averages the part's colour with the clear colour as it is,
+	/// whatever the opacity (Studio 0.747: a white part's edge over a half-transparent background is the
+	/// mean of white and that colour at the mean opacity).
+	#[test]
+	fn a_viewport_frames_target_is_cleared_to_its_background() {
+		let state = std::env::temp_dir().join(format!("ror-viewport-frame-test-{}", std::process::id()));
+		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let mut model = crate::scene::build::ModelBuilder::new("Plate");
+		model.part(&crate::scene::build::PartSpec { name: "Plate".into(), size: Vec3::new(4.0, 4.0, 1.0), material: 272, color: [255, 255, 255], ..Default::default() });
+		let mut scene = crate::scene::extract::extract(&model.into_document());
+		scene.in_viewport_frame(crate::scene::environment::ViewportLighting { ambient: Vec3::ONE, light_color: Vec3::ZERO, light_direction: Vec3::NEG_Z, sky: None });
+		let colour = [0.2f32, 0.4, 0.6];
+		let size = 64u32;
+		let request = ViewRequest { width: size, height: size, camera: CameraSpec::LookAt { eye: [0.0, 0.0, -10.0], target: [0.0; 3], fov: 40.0 }, background: Background::Frame { color: colour, alpha: 0.5 }, bloom: false, ..Default::default() };
+		let (images, _) = renderer.render(&scene, std::slice::from_ref(&request)).unwrap();
+		let pixel = |x: u32, y: u32| -> [f32; 4] { let i = ((y * size + x) * 4) as usize; std::array::from_fn(|c| images[0].rgba[i + c] as f32 / 255.0) };
+		let corner = pixel(1, 1);
+		assert!((0..3).all(|c| (corner[c] - colour[c]).abs() < 1.5 / 255.0) && (corner[3] - 0.5).abs() < 1.5 / 255.0, "the clear colour at its opacity: {corner:?}");
+		let middle = pixel(size / 2, size / 2);
+		assert!(middle[3] > 254.0 / 255.0 && middle[0] > 0.9, "the part opaque: {middle:?}");
+		// along the middle row, every pixel the part covers in part: the straight mean, at the mean opacity
+		let row: Vec<[f32; 4]> = (0..size).map(|x| pixel(x, size / 2)).collect();
+		let edges: Vec<&[f32; 4]> = row.iter().filter(|p| p[3] > 0.52 && p[3] < 0.98).collect();
+		assert!(!edges.is_empty(), "an anti-aliased edge");
+		for edge in edges {
+			let covered = (edge[3] - 0.5) / 0.5;
+			let blue = 1.0 * covered + colour[2] * (1.0 - covered);
+			assert!((edge[2] - blue).abs() < 3.0 / 255.0, "the edge's colour is the straight mean ({blue}): {edge:?}");
+		}
 		let _ = std::fs::remove_dir_all(&state);
 	}
 }
