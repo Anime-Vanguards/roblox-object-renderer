@@ -2034,7 +2034,7 @@ impl Resolved<'_> {
 			emitter.cframe = parent_now;
 			emitter.births = Some(births);
 		};
-		if crate::par::spread(scene.particles.len(), 64) {
+		if crate::par::spread(scene.particles.len(), crate::par::CLIP_EMITTERS) {
 			scene.particles.par_iter_mut().for_each(play);
 		} else {
 			scene.particles.iter_mut().for_each(play);

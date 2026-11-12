@@ -316,19 +316,9 @@ fn nv12_brightness(nv12: &[u8], width: usize, height: usize) -> Brightness {
 		let (mut sum, mut bright, mut near_white) = (0u64, 0u64, 0u64);
 		for (offset, line) in rows.chunks_exact(width).enumerate() {
 			let row = band * BAND + offset;
-			// u32 sums of a row cannot overflow below 18 million pixels across
-			let (mut total, mut lit, mut light) = (0u32, 0u32, 0u32);
-			for &y in line {
-				total += y.clamp(16, 235) as u32;
-				lit += (y >= BRIGHT_Y) as u32;
-				light += (y >= NEAR_WHITE_Y) as u32;
-			}
-			(sum, bright) = (sum + total as u64, bright + lit as u64);
-			// only rows with a pixel light enough are decoded
-			if light > 0 {
-				let pairs = &chroma[row / 2 * width..(row / 2 + 1) * width];
-				near_white += line.iter().enumerate().filter(|&(column, &y)| y >= NEAR_WHITE_Y && near_white_yuv(y, pairs[column & !1], pairs[column | 1])).count() as u64;
-			}
+			let pairs = &chroma[row / 2 * width..(row / 2 + 1) * width];
+			let (total, lit, white) = row_levels(line, pairs);
+			(sum, bright, near_white) = (sum + total, bright + lit, near_white + white);
 		}
 		(sum, bright, near_white)
 	};
@@ -340,6 +330,56 @@ fn nv12_brightness(nv12: &[u8], width: usize, height: usize) -> Brightness {
 	};
 	let mean = sum as f64 / pixels as f64;
 	Brightness { near_white, bright, luma: ((mean - 16.0) / 219.0).clamp(0.0, 1.0) }
+}
+
+/// A row of luma's sum (each pixel within 16-235), its pixels at least [`BRIGHT_Y`] and those near white
+/// ([`near_white_yuv`] with the row's chroma `pairs`; only pixels light enough are decoded).
+fn row_levels_plain(line: &[u8], pairs: &[u8], from: usize) -> (u64, u64, u64) {
+	let (mut total, mut lit, mut white) = (0u64, 0u64, 0u64);
+	for (column, &y) in line.iter().enumerate().skip(from) {
+		total += y.clamp(16, 235) as u64;
+		lit += (y >= BRIGHT_Y) as u64;
+		white += (y >= NEAR_WHITE_Y && near_white_yuv(y, pairs[column & !1], pairs[column | 1])) as u64;
+	}
+	(total, lit, white)
+}
+
+/// [`row_levels_plain`] sixteen pixels at a time: a 1440p frame's 3.7 million took 1.25 ms one by one on
+/// the thread that hands the frame to the encoder, a third of that thread's time.
+#[cfg(target_arch = "x86_64")]
+fn row_levels(line: &[u8], pairs: &[u8]) -> (u64, u64, u64) {
+	use std::arch::x86_64::*;
+	let blocks = line.len() / 16;
+	let mut white = 0u64;
+	// SAFETY: SSE2 is part of x86_64; each load reads 16 bytes inside `line`
+	let (total, lit) = unsafe {
+		let (zero, one) = (_mm_setzero_si128(), _mm_set1_epi8(1));
+		let (low, high) = (_mm_set1_epi8(16), _mm_set1_epi8(235u8 as i8));
+		let (bright, light) = (_mm_set1_epi8(BRIGHT_Y as i8), _mm_set1_epi8(NEAR_WHITE_Y as i8));
+		let (mut total, mut lit) = (zero, zero);
+		for block in 0..blocks {
+			let pixels = _mm_loadu_si128(line.as_ptr().add(block * 16).cast());
+			total = _mm_add_epi64(total, _mm_sad_epu8(_mm_min_epu8(_mm_max_epu8(pixels, low), high), zero));
+			// unsigned y >= level: the larger of the two is y
+			let is_bright = _mm_cmpeq_epi8(_mm_max_epu8(pixels, bright), pixels);
+			lit = _mm_add_epi64(lit, _mm_sad_epu8(_mm_and_si128(is_bright, one), zero));
+			let mut is_light = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_max_epu8(pixels, light), pixels)) as u32;
+			while is_light != 0 {
+				let column = block * 16 + is_light.trailing_zeros() as usize;
+				white += near_white_yuv(line[column], pairs[column & !1], pairs[column | 1]) as u64;
+				is_light &= is_light - 1;
+			}
+		}
+		let lanes = |sums: __m128i| _mm_cvtsi128_si64(sums) as u64 + _mm_cvtsi128_si64(_mm_unpackhi_epi64(sums, sums)) as u64;
+		(lanes(total), lanes(lit))
+	};
+	let rest = row_levels_plain(line, pairs, blocks * 16);
+	(total + rest.0, lit + rest.1, white + rest.2)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn row_levels(line: &[u8], pairs: &[u8]) -> (u64, u64, u64) {
+	row_levels_plain(line, pairs, 0)
 }
 
 /// Whether a limited-range BT.709 pixel decodes to red, green and blue all at least 229.5 of 255
@@ -406,10 +446,24 @@ struct Census {
 
 impl Census {
 	fn add(&mut self, scene: &Scene) {
-		self.parts.add(scene.parts.iter().map(|part| part.path.as_str()));
-		self.emitters.add(scene.particles.iter().map(|emitter| emitter.path.as_str()));
-		self.beams.add(scene.beams.iter().map(|beam| beam.path.as_str()));
-		self.trails.add(scene.trails.iter().map(|trail| trail.path.as_str()));
+		self.add_after(scene, None);
+	}
+
+	/// [`Census::add`] of the frame after `last`'s, both counted here: a kind whose paths are the last
+	/// frame's in the same order adds nothing (a map clip hashed its 2,100 part paths every frame, 0.55 ms).
+	fn add_after(&mut self, scene: &Scene, last: Option<&Scene>) {
+		fn paths<'a, T: 'a>(items: &'a [T], path: fn(&T) -> &str) -> impl Iterator<Item = &'a str> + Clone {
+			items.iter().map(path)
+		}
+		fn add<'a, T: 'a>(copies: &mut Copies, items: &'a [T], last: Option<&'a [T]>, path: fn(&T) -> &str) {
+			if !last.is_some_and(|last| last.len() == items.len() && paths(last, path).eq(paths(items, path))) {
+				copies.add(paths(items, path));
+			}
+		}
+		add(&mut self.parts, &scene.parts, last.map(|last| &last.parts[..]), |part| part.path.as_str());
+		add(&mut self.emitters, &scene.particles, last.map(|last| &last.particles[..]), |emitter| emitter.path.as_str());
+		add(&mut self.beams, &scene.beams, last.map(|last| &last.beams[..]), |beam| beam.path.as_str());
+		add(&mut self.trails, &scene.trails, last.map(|last| &last.trails[..]), |trail| trail.path.as_str());
 	}
 
 	/// (parts, emitters, beams, trails)
@@ -2372,12 +2426,14 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 		let (lint_sender, lint_receiver) = sync_channel::<Scene>(2);
 		let linting = scope.spawn(move || {
 			let (mut motion, mut census, mut effects) = (crate::lint::Motion::default(), Census::default(), crate::lint::Effects::default());
+			let mut last: Option<Scene> = None;
 			for scene in lint_receiver {
 				// they read the model, not a map around it
 				let subject = scene.framing_subject();
 				motion.add(subject.as_ref().unwrap_or(&scene));
-				census.add(&scene);
+				census.add_after(&scene, last.as_ref());
 				effects.add(subject.as_ref().unwrap_or(&scene));
+				last = Some(scene);
 			}
 			(motion, census, effects)
 		});
@@ -2990,13 +3046,18 @@ mod tests {
 		let first = builder.scene_at(0.0).unwrap();
 		assert_eq!((first.parts.len(), first.particles.len(), first.beams.len()), (1, 0, 0), "the effect is out of the world at first");
 		let mut census = Census::default();
+		// each frame after the last, as a clip counts them: the same counts
+		let (mut after, mut last) = (Census::default(), None);
 		let mut effects = crate::lint::Effects::default();
 		for time in [0.0, 0.3, 0.6, 0.9, 0.95] {
 			let scene = builder.scene_at(time).unwrap();
 			census.add(&scene);
+			after.add_after(&scene, last.as_ref());
 			effects.add(&scene);
+			last = Some(scene);
 		}
 		assert_eq!(census.counts(), (2, 3, 1, 0), "the floor and the holder, the three emitters (copies apart), the beam; each once");
+		assert_eq!(after.counts(), census.counts());
 		// the effect's own counts alike (the floor holds none)
 		let counts = effects.counts(&builder.roots);
 		assert_eq!(counts.effects.iter().map(|effect| (effect.root.as_str(), effect.emitters, effect.beams)).collect::<Vec<_>>(), [("Link.Effect", 3, 1)]);
@@ -3358,6 +3419,19 @@ mod tests {
 		let grey = |level: u8| nv12_brightness(&crate::render::nv12::from_rgba(&[level, level, level, 255].repeat(16), 4, 4, true), 4, 4).near_white;
 		assert_eq!((grey(229), grey(230)), (0, 16));
 		assert_eq!(nv12_brightness(&[0; 5], 2, 2), Brightness::default(), "a short buffer measures nothing");
+		// sixteen at a time counts what one at a time does, at every level and with a row's odd end
+		let mut state = 0x9e3779b97f4a7c15u64;
+		let mut next = || {
+			state ^= state << 13;
+			state ^= state >> 7;
+			state ^= state << 17;
+			(state >> 32) as u8
+		};
+		for width in [2usize, 16, 30, 50, 258] {
+			let line: Vec<u8> = (0..width).map(|index| if index % 7 == 0 { 255 - (next() % 48) } else { next() }).collect();
+			let pairs: Vec<u8> = (0..width).map(|_| 96 + next() % 64).collect();
+			assert_eq!(row_levels(&line, &pairs), row_levels_plain(&line, &pairs, 0), "a row {width} wide");
+		}
 	}
 
 	#[test]

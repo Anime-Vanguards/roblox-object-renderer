@@ -3184,10 +3184,12 @@ impl Renderer {
 			self.preparations.keep_parts(table, keep.map(|((position, part), _)| (&key.parts[*position][..], flags[*position], part.clone())));
 		}
 		let moving = !prepared.is_empty() && prepared.len() < scene.parts.len();
-		// which parts a later frame may take as they are (what the kept table takes)
+		// which parts a later frame may take as they are: what the kept table takes, and a skinned part too
+		// (its key holds its pose, and its posed mesh is its own unless the scene is live): a map's 253 tufts
+		// of grass, skinned and never moving, were prepared again every frame of a clip
 		let mut reusable: Vec<bool> = kept.iter().map(Option::is_some).collect();
 		for ((position, part), complete) in fresh.iter().zip(&prepared).zip(&complete) {
-			reusable[*position] = *complete && part.missing.is_empty() && scene.parts[*position].skeleton.is_none();
+			reusable[*position] = *complete && part.missing.is_empty() && (scene.parts[*position].skeleton.is_none() || !scene.live);
 		}
 
 		// the frame's parts in order, each part's instances and draws after those before it: the last
@@ -5570,9 +5572,10 @@ fn effect_bounds(scene: &Scene, particles: &particles::PreparedParticles) -> Opt
 	})
 }
 
-/// The parts a clip's frame prepares on its own thread ([`crate::par`]): a map's 250 tufts of grass swaying on
-/// their bones, prepared again every frame, took 1.3 ms there and as long on the pool's eight threads, which
-/// spent 12 ms of CPU on them waiting for the texture cache's lock and each other.
+/// The parts a clip's frame prepares on its own thread ([`crate::par`]): 250 parts prepared again every frame
+/// (a map's skinned tufts of grass, before a skinned part was kept from the last frame) took 1.3 ms there and
+/// as long on the pool's eight threads, which spent 12 ms of CPU on them waiting for the texture cache's lock
+/// and each other.
 const CLIP_PARTS: usize = 1024;
 
 /// `f` of each part of `scene`, in order: on the calling thread for a live scene (`Scene::live`),

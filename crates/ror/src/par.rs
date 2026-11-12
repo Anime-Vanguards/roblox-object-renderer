@@ -14,6 +14,11 @@ thread_local! {
 	static CLIP: Cell<bool> = const { Cell::new(false) };
 }
 
+/// The emitters a clip's thread plays and simulates itself: an attack's 500, some 3,000 particles, took
+/// 0.4 ms a frame on the pool's eight threads and no longer on the frame's own, the clip 0.55 core-seconds
+/// less of its 5.2.
+pub(crate) const CLIP_EMITTERS: usize = 2048;
+
 /// Marks the calling thread as one of a clip's until dropped.
 pub(crate) struct ClipThread(bool);
 
