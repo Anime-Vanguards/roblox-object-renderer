@@ -42,7 +42,8 @@ Windows uses a software adapter when needed, Linux installs Mesa's software Vulk
 uses Metal. Studio and rur are not installed, so parity and GUI rendering are not smoke-tested.
 
 A push to main that changes the release tooling, and a manual run, build, test and upload artifacts
-without publishing. Only a tag push publishes.
+without publishing (a dry run). Only a tag push publishes: the zips of the dry run that passed on main
+at the tagged commit, or, when there is none, zips the tag run builds and tests itself first.
 
 ### Verifying a download
 

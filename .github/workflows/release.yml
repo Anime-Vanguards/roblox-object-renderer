@@ -1,7 +1,10 @@
 # Release builds use only public source, a pinned toolchain and clean runners, with no build cache.
 #
-# A push of a tag vMAJOR.MINOR.PATCH builds, smoke-tests and publishes the release. A push to main that
-# changes release files, or a manual run, does everything except publish (a dry run).
+# A push to main that changes release files, or a manual run, builds and smoke-tests every platform
+# without publishing (a dry run). A push of a tag vMAJOR.MINOR.PATCH publishes the release: the zips
+# of the dry run that passed on main at the tagged commit when there is one (tools/release/dry-run.mjs;
+# the release command tags only such a commit), so a tag needs no second build of the same source;
+# otherwise it builds and smoke-tests every platform itself first.
 #
 # Jobs: version -> build (one per platform) -> smoke (a fresh runner per platform) -> publish,
 # with notes written beside them. Only publish can write, and it runs nothing from the repository.
@@ -28,17 +31,24 @@ on:
 permissions:
   contents: read
 
-# one run per ref: a newer push to main cancels an older dry run, a tag run is never cancelled
+# No release run is ever cancelled by another. Pushes to main share one group without cancelling: a
+# dry run that has started always finishes (the release command may be waiting on it), and a newer
+# push only replaces a dry run still waiting for it. A tag or a manual run is a group of its own.
 concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+  group: release-${{ github.event_name == 'push' && github.ref_type == 'branch' && github.ref || github.run_id }}
+  cancel-in-progress: false
 
 jobs:
   version:
     if: ${{ !github.event.repository.private }}
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      actions: read # to find the dry run of the tagged commit
     outputs:
       version: ${{ steps.version.outputs.version }}
+      # the dry run whose zips a tag publishes; empty when this run builds them
+      dry-run: ${{ steps.dry-run.outputs.run-id }}
     steps:
       - name: Check out the full history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -59,9 +69,18 @@ jobs:
             version=$(node tools/release/version.mjs)
           fi
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+      # A tag publishes the zips the passing dry run of the same commit built and smoke-tested on
+      # every platform; build and smoke below then have nothing to do. Without one they run.
+      - name: Find the passing dry run of the tagged commit
+        id: dry-run
+        if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node tools/release/dry-run.mjs --repository "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --artifacts ror-windows-x86_64,ror-linux-x86_64,ror-macos-aarch64 >> "$GITHUB_OUTPUT"
 
   build:
-    if: ${{ !github.event.repository.private }}
+    if: ${{ !github.event.repository.private && needs.version.outputs.dry-run == '' }}
     needs: version
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
@@ -114,7 +133,7 @@ jobs:
           if-no-files-found: error
 
   smoke:
-    if: ${{ !github.event.repository.private }}
+    if: ${{ !github.event.repository.private && needs.version.outputs.dry-run == '' }}
     needs: [version, build]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
@@ -198,22 +217,44 @@ jobs:
           path: release-notes.md
           if-no-files-found: error
 
+  # Runs after this run's build and smoke passed, or, when they were skipped, on the dry run's zips.
   publish:
-    if: ${{ !github.event.repository.private && github.event_name == 'push' && github.ref_type == 'tag' }}
+    if: ${{ !cancelled() && !github.event.repository.private && github.event_name == 'push' && github.ref_type == 'tag' && needs.version.result == 'success' && needs.notes.result == 'success' && (needs.version.outputs.dry-run != '' || (needs.build.result == 'success' && needs.smoke.result == 'success')) }}
     needs: [version, build, smoke, notes]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
       id-token: write
       attestations: write
+      actions: read # to download the dry run's zips
     steps:
       # No checkout, repository scripts or build tools in the only job with write permissions.
+      - name: Say which run built the zips
+        shell: bash
+        env:
+          DRY_RUN: ${{ needs.version.outputs.dry-run }}
+        run: |
+          if [ -n "$DRY_RUN" ]; then
+            echo "Publishing the zips that dry run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$DRY_RUN built and smoke-tested at $GITHUB_SHA" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Publishing the zips this run built and smoke-tested" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Download the zips
+        if: ${{ needs.version.outputs.dry-run == '' }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: ror-*
           merge-multiple: true
           path: assets
+      - name: Download the zips the dry run of this commit built and smoke-tested
+        if: ${{ needs.version.outputs.dry-run != '' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: ror-*
+          merge-multiple: true
+          path: assets
+          run-id: ${{ needs.version.outputs.dry-run }}
+          github-token: ${{ github.token }}
       - name: Download the release notes
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
