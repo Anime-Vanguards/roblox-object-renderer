@@ -38,8 +38,12 @@ jobs:
           # Its own cache, so the workspace's feature set never replaces the one the ror jobs restore.
           shared-key: workspace
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Every target with the workspace's features but the unit-test harnesses: ror's is the one large
+      # unit in this build that no job here runs (the library jobs build and run it with the shipped
+      # binary's features), and Clippy below still checks it with these features (--all-targets). The
+      # decoding crates' harnesses are built and run by the next step.
       - name: Build
-        run: cargo build --release --locked --workspace --all-targets
+        run: cargo build --release --locked --workspace --lib --bins --examples --benches --test '*'
       - name: Test the decoding and asset crates
         run: cargo test --release --locked -p ror-image -p ror-mesh -p ror-assets
       - name: Clippy
