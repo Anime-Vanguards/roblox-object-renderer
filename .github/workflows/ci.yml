@@ -1,8 +1,9 @@
 # Runs on the public repository only: the private one has no free Actions minutes to spare.
 # Third-party actions are pinned to full commit SHAs; Dependabot (private repo) keeps them current.
 #
-# Four jobs run side by side: one builds the whole workspace, tests the decoding crates and runs Clippy;
-# three share ror's own tests, which are the slow part.
+# Eight jobs run side by side: one builds the whole workspace, tests the decoding crates and runs Clippy;
+# one runs ror's binary, integration and documentation tests and builds the examples; six share ror's
+# library tests, which are the slow part. Each of those six builds only the library's test binary.
 name: CI
 
 on:
@@ -43,26 +44,21 @@ jobs:
         run: cargo test --release --locked -p ror-image -p ror-mesh -p ror-assets
       - name: Clippy
         run: cargo clippy --release --locked --workspace --all-targets
+      # The runner that shares ror's library tests over the jobs below. It needs no build, and runs
+      # after a failed step too.
+      - name: CI tool tests
+        if: ${{ !cancelled() }}
+        run: node --test tools/ci/test.mjs
 
-  # ror's tests, split over three runners. A test belongs to the runner its name hashes to, so the jobs
-  # together run every test once. They build only ror (-p ror), the same dependency features as the
-  # shipped binary: a workspace test run would also switch on ror-mesh's Draco encoder and rusqlite's
-  # hashbrown feature.
-  #
-  # GitHub's runners have no GPU, so the render tests use the software adapter (WARP), which runs faster
-  # with a runner's CPUs to itself. They have no Studio install or Roblox client cache either, so the
-  # tests needing them skip. The render budgets, the GPU state and the environment are shared by every
-  # test in a process, so each runner runs its tests one at a time (--test-threads=1), as before the split.
-  ror:
+  # Everything of ror's but its library's unit tests: the binary's tests, the integration tests, the
+  # documentation tests and the examples (which a plain cargo test builds as ordinary programs). The
+  # same package and features as the jobs below (-p ror, the shipped binary's dependency features), so
+  # the two kinds of job share one dependency cache.
+  ror-targets:
     if: ${{ !github.event.repository.private }}
-    name: Test ror, part ${{ matrix.shard }} of 3 (windows-latest)
+    name: Test ror's binary, integration and documentation tests, build the examples (windows-latest)
     runs-on: windows-latest
     timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        # Only labels the jobs. The scripts below count from strategy.job-index, which starts at 0.
-        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -70,89 +66,59 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
         with:
           toolchain: "1.90.0"
-          components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # One cache for the three ror jobs, which all build the same features.
+          # The library jobs' cache (see below); they store it.
           shared-key: test
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      # A plain cargo test also builds the examples, as ordinary programs. The test step below picks
-      # test targets only, so one job builds the examples here and they stay covered.
+          save-if: false
       - name: Build the examples
-        if: ${{ strategy.job-index == 0 }}
         run: cargo build --release --locked -p ror --examples
-      - name: Test ror
-        shell: pwsh
-        env:
-          SHARD: ${{ strategy.job-index }}
-          SHARDS: ${{ strategy.job-total }}
-        run: |
-          # Runs the given tests, each by its exact name. A failure does not end the step: it is kept in
-          # $script:testExitCode (the step's variable, not a local one), so the later chunks still run and
-          # one log shows every failing test. --no-fail-fast does the same inside a chunk, where cargo
-          # would otherwise skip the remaining test binaries after the first failing one.
-          function Invoke-Tests($names) {
-            cargo test --release --locked --no-fail-fast -p ror --lib --bins --tests -- --test-threads=1 --exact @names
-            if ($LASTEXITCODE -ne 0) { $script:testExitCode = $LASTEXITCODE }
-          }
-
-          # 1. Ask cargo for every unit, binary and integration test, so a new test file needs no change
-          #    here. Each line reads "<path>::<name>: test"; a name in two binaries is listed once.
-          $listing = @(cargo test --release --locked -p ror --lib --bins --tests -- --list --format terse)
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          #    The set drops repeated names and keeps them sorted by character code, not by culture rules,
-          #    so two different names never count as one and the order is the same on every runner.
-          $uniqueNames = [Collections.Generic.SortedSet[string]]::new([StringComparer]::Ordinal)
-          foreach ($line in $listing) {
-            if ($line -match '^(.+): (?:test|benchmark)$') { [void]$uniqueNames.Add($Matches[1]) }
-          }
-          $tests = @($uniqueNames)
-          if ($tests.Count -eq 0) { throw 'No tests were listed' }
-
-          # 2. A test's shard is the first byte of the SHA-256 of "710:<name>", modulo the number of jobs.
-          #    Every name has exactly one hash, so it falls in exactly one shard and the shards cover all
-          #    names. The shard depends on the name alone, so adding a test moves no other test. The 710 is
-          #    a salt, picked from 0 to 1999 to spread the 12 slow tests (30 to 101 seconds each) evenly
-          #    over three jobs: with the times measured in run 42680788675 they would sum to 203/204/207
-          #    seconds per job, where the bare name gave 94/195/325. A new or changed test lands by its
-          #    hash, so the balance drifts over time; pick a new salt from fresh test times when it does,
-          #    or when the number of jobs changes.
-          $selected = @()
-          $sha256 = [Security.Cryptography.SHA256]::Create()
-          try {
-            foreach ($test in $tests) {
-              $firstByte = $sha256.ComputeHash([Text.Encoding]::UTF8.GetBytes("710:${test}"))[0]
-              if ($firstByte % [int]$env:SHARDS -eq [int]$env:SHARD) {
-                $selected += $test
-              }
-            }
-          } finally { $sha256.Dispose() }
-
-          # 3. Run this shard's tests by exact name, so a name that two binaries share runs in both. The
-          #    names go on the command line, and Windows allows 32767 UTF-16 characters there. A chunk
-          #    holds at most 12000 characters of names, counting 2 per character plus 3 for the quotes
-          #    and the space, which leaves room for the executable path and the fixed arguments.
-          #    Invoke-Tests keeps the exit code of a failing chunk; 0 means every chunk passed.
-          $testExitCode = 0
-          $chunk = @()
-          $length = 0
-          foreach ($test in $selected) {
-            $cost = 2 * $test.Length + 3
-            if ($cost -gt 12000) { throw 'Test name exceeds command line budget' }
-            if ($length + $cost -gt 12000) {
-              Invoke-Tests $chunk
-              $chunk = @()
-              $length = 0
-            }
-            $chunk += $test
-            $length += $cost
-          }
-          # A shard with no tests must run nothing: libtest with no filters would run every test.
-          if ($chunk.Count -gt 0) {
-            Invoke-Tests $chunk
-          }
-          # Every chunk has run. End with the exit code of the last failing chunk, or 0.
-          exit $testExitCode
+      # --test '*' picks every integration test; --tests would add the library's unit tests too
+      - name: Test ror's binary and integration tests
+        if: ${{ !cancelled() }}
+        run: cargo test --release --locked --no-fail-fast -p ror --bins --test '*' -- --test-threads=1
       - name: Test ror documentation
-        if: ${{ strategy.job-index == 0 }}
+        if: ${{ !cancelled() }}
         run: cargo test --release --locked -p ror --doc -- --test-threads=1
+
+  # ror's library tests, split over six runners. They build only the library's test binary, with the
+  # same dependency features as the shipped binary (-p ror): a workspace test run would also switch on
+  # ror-mesh's Draco encoder and rusqlite's hashbrown feature.
+  #
+  # GitHub's runners have no GPU, so the render tests use the software adapter (WARP), which runs faster
+  # with a runner's CPUs to itself. They have no Studio install or Roblox client cache either, so the
+  # tests needing them skip. The render budgets, the GPU state and the environment are shared by every
+  # test in a process, so each runner runs its tests one at a time (--test-threads=1), as before the split.
+  #
+  # Cargo starts the test binary through tools/ci/test-entry.mjs. Its runner (tools/ci/test-shard.mjs)
+  # lists the tests and runs this job's share: fourteen tests that draw on the software adapter take
+  # nearly all of the time, so the shares are cut by the times in tools/ci/test-weights.json, longest
+  # first, each to the job with the least so far. Together the six shares hold every test exactly once.
+  ror:
+    if: ${{ !github.event.repository.private }}
+    name: Test ror's library, part ${{ matrix.part }} of 6 (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # Only labels the jobs: the runner counts from strategy.job-index (from 0) and job-total
+        part: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
+        with:
+          toolchain: "1.90.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # One cache for ror's test jobs, which all build the same features. Only the first library
+          # job stores it, on main: the others would only race it to store the same key.
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' && strategy.job-index == 0 }}
+      # The entry is given by its absolute path, as cargo starts it in the package's folder.
+      - name: Test ror's library (this job's share)
+        run: |
+          $entry = (Resolve-Path tools/ci/test-entry.mjs).Path.Replace('\', '/')
+          cargo test --release --locked --no-fail-fast -p ror --lib --config "target.x86_64-pc-windows-msvc.runner=['node','$entry','${{ strategy.job-index }}','${{ strategy.job-total }}']" -- --test-threads=1
