@@ -1,10 +1,16 @@
 # Release builds use only public source, a pinned toolchain and clean runners, with no build cache.
 #
 # A push to main that changes release files, or a manual run, builds and smoke-tests every platform
-# without publishing (a dry run). A push of a tag vMAJOR.MINOR.PATCH publishes the release: the zips
-# of the dry run that passed on main at the tagged commit when there is one (tools/release/dry-run.mjs;
+# without publishing (a dry run). So does a nightly run at main's head, unless the head already has a
+# passing run; then it does nothing. A push of a tag vMAJOR.MINOR.PATCH publishes the release: the zips
+# of the run that passed on main at the tagged commit when there is one (tools/release/dry-run.mjs;
 # the release command tags only such a commit), so a tag needs no second build of the same source;
 # otherwise it builds and smoke-tests every platform itself first.
+#
+# The tag canary, moved by the export to the newest commit of main with a passing run, publishes that
+# run's zips as the rolling canary prerelease, a build of main between releases. It never builds: with
+# no such run, or one whose zips expired, it fails. The prerelease is never marked latest, and its
+# assets keep the same names (ror-canary-<os>-<arch>.zip, SHA256SUMS), so links to them never change.
 #
 # Jobs: version -> build (one per platform) -> smoke (a fresh runner per platform) -> publish,
 # with notes written beside them. Only publish can write, and it runs nothing from the repository.
@@ -14,7 +20,7 @@ on:
   push:
     branches: [main]
     # path filters do not apply to tags, so a tag always runs
-    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+    tags: ['v[0-9]+.[0-9]+.[0-9]+', 'canary']
     paths:
       - .github/workflows/release.yml
       - tools/release/**
@@ -26,6 +32,9 @@ on:
       - NOTICE
       - THIRD_PARTY_NOTICES.md
       - licenses/**
+  # nightly, at main's head
+  schedule:
+    - cron: "11 1 * * *"
   workflow_dispatch:
 
 permissions:
@@ -33,9 +42,11 @@ permissions:
 
 # No release run is ever cancelled by another. Pushes to main share one group without cancelling: a
 # dry run that has started always finishes (the release command may be waiting on it), and a newer
-# push only replaces a dry run still waiting for it. A tag or a manual run is a group of its own.
+# push only replaces a dry run still waiting for it. Nightly runs share a group of their own, so they
+# never take a push's place, and so do canary tag runs: the newest move of the tag replaces only a run
+# still waiting. A version tag or a manual run is a group of its own.
 concurrency:
-  group: release-${{ github.event_name == 'push' && github.ref_type == 'branch' && github.ref || github.run_id }}
+  group: release-${{ (github.event_name == 'push' && github.ref_type == 'branch' && github.ref) || (github.event_name == 'schedule' && 'nightly') || (github.event_name == 'push' && github.ref == 'refs/tags/canary' && 'canary') || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -44,11 +55,14 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: read
-      actions: read # to find the dry run of the tagged commit
+      actions: read # to find the passing run of this commit
     outputs:
       version: ${{ steps.version.outputs.version }}
-      # the dry run whose zips a tag publishes; empty when this run builds them
+      # the passing run whose zips a tag publishes, or because of which a nightly run does nothing;
+      # empty when this run builds them
       dry-run: ${{ steps.dry-run.outputs.run-id }}
+      # when that run started, for the canary's notes
+      dry-run-date: ${{ steps.dry-run.outputs.run-date }}
     steps:
       - name: Check out the full history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -61,23 +75,38 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_TYPE" == tag ]]; then
-            # a release: the manifests must say the tag's version, and the tagged commit must be on main
-            version=$(node tools/release/version.mjs --tag "$GITHUB_REF_NAME")
+            # a release: the manifests must say the tag's version, and the tagged commit must be on main;
+            # the canary is a build of main, so its manifests say whatever main says
+            if [[ "$GITHUB_REF_NAME" == canary ]]; then
+              version=$(node tools/release/version.mjs)
+            else
+              version=$(node tools/release/version.mjs --tag "$GITHUB_REF_NAME")
+            fi
             git fetch --no-tags origin main:refs/remotes/origin/main
             git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
           else
             version=$(node tools/release/version.mjs)
           fi
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
-      # A tag publishes the zips the passing dry run of the same commit built and smoke-tested on
-      # every platform; build and smoke below then have nothing to do. Without one they run.
-      - name: Find the passing dry run of the tagged commit
+      # A tag publishes the zips the passing run of the same commit built and smoke-tested on every
+      # platform, and a nightly run whose commit has one does nothing; build and smoke below then
+      # have nothing to do. Without one they run, except for the canary, which then fails here.
+      - name: Find a passing dry run of this commit
         id: dry-run
-        if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+        if: ${{ (github.event_name == 'push' && github.ref_type == 'tag') || github.event_name == 'schedule' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: node tools/release/dry-run.mjs --repository "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --artifacts ror-windows-x86_64,ror-linux-x86_64,ror-macos-aarch64 >> "$GITHUB_OUTPUT"
+          REQUIRED: ${{ github.event_name == 'push' && github.ref == 'refs/tags/canary' && '--required' || '' }}
+        # $REQUIRED is unquoted so that, empty, it adds no argument
+        run: node tools/release/dry-run.mjs --repository "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --artifacts ror-windows-x86_64,ror-linux-x86_64,ror-macos-aarch64 $REQUIRED >> "$GITHUB_OUTPUT"
+      - name: Say that main's head already has a passing run
+        if: ${{ github.event_name == 'schedule' && steps.dry-run.outputs.run-id != '' }}
+        shell: bash
+        env:
+          RUN_ID: ${{ steps.dry-run.outputs.run-id }}
+        run: |
+          echo "Nothing to build: run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$RUN_ID passed at main's head, $GITHUB_SHA" | tee -a "$GITHUB_STEP_SUMMARY"
 
   build:
     if: ${{ !github.event.repository.private && needs.version.outputs.dry-run == '' }}
@@ -208,8 +237,16 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - name: Write release notes from public history
+        if: ${{ github.ref != 'refs/tags/canary' }}
         shell: bash
         run: node tools/release/notes.mjs --tag "$GITHUB_REF_NAME" --output release-notes.md --repository "$GITHUB_REPOSITORY"
+      - name: Write the canary's notes from public history
+        if: ${{ github.ref == 'refs/tags/canary' }}
+        shell: bash
+        env:
+          RUN_ID: ${{ needs.version.outputs.dry-run }}
+          BUILT: ${{ needs.version.outputs.dry-run-date }}
+        run: node tools/release/canary.mjs --run "$RUN_ID" --built "$BUILT" --output release-notes.md --repository "$GITHUB_REPOSITORY"
       - name: Upload the release notes
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -235,7 +272,7 @@ jobs:
           DRY_RUN: ${{ needs.version.outputs.dry-run }}
         run: |
           if [ -n "$DRY_RUN" ]; then
-            echo "Publishing the zips that dry run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$DRY_RUN built and smoke-tested at $GITHUB_SHA" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "Publishing the zips that run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$DRY_RUN built and smoke-tested at $GITHUB_SHA" | tee -a "$GITHUB_STEP_SUMMARY"
           else
             echo "Publishing the zips this run built and smoke-tested" | tee -a "$GITHUB_STEP_SUMMARY"
           fi
@@ -260,6 +297,23 @@ jobs:
         with:
           name: release-notes
           path: notes
+      # ror-<version>-<os>-<arch>.zip becomes ror-canary-<os>-<arch>.zip, so links to it never change
+      - name: Give the canary's zips their lasting names
+        if: ${{ github.ref == 'refs/tags/canary' }}
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd assets
+          for zip in *.zip; do
+            platform=${zip#"ror-$VERSION-"}
+            if [[ "$platform" == "$zip" ]]; then
+              echo "::error::$zip is not named ror-$VERSION-<os>-<arch>.zip"
+              exit 1
+            fi
+            mv -- "$zip" "ror-canary-$platform"
+          done
       - name: Write SHA256SUMS
         shell: bash
         run: |
@@ -271,6 +325,7 @@ jobs:
         with:
           subject-path: assets/*.zip
       - name: Create the release for the existing tag
+        if: ${{ github.ref != 'refs/tags/canary' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -280,3 +335,30 @@ jobs:
           gh release create "$TAG" --verify-tag --title "ror $TAG" \
             --notes-file notes/release-notes.md -R "$GITHUB_REPOSITORY" \
             assets/*.zip assets/SHA256SUMS
+      # A prerelease, never the latest release. Neither command names a target, so the tag stays where
+      # it is: --verify-tag fails rather than create it. An existing release gets each asset replaced
+      # under its own name first; only then are the assets this build lacks deleted.
+      - name: Create or update the canary prerelease for the existing tag
+        if: ${{ github.ref == 'refs/tags/canary' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          title="Canary (main ${GITHUB_SHA:0:10})"
+          assets=(assets/*.zip assets/SHA256SUMS)
+          if ! gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json tagName > /dev/null; then
+            gh release create "$TAG" --verify-tag --prerelease --latest=false --title "$title" \
+              --notes-file notes/release-notes.md -R "$GITHUB_REPOSITORY" "${assets[@]}"
+            exit 0
+          fi
+          gh release upload "$TAG" --clobber -R "$GITHUB_REPOSITORY" "${assets[@]}"
+          names=$(printf '%s\n' "${assets[@]##*/}")
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | while IFS= read -r name; do
+            if ! grep -qxF -- "$name" <<< "$names"; then
+              gh release delete-asset "$TAG" "$name" --yes -R "$GITHUB_REPOSITORY"
+            fi
+          done
+          gh release edit "$TAG" --prerelease --latest=false --title "$title" \
+            --notes-file notes/release-notes.md -R "$GITHUB_REPOSITORY"

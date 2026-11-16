@@ -58,6 +58,10 @@ Download the zip for your platform from
 (Windows) or `ror` (Linux and macOS). Then run `ror --version` and
 `ror render path/to/Model.rbxm --views iso --out out/model`.
 
+Between releases, the
+[canary](https://github.com/Anime-Vanguards/roblox-object-renderer/releases/tag/canary) prerelease
+has a build of the current main, refreshed nightly. It is not a release and may break.
+
 Or add ror to `rokit.toml`:
 
 ```toml
