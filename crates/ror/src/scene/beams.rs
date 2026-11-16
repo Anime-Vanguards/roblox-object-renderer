@@ -156,15 +156,23 @@ pub(crate) fn world_cframe(document: &Document, referent: Ref) -> Option<Affine3
 		return None;
 	}
 	let local = props::cframe(attachment, "CFrame").unwrap_or(Affine3A::IDENTITY);
-	let parent = document.dom.get_by_ref(attachment.parent())?;
-	if parent.class == "Terrain" {
-		Some(local)
-	} else if props::is_a(parent, "BasePart") {
-		Some(props::cframe(parent, "CFrame")? * local)
-	} else if props::is_a(parent, "Attachment") {
-		Some(world_cframe(document, attachment.parent())? * local)
+	Some(parent_frame(document, attachment.parent())? * local)
+}
+
+/// The frame an Attachment's CFrame is relative to under `parent` ([`world_cframe`]): the world's
+/// under Terrain, a part's CFrame, an attachment's world CFrame, else [`frame_above`] (a Model's
+/// PrimaryPart or its parts' centre, the world's above a Folder outside any model). `None` without
+/// the parent. A playback placing a moving attachment writes its CFrame in this same frame.
+pub(crate) fn parent_frame(document: &Document, parent: Ref) -> Option<Affine3A> {
+	let instance = document.dom.get_by_ref(parent)?;
+	if instance.class == "Terrain" {
+		Some(Affine3A::IDENTITY)
+	} else if props::is_a(instance, "BasePart") {
+		props::cframe(instance, "CFrame")
+	} else if props::is_a(instance, "Attachment") {
+		world_cframe(document, parent)
 	} else {
-		Some(frame_above(document, attachment.parent()) * local)
+		Some(frame_above(document, parent))
 	}
 }
 

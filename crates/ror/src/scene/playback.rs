@@ -1702,9 +1702,17 @@ impl Resolved<'_> {
 						}
 					}
 					Mover::Attachment(referent, index) => {
-						// placed relative to its parent where the parent is then
-						let parent = document.dom.get_by_ref(referent).map(|instance| instance.parent()).unwrap_or_else(Ref::none);
-						let parent_now = match (rest_cframe(document, parent), self.track_of(document, parent)) {
+						// placed relative to the parent it has by then (the playback may move it out of its
+						// model in this moment: the parents are set below), in the frame its world CFrame is
+						// read from there (beams::parent_frame: a part's CFrame, a model's PrimaryPart or its
+						// parts' centre, the world's above a Folder), so it stands where its track puts it
+						let parent = self
+							.parents
+							.iter()
+							.find(|(moved, _)| *moved == referent)
+							.and_then(|(_, events)| events.iter().take_while(|(at, _)| *at <= time + 1e-6).last().map(|&(_, parent)| parent))
+							.unwrap_or_else(|| document.dom.get_by_ref(referent).map(|instance| instance.parent()).unwrap_or_else(Ref::none));
+						let parent_now = match (super::beams::parent_frame(document, parent), self.track_of(document, parent)) {
 							(Some(rest), Some(moving)) => self.tracks[moving].delta(time) * rest,
 							(Some(rest), None) => rest,
 							_ => Affine3A::IDENTITY,
@@ -3190,6 +3198,54 @@ mod tests {
 		assert!(Playback { actions: vec![mode], ..Default::default() }.resolve(&document).is_err());
 		let short = Action { cframe: Some(vec![1.0, 2.0, 3.0]), ..burst(true, corners[0]) };
 		assert!(Playback { actions: vec![short], ..Default::default() }.resolve(&document).is_err());
+	}
+
+	/// A moving Attachment stands where its track puts it whatever its parent: under a Model, whose
+	/// pivot is not the frame its attachments are read in, and moved out under a Folder in the same
+	/// moment. An attack's arm Models do both: each Attachment goes under the effect's Folder, is
+	/// tracked there and emits LockedToPart bursts, which the engine draws on the track and which were
+	/// drawn by the world's origin, written against the model's pivot and read against the Folder's frame.
+	#[test]
+	fn a_moving_attachment_stands_on_its_track_whatever_its_parent() {
+		use crate::scene::build::{ModelBuilder, cframe};
+		use rbx_dom_weak::InstanceBuilder;
+		use rbx_dom_weak::types::{NumberRange, Vector3};
+		let mut model = ModelBuilder::new("Fx");
+		let root = model.dom.root_ref();
+		let visuals = model.child(root, InstanceBuilder::new("Folder").with_name("Visuals"));
+		let pivot = Variant::OptionalCFrame(Some(cframe(Affine3A::from_translation(Vec3::new(0.0, 0.0, 20.0)))));
+		let arm = model.child(visuals, InstanceBuilder::new("Model").with_name("LHand").with_property("WorldPivotData", pivot));
+		model.child(arm, InstanceBuilder::new("Part").with_name("Hand").with_property("CFrame", cframe(Affine3A::from_translation(Vec3::new(0.0, 50.0, 0.0)))).with_property("Size", Vector3::new(1.0, 1.0, 1.0)));
+		let attachment = model.child(arm, InstanceBuilder::new("Attachment").with_name("Attachment"));
+		let emitter = InstanceBuilder::new("ParticleEmitter").with_name("Burst").with_property("Rate", 0.0f32).with_property("Speed", NumberRange::new(0.0, 0.0)).with_property("Lifetime", NumberRange::new(5.0, 5.0)).with_property("LockedToPart", true);
+		model.child(attachment, emitter);
+		let mut document = model.into_document();
+		document.roots.push(visuals);
+		let target = Vec3::new(10.0, 2.0, -3.0);
+		let at = |position: Vec3| -> Vec<f32> { cframe_json(Affine3A::from_translation(position)).as_array().unwrap().iter().map(|n| n.as_f64().unwrap() as f32).collect() };
+		let drawn = |document: &mut Document, moved_out: bool| -> (Vec3, Vec<Vec3>) {
+			let mut actions = vec![Action { at: 0.1, target: "Visuals.LHand.Attachment.Burst".into(), class: Some("ParticleEmitter".into()), emit: Some(Emit::Count(4)), cframe: Some(at(target)), ..Default::default() }];
+			if moved_out {
+				actions.insert(0, Action { at: 0.1, target: "Visuals.LHand.Attachment".into(), parent: Some("Visuals".into()), ..Default::default() });
+			}
+			let keys = vec![MotionKey { at: 0.05, cframe: at(target - Vec3::X), ..Default::default() }, MotionKey { at: 0.1, cframe: at(target), ..Default::default() }];
+			let playback = Playback { time: 0.5, actions, motion: vec![Motion { target: "Visuals.LHand.Attachment".into(), keys, ..Default::default() }], ..Default::default() };
+			let resolved = playback.resolve(document).unwrap();
+			let undo = resolved.apply_state(document).unwrap();
+			let mut scene = crate::scene::extract::extract(document);
+			resolved.apply_history(document, &mut scene);
+			let world = Vec3::from(super::super::beams::world_cframe(document, attachment).unwrap().translation);
+			let burst = scene.particles.iter().find(|emitter| emitter.path.ends_with("Burst")).expect("the burst's emitter is in the scene");
+			let positions = crate::render::particles::simulate(burst).iter().map(|particle| particle.position).collect();
+			undo.restore(document);
+			(world, positions)
+		};
+		for moved_out in [false, true] {
+			let (world, positions) = drawn(&mut document, moved_out);
+			assert!((world - target).length() < 1e-3, "moved out {moved_out}: the attachment at {world}, its track at {target}");
+			assert_eq!(positions.len(), 4, "moved out {moved_out}");
+			assert!(positions.iter().all(|position| (*position - target).length() < 1e-2), "moved out {moved_out}: {positions:?}");
+		}
 	}
 
 	/// An instance reference set by a playback names the instance by its path, null for none: a beam
