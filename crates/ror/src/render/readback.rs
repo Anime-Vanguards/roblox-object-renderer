@@ -73,8 +73,18 @@ pub struct PendingView<'a> {
 	highlight: Option<(MappedRows, Vec<Highlight>)>,
 	gui: Option<MappedRows>,
 	ids: Option<MappedRows>,
+	layers: Option<LayerRows>,
 	nv12: Option<MappedRows>,
 	flatten: bool,
+}
+
+/// A view's [`ids::Layers`] being read back.
+struct LayerRows {
+	opaque: MappedRows,
+	depth: MappedRows,
+	pixels: MappedRows,
+	parts: MappedRows,
+	part_count: u32,
 }
 
 impl<'a> PendingView<'a> {
@@ -88,9 +98,22 @@ impl<'a> PendingView<'a> {
 			highlight: highlight.map(|(readback, styles)| (MappedRows::new(readback, height * 2), styles)),
 			gui: gui.map(|readback| MappedRows::new(readback, height)),
 			ids: ids.map(|readback| MappedRows::new(readback, height)),
+			layers: None,
 			nv12: None,
 			flatten: false,
 		}
+	}
+
+	pub(super) fn with_layers(mut self, layers: Option<ids::LayersReadback>) -> Self {
+		let height = self.image.height;
+		self.layers = layers.map(|layers| LayerRows {
+			opaque: MappedRows::new(layers.opaque, height),
+			depth: MappedRows::new(layers.depth, height),
+			pixels: MappedRows::new(layers.pixels, height),
+			parts: MappedRows::new(layers.parts, 1),
+			part_count: layers.part_count,
+		});
+		self
 	}
 
 	pub(super) fn with_video(mut self, nv12: Option<ids::Readback>, flatten: bool) -> Self {
@@ -171,7 +194,7 @@ impl<'a> PendingView<'a> {
 	pub(crate) fn with_rgba_held<T>(mut self, stats: &mut RenderStats, consume: impl FnOnce(ViewImage, &[u8]) -> Result<T>) -> Result<(T, Held<'a>)> {
 		let (renderer, submission) = (self.renderer, self.submission);
 		let contiguous = self.rgba.as_ref().is_some_and(|rows| rows.readback.bytes_per_row == self.image.width * 4);
-		if !contiguous || self.highlight.is_some() || self.gui.is_some() || self.ids.is_some() {
+		if !contiguous || self.highlight.is_some() || self.gui.is_some() || self.ids.is_some() || self.layers.is_some() {
 			let mut image = self.finish(stats)?;
 			let rgba = std::mem::take(&mut image.rgba);
 			let result = consume(image, &rgba)?;
@@ -208,7 +231,7 @@ impl<'a> PendingView<'a> {
 	/// overlays use the same owned image as a still render; the buffer is returned after consumption.
 	pub fn with_rgba<T>(mut self, stats: &mut RenderStats, consume: impl FnOnce(ViewImage, &[u8]) -> Result<T>) -> Result<T> {
 		let contiguous = self.rgba.as_ref().is_some_and(|rows| rows.readback.bytes_per_row == self.image.width * 4);
-		if !contiguous || self.highlight.is_some() || self.gui.is_some() || self.ids.is_some() {
+		if !contiguous || self.highlight.is_some() || self.gui.is_some() || self.ids.is_some() || self.layers.is_some() {
 			let mut image = self.finish(stats)?;
 			let rgba = std::mem::take(&mut image.rgba);
 			return consume(image, &rgba);
@@ -243,6 +266,17 @@ impl<'a> PendingView<'a> {
 		}
 		if let Some(ids) = &mut self.ids {
 			self.image.ids = Some(ids.read(gpu, submission, self.image.width)?);
+		}
+		if let Some(layers) = &mut self.layers {
+			let (width, height) = (self.image.width, self.image.height);
+			self.image.layers = Some(ids::Layers {
+				width,
+				height,
+				opaque: layers.opaque.read(gpu, submission, width)?,
+				depth: layers.depth.read(gpu, submission, width)?,
+				blended: layers.pixels.read(gpu, submission, width)?,
+				part_blended: layers.parts.read(gpu, submission, layers.part_count)?,
+			});
 		}
 		// The staging buffer was detached from the render's lease until its mapping finished.
 		let buffer = readback.readback.buffer.clone();

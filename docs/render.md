@@ -103,6 +103,12 @@ transparency, position) and `visible.json` (per view, each part index and the pi
 `--no-png` the only output, for visibility sweeps over thousands of views); a job sets `"ids": true`
 per view.
 
+A view's `"layers": true` (in the library, `ViewRequest::layers`) reads back what lies at every pixel
+for the cost of drawing it (`ViewImage::layers`): the frontmost opaque part's index + 1 and its depth
+(see-through parts and decals left out), and the fragments of see-through parts and decals in front
+of it, per pixel and per part, counted on the GPU against that depth (a decal on its own face
+counts), single-sided parts by their faces toward the camera.
+
 `--alone <instance>` (with `--ids`; a job's `alone`) says how much of one instance each view shows:
 the view's `alone` in the result holds the pixels its parts own in the view (`shown`) and the pixels
 they own drawn from the same camera with nothing else (`whole`), so `shown / whole` is the share of

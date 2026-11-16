@@ -132,6 +132,10 @@ pub struct ViewRequest {
 	/// Also report which part is in front at every pixel ([`ViewImage::ids`]).
 	#[serde(default)]
 	pub ids: bool,
+	/// Also report what lies at every pixel for the cost of drawing it: the frontmost opaque part, its
+	/// depth, and the see-through parts' and decals' fragments in front of it ([`ViewImage::layers`]).
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub layers: bool,
 	/// Device pixels per GUI pixel for BillboardGuis (their pixel offsets, text, lines); default the
 	/// image height / 744, Studio's 1.5 at its 1116 px tall capture viewport (render::guis).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -171,7 +175,7 @@ fn default_supersample() -> u32 {
 
 impl Default for ViewRequest {
 	fn default() -> Self {
-		Self { width: 1024, height: 1024, camera: CameraSpec::default(), background: Background::Sky, msaa: 4, supersample: 1, bloom: true, ids: false, gui_scale: None, linear_scale: None, texture: false, opaque_share: false, lod: None }
+		Self { width: 1024, height: 1024, camera: CameraSpec::default(), background: Background::Sky, msaa: 4, supersample: 1, bloom: true, ids: false, layers: false, gui_scale: None, linear_scale: None, texture: false, opaque_share: false, lod: None }
 	}
 }
 
@@ -191,10 +195,14 @@ pub struct ViewImage {
 	/// With [`ViewRequest::ids`]: per pixel, the frontmost part's index in `Scene::parts` + 1 (0 for
 	/// none; decals count as their part).
 	pub ids: Option<Vec<u32>>,
+	/// With [`ViewRequest::layers`]: the opaque part and its depth at every pixel and the see-through
+	/// layers in front of it.
+	pub layers: Option<ids::Layers>,
 	/// With [`ViewRequest::lod`]: the levels its meshes drew at and the parts left out.
 	pub lod: Option<levels::LodView>,
 }
 
+pub use ids::Layers;
 pub use levels::LodView;
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -1137,6 +1145,8 @@ pub struct Renderer {
 	preparations: prepared::Preparations,
 	shadows: shadow_reuse::Shadows,
 	nv12: std::sync::OnceLock<nv12::Conversion>,
+	/// The see-through layers' pipelines ([`ViewRequest::layers`]), made when first asked for
+	layers: std::sync::OnceLock<ids::LayerPipelines>,
 	/// The lights' voxels' bake, made the first time a view has lit effects ([`voxel_field`])
 	voxel_field: std::sync::OnceLock<voxel_field::Baker>,
 	/// Studio's cloud volume, loaded the first time a view draws Terrain Clouds ([`clouds`]), or why it
@@ -1837,6 +1847,7 @@ impl Renderer {
 			// camera's frames draw the sun's shadows once (at 64 MB none was ever kept)
 			shadows: shadow_reuse::Shadows::new(cache_budget("SHADOW", 128)),
 			nv12: std::sync::OnceLock::new(),
+			layers: std::sync::OnceLock::new(),
 			voxel_field: std::sync::OnceLock::new(),
 			clouds: std::sync::OnceLock::new(),
 			staging: texture_files::Staging::new(),
@@ -5011,6 +5022,25 @@ impl Renderer {
 			let group = self.ids.bind_group(device, &ids);
 			ids::encode_part_ids(device, &mut encoder, &self.ids, &group, &frame_group, &prepared.draws, width, height, &profile)
 		});
+		let layers = (request.layers && !keep).then(|| {
+			let mut owners = vec![0u32; prepared.instance_count.max(1)];
+			for (part, draw) in prepared.part_draws.iter().enumerate() {
+				if let Some((instance, _)) = draw {
+					owners[*instance as usize] = part as u32 + 1;
+				}
+			}
+			for draw in prepared.draws.iter().filter(|draw| draw.decal) {
+				if let Some(owner) = owners.get_mut(draw.instance as usize) {
+					*owner = draw.decal_order.0 + 1;
+				}
+			}
+			let pipelines = self.layers.get_or_init(|| {
+				let pipelines = ids::LayerPipelines::new(device, &self.pipelines.frame_layout, self.gpu.pipeline_cache.as_ref());
+				self.gpu.save_pipeline_cache();
+				pipelines
+			});
+			ids::encode_layers(device, &mut encoder, &self.ids, pipelines, &owners, prepared.part_draws.len(), &frame_group, &prepared.draws, width, height, &profile)
+		});
 		let bytes_per_row = (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
 		let readback_size = bytes_per_row as u64 * height as u64;
 		// Highlights and AlwaysOnTop GUIs finish on the CPU; convert their fully composited RGBA there.
@@ -5055,8 +5085,8 @@ impl Renderer {
 		}
 		let readback = readback.map(|buffer| ids::Readback { buffer, bytes_per_row });
 		let highlight = highlight_mask.zip(prepared.highlights.as_ref().map(|highlight| highlight.styles.clone()));
-		let image = ViewImage { width, height, rgba: Vec::new(), texture: keep.then_some(output), opaque_share: share_texture, camera, ids: None, lod: None };
-		Ok(PendingView::new(self, image, submission, readback, highlight, gui_layer, part_ids).with_video(nv12, video.is_some_and(|video| video.flatten)))
+		let image = ViewImage { width, height, rgba: Vec::new(), texture: keep.then_some(output), opaque_share: share_texture, camera, ids: None, layers: None, lod: None };
+		Ok(PendingView::new(self, image, submission, readback, highlight, gui_layer, part_ids).with_layers(layers).with_video(nv12, video.is_some_and(|video| video.flatten)))
 	}
 }
 
