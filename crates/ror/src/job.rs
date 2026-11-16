@@ -691,6 +691,9 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 	};
 	// another place's MaterialService / Lighting
 	let lighting_from = lighting_from.filter(|_| !lent_lighting);
+	// another file's Lighting or MaterialService drawn (the cost loop's trials keep them, and charge
+	// the lent Lighting's effects to no instance of this file)
+	let lent = (lighting_from.is_some() || lent_lighting, materials_from.is_some());
 	let scene = if materials_from.is_some() || lighting_from.is_some() {
 		let mut scene = scene.as_ref().clone();
 		scenes.lend(&mut scene, materials_from, lighting_from)?;
@@ -847,7 +850,26 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 		});
 	}
 	let cost = match (&job.cost, &cost_document) {
-		(Some(options), Some(document)) => Some(crate::cost::run(renderer, &scene, document, options, &job.views, &shots, &out, gpu)?),
+		(Some(options), Some(document)) => {
+			// the cost loop's what-if reads the file again for each trial (not a playback's or a map's)
+			let reload = || -> Result<scene::load::Document> {
+				let mut document = if path.is_file() {
+					scene::load::read_file(path)?
+				} else {
+					let uri = if job.input.chars().all(|c| c.is_ascii_digit()) { format!("rbxassetid://{}", job.input) } else { job.input.clone() };
+					scene::load::read_bytes(&renderer.assets.fetch(&uri).map_err(|error| anyhow::anyhow!("{}: {error}", job.input))?.bytes)?
+				};
+				if let Some(select) = &job.select {
+					document.select(select)?;
+				}
+				if let Some(folder) = &job.relative_to {
+					document.read_relative_to(folder);
+				}
+				Ok(document)
+			};
+			let reload: Option<&dyn Fn() -> Result<scene::load::Document>> = (job.playback.is_none() && job.map.is_none()).then_some(&reload as _);
+			Some(crate::cost::run(renderer, &scene, document, options, &job.views, &shots, &out, gpu, reload, &job.input, lent)?)
+		}
 		_ => None,
 	};
 	// the authoring lint reads the model, not the map around it

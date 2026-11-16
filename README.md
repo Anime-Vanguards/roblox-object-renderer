@@ -43,7 +43,9 @@ the Neon ring's bloom follow the camera. [MP4](docs/media/unit-turntable.mp4).
 - **Runs scripts**: a `.luau` file that builds a model or an effect runs in ree, and ror draws what
   it puts in the Workspace.
 - **Counts what a scene costs Roblox to draw**: draw calls, triangles, levels of detail and
-  occlusion culling per view, and what would cut them most (`ror cost`).
+  occlusion culling per view, and what would cut them most (`ror cost`); each instance's share in
+  phone milliseconds, findings with the edits that realise them, edits tried in memory with their
+  look checked, and a change list for the real place ([the cost loop](docs/cost-loop.md)).
 - **Measures itself against Studio**: `ror compare` and the calibration experiments capture the same
   scene in a dedicated Studio and compare pixel by pixel.
 - **Serves many callers at once**: one warm render service per state dir, shared by every `ror`
@@ -98,6 +100,7 @@ target/release/ror cost Map.rbxm --sweep 5                    # what a map costs
 | [docs/video.md](docs/video.md) | `ror video`: cameras, formats, encoders, the contact sheet, copies, summary metrics and lints |
 | [docs/scripts.md](docs/scripts.md) | `.luau` scripts as input, run in the engine emulator |
 | [docs/cost.md](docs/cost.md) | `ror cost`: draw calls, triangles, levels of detail and occlusion as Roblox counts them |
+| [docs/cost-loop.md](docs/cost-loop.md) | the cost loop: each instance's cost in phone ms, ranked findings with edits, what-if edits with look checks, export to Lune |
 | [docs/service.md](docs/service.md) | the render service, many callers at once, its HTTP API, the job JSON, memory admission, profiling |
 | [docs/assets.md](docs/assets.md) | downloads, texture caches, refused assets, the content store and disk use |
 | [docs/parity.md](docs/parity.md) | how agreement with Studio is measured: the capture Studio, compares, agreement figures, calibration experiments |

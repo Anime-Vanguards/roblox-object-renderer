@@ -76,6 +76,13 @@ ror cost Map.rbxm --paths 4 --check --profile   # also Studio's counts, and its 
   `python tools/cost_probes.py <case>` and `python tools/occlusion_probes.py <case>` rerun a
   measurement probe in the capture Studio.
 
+- The cost loop ([cost-loop.md](cost-loop.md)): every run also attributes each view's work to the
+  instances that cause it, priced in phone frame ms (`--preset phone|desktop`), with ranked findings
+  and their edits (`analysis.json`, `tree.json`, `analysis.txt`); `--edits` tries edits in memory,
+  `--look` checks what they change on screen, `--export` writes them for Lune, `--explain` one
+  instance, `--budget` limits per view, `--heat` heat images. `--no-pixels` skips each view's pixel
+  render.
+
 ## Counting
 
 Roblox exposes its renderer's counts to scripts, in edit mode as in play:

@@ -181,6 +181,44 @@ struct CostArgs {
 	/// Print the cost report as JSON
 	#[arg(long)]
 	json: bool,
+	/// The device to count for: phone (2532x1170, graphics quality 2: no sun shadows, a phone's particle
+	/// rate) or desktop (1920x1080, quality 21); sets --size and --quality (--quality still wins)
+	#[arg(long, value_parser = ["phone", "desktop"])]
+	preset: Option<String>,
+	/// Count no pixels (no layers render of each view): the cost loop attributes draws, triangles and
+	/// parts only
+	#[arg(long)]
+	no_pixels: bool,
+	/// Count pixels at 1/N of the view's resolution each way (1: every pixel; default 3 for the phone
+	/// preset, 2 for the desktop): finer is slower and catches smaller detail
+	#[arg(long, value_name = "N")]
+	pixel_scale: Option<u32>,
+	/// Also write the heat images: <view>.heat-cost.png (each pixel's GPU cost), -overdraw (blended
+	/// layers), -lights (local lights holding it) and -density (its part's triangles per pixel)
+	#[arg(long)]
+	heat: bool,
+	/// Try edits in memory (docs/cost-loop.md): each trial of the file costed against the same views,
+	/// before and after per view (whatif.json)
+	#[arg(long, value_name = "FILE")]
+	edits: Option<PathBuf>,
+	/// With --edits: draw every view before and after each trial and report the share of pixels it
+	/// changes, the worst view first, with crops of where (look/<trial>/)
+	#[arg(long, requires = "edits")]
+	look: bool,
+	/// With --edits: write each trial's changes as a kit (changes.json, apply.luau, revert.luau) in
+	/// DIR/<trial>
+	#[arg(long, value_name = "DIR", requires = "edits")]
+	export: Option<PathBuf>,
+	/// Explain an instance (its id from analysis.json or tree.json): its cost view by view, where its
+	/// parts drew, and the costliest instances under it (repeatable)
+	#[arg(long, value_name = "ID")]
+	explain: Vec<String>,
+	/// Limits per view: phone (600 draws, 800k triangles, 10 ms), desktop, or draws=N,triangles=N,ms=N
+	#[arg(long, value_name = "SPEC")]
+	budget: Option<String>,
+	/// With --budget: exit with status 2 when a view is over it
+	#[arg(long, requires = "budget")]
+	fail_over_budget: bool,
 	/// Count in this process instead of the warm render service
 	#[arg(long)]
 	no_service: bool,
@@ -1572,6 +1610,10 @@ fn cost(mut args: CostArgs) -> Result<()> {
 	}
 	#[allow(unused_mut)]
 	let (mut width, mut height) = parse_size(&args.size)?;
+	let preset = args.preset.as_deref().and_then(ror::cost::prices::Preset::named);
+	if let Some(preset) = &preset {
+		(width, height) = (preset.width, preset.height);
+	}
 	// --check: Studio's viewport decides the shape of the views (what is in view)
 	#[cfg(windows)]
 	if args.check {
@@ -1655,6 +1697,14 @@ fn cost(mut args: CostArgs) -> Result<()> {
 			view.view.camera = cameras.get(&view.name).cloned().with_context(|| format!("--camera-from {}: it has no view {:?} (it has {})", dir.display(), view.name, names()))?;
 		}
 	}
+	// a grid counts each cell's draws and triangles from above; the cost loop needs views
+	if args.grid.is_some() {
+		let loop_flags = [("--edits", args.edits.is_some()), ("--explain", !args.explain.is_empty()), ("--heat", args.heat), ("--budget", args.budget.is_some()), ("--preset", args.preset.is_some()), ("--pixel-scale", args.pixel_scale.is_some())];
+		let given: Vec<&str> = loop_flags.iter().filter(|(_, given)| *given).map(|(flag, _)| *flag).collect();
+		if !given.is_empty() {
+			bail!("--grid counts each cell's draws, triangles and occlusion work; {} belong to the cost loop, which needs views (--cameras, --paths, --sweep)", given.join(", "));
+		}
+	}
 	let technology = args.technology.as_deref().map(|name| ["legacy", "voxel", "compatibility", "shadowmap", "future", "unified"].iter().position(|item| *item == name).unwrap_or(5) as u32);
 	let lod = args.lod.as_deref().map(ror::lod::Lod::parse).transpose()?;
 	let playback = playback_args(&TimelineArgs { playback: args.playback.as_deref(), time: args.time, emit: &args.emit, enable: &[], disable: &[], changes: None })?;
@@ -1679,7 +1729,7 @@ fn cost(mut args: CostArgs) -> Result<()> {
 		map: None,
 		cost: Some(ror::cost::CostOptions {
 			technology,
-			quality: lod.map(|lod| lod.quality).or(args.quality),
+			quality: lod.map(|lod| lod.quality).or(args.quality).or(preset.as_ref().map(|preset| preset.quality)),
 			no_occlusion: args.no_occlusion,
 			// the capture Studio draws every mesh at full detail (its MeshPartDetailLevel setting)
 			// unless told to count as a game does
@@ -1691,6 +1741,20 @@ fn cost(mut args: CostArgs) -> Result<()> {
 			grid_area,
 			items: args.items,
 			all_emitters: args.all_emitters,
+			attribute: args.grid.is_none(),
+			pixels: !args.no_pixels,
+			preset: args.preset.clone(),
+			pixel_scale: args.pixel_scale,
+			heat: args.heat,
+			edits: args.edits.as_ref().map(|file| -> Result<ror::cost::edits::EditsFile> {
+				let text = std::fs::read_to_string(file).with_context(|| format!("--edits {}", file.display()))?;
+				ror::cost::edits::EditsFile::read(&text).with_context(|| format!("--edits {}", file.display()))
+			}).transpose()?,
+			look: args.look,
+			export: args.export.as_deref().map(absolute).map(PathBuf::from),
+			explain: args.explain.clone(),
+			budget: args.budget.clone(),
+			fail_over_budget: args.fail_over_budget,
 		}),
 		relative_to: std::env::current_dir().ok(),
 		alone: None,
@@ -1715,7 +1779,16 @@ fn cost(mut args: CostArgs) -> Result<()> {
 			println!("{}", line.as_str().unwrap_or_default());
 		}
 		println!("cost.json, <view>.draws.png and <view>.heat.png in {}", out.display());
+		let agent: Vec<&str> = report.get("agent").and_then(|lines| lines.as_array()).into_iter().flatten().filter_map(|line| line.as_str()).collect();
+		if !agent.is_empty() {
+			println!();
+			for line in agent {
+				println!("{line}");
+			}
+			println!("analysis.json, tree.json and analysis.txt in {}", out.display());
+		}
 	}
+	let over_budget = report.get("overBudget").and_then(|value| value.as_u64()).unwrap_or(0);
 	if let Some(dir) = &args.compare {
 		for line in cost_compare(&report, dir)? {
 			println!("{line}");
@@ -1726,6 +1799,10 @@ fn cost(mut args: CostArgs) -> Result<()> {
 		cost_check(&args, &read_document()?, &result, &report, &out, width, height)?;
 		#[cfg(not(windows))]
 		bail!("--check needs Windows (the capture Studio)");
+	}
+	if args.fail_over_budget && over_budget > 0 {
+		eprintln!("ror cost: {over_budget} views over the budget");
+		std::process::exit(2);
 	}
 	Ok(())
 }

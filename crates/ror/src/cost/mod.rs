@@ -9,10 +9,17 @@
 //! Studio against those counters, one property at a time (notes/cost.md has each measurement), and
 //! `ror cost --studio` checks a whole scene's views against them.
 
+pub mod agent;
+pub mod attribute;
 pub mod cull;
+pub mod edits;
+pub mod findings;
 pub mod grid;
+pub mod ids;
 pub mod images;
 pub mod meshes;
+pub mod pixels;
+pub mod prices;
 pub mod report;
 #[cfg(windows)]
 pub mod studio;
@@ -165,6 +172,43 @@ pub struct CostOptions {
 	/// Every emitter in `visible.fullest` (`ror cost --all-emitters`), not the fullest few.
 	#[serde(default)]
 	pub all_emitters: bool,
+	/// The cost loop (cost::agent): every view's work attributed to instances and priced in phone ms,
+	/// the instance tree, ranked findings with their edits (`analysis.json`, `tree.json`,
+	/// `analysis.txt`).
+	#[serde(default)]
+	pub attribute: bool,
+	/// With `attribute`: count each view's pixels (a layers render of it): opaque pixels, blended
+	/// layers and lights per instance.
+	#[serde(default)]
+	pub pixels: bool,
+	/// `phone` or `desktop` (cost::prices::Preset): the device the pixels are counted for.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub preset: Option<String>,
+	/// Pixels counted at this fraction of the preset's resolution each way (1: every pixel; the
+	/// preset's own when absent: a third for the phone, a half for the desktop).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub pixel_scale: Option<u32>,
+	/// With `attribute`: `<view>.heat-cost.png`, `-overdraw`, `-lights` and `-density`.
+	#[serde(default)]
+	pub heat: bool,
+	/// With `attribute`: edits to try (cost::edits), each trial costed against the same views.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub edits: Option<edits::EditsFile>,
+	/// With `edits`: draw every view before and after, and report the pixels each trial changes.
+	#[serde(default)]
+	pub look: bool,
+	/// With `edits`: write each trial's changes and the Lune scripts applying them here.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub export: Option<std::path::PathBuf>,
+	/// With `attribute`: instances explained view by view.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub explain: Vec<String>,
+	/// With `attribute`: limits per view (agent::Budget::parse).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub budget: Option<String>,
+	/// With `budget`: the run fails when a view is over it.
+	#[serde(default)]
+	pub fail_over_budget: bool,
 }
 
 impl CostOptions {
@@ -568,6 +612,12 @@ fn effect(kind: Kind, pass: Pass, draws: u32, triangles: u32, base: ItemBase, in
 impl Analysis {
 	/// Everything that draws in `scene` (read from `document`), by the measured rules.
 	pub fn new(scene: &Scene, document: &Document, assets: &ror_assets::Assets, options: &CostOptions) -> Self {
+		Self::new_with(scene, document, assets, options, &HashMap::new())
+	}
+
+	/// [`Analysis::new`], the parts in `merges` (scene index: merge name) counted as one mesh per merge:
+	/// copies of one appearance among them one batch (cost::edits' merge).
+	pub fn new_with(scene: &Scene, document: &Document, assets: &ror_assets::Assets, options: &CostOptions, merges: &HashMap<usize, String>) -> Self {
 		let meshes = Meshes::load(&scene.parts, assets);
 		let technology = options.technology.unwrap_or(scene.environment.technology);
 		let quality = options.quality();
@@ -604,7 +654,7 @@ impl Analysis {
 				None => Cluster::Static,
 			};
 			let triangles = part_triangles(part, &meshes);
-			let geometry = labels.of(geometry_label(part));
+			let geometry = labels.of(merges.get(&index).map(|name| format!("merged mesh {name}")).unwrap_or_else(|| geometry_label(part)));
 			if let Some(key) = meshes::mesh_key(&part.geometry) {
 				geometry_meshes.entry(geometry).or_insert((key, matches!(part.geometry, Geometry::Union { .. })));
 			}
@@ -1414,7 +1464,7 @@ impl Analysis {
 		// the transparent queue: (depth, label (MAX: alone), pass, item, triangles)
 		let mut queue: Vec<(f32, u32, u8, usize, u64)> = Vec::new();
 		let mut characters_seen: HashSet<u32> = HashSet::new();
-		let record = options.items;
+		let record = options.items || options.attribute;
 		let mut drawn: Vec<(u32, u8, u64)> = Vec::new();
 		let mut hidden: Vec<u32> = Vec::new();
 		let mut character_opaque: HashMap<u32, (HashSet<u32>, u64)> = HashMap::new();
@@ -1810,6 +1860,12 @@ pub struct CostReport {
 	/// The report as text (`ror cost` prints it).
 	pub lines: Vec<String>,
 	pub warnings: Vec<String>,
+	/// The cost loop's summary (`analysis.txt`, and the what-if's), printed after `lines`.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub agent: Vec<String>,
+	/// Views over the run's budget (`--budget`).
+	#[serde(default)]
+	pub over_budget: usize,
 }
 
 /// A view's cost images and numbers for a job: the analysis of `scene` (read from `document`), each
@@ -1825,10 +1881,27 @@ pub fn run(
 	shots: &[(Camera, u32, u32)],
 	out: &std::path::Path,
 	gpu: Option<&crate::budget::GpuGate>,
+	reload: Option<&dyn Fn() -> anyhow::Result<Document>>,
+	input: &str,
+	// (Lighting, MaterialService) lent by another file
+	lent: (bool, bool),
 ) -> anyhow::Result<CostReport> {
-	let analysis = Analysis::new(scene, document, &renderer.assets, options);
-	// each view on every core (a map's 20-stud grid, 440 views: 4.6 s one after another)
-	let costs: Vec<ViewCost> = views.par_iter().zip(shots.par_iter()).map(|(view, (camera, width, height))| analysis.view(&view.name, camera, *width as f32 / (*height).max(1) as f32, options)).collect();
+	// the cost loop: its own costing of every view (attributed, with pixels), the report's from it
+	let (analysis, costs, agent_lines, over_budget) = if options.attribute && options.grid.is_none() {
+		let preset = agent::preset_of(options, shots)?;
+		let quality = prices::Quality::of(options.quality(), preset.phone);
+		let setup = agent::Setup { renderer, options, names: views.iter().map(|view| view.name.clone()).collect(), shots, preset, quality, gpu, lent_lighting: lent.0, lent_materials: lent.1 };
+		let (costed, lines) = agent::run(&setup, scene, document, reload, out, input)?;
+		let over = options.budget.as_deref().map(agent::Budget::parse).transpose()?.map_or(0, |budget| {
+			costed.costs.iter().zip(&costed.works).filter(|(cost, work)| cost.total.draws > budget.draws || cost.total.triangles > budget.triangles || work.total.ms > budget.ms).count()
+		});
+		(costed.analysis, costed.costs, lines, over)
+	} else {
+		let analysis = Analysis::new(scene, document, &renderer.assets, options);
+		// each view on every core (a map's 20-stud grid, 440 views: 4.6 s one after another)
+		let costs: Vec<ViewCost> = views.par_iter().zip(shots.par_iter()).map(|(view, (camera, width, height))| analysis.view(&view.name, camera, *width as f32 / (*height).max(1) as f32, options)).collect();
+		(analysis, costs, Vec::new(), 0)
+	};
 	let mut grid_lines = Vec::new();
 	if let Some(spacing) = options.grid {
 		let cameras: Vec<Camera> = shots.iter().map(|(camera, _, _)| *camera).collect();
@@ -1886,6 +1959,8 @@ pub fn run(
 		views: costs,
 		lines: Vec::new(),
 		warnings: analysis.warnings.clone(),
+		agent: agent_lines,
+		over_budget,
 	};
 	if options.items {
 		write_items(&out.join("items.json"), scene, &analysis, &report.views)?;

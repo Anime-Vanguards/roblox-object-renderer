@@ -13,6 +13,7 @@ Using ror:
 | [video.md](video.md) | `ror video`: cameras, formats, encoders, the x264 feature, the contact sheet, copies, summary metrics and lints |
 | [scripts.md](scripts.md) | `.luau` scripts as input, run in the engine emulator |
 | [cost.md](cost.md) | `ror cost`: how Roblox batches draws, counts triangles, picks levels of detail and culls by occlusion |
+| [cost-loop.md](cost-loop.md) | the cost loop for agents: where a map's cost goes per instance in phone ms, ranked findings with edits, what-if edits with look checks, export to Lune, budgets |
 | [service.md](service.md) | the render service, many callers at once, its HTTP API, the job JSON, caches, memory admission, profiling |
 | [assets.md](assets.md) | downloads, texture caches, refused assets, the content store and disk use |
 | [parity.md](parity.md) | how agreement with Studio is measured: the capture Studio, compares, agreement figures, calibration experiments |

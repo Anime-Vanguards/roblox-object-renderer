@@ -107,7 +107,8 @@ A view's `"layers": true` (in the library, `ViewRequest::layers`) reads back wha
 for the cost of drawing it (`ViewImage::layers`): the frontmost opaque part's index + 1 and its depth
 (see-through parts and decals left out), and the fragments of see-through parts and decals in front
 of it, per pixel and per part, counted on the GPU against that depth (a decal on its own face
-counts), single-sided parts by their faces toward the camera.
+counts), single-sided parts by their faces toward the camera. `ror cost` counts each view's pixels
+with it ([cost-loop.md](cost-loop.md)).
 
 `--alone <instance>` (with `--ids`; a job's `alone`) says how much of one instance each view shows:
 the view's `alone` in the result holds the pixels its parts own in the view (`shown`) and the pixels
