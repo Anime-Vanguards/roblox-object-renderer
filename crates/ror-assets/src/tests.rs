@@ -8,11 +8,13 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
+use crate::broker::{Broker, BrokerSource, Unusable};
 use crate::cookie::{CookieSource, Secret};
 use crate::http::Endpoints;
-use crate::{AssetConfig, AssetError, Assets, Source, Transcode};
+use crate::{Account, AssetConfig, AssetError, Assets, Source, Transcode};
 
 const TEST_COOKIE: &str = "TEST-COOKIE-0123456789";
+const TEST_TOKEN: &str = "TEST-TOKEN-0123456789";
 
 #[derive(Clone, Debug)]
 struct Recorded {
@@ -174,8 +176,24 @@ fn endpoints(assetdelivery: &MockServer, thumbnails: &MockServer) -> Endpoints {
 }
 
 fn assets(config: AssetConfig, endpoints: Endpoints, cookie: bool) -> Assets {
-	let preset = cookie.then(|| (Secret::new(TEST_COOKIE).unwrap(), CookieSource::Env("TEST")));
-	Assets::with_endpoints(config, endpoints, Some(preset))
+	let account = Account::find(None, || cookie.then(|| (Secret::new(TEST_COOKIE).unwrap(), CookieSource::Env("TEST"))));
+	Assets::with_endpoints(config, endpoints, Some(account))
+}
+
+/// Assets whose account is used through `broker` with a fake token; reading a cookie source fails the test.
+fn via_broker(config: AssetConfig, endpoints: Endpoints, broker: &MockServer) -> Assets {
+	let found = Ok((Broker { base: broker.origin(), token: Secret::new(TEST_TOKEN).unwrap() }, BrokerSource::Env));
+	let account = Account::find(Some(found), || panic!("a cookie source was read with a broker's credentials"));
+	Assets::with_endpoints(config, endpoints, Some(account))
+}
+
+/// The broker's path for a request to `path` on the mock assetdelivery.
+fn behind(assetdelivery: &MockServer, path: &str) -> String {
+	format!("/rbx/127.0.0.1:{}{path}", assetdelivery.port)
+}
+
+fn bearer() -> String {
+	format!("Bearer {TEST_TOKEN}")
 }
 
 fn no_cookie_anywhere(servers: &[&MockServer]) {
@@ -794,8 +812,13 @@ fn transcodes_need_the_representation_named() {
 /// `/cdn/<id>/<fidelity>` for a named representation, its specifier naming ktx2 when `transcodes`
 /// holds the id), or an error code from `refuse`.
 fn batch_server(cdn: String, transcodes: Vec<u64>, refuse: Vec<(u64, u16)>) -> MockServer {
+	batch_server_at("/v1/assets/batch".into(), cdn, transcodes, refuse)
+}
+
+/// [`batch_server`] answering at `path`.
+fn batch_server_at(path: String, cdn: String, transcodes: Vec<u64>, refuse: Vec<(u64, u16)>) -> MockServer {
 	MockServer::start(move |r| {
-		if r.method != "POST" || r.path != "/v1/assets/batch" {
+		if r.method != "POST" || r.path != path {
 			return Reply::status(404);
 		}
 		let requests: Vec<serde_json::Value> = serde_json::from_slice(&r.body).unwrap_or_default();
@@ -908,4 +931,208 @@ fn warm_remembers_refusals_and_leaves_failures_to_fetch() {
 	let again = a.warm(&downloads, &|_| 0);
 	assert_eq!((again.downloaded, again.cached, again.failed), (0, 2, 1));
 	assert!(matches!(a.fetch("rbxassetid://2"), Err(AssetError::NotFound(_))));
+}
+
+// --- an account broker in place of the cookie -------------------------------------------------------
+
+const NEEDS_ACCOUNT: &str = r#"{"errors":[{"code":401,"message":"Authentication required to access Asset."}]}"#;
+
+/// A broker's own refusal: `X-Broker-Error` and a JSON body.
+fn broker_refusal(status: u16, code: &str, message: &str) -> Reply {
+	let body = serde_json::json!({ "error": code, "message": message }).to_string();
+	Reply { status, headers: vec![("X-Broker-Error".into(), code.into()), ("Content-Type".into(), "application/json".into())], body: body.into_bytes(), delay: Duration::ZERO }
+}
+
+#[test]
+fn a_broker_carries_what_the_cookie_would() {
+	let real = MockServer::start(|r| if r.path == "/real/42" { Reply::bytes(MESH) } else { Reply::status(404) });
+	let real_url = real.url("/real/42");
+	let cdn = MockServer::start(move |r| if r.path == "/obj/42" { Reply::redirect(&real_url) } else { Reply::status(404) });
+	let cdn_url = cdn.url("/obj/42");
+	let ad = {
+		let cdn_url = cdn_url.clone();
+		// assetdelivery itself only ever gives the public asset
+		MockServer::start(move |r| if r.path == "/v1/assetId/5" { Reply::json(&format!("{{\"location\":\"{cdn_url}\"}}")) } else { Reply::json(NEEDS_ACCOUNT) })
+	};
+	let paths = [behind(&ad, "/v1/assetId/42"), behind(&ad, "/v1/assetId/42/version/3")];
+	let broker = MockServer::start(move |r| {
+		if r.method == "GET" && paths.contains(&r.path) && r.header("Authorization") == Some(bearer().as_str()) {
+			Reply::json(&format!("{{\"location\":\"{cdn_url}\"}}"))
+		} else {
+			Reply::status(404)
+		}
+	});
+
+	let config = AssetConfig { assetdelivery_headers: vec![("Roblox-Place-Id".into(), "123".into())], ..AssetConfig::new(temp_state("broker")) };
+	let a = via_broker(config, endpoints(&ad, &cdn), &broker);
+	let fetched = a.fetch("rbxassetid://42").unwrap();
+	assert_eq!((fetched.bytes.as_slice(), fetched.source), (MESH, Source::Network));
+	assert_eq!(a.fetch("rbxassetid://42?version=3").unwrap().bytes, MESH);
+
+	// the public route as ever, then the same request behind the broker with the token
+	assert_eq!(ad.requests().iter().map(|r| r.path.as_str()).collect::<Vec<_>>(), ["/v1/assetId/42", "/v1/assetId/42/version/3"]);
+	let through = broker.requests();
+	assert_eq!(through.len(), 2);
+	for r in &through {
+		assert_eq!(r.header("Authorization"), Some(bearer().as_str()));
+		assert_eq!(r.header("Cookie"), None, "no cookie in broker mode");
+		assert_eq!(r.header("X-CSRF-TOKEN"), None);
+		assert_eq!(r.header("Roblox-Place-Id"), Some("123"));
+		assert_eq!(r.header("Accept"), Some("application/json"));
+	}
+	// a public asset never goes near the broker
+	assert_eq!(a.fetch("rbxassetid://5").unwrap().bytes, MESH);
+	assert_eq!(broker.requests().len(), 2);
+	no_cookie_anywhere(&[&ad, &cdn, &real]);
+
+	// what is reported is the broker and where its credentials came from, not the token
+	assert!(a.has_cookie());
+	assert_eq!(a.cookie_source().as_deref(), Some("account broker (env ROBLOX_BROKER_TOKEN)"));
+	let file = Account::find(Some(Ok((Broker { base: broker.origin(), token: Secret::new(TEST_TOKEN).unwrap() }, BrokerSource::File("creds.json".into())))), || None);
+	assert_eq!(file.source.as_deref(), Some("account broker (file creds.json)"));
+	// without a broker's credentials the cookie is what it was
+	let cookie = Account::find(None, || Some((Secret::new(TEST_COOKIE).unwrap(), CookieSource::Env("ROBLOSECURITY"))));
+	assert_eq!(cookie.source.as_deref(), Some("env ROBLOSECURITY"));
+	assert!(matches!(cookie.credential, Some(crate::Credential::Cookie(_))));
+}
+
+#[test]
+fn a_brokers_token_never_crosses_redirects() {
+	let real = MockServer::start(|_| Reply::bytes(MESH));
+	let real_url = real.url("/real");
+	let other = {
+		let real_url = real_url.clone();
+		MockServer::start(move |_| Reply::json(&format!("{{\"location\":\"{real_url}\"}}")))
+	};
+	let other_url = other.url("/json");
+	let ad = {
+		let real_url = real_url.clone();
+		MockServer::start(move |r| if r.path == "/again/8" { Reply::json(&format!("{{\"location\":\"{real_url}\"}}")) } else { Reply::json(NEEDS_ACCOUNT) })
+	};
+	let (to_other, relative, to_itself) = (behind(&ad, "/v1/assetId/7"), behind(&ad, "/v1/assetId/8"), behind(&ad, "/v1/assetId/9"));
+	let broker = MockServer::start(move |r| {
+		if r.path == to_other {
+			// to another host
+			Reply::redirect(&other_url)
+		} else if r.path == relative {
+			// a relative one is the forwarded request's: assetdelivery's origin
+			Reply::redirect("/again/8")
+		} else if r.path == to_itself {
+			// back to the broker's own origin
+			Reply::redirect(&format!("http://{}/elsewhere/9", r.header("Host").unwrap_or("")))
+		} else if r.path == "/elsewhere/9" {
+			Reply::json(&format!("{{\"location\":\"{real_url}\"}}"))
+		} else {
+			Reply::status(404)
+		}
+	});
+
+	let a = via_broker(AssetConfig::new(temp_state("broker-redirect")), endpoints(&ad, &other), &broker);
+	for id in [7, 8, 9] {
+		assert_eq!(a.fetch(&format!("rbxassetid://{id}")).unwrap().bytes, MESH, "{id}");
+	}
+	no_cookie_anywhere(&[&other, &real, &ad]);
+	let through = broker.requests();
+	assert_eq!(through.iter().filter(|r| r.header("Authorization").is_some()).count(), 3, "the first hop of each");
+	let second: Vec<&Recorded> = through.iter().filter(|r| r.path == "/elsewhere/9").collect();
+	assert_eq!(second.len(), 1);
+	assert_eq!(second[0].header("Authorization"), None, "redirected hop on the broker's own origin");
+	assert_eq!(ad.requests().iter().filter(|r| r.path == "/again/8").count(), 1);
+}
+
+#[test]
+fn warm_batches_go_through_the_broker() {
+	let cdn = MockServer::start(|r| if r.path.starts_with("/cdn/") { Reply::bytes(MESH) } else { Reply::status(404) });
+	let ad = MockServer::start(|_| Reply::json(NEEDS_ACCOUNT));
+	let broker = batch_server_at(behind(&ad, "/v1/assets/batch"), cdn.origin(), Vec::new(), Vec::new());
+	let a = via_broker(AssetConfig { max_concurrent_downloads: 8, ..AssetConfig::new(temp_state("broker-warm")) }, endpoints(&ad, &cdn), &broker);
+	let downloads: Vec<crate::Download> = (1..=20).map(|id| crate::Download::Asset(format!("rbxassetid://{id}"))).collect();
+	let report = a.warm(&downloads, &|_| 0);
+	assert_eq!((report.downloaded, report.failed, report.cached), (20, 0, 0));
+	let through = broker.requests();
+	assert_eq!(through.len(), report.batches);
+	for r in &through {
+		assert_eq!((r.method.as_str(), r.path.as_str()), ("POST", behind(&ad, "/v1/assets/batch").as_str()));
+		assert_eq!(r.header("Authorization"), Some(bearer().as_str()));
+		assert_eq!(r.header("Content-Type"), Some("application/json"));
+		assert_eq!(r.header("Cookie"), None, "no cookie in broker mode");
+		assert_eq!(r.header("X-CSRF-TOKEN"), None);
+	}
+	assert!(ad.requests().is_empty(), "the batch goes to the broker alone");
+	no_cookie_anywhere(&[&cdn]);
+
+	// the broker answers Roblox's CSRF challenge itself: one passed on is no reason to send a token
+	let challenged = MockServer::start(|_| Reply { status: 403, headers: vec![("x-csrf-token".into(), "abc".into())], body: Vec::new(), delay: Duration::ZERO });
+	let a = via_broker(AssetConfig::new(temp_state("broker-csrf")), endpoints(&ad, &cdn), &challenged);
+	let report = a.warm(&downloads[..3], &|_| 0);
+	assert_eq!((report.downloaded, report.failed), (0, 3));
+	assert_eq!(challenged.requests().len(), 1);
+	assert_eq!(challenged.requests()[0].header("X-CSRF-TOKEN"), None);
+}
+
+#[test]
+fn a_brokers_refusals_say_why() {
+	let cdn = MockServer::start(|_| Reply::bytes(MESH));
+	let cdn_url = cdn.url("/obj");
+	let ad = MockServer::start(|_| Reply::json(NEEDS_ACCOUNT));
+	let (signed_out, revoked, limited, roblox) = (behind(&ad, "/v1/assetId/1"), behind(&ad, "/v1/assetId/2"), behind(&ad, "/v1/assetId/3"), behind(&ad, "/v1/assetId/4"));
+	let limits = AtomicUsize::new(0);
+	let broker = MockServer::start(move |r| {
+		if r.path == signed_out {
+			broker_refusal(503, "account_signed_out", "the shared account is signed out")
+		} else if r.path == revoked {
+			broker_refusal(401, "token_invalid", "this token is unknown or revoked")
+		} else if r.path == limited {
+			if limits.fetch_add(1, Ordering::SeqCst) == 0 {
+				let mut refusal = broker_refusal(429, "rate_limited", "too many requests");
+				refusal.headers.push(("Retry-After".into(), "0".into()));
+				refusal
+			} else {
+				Reply::json(&format!("{{\"location\":\"{cdn_url}\"}}"))
+			}
+		} else if r.path == roblox {
+			// no X-Broker-Error: Roblox's own answer about the asset, passed through
+			Reply::json(r#"{"errors":[{"code":403,"message":"User is not authorized to access Asset."}]}"#)
+		} else {
+			Reply::status(404)
+		}
+	});
+	let state = temp_state("broker-refusals");
+	let asked = |id: u32| broker.requests().iter().filter(|r| r.path == behind(&ad, &format!("/v1/assetId/{id}"))).count();
+
+	let a = via_broker(AssetConfig::new(&state), endpoints(&ad, &cdn), &broker);
+	// the account is down: said in the broker's words, at once
+	let error = a.fetch("rbxassetid://1").unwrap_err();
+	assert_eq!(error.to_string(), "rbxassetid://1: account broker: the shared account is signed out (HTTP 503)");
+	assert_eq!(asked(1), 1, "not retried");
+	// the token is refused: that is not Roblox refusing the asset
+	let error = a.fetch("rbxassetid://2").unwrap_err();
+	assert_eq!(error.to_string(), "rbxassetid://2: account broker: this token is unknown or revoked (HTTP 401)");
+	assert!(!format!("{error} {error:?}").contains(TEST_TOKEN));
+	// the broker's rate limit is waited out
+	assert_eq!(a.fetch("rbxassetid://3").unwrap().bytes, MESH);
+	assert_eq!(asked(3), 2);
+	// Roblox's refusal through the broker is the asset's, as with the cookie
+	assert!(matches!(a.fetch("rbxassetid://4"), Err(AssetError::Http { status: 403, .. })));
+
+	// only Roblox's refusal is remembered: a new token, or the account back, is tried again
+	let b = via_broker(AssetConfig::new(&state), endpoints(&ad, &cdn), &broker);
+	assert!(b.fetch("rbxassetid://1").is_err());
+	assert!(b.fetch("rbxassetid://2").is_err());
+	assert!(b.fetch("rbxassetid://4").is_err());
+	assert_eq!((asked(1), asked(2), asked(4)), (2, 2, 1));
+}
+
+#[test]
+fn unusable_broker_credentials_are_said_not_skipped() {
+	let ad = MockServer::start(|_| Reply::json(NEEDS_ACCOUNT));
+	let found = Err(Unusable { source: BrokerSource::Env, why: "the broker URL must be https (plain http only for 127.0.0.1 or localhost)" });
+	let account = Account::find(Some(found), || panic!("a cookie source was read with a broker's credentials"));
+	let a = Assets::with_endpoints(AssetConfig::new(temp_state("broker-unusable")), endpoints(&ad, &ad), Some(account));
+	assert!(!a.has_cookie());
+	assert_eq!(a.cookie_source(), None);
+	let error = a.fetch("rbxassetid://42").unwrap_err().to_string();
+	assert_eq!(error, "rbxassetid://42: account broker credentials (env ROBLOX_BROKER_TOKEN) not usable: the broker URL must be https (plain http only for 127.0.0.1 or localhost)");
+	assert_eq!(ad.requests().len(), 1, "the public route alone");
+	no_cookie_anywhere(&[&ad]);
 }

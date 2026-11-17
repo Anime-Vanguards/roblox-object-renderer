@@ -22,7 +22,12 @@
 //! The account cookie is read from the environment or env files (see [`AssetConfig`]), only ever
 //! sent in the `Cookie` header of requests to `https://assetdelivery.roblox.com`, never forwarded
 //! across redirects, and never printed, logged, cached or written anywhere.
+//!
+//! With an account broker's credentials (the `broker` module: a service that holds the account's
+//! session, used with a personal token) no cookie is read: the requests that would carry it go to the
+//! broker with the token instead, which is sent nowhere else and treated like the cookie.
 
+mod broker;
 mod cache;
 mod cookie;
 mod http;
@@ -49,8 +54,7 @@ pub use uri::{ContentId, Thumbnail, ThumbnailKind};
 pub use warm::{BATCH, Download, WarmReport};
 
 use cache::{DiskCache, FileStamp, MemoryCache, Meta, Refusal};
-use cookie::Secret;
-use http::{Client, Endpoints, Reply};
+use http::{Client, Credential, Endpoints, Reply};
 
 #[derive(Clone, Debug)]
 pub struct AssetConfig {
@@ -73,6 +77,11 @@ pub struct AssetConfig {
 	/// then the env files named by `ROR_COOKIE_ENV` and `RUR_COOKIE_ENV`, then `<repo_dir>/.env` (lines
 	/// `ROBLOX_ASSET_DELIVERY_COOKIE=...` or `ROBLOSECURITY=...`). Read lazily, on the first request
 	/// that needs authentication.
+	///
+	/// An account broker's credentials come before all of them, and no cookie is read when they are
+	/// found: env `ROBLOX_BROKER_TOKEN` with `ROBLOX_BROKER_URL`, then the JSON file
+	/// (`{ "url": ..., "token": ... }`) named by env `ROBLOX_BROKER_CREDENTIALS`, else
+	/// `~/.config/roblox-broker/credentials.json`.
 	pub repo_dir: Option<PathBuf>,
 	/// Byte budget of the in-memory cache.
 	pub memory_budget: usize,
@@ -271,12 +280,41 @@ struct Slot {
 	ready: Condvar,
 }
 
+/// What authenticates downloads that need the account, and where it came from.
+struct Account {
+	credential: Option<Credential>,
+	/// `env NAME`, `file <path>`, `account broker (...)`: never a value
+	source: Option<String>,
+	/// A broker's credentials were found but cannot be used: why. No cookie stands in for them.
+	problem: Option<String>,
+}
+
+impl Account {
+	/// The broker's credentials when there are any (`cookie` is then never asked), else the cookie.
+	fn find(broker: Option<broker::Found>, cookie: impl FnOnce() -> Option<(cookie::Secret, cookie::CookieSource)>) -> Account {
+		match broker {
+			Some(Ok((broker, source))) => Account { credential: Some(Credential::Broker(broker)), source: Some(format!("account broker ({})", source.label())), problem: None },
+			Some(Err(unusable)) => Account { credential: None, source: None, problem: Some(format!("account broker credentials ({}) not usable: {}", unusable.source.label(), unusable.why)) },
+			None => match cookie() {
+				Some((secret, source)) => {
+					let source = match source {
+						cookie::CookieSource::Env(name) => format!("env {name}"),
+						cookie::CookieSource::File(path) => format!("file {}", path.display()),
+					};
+					Account { credential: Some(Credential::Cookie(secret)), source: Some(source), problem: None }
+				}
+				None => Account { credential: None, source: None, problem: None },
+			},
+		}
+	}
+}
+
 struct Inner {
 	config: AssetConfig,
 	client: Client,
 	disk: DiskCache,
 	studio: OnceLock<Option<studio::StudioInstall>>,
-	cookie: OnceLock<Option<(Secret, cookie::CookieSource)>>,
+	account: OnceLock<Account>,
 	memory: Mutex<MemoryCache>,
 	inflight: Mutex<HashMap<String, Arc<Slot>>>,
 	/// Network URIs already re-downloaded in refresh mode
@@ -294,11 +332,11 @@ impl Assets {
 		Self::with_endpoints(config, Endpoints::production(), None)
 	}
 
-	fn with_endpoints(config: AssetConfig, endpoints: Endpoints, cookie: Option<Option<(Secret, cookie::CookieSource)>>) -> Self {
+	fn with_endpoints(config: AssetConfig, endpoints: Endpoints, account: Option<Account>) -> Self {
 		let client = Client::new(endpoints, config.max_concurrent_downloads, &config.assetdelivery_headers);
-		let cookie_cell = OnceLock::new();
-		if let Some(preset) = cookie {
-			let _ = cookie_cell.set(preset);
+		let account_cell = OnceLock::new();
+		if let Some(preset) = account {
+			let _ = account_cell.set(preset);
 		}
 		Assets {
 			inner: Arc::new(Inner {
@@ -306,7 +344,7 @@ impl Assets {
 				memory: Mutex::new(MemoryCache::new(config.memory_budget)),
 				client,
 				studio: OnceLock::new(),
-				cookie: cookie_cell,
+				account: account_cell,
 				inflight: Mutex::new(HashMap::new()),
 				refreshed: Mutex::new(HashSet::new()),
 				config,
@@ -344,32 +382,47 @@ impl Assets {
 		used
 	}
 
-	/// Whether a cookie is configured (reads the sources; never reveals the value).
+	/// Whether the account can be used: a cookie, or an account broker's credentials, is configured
+	/// (reads the sources; never reveals a value).
 	pub fn has_cookie(&self) -> bool {
-		self.cookie().is_some()
+		self.credential().is_some()
 	}
 
-	/// A description of where the cookie comes from (`env ROBLOSECURITY`, `file <path>`), never the
-	/// value itself.
+	/// A description of where the account's credential comes from (`env ROBLOSECURITY`,
+	/// `file <path>`; with a broker `account broker (env ROBLOX_BROKER_TOKEN)` or
+	/// `account broker (file <path>)`), never a value itself.
 	pub fn cookie_source(&self) -> Option<String> {
-		self.inner.cookie.get_or_init(|| cookie::load(self.inner.config.repo_dir.as_deref())).as_ref().map(|(_, source)| match source {
-			cookie::CookieSource::Env(name) => format!("env {name}"),
-			cookie::CookieSource::File(path) => format!("file {}", path.display()),
-		})
+		self.account().source.clone()
 	}
 
-	/// One line per cookie source with its status (`not set`, `missing`, `no cookie line`,
-	/// `invalid value`, `ok`, ...), in lookup order. Never contains the value.
+	/// One line per credential source with its status (`not set`, `missing`, `no cookie line`,
+	/// `invalid value`, `ok`, ...), in lookup order: the account broker's, then the cookie's. Never
+	/// contains a value.
 	pub fn cookie_diagnostics(&self) -> Vec<String> {
-		cookie::diagnose(self.inner.config.repo_dir.as_deref())
+		let mut lines = broker::diagnose(&|name| std::env::var_os(name));
+		lines.extend(cookie::diagnose(self.inner.config.repo_dir.as_deref()));
+		lines
 	}
 
 	fn studio(&self) -> Option<&studio::StudioInstall> {
 		self.inner.studio.get_or_init(|| studio::detect(self.inner.config.studio_content.as_deref())).as_ref()
 	}
 
-	fn cookie(&self) -> Option<&Secret> {
-		self.inner.cookie.get_or_init(|| cookie::load(self.inner.config.repo_dir.as_deref())).as_ref().map(|(s, _)| s)
+	fn account(&self) -> &Account {
+		self.inner.account.get_or_init(|| Account::find(broker::load(), || cookie::load(self.inner.config.repo_dir.as_deref())))
+	}
+
+	fn credential(&self) -> Option<&Credential> {
+		self.account().credential.as_ref()
+	}
+
+	/// The answer to a refusal no credential could be tried for: the refusal, or why the account
+	/// broker's credentials cannot be used.
+	fn refused_without_credential(&self, uri: &str, status: u16, reason: Option<RefusalReason>) -> AssetError {
+		match &self.account().problem {
+			Some(problem) => AssetError::Network { uri: uri.to_string(), detail: problem.clone() },
+			None => http(uri, status, reason),
+		}
 	}
 
 	/// Fetches a content URI (blocking). Concurrent calls for the same URI share one download.
@@ -568,8 +621,8 @@ impl Assets {
 					AssetError::NotFound(_) => Some((404, None)),
 					_ => None,
 				};
-				// an authorisation refusal is only final once the cookie was tried too
-				let final_refusal = |status: u16| !matches!(status, 401 | 403 | 409) || self.cookie().is_some();
+				// an authorisation refusal is only final once the account's credential was tried too
+				let final_refusal = |status: u16| !matches!(status, 401 | 403 | 409) || self.credential().is_some();
 				if let Some((status, reason)) = refusal
 					&& final_refusal(status)
 				{
@@ -594,8 +647,9 @@ impl Assets {
 		Ok(Fetched { uri: uri.to_string(), bytes, source: Source::Network })
 	}
 
-	/// assetdelivery `GET /v1/assetId/{id}[/version/{v}]` (public, then with the cookie on an
-	/// authorisation error), then the CDN location without the cookie. Returns (bytes, CDN host).
+	/// assetdelivery `GET /v1/assetId/{id}[/version/{v}]` (public, then with the cookie, or through the
+	/// account broker, on an authorisation error), then the CDN location without either. Returns
+	/// (bytes, CDN host).
 	fn download_asset(&self, id: u64, version: Option<u64>, uri: &str) -> Result<(Vec<u8>, String), AssetError> {
 		let client = &self.inner.client;
 		let base = &client.endpoints().assetdelivery;
@@ -606,13 +660,13 @@ impl Assets {
 
 		let location = match self.asset_location(&url, None, uri)? {
 			Located::Url(location) => location,
-			Located::Unauthorized(status, reason) => match self.cookie() {
-				Some(secret) => match self.asset_location(&url, Some(secret), uri)? {
+			Located::Unauthorized(status, reason) => match self.credential() {
+				Some(credential) => match self.asset_location(&url, Some(credential), uri)? {
 					Located::Url(location) => location,
 					Located::Unauthorized(status, reason) => return Err(http(uri, status, reason)),
 					Located::Generating => return Err(http(uri, 406, None)),
 				},
-				None => return Err(http(uri, status, reason)),
+				None => return Err(self.refused_without_credential(uri, status, reason)),
 			},
 			Located::Generating => return Err(http(uri, 406, None)),
 		};
@@ -637,13 +691,14 @@ impl Assets {
 		};
 		let url = format!("{path}?contentRepresentationPriorityList={}&doNotFallbackToBaselineRepresentation=true", transcode::query_escape(&transcode.priority_list(pack)));
 
-		let mut cookie = None;
+		let mut credential = None;
 		let mut waits = waits.iter();
 		let location = loop {
-			match self.transcode_location(&url, cookie, uri)? {
+			match self.transcode_location(&url, credential, uri)? {
 				Located::Url(location) => break location,
-				Located::Unauthorized(status, reason) => match (cookie, self.cookie()) {
-					(None, Some(secret)) => cookie = Some(secret),
+				Located::Unauthorized(status, reason) => match (credential, self.credential()) {
+					(None, Some(found)) => credential = Some(found),
+					(None, None) => return Err(self.refused_without_credential(uri, status, reason)),
 					_ => return Err(http(uri, status, reason)),
 				},
 				Located::Generating => match waits.next() {
@@ -666,8 +721,8 @@ impl Assets {
 
 	/// A transcode's location: only a reply naming the requested representation counts (without one
 	/// the location is the uploaded image's).
-	fn transcode_location(&self, url: &str, cookie: Option<&Secret>, uri: &str) -> Result<Located, AssetError> {
-		let reply = self.get(url, cookie, "application/json", uri)?;
+	fn transcode_location(&self, url: &str, credential: Option<&Credential>, uri: &str) -> Result<Located, AssetError> {
+		let reply = self.get(url, credential, "application/json", uri)?;
 		let parsed: Option<TranscodeLocation> = serde_json::from_slice(&reply.body).ok();
 		if let Some(parsed) = parsed.as_ref()
 			&& let Some(location) = parsed.location.as_ref().filter(|l| !l.is_empty())
@@ -684,8 +739,8 @@ impl Assets {
 		}
 	}
 
-	fn asset_location(&self, url: &str, cookie: Option<&Secret>, uri: &str) -> Result<Located, AssetError> {
-		let reply = self.get(url, cookie, "application/json", uri)?;
+	fn asset_location(&self, url: &str, credential: Option<&Credential>, uri: &str) -> Result<Located, AssetError> {
+		let reply = self.get(url, credential, "application/json", uri)?;
 		let parsed: Option<AssetLocation> = serde_json::from_slice(&reply.body).ok();
 		if let Some(location) = parsed.as_ref().and_then(|p| p.location.clone()).filter(|l| !l.is_empty()) {
 			return Ok(Located::Url(location));
@@ -766,9 +821,15 @@ impl Assets {
 		Err(AssetError::Network { uri: uri.to_string(), detail: "thumbnail still pending".into() })
 	}
 
-	/// GET with retries; failures become errors about `uri` (never the request URL or headers).
-	fn get(&self, url: &str, cookie: Option<&Secret>, accept: &str, uri: &str) -> Result<Reply, AssetError> {
-		self.inner.client.get_retrying(url, cookie, accept).map_err(|f| AssetError::Network { uri: uri.to_string(), detail: f.describe() })
+	/// GET with retries; failures become errors about `uri` (never the request URL or headers), and so
+	/// does what an account broker refused itself, in its words: that is not Roblox's answer about
+	/// the asset, so it is never read or remembered as one.
+	fn get(&self, url: &str, credential: Option<&Credential>, accept: &str, uri: &str) -> Result<Reply, AssetError> {
+		let reply = self.inner.client.get_retrying(url, credential, accept).map_err(|f| AssetError::Network { uri: uri.to_string(), detail: f.describe() })?;
+		match &reply.broker_error {
+			Some(said) => Err(AssetError::Network { uri: uri.to_string(), detail: format!("account broker: {said} (HTTP {})", reply.status) }),
+			None => Ok(reply),
+		}
 	}
 }
 

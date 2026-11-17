@@ -7,9 +7,10 @@
 //! `--transcode` fetches a pack of the asset's KTX2 texture transcode instead (`image`: an image
 //! asset; `color`, `normal`, `mr`: a TexturePack's layers), pack 0 unless `--pack` says otherwise.
 //!
-//! The account cookie (for assets that need authentication) is read by the library from its
-//! documented sources, e.g. `ROR_COOKIE_ENV=<path to an env file>`; this program only ever prints
-//! where it came from, never the value.
+//! The account's credential (for assets that need authentication) is read by the library from its
+//! documented sources: an account broker's credentials, e.g. `ROBLOX_BROKER_CREDENTIALS=<path to its
+//! JSON file>`, else the cookie, e.g. `ROR_COOKIE_ENV=<path to an env file>`. This program only ever
+//! prints where it came from, never the value.
 
 use std::time::Instant;
 
@@ -60,9 +61,9 @@ fn main() {
 		None => println!("studio content: not found"),
 	}
 	match assets.cookie_source() {
-		Some(source) => println!("cookie: available ({source})"),
+		Some(source) => println!("account: available ({source})"),
 		None => {
-			println!("cookie: not configured");
+			println!("account: not configured");
 			for line in assets.cookie_diagnostics() {
 				println!("  {line}");
 			}

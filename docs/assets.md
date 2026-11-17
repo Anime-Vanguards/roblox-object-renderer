@@ -2,7 +2,7 @@
 
 Where ror's content comes from, what it keeps, and what keeps renders, captures and downloads from
 piling up. The code is in `crates/ror-assets` (content URIs, downloads, the disk cache, the content
-store, the Studio install, the cookie), `crates/ror-image` and `crates/ror/src/render/texels.rs`
+store, the Studio install, the cookie or an account broker), `crates/ror-image` and `crates/ror/src/render/texels.rs`
 (textures as the GPU takes them).
 
 `<state dir>` is the [state folder](building.md#standalone-commands-and-state); a checkout defaults
@@ -20,6 +20,30 @@ by Roblox moderation`, `archived by its creator` and `not yet reviewed by Roblox
 refused to every account and place, and Studio, which cannot load them either, draws nothing for
 them, as ror does; `not authorized for this account` and `authentication required` may need the
 cookie ([building.md](building.md) "Requirements") or another account.
+
+### Account broker
+
+Where a team shares one Roblox account for its private assets, the account's cookie need not be on
+every machine: an account broker is a service that holds the session and forwards asset requests for
+personal tokens. ror uses one when it finds credentials for it, and then reads no cookie at all:
+
+1. `ROBLOX_BROKER_TOKEN` with `ROBLOX_BROKER_URL` in the environment;
+2. the JSON file named by `ROBLOX_BROKER_CREDENTIALS`, else `~/.config/roblox-broker/credentials.json`
+   (under the user profile on Windows): `{ "url": "https://...", "token": "..." }`, other keys ignored.
+
+The URL must be https, or http on `127.0.0.1` or `localhost` (a tunnel); credentials with any other
+URL are reported as unusable instead of a cookie being used in their place.
+
+What a broker has to do: a request that would carry the cookie to
+`https://assetdelivery.roblox.com/<path>?<query>` comes to `<url>/rbx/assetdelivery.roblox.com/<path>?<query>`
+with `Authorization: Bearer <token>`, the same method, body and `Content-Type`, and no cookie or CSRF
+token (the broker answers Roblox's CSRF challenge). ror sends `GET /v1/assetId/{id}[/version/{n}]`
+(queries included) and `POST /v1/assets/batch` this way, and only after Roblox refused the asset
+without an account; the files themselves come from the CDN location in the answer, without the token.
+The broker answers with Roblox's status and body. When it refuses a request itself, it adds an
+`X-Broker-Error: <code>` header and a JSON body `{ "error", "message" }`, and ror reports that message
+(`account broker: the shared account is signed out (HTTP 503)`) and does not remember it as Roblox's
+refusal of the asset; a 429 with `Retry-After` is waited out.
 
 ## Textures
 

@@ -131,6 +131,9 @@ does not, and keeps the library's original defaults:
 - Optional: a Roblox account cookie for assets that need authentication, in a source checkout's `.env`
   (`ROBLOX_ASSET_DELIVERY_COOKIE=...`, ignored by Git) or a file named by `ROR_COOKIE_ENV`. It is
   only ever sent to assetdelivery.roblox.com ([SECURITY.md](../SECURITY.md)).
+- Optional, in place of the cookie: an account broker's credentials (`ROBLOX_BROKER_TOKEN` with
+  `ROBLOX_BROKER_URL`, or a JSON file: [assets.md](assets.md#account-broker)). They win over every
+  cookie source.
 - Optional, for parity work: Roblox Studio running on Windows and a Studio MCP bridge
   ([parity.md](parity.md)).
 

@@ -278,7 +278,8 @@ impl Assets {
 		outcomes.into_iter().map(|outcome| outcome.into_inner().unwrap_or(Outcome::Failed)).collect()
 	}
 
-	/// One batch request for `items`' locations (with the cookie when there is one), in their order.
+	/// One batch request for `items`' locations (with the cookie when there is one, or through the
+	/// account broker), in their order.
 	fn locate(&self, items: &[Item]) -> Vec<Place> {
 		let requests: Vec<BatchRequest> = items
 			.iter()
@@ -302,10 +303,11 @@ impl Assets {
 			return unknown();
 		};
 		let url = format!("{}/v1/assets/batch", self.inner.client.endpoints().assetdelivery);
-		let Ok(reply) = self.inner.client.post_json_retrying(&url, &body, self.cookie()) else {
+		let Ok(reply) = self.inner.client.post_json_retrying(&url, &body, self.credential()) else {
 			return unknown();
 		};
-		if reply.status != 200 {
+		// an account broker's own refusal is left to a fetch, like any failure: it says why
+		if reply.status != 200 || reply.broker_error.is_some() {
 			return unknown();
 		}
 		let Ok(replies) = serde_json::from_slice::<Vec<BatchReply>>(&reply.body) else {
@@ -352,8 +354,8 @@ impl Assets {
 				return Outcome::NoTranscode;
 			}
 			Place::Refused(status, reason) => {
-				// remembered only when final: an authorisation refusal once the cookie was tried
-				if !matches!(status, 401 | 403 | 409) || self.cookie().is_some() {
+				// remembered only when final: an authorisation refusal once the account's credential was tried
+				if !matches!(status, 401 | 403 | 409) || self.credential().is_some() {
 					self.remember_refusal(&item.key, status, reason, now());
 				}
 				return failed();
