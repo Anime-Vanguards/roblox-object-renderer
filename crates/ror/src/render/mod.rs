@@ -5873,6 +5873,65 @@ mod decal_uv_tests {
 }
 
 #[cfg(test)]
+mod tint_mask_tests {
+	use super::*;
+
+	/// A SurfaceAppearance in AlphaMode TintMask multiplies its texel by Color mixed from white by the
+	/// texel's alpha, both as stored, and decodes the product as it decodes the map (Studio, tintmask-ramp):
+	/// each cell draws as an untinted map holding that product does, the texel itself at alpha 0.
+	#[test]
+	fn a_tint_mask_mixes_color_into_the_stored_texel() {
+		let state = std::env::temp_dir().join(format!("ror-tint-mask-test-{}", std::process::id()));
+		std::fs::create_dir_all(&state).unwrap();
+		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let (texel, color) = ([204u8, 128, 77], Vec3::new(0.3, 0.6, 0.9));
+		let size = 32u32;
+		let request = ViewRequest { width: size, height: size, camera: CameraSpec::LookAt { eye: [0.0, 0.0, -10.0], target: [0.0; 3], fov: 20.0 }, background: Background::Color([0.0; 3]), bloom: false, ..Default::default() };
+		let draw = |name: &str, rgba: [u8; 4], color: Vec3| -> [i32; 3] {
+			let path = state.join(format!("{name}.png"));
+			crate::output::write_png(&path, 8, 8, &rgba.repeat(64), false).unwrap();
+			let mut model = crate::scene::build::ModelBuilder::new("Plate");
+			model.part(&crate::scene::build::PartSpec { name: "Plate".into(), size: Vec3::new(4.0, 4.0, 1.0), cast_shadow: false, ..Default::default() });
+			let mut scene = crate::scene::extract::extract(&model.into_document());
+			scene.environment.brightness = 0.0;
+			scene.environment.ambient = Vec3::splat(0.7);
+			scene.environment.outdoor_ambient = Vec3::ZERO;
+			scene.environment.environment_diffuse_scale = 0.0;
+			scene.environment.environment_specular_scale = 0.0;
+			scene.environment.global_shadows = false;
+			Arc::make_mut(&mut scene.parts[0]).surface_appearance = Some(crate::scene::SurfaceAppearance {
+				color_map: Some(format!("file:///{}", path.display().to_string().replace('\\', "/"))),
+				normal_map: None,
+				metalness_map: None,
+				roughness_map: None,
+				texture_pack: None,
+				alpha_mode: 2,
+				color,
+				emissive_mask: None,
+				emissive_strength: 1.0,
+				emissive_tint: Vec3::ONE,
+			});
+			let (images, stats) = renderer.render(&scene, std::slice::from_ref(&request)).unwrap();
+			assert!(stats.missing.is_empty(), "{name}: missing {:?}", stats.missing);
+			let index = ((size / 2 * size + size / 2) * 4) as usize;
+			std::array::from_fn(|c| images[0].rgba[index + c] as i32)
+		};
+		for alpha in [0u8, 73, 146, 219, 255] {
+			let weight = alpha as f32 / 255.0;
+			let stored: [u8; 3] = std::array::from_fn(|c| (texel[c] as f32 * (1.0 + (color[c] - 1.0) * weight)).round() as u8);
+			let tinted = draw(&format!("tinted-{alpha}"), [texel[0], texel[1], texel[2], alpha], color);
+			let reference = draw(&format!("reference-{alpha}"), [stored[0], stored[1], stored[2], 0], Vec3::ONE);
+			assert!(tinted.iter().zip(reference).all(|(tinted, reference)| (tinted - reference).abs() <= 2), "alpha {alpha}: tinted {tinted:?}, an untinted map of {stored:?} {reference:?}");
+			assert!(reference.iter().all(|value| (12..240).contains(value)), "alpha {alpha}: the plate lit within range {reference:?}");
+		}
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+}
+
+#[cfg(test)]
 mod viewport_frame_tests {
 	use super::*;
 

@@ -2678,6 +2678,114 @@ pub fn sky_reflection() -> Experiment {
 }
 
 
+/// Setup Luau for tintmask-ramp: each SurfaceAppearance named `RorTexel_<r>_<g>_<b>_<a>` gets an 8 x 8
+/// EditableImage of that one texel as its colour map (ror reads the same texel from a PNG).
+const TINTMASK_SETUP: &str = r#"local AssetService = game:GetService("AssetService")
+local SIDE = 8
+local count = 0
+for _, appearance in workspace.RorCapture:GetDescendants() do
+	local r, g, b, a = string.match(appearance.Name, "^RorTexel_(%d+)_(%d+)_(%d+)_(%d+)$")
+	if appearance:IsA("SurfaceAppearance") and r then
+		local image = AssetService:CreateEditableImage({ Size = Vector2.new(SIDE, SIDE) })
+		local pixels = buffer.create(SIDE * SIDE * 4)
+		for i = 0, SIDE * SIDE - 1 do
+			buffer.writeu8(pixels, i * 4, tonumber(r))
+			buffer.writeu8(pixels, i * 4 + 1, tonumber(g))
+			buffer.writeu8(pixels, i * 4 + 2, tonumber(b))
+			buffer.writeu8(pixels, i * 4 + 3, tonumber(a))
+		end
+		image:WritePixelsBuffer(Vector2.zero, image.Size, pixels)
+		appearance.ColorMapContent = Content.fromObject(image)
+		count += 1
+	end
+end
+task.wait(1)
+return count .. " images"
+"#;
+
+/// How AlphaMode TintMask mixes SurfaceAppearance.Color into the colour map: eight-step alpha ramps (0,
+/// 1/7 ... 1) of one texel under one Color on flat quads, and beside each ramp three rows of the colour
+/// each candidate predicts, drawn as an alpha-0 TintMask texel (shown as it is): the mix in stored
+/// values (`srgb`), in linear light (`linear`) and the built-in packs' gamma-2 mix (`gamma2`). A warm
+/// case (texel 0.8, 0.5, 0.3 under Color 0.3, 0.6, 0.9) separates them; a dark one (0.22, 0.17, 0.12
+/// under 0.25, 0.2, 0.22) checks the low end. The texels are made in Studio as EditableImages
+/// (`TINTMASK_SETUP`) and for ror as PNGs in the state dir; each cell is a probe whose inputs hold its
+/// row's texel and prediction.
+pub fn tintmask_ramp() -> Result<Experiment> {
+	use rbx_dom_weak::InstanceBuilder;
+	use rbx_dom_weak::types::{Color3, ContentId, Enum};
+
+	let to_linear = |x: f32| if x <= 0.04045 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) };
+	let to_srgb = |x: f32| {
+		let x = x.clamp(0.0, 1.0);
+		if x <= 0.003_130_8 { x * 12.92 } else { 1.055 * x.powf(1.0 / 2.4) - 0.055 }
+	};
+	type Formula<'a> = &'a dyn Fn(f32, f32, f32) -> f32;
+	let formulas: [(&str, Formula); 3] = [
+		("srgb", &|t, c, a| t * (1.0 + (c - 1.0) * a)),
+		("linear", &|t, c, a| to_srgb(to_linear(t) * (1.0 + (to_linear(c) - 1.0) * a))),
+		("gamma2", &|t, c, a| {
+			let k = 1.0 + (to_linear(c).sqrt() - 1.0) * a;
+			to_srgb(to_linear(t) * k * k)
+		}),
+	];
+	let cases: [(&str, [u8; 3], [f32; 3]); 2] = [("warm", [204, 128, 77], [0.3, 0.6, 0.9]), ("dark", [56, 43, 31], [0.25, 0.2, 0.22])];
+	const STEPS: usize = 8;
+	let images = output::state_dir().join("inputs").join("tintmask-ramp");
+	let mut model = ModelBuilder::new("TintMaskRamp");
+	let mut probes = Vec::new();
+	let mut row = 0.0f32;
+	let cell = |model: &mut ModelBuilder, probes: &mut Vec<Probe>, label: String, center: Vec3, rgba: [u8; 4], color: [f32; 3], inputs: serde_json::Value| -> Result<()> {
+		let path = images.join(format!("{}_{}_{}_{}.png", rgba[0], rgba[1], rgba[2], rgba[3]));
+		output::write_png(&path, 8, 8, &rgba.repeat(64), false)?;
+		let shown = path.display().to_string();
+		let uri = format!("file:///{}", shown.strip_prefix(r"\\?\").unwrap_or(&shown).replace('\\', "/"));
+		let part = model.part(&PartSpec { class: "MeshPart", name: label.clone(), cframe: quad_cframe(center, 1.0, 0.0), size: Vec3::new(1.0, 1.0, 0.05), color: [255; 3], material: 272, cast_shadow: false, ..Default::default() });
+		model.set(part, "MeshId", ContentId::from(QUAD_MESH.0));
+		model.set(part, "InitialSize", rbx_dom_weak::types::Vector3::new(QUAD_MESH.1[0], QUAD_MESH.1[1], QUAD_MESH.1[2]));
+		model.child(
+			part,
+			InstanceBuilder::new("SurfaceAppearance")
+				.with_name(format!("RorTexel_{}_{}_{}_{}", rgba[0], rgba[1], rgba[2], rgba[3]))
+				.with_property("ColorMap", ContentId::from(uri))
+				.with_property("AlphaMode", Enum::from_u32(2))
+				.with_property("Color", Color3::new(color[0], color[1], color[2])),
+		);
+		probes.push(Probe { label, position: center.into(), inputs });
+		Ok(())
+	};
+	for (case, texel, color) in cases {
+		let stored = texel.map(|value| value as f32 / 255.0);
+		let mut rows: Vec<(String, Option<Formula>)> = vec![("test".into(), None)];
+		rows.extend(formulas.iter().map(|(name, formula)| (name.to_string(), Some(*formula))));
+		for (name, formula) in rows {
+			for step in 0..STEPS {
+				let alpha = step as f32 / (STEPS - 1) as f32;
+				let center = Vec3::new((step as f32 - (STEPS - 1) as f32 * 0.5) * 1.25, -row * 1.25, 0.0);
+				let (rgba, tint) = match formula {
+					None => ([texel[0], texel[1], texel[2], (alpha * 255.0).round() as u8], color),
+					Some(formula) => {
+						let predicted: [u8; 3] = std::array::from_fn(|c| (formula(stored[c], color[c], alpha) * 255.0).round() as u8);
+						([predicted[0], predicted[1], predicted[2], 0], [1.0; 3])
+					}
+				};
+				let inputs = serde_json::json!({"case": case, "row": name, "step": step, "alpha": alpha, "texel": texel, "color": color, "drawn": rgba});
+				cell(&mut model, &mut probes, format!("{case}:{name}:{step}"), center, rgba, tint, inputs)?;
+			}
+			row += 1.0;
+		}
+		row += 0.5;
+	}
+	with_setup(&mut model, TINTMASK_SETUP);
+	let center = Vec3::new(0.0, -(row - 1.5) * 1.25 * 0.5, 0.0);
+	let camera = CameraSpec::LookAt { eye: (center + Vec3::new(0.0, 0.0, -70.0)).into(), target: center.into(), fov: 10.0 };
+	let runs = vec![
+		Run { label: "flat".into(), environment: flat_ambient(), camera: camera.clone() },
+		Run { label: "sun".into(), environment: Environment { global_shadows: false, ..Environment::default() }, camera },
+	];
+	Ok(Experiment { name: "tintmask-ramp".into(), model, probes, runs })
+}
+
 /// Per-material texture offsets: every regularly tiled material on a white 16 x 1 x 16 slab at a
 /// grid-aligned position and at an odd, rotated one, seen straight down under flat ambient light.
 pub fn material_offsets() -> Experiment {
@@ -4226,6 +4334,7 @@ pub fn experiment(name: &str) -> Result<Experiment> {
 		"organic-maps" => organic_maps(),
 		"organic-slopes" => organic_slopes(),
 		"organic-sun" => organic_sun(),
+		"tintmask-ramp" => tintmask_ramp()?,
 		"organic-reset" => organic_reset(),
 		"organic-uniqueid" => organic_uniqueid(),
 		"organic-builtin" => organic_builtin(),

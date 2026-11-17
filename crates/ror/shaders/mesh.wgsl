@@ -868,7 +868,12 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 			let tint = mix(vec3<f32>(1.0), sqrt(base), texel.a);
 			base = texel.rgb * tint * tint;
 		} else if ((flags & TEX_ALPHA_TINTMASK) != 0u) {
-			base = texel.rgb * mix(vec3<f32>(1.0), instance.color.rgb, texel.a);
+			// a SurfaceAppearance: the stored texel times Color mixed from white by the alpha, both as
+			// stored, then decoded as the map is (tintmask-ramp: an 8-step alpha ramp of (0.8, 0.5, 0.3)
+			// under Color (0.3, 0.6, 0.9) within 2.1 of 255 of that mix on average, the gamma-2 mix 3.4,
+			// the linear mix 6.8)
+			let stored = raw_texel.rgb * mix(vec3<f32>(1.0), sqrt(instance.color.rgb), texel.a);
+			base = select(stored * stored, srgb_to_linear(stored), (flags & TEX_SRGB) != 0u) * TEXTURE_ALBEDO_SCALE;
 		} else {
 			base *= texel.rgb;
 			// a built-in pack's alpha is never coverage (Glass's colour map is 0.002 on average, and

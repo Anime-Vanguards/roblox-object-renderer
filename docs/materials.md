@@ -25,6 +25,12 @@ takes them) and `shaders/mesh.wgsl`. The general light and colour rules are in
 - A SurfaceAppearance's ColorMap, NormalMap, MetalnessMap and RoughnessMap replace the part's
   material entirely (its Material and TextureID no longer matter), tinted by its Color; AlphaMode
   Overlay, Transparency and TintMask decide what its colour map's alpha does.
+- In AlphaMode TintMask the Color is mixed in by the map's alpha in stored (gamma-encoded) values:
+  texel x (1 - a + a · Color), both as stored, then decoded as the map is and lit as usual. Alpha 0
+  shows the texel unchanged, alpha 1 the texel times the Color. Measured on eight-step alpha ramps
+  against each candidate's predicted colour (`tintmask-ramp`): within 2.1 of 255 per cell on average,
+  against 3.4 for a gamma-2 mix and 6.8 for a mix in linear light. (A built-in material's TintMask
+  instead mixes the part colour in gamma 2.)
 - A MaterialVariant from the place's MaterialService replaces a base material's maps by name
   (`MaterialVariant` on the part, or MaterialService's override for that material), with its own
   StudsPerTile, pattern and emissive mask.
