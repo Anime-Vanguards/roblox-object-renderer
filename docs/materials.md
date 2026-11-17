@@ -31,6 +31,10 @@ takes them) and `shaders/mesh.wgsl`. The general light and colour rules are in
   against each candidate's predicted colour (`tintmask-ramp`): within 2.1 of 255 per cell on average,
   against 3.4 for a gamma-2 mix and 6.8 for a mix in linear light. (A built-in material's TintMask
   instead mixes the part colour in gamma 2.)
+- A TintMask appearance glows in that tinted colour, not in the stored texel: a texel O / C at alpha
+  1 under Color C glows as O at alpha 0 does, times the emissive mask's red channel, EmissiveTint and
+  EmissiveStrength (`tintmask-emission`). So a recoloured surface's glow follows its new colour, and
+  a mask made from the stored texels glows as the original's did once EmissiveTint carries C's red.
 - A MaterialVariant from the place's MaterialService replaces a base material's maps by name
   (`MaterialVariant` on the part, or MaterialService's override for that material), with its own
   StudsPerTile, pattern and emissive mask.

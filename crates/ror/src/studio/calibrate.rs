@@ -2678,25 +2678,37 @@ pub fn sky_reflection() -> Experiment {
 }
 
 
-/// Setup Luau for tintmask-ramp: each SurfaceAppearance named `RorTexel_<r>_<g>_<b>_<a>` gets an 8 x 8
-/// EditableImage of that one texel as its colour map (ror reads the same texel from a PNG).
+/// Setup Luau for tintmask-ramp and tintmask-emission: each SurfaceAppearance named
+/// `RorTexel_<r>_<g>_<b>_<a>` gets an 8 x 8 EditableImage of that one texel as its colour map, and one
+/// named `RorTexel_<r>_<g>_<b>_<a>_<mr>_<mg>_<mb>` an opaque one of the second texel as its emissive
+/// mask too (ror reads the same texels from PNGs).
 const TINTMASK_SETUP: &str = r#"local AssetService = game:GetService("AssetService")
 local SIDE = 8
 local count = 0
+local function solid(r, g, b, a)
+	local image = AssetService:CreateEditableImage({ Size = Vector2.new(SIDE, SIDE) })
+	local pixels = buffer.create(SIDE * SIDE * 4)
+	for i = 0, SIDE * SIDE - 1 do
+		buffer.writeu8(pixels, i * 4, r)
+		buffer.writeu8(pixels, i * 4 + 1, g)
+		buffer.writeu8(pixels, i * 4 + 2, b)
+		buffer.writeu8(pixels, i * 4 + 3, a)
+	end
+	image:WritePixelsBuffer(Vector2.zero, image.Size, pixels)
+	count += 1
+	return Content.fromObject(image)
+end
 for _, appearance in workspace.RorCapture:GetDescendants() do
-	local r, g, b, a = string.match(appearance.Name, "^RorTexel_(%d+)_(%d+)_(%d+)_(%d+)$")
-	if appearance:IsA("SurfaceAppearance") and r then
-		local image = AssetService:CreateEditableImage({ Size = Vector2.new(SIDE, SIDE) })
-		local pixels = buffer.create(SIDE * SIDE * 4)
-		for i = 0, SIDE * SIDE - 1 do
-			buffer.writeu8(pixels, i * 4, tonumber(r))
-			buffer.writeu8(pixels, i * 4 + 1, tonumber(g))
-			buffer.writeu8(pixels, i * 4 + 2, tonumber(b))
-			buffer.writeu8(pixels, i * 4 + 3, tonumber(a))
+	local rest = string.match(appearance.Name, "^RorTexel_([%d_]+)$")
+	if appearance:IsA("SurfaceAppearance") and rest then
+		local v = string.split(rest, "_")
+		for i, value in v do
+			v[i] = tonumber(value)
 		end
-		image:WritePixelsBuffer(Vector2.zero, image.Size, pixels)
-		appearance.ColorMapContent = Content.fromObject(image)
-		count += 1
+		appearance.ColorMapContent = solid(v[1], v[2], v[3], v[4])
+		if #v == 7 then
+			appearance.EmissiveMaskContent = solid(v[5], v[6], v[7], 255)
+		end
 	end
 end
 task.wait(1)
@@ -2784,6 +2796,80 @@ pub fn tintmask_ramp() -> Result<Experiment> {
 		Run { label: "sun".into(), environment: Environment { global_shadows: false, ..Environment::default() }, camera },
 	];
 	Ok(Experiment { name: "tintmask-ramp".into(), model, probes, runs })
+}
+
+/// How a TintMask SurfaceAppearance glows: per case an "original" texel O at alpha 0 under a white
+/// Color, and the same colour stored as O / C at alpha 1 under Color C, at EmissiveStrength 0, 1, 2 and
+/// 4 (columns) under flat ambient light. Rows: `original` and `masked` with a white mask (the glow
+/// follows the tinted colour when they match), `compensated` the masked one with EmissiveTint C;
+/// `own` the original with O as its mask, `maskimg` the masked one with its stored texel as the mask,
+/// `maskimg-tint` that with EmissiveTint C and `maskimg-red` with C's red as a gray (the mask is read
+/// per channel when `maskimg-tint` matches `own`, by its red alone when `maskimg-red` does). A gray case
+/// (O 0.32 under 0.4) and a warm one (O (0.36, 0.15, 0.08) under (0.6, 0.3, 0.2)); the warm one's green
+/// and blue tell the mask rules apart. The images are EditableImages in Studio (`TINTMASK_SETUP`) and
+/// PNGs in the state dir for ror.
+pub fn tintmask_emission() -> Result<Experiment> {
+	use rbx_dom_weak::InstanceBuilder;
+	use rbx_dom_weak::types::{Color3, ContentId, Enum};
+
+	let images = output::state_dir().join("inputs").join("tintmask-emission");
+	let mut model = ModelBuilder::new("TintMaskEmission");
+	let mut probes = Vec::new();
+	let strengths = [0.0f32, 1.0, 2.0, 4.0];
+	let cases: [(&str, [u8; 3], [f32; 3]); 2] = [("gray", [82, 82, 82], [0.4, 0.4, 0.4]), ("warm", [92, 38, 20], [0.6, 0.3, 0.2])];
+	let png = |rgba: [u8; 4]| -> Result<String> {
+		let path = images.join(format!("{}_{}_{}_{}.png", rgba[0], rgba[1], rgba[2], rgba[3]));
+		output::write_png(&path, 8, 8, &rgba.repeat(64), false)?;
+		let shown = path.display().to_string();
+		Ok(format!("file:///{}", shown.strip_prefix(r"\\?\").unwrap_or(&shown).replace('\\', "/")))
+	};
+	let mut row = 0.0f32;
+	for (case, original, color) in cases {
+		let stored: [u8; 3] = std::array::from_fn(|c| (original[c] as f32 / color[c]).round().min(255.0) as u8);
+		let white = [1.0f32; 3];
+		let red = [color[0]; 3];
+		type Row<'a> = (&'a str, [u8; 3], u8, [f32; 3], [u8; 3], [f32; 3]);
+		let rows: [Row; 7] = [
+			("original", original, 0, white, [255; 3], white),
+			("masked", stored, 255, color, [255; 3], white),
+			("compensated", stored, 255, color, [255; 3], color),
+			("own", original, 0, white, original, white),
+			("maskimg", stored, 255, color, stored, white),
+			("maskimg-tint", stored, 255, color, stored, color),
+			("maskimg-red", stored, 255, color, stored, red),
+		];
+		for (name, texel, alpha, sa_color, mask, tint) in rows {
+			let map = png([texel[0], texel[1], texel[2], alpha])?;
+			let mask_uri = png([mask[0], mask[1], mask[2], 255])?;
+			for (column, strength) in strengths.iter().enumerate() {
+				let label = format!("{case}:{name}:{strength}");
+				let center = Vec3::new((column as f32 - 1.5) * 1.25, -row * 1.25, 0.0);
+				let part = model.part(&PartSpec { class: "MeshPart", name: label.clone(), cframe: quad_cframe(center, 1.0, 0.0), size: Vec3::new(1.0, 1.0, 0.05), color: [255; 3], material: 272, cast_shadow: false, ..Default::default() });
+				model.set(part, "MeshId", ContentId::from(QUAD_MESH.0));
+				model.set(part, "InitialSize", rbx_dom_weak::types::Vector3::new(QUAD_MESH.1[0], QUAD_MESH.1[1], QUAD_MESH.1[2]));
+				model.child(
+					part,
+					InstanceBuilder::new("SurfaceAppearance")
+						.with_name(format!("RorTexel_{}_{}_{}_{}_{}_{}_{}", texel[0], texel[1], texel[2], alpha, mask[0], mask[1], mask[2]))
+						.with_property("ColorMap", ContentId::from(map.clone()))
+						.with_property("EmissiveMask", ContentId::from(mask_uri.clone()))
+						.with_property("AlphaMode", Enum::from_u32(2))
+						.with_property("Color", Color3::new(sa_color[0], sa_color[1], sa_color[2]))
+						.with_property("EmissiveStrength", *strength)
+						.with_property("EmissiveTint", Color3::new(tint[0], tint[1], tint[2])),
+				);
+				let inputs = serde_json::json!({"case": case, "row": name, "strength": strength, "texel": texel, "alpha": alpha, "color": sa_color, "mask": mask, "tint": tint});
+				probes.push(Probe { label, position: center.into(), inputs });
+			}
+			row += 1.0;
+		}
+		row += 0.5;
+	}
+	with_setup(&mut model, TINTMASK_SETUP);
+	let center = Vec3::new(0.0, -(row - 1.5) * 1.25 * 0.5, 0.0);
+	let camera = CameraSpec::LookAt { eye: (center + Vec3::new(0.0, 0.0, -70.0)).into(), target: center.into(), fov: 18.0 };
+	let runs = vec![Run { label: "flat".into(), environment: flat_ambient(), camera }];
+	Ok(Experiment { name: "tintmask-emission".into(), model, probes, runs })
 }
 
 /// Per-material texture offsets: every regularly tiled material on a white 16 x 1 x 16 slab at a
@@ -4335,6 +4421,7 @@ pub fn experiment(name: &str) -> Result<Experiment> {
 		"organic-slopes" => organic_slopes(),
 		"organic-sun" => organic_sun(),
 		"tintmask-ramp" => tintmask_ramp()?,
+		"tintmask-emission" => tintmask_emission()?,
 		"organic-reset" => organic_reset(),
 		"organic-uniqueid" => organic_uniqueid(),
 		"organic-builtin" => organic_builtin(),

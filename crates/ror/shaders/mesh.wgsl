@@ -853,6 +853,9 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 	if ((flags & TEX_VERTEX_COLOR) != 0u) {
 		base = input.color.rgb * input.color.rgb;
 	}
+	// the colour map as decoded, before the textures' 2.9 % loss; under a SurfaceAppearance's TintMask
+	// with its Color mixed in (the glow takes it)
+	var colour_map = texel.rgb / TEXTURE_ALBEDO_SCALE;
 	if ((flags & TEX_COLOR) != 0u) {
 		if ((flags & TEX_ALPHA_OVERLAY) != 0u) {
 			// the part colour and the tinted map mixed by the map's alpha in Roblox's gamma-2 colour
@@ -873,7 +876,8 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 			// under Color (0.3, 0.6, 0.9) within 2.1 of 255 of that mix on average, the gamma-2 mix 3.4,
 			// the linear mix 6.8)
 			let stored = raw_texel.rgb * mix(vec3<f32>(1.0), sqrt(instance.color.rgb), texel.a);
-			base = select(stored * stored, srgb_to_linear(stored), (flags & TEX_SRGB) != 0u) * TEXTURE_ALBEDO_SCALE;
+			colour_map = select(stored * stored, srgb_to_linear(stored), (flags & TEX_SRGB) != 0u);
+			base = colour_map * TEXTURE_ALBEDO_SCALE;
 		} else {
 			base *= texel.rgb;
 			// a built-in pack's alpha is never coverage (Glass's colour map is 0.002 on average, and
@@ -1036,8 +1040,10 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 		// colour map (as decoded, before the textures' 2.9 % loss) times the mask as stored
 		// (variant-emission: uniform masks of 76, 130 and 255 emit 0.299, 0.506 and 1 of the full mask; a
 		// colour map of 130 cuts it to 0.223; CrackedLava's glow in material-glass); in AlphaMode
-		// Transparency the map's alpha fades it with the surface (sa-emission-sweep)
-		var colour_map = select(vec3<f32>(1.0), texel.rgb / TEXTURE_ALBEDO_SCALE, (flags & TEX_COLOR) != 0u);
+		// Transparency the map's alpha fades it with the surface (sa-emission-sweep); in TintMask it takes
+		// the tinted colour, Color mixed in by the alpha as the surface's own colour is (tintmask-emission:
+		// a texel O / C at alpha 1 under Color C glows as O at alpha 0 within 2 of 255 at strengths 0-4)
+		colour_map = select(vec3<f32>(1.0), colour_map, (flags & TEX_COLOR) != 0u);
 		// in AlphaMode Overlay the glow takes the overlaid colour: the part colour mixed with the map
 		// in Color by the map's alpha (sa-emission-sweep: the portal atlas over black, gray and white
 		// parts glows 12 / 42 / 67 of 255 in red, where ror's map alone read 18-21)

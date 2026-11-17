@@ -5289,8 +5289,9 @@ impl Renderer {
 			// tint (1, 0.5, 0.25) as stored, Color (1, 0.5, 0.25) squared, a map of 130 decoded with the sRGB
 			// curve 0.434; a gray part under the white map as a white one)
 			if appearance.emissive_mask.is_some() {
-				// in AlphaMode Overlay the shader takes Color with the overlaid colour (mesh.wgsl)
-				let color = if appearance.alpha_mode == 0 && material.key.color.is_some() { Vec3::ONE } else { linear(appearance.color) };
+				// in AlphaMode Overlay and TintMask the shader takes Color with the overlaid or tinted colour
+				// (mesh.wgsl)
+				let color = if matches!(appearance.alpha_mode, 0 | 2) && material.key.color.is_some() { Vec3::ONE } else { linear(appearance.color) };
 				material.emissive = color * appearance.emissive_tint * appearance.emissive_strength * materials::VARIANT_EMISSION;
 			}
 			if material.key.color.is_some() {
@@ -5927,6 +5928,70 @@ mod tint_mask_tests {
 			let reference = draw(&format!("reference-{alpha}"), [stored[0], stored[1], stored[2], 0], Vec3::ONE);
 			assert!(tinted.iter().zip(reference).all(|(tinted, reference)| (tinted - reference).abs() <= 2), "alpha {alpha}: tinted {tinted:?}, an untinted map of {stored:?} {reference:?}");
 			assert!(reference.iter().all(|value| (12..240).contains(value)), "alpha {alpha}: the plate lit within range {reference:?}");
+		}
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	/// Under TintMask the glow takes the tinted colour, not the stored texel, and the mask by its red
+	/// channel (Studio, tintmask-emission): a texel O / C at alpha 1 under Color C glows as O at alpha 0
+	/// does with a white mask; with its own stored texel as the mask it glows as O's own mask does once
+	/// EmissiveTint is C's red.
+	#[test]
+	fn a_tint_mask_glows_in_the_tinted_colour() {
+		let state = std::env::temp_dir().join(format!("ror-tint-mask-emission-test-{}", std::process::id()));
+		std::fs::create_dir_all(&state).unwrap();
+		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let size = 32u32;
+		let request = ViewRequest { width: size, height: size, camera: CameraSpec::LookAt { eye: [0.0, 0.0, -10.0], target: [0.0; 3], fov: 20.0 }, background: Background::Color([0.0; 3]), bloom: false, ..Default::default() };
+		let uri = |name: &str, rgba: [u8; 4]| -> String {
+			let path = state.join(format!("{name}.png"));
+			crate::output::write_png(&path, 8, 8, &rgba.repeat(64), false).unwrap();
+			format!("file:///{}", path.display().to_string().replace('\\', "/"))
+		};
+		let draw = |name: &str, texel: [u8; 4], color: Vec3, mask: [u8; 3], tint: Vec3, strength: f32| -> [i32; 3] {
+			let mut model = crate::scene::build::ModelBuilder::new("Plate");
+			model.part(&crate::scene::build::PartSpec { name: "Plate".into(), size: Vec3::new(4.0, 4.0, 1.0), cast_shadow: false, ..Default::default() });
+			let mut scene = crate::scene::extract::extract(&model.into_document());
+			scene.environment.brightness = 0.0;
+			scene.environment.ambient = Vec3::splat(0.3);
+			scene.environment.outdoor_ambient = Vec3::ZERO;
+			scene.environment.environment_diffuse_scale = 0.0;
+			scene.environment.environment_specular_scale = 0.0;
+			scene.environment.global_shadows = false;
+			Arc::make_mut(&mut scene.parts[0]).surface_appearance = Some(crate::scene::SurfaceAppearance {
+				color_map: Some(uri(&format!("{name}-map"), texel)),
+				normal_map: None,
+				metalness_map: None,
+				roughness_map: None,
+				texture_pack: None,
+				alpha_mode: 2,
+				color,
+				emissive_mask: Some(uri(&format!("{name}-mask"), [mask[0], mask[1], mask[2], 255])),
+				emissive_strength: strength,
+				emissive_tint: tint,
+			});
+			let (images, stats) = renderer.render(&scene, std::slice::from_ref(&request)).unwrap();
+			assert!(stats.missing.iter().all(|reason| reason.contains("rbxasset://")), "{name}: missing {:?}", stats.missing);
+			let index = ((size / 2 * size + size / 2) * 4) as usize;
+			std::array::from_fn(|c| images[0].rgba[index + c] as i32)
+		};
+		let cases: [(&str, [u8; 3], Vec3); 2] = [("gray", [82, 82, 82], Vec3::splat(0.4)), ("warm", [92, 38, 20], Vec3::new(0.6, 0.3, 0.2))];
+		for (case, original, color) in cases {
+			let stored: [u8; 3] = std::array::from_fn(|c| (original[c] as f32 / color[c]).round().min(255.0) as u8);
+			let dark = draw(&format!("{case}-dark"), [original[0], original[1], original[2], 0], Vec3::ONE, [255; 3], Vec3::ONE, 0.0);
+			for strength in [1.0f32, 2.0, 4.0] {
+				let label = format!("{case} strength {strength}");
+				let reference = draw(&format!("{case}-{strength}-original"), [original[0], original[1], original[2], 0], Vec3::ONE, [255; 3], Vec3::ONE, strength);
+				assert!(reference[0] - dark[0] > 20, "{label}: the white mask glows {reference:?} over {dark:?}");
+				let tinted = draw(&format!("{case}-{strength}-tinted"), [stored[0], stored[1], stored[2], 255], color, [255; 3], Vec3::ONE, strength);
+				assert!(tinted.iter().zip(reference).all(|(tinted, reference)| (tinted - reference).abs() <= 2), "{label}: {stored:?} under {color} glows {tinted:?}, {original:?} {reference:?}");
+				let own = draw(&format!("{case}-{strength}-own"), [original[0], original[1], original[2], 0], Vec3::ONE, original, Vec3::ONE, strength);
+				let masked = draw(&format!("{case}-{strength}-masked"), [stored[0], stored[1], stored[2], 255], color, stored, Vec3::splat(color.x), strength);
+				assert!(masked.iter().zip(own).all(|(masked, own)| (masked - own).abs() <= 2), "{label}: its stored mask under EmissiveTint {} glows {masked:?}, {original:?}'s own {own:?}", color.x);
+			}
 		}
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
