@@ -5914,7 +5914,9 @@ mod tint_mask_tests {
 				emissive_tint: Vec3::ONE,
 			});
 			let (images, stats) = renderer.render(&scene, std::slice::from_ref(&request)).unwrap();
-			assert!(stats.missing.is_empty(), "{name}: missing {:?}", stats.missing);
+			// the colour map loaded; without a Studio install the default sky and sun (rbxasset://) are
+			// missing too, and the sky drawn instead lights nothing here
+			assert!(stats.missing.iter().all(|reason| reason.contains("rbxasset://")), "{name}: missing {:?}", stats.missing);
 			let index = ((size / 2 * size + size / 2) * 4) as usize;
 			std::array::from_fn(|c| images[0].rgba[index + c] as i32)
 		};
