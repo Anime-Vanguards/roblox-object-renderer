@@ -32,6 +32,7 @@ pub mod script;
 pub mod service;
 pub mod studio;
 pub mod video;
+pub mod viewport;
 #[cfg(ror_x264)]
 pub mod x264;
 

@@ -106,6 +106,7 @@ target/release/ror cost Map.rbxm --sweep 5                    # what a map costs
 | [docs/cost.md](docs/cost.md) | `ror cost`: draw calls, triangles, levels of detail and occlusion as Roblox counts them |
 | [docs/cost-loop.md](docs/cost-loop.md) | the cost loop: each instance's cost in phone ms, ranked findings with edits, what-if edits with look checks, export to Lune |
 | [docs/service.md](docs/service.md) | the render service, many callers at once, its HTTP API, the job JSON, memory admission, profiling |
+| [docs/viewport-worker.md](docs/viewport-worker.md) | `ror viewport-worker`: ViewportFrames drawn for roblox-ui-renderer and other programs, its JSON protocol |
 | [docs/assets.md](docs/assets.md) | downloads, texture caches, refused assets, the content store and disk use |
 | [docs/parity.md](docs/parity.md) | how agreement with Studio is measured: the capture Studio, compares, agreement figures, calibration experiments |
 | [docs/rendering.md](docs/rendering.md) | the rules behind the pictures: scene model, colour pipeline, light, shadows, sky, clouds, post effects, GUIs |

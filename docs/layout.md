@@ -2,7 +2,8 @@
 
 - `crates/ror`: the `ror` binary: model loading and scene extraction (`scene/`), the wgpu renderer
   (`render/`, shaders in `shaders/`), what a scene costs Roblox to draw (`cost/`), the render service
-  and its client (`service/`), and the Studio parity harness (`studio/`).
+  and its client (`service/`), the viewport worker (`viewport.rs`), and the Studio parity harness
+  (`studio/`).
 - `crates/ror/examples/tools`: ror's tools (scans, dumps, probes, one-off renders) in one example, so
   checking or building them is one crate and one link instead of one of each per tool.
   `cargo run -p ror --release --example tools -- <tool> [arguments]` runs one, and `--example tools`

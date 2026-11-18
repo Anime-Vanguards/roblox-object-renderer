@@ -57,6 +57,16 @@ enum Command {
 	/// most; <view>.draws.png gives each draw call a colour, <view>.heat.png shows what costs a draw
 	/// call of its own (through the warm render service unless --no-service)
 	Cost(CostArgs),
+	/// Draw ViewportFrames for another program (roblox-ui-renderer): one JSON request a line on stdin,
+	/// one JSON reply a line on stdout, until stdin closes (docs/viewport-worker.md)
+	ViewportWorker(ViewportWorkerArgs),
+}
+
+#[derive(clap::Args)]
+struct ViewportWorkerArgs {
+	/// Use only what is on disk: no downloads
+	#[arg(long)]
+	offline: bool,
 }
 
 #[derive(clap::Args)]
@@ -2191,6 +2201,7 @@ fn run(command: Command) -> Result<()> {
 		Command::Inspect(args) => inspect(args),
 		Command::Diff(args) => diff(args),
 		Command::Cost(args) => cost(args),
+		Command::ViewportWorker(args) => ror::viewport::serve(assets(args.offline)?, &mut ()),
 	}
 }
 

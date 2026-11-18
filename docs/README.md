@@ -15,6 +15,7 @@ Using ror:
 | [cost.md](cost.md) | `ror cost`: how Roblox batches draws, counts triangles, picks levels of detail and culls by occlusion |
 | [cost-loop.md](cost-loop.md) | the cost loop for agents: where a map's cost goes per instance in phone ms, ranked findings with edits, what-if edits with look checks, export to Lune, budgets |
 | [service.md](service.md) | the render service, many callers at once, its HTTP API, the job JSON, caches, memory admission, profiling |
+| [viewport-worker.md](viewport-worker.md) | `ror viewport-worker`: ViewportFrames drawn for roblox-ui-renderer and other programs, its JSON protocol |
 | [assets.md](assets.md) | downloads, texture caches, refused assets, the content store and disk use |
 | [parity.md](parity.md) | how agreement with Studio is measured: the capture Studio, compares, agreement figures, calibration experiments |
 
