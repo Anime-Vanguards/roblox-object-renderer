@@ -77,6 +77,16 @@ impl Environment {
 	}
 }
 
+impl Environment {
+	/// A ViewportFrame without a Sky: it shows no sky (its target is cleared to the frame's fill) and
+	/// takes no light from one ([`Environment::viewport_frame`]), so the default sky's built-in textures
+	/// are optional there. Without a Roblox install to read them from, the picture is the same and they
+	/// are not missing.
+	pub fn default_sky_unused(&self) -> bool {
+		self.viewport.as_ref().is_some_and(|viewport| viewport.sky.is_none())
+	}
+}
+
 impl Default for Environment {
 	fn default() -> Self {
 		Self {

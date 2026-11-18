@@ -2414,6 +2414,7 @@ impl Renderer {
 
 	fn environment(&self, scene: &Scene, missing: &mut Vec<String>) -> Arc<EnvironmentMaps> {
 		let sky = scene.environment.sky.clone().unwrap_or_default();
+		let optional = scene.environment.default_sky_unused();
 		// the Atmosphere's haze and glare change the sky drawn and reflected (atmosphere-light), so they
 		// and, with a glare, where it sits, its share by the hour and Brightness key the maps too
 		let lighting = &scene.environment;
@@ -2455,7 +2456,9 @@ impl Renderer {
 		match result {
 			Ok(maps) => maps,
 			Err(error) => {
-				missing.push(format!("{error:#} (using a gradient sky)"));
+				if !optional {
+					missing.push(format!("{error:#} (using a gradient sky)"));
+				}
 				self.gradient_environment()
 			}
 		}
@@ -5121,10 +5124,13 @@ impl Renderer {
 		if !sky.celestial_bodies_shown {
 			return bodies;
 		}
+		let optional = lighting.default_sky_unused();
 		let mut load = |uri: &str| match self.load_whole(uri, TextureUse::Color) {
 			Ok(texture) => Some(texture),
 			Err(error) => {
-				missing.push(format!("{error:#}"));
+				if !optional {
+					missing.push(format!("{error:#}"));
+				}
 				None
 			}
 		};
@@ -6009,6 +6015,31 @@ mod viewport_frame_tests {
 		assert_eq!(uv_mode(0, false, &Geometry::Ball, 1 << 4), UV_BALL);
 		assert_eq!(uv_mode(0, false, &Geometry::Block, 0), UV_MESH);
 		assert_eq!(uv_mode(TEX_MATERIAL, false, &Geometry::Block, 0), UV_PLANAR);
+	}
+
+	/// Without a Roblox install (a CI runner, a machine without Studio), the default sky's built-in
+	/// textures can't be read: a world misses them, but a ViewportFrame without a Sky draws no sky and
+	/// takes no light from one, so it misses nothing.
+	#[test]
+	fn a_viewport_frame_without_a_sky_needs_no_built_in_sky() {
+		let state = std::env::temp_dir().join(format!("ror-viewport-frame-sky-test-{}", std::process::id()));
+		let no_install = state.join("no-roblox-install");
+		std::fs::create_dir_all(&no_install).unwrap();
+		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, studio_content: Some(no_install), ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let mut model = crate::scene::build::ModelBuilder::new("Plate");
+		model.part(&crate::scene::build::PartSpec { name: "Plate".into(), size: Vec3::new(4.0, 4.0, 1.0), material: 272, color: [255, 255, 255], ..Default::default() });
+		let world = crate::scene::extract::extract(&model.into_document());
+		let request = ViewRequest { width: 32, height: 32, camera: CameraSpec::LookAt { eye: [0.0, 0.0, -10.0], target: [0.0; 3], fov: 40.0 }, background: Background::Frame { color: [0.2, 0.4, 0.6], alpha: 1.0 }, bloom: false, ..Default::default() };
+		let (_, stats) = renderer.render(&world, std::slice::from_ref(&request)).unwrap();
+		assert!(stats.missing.iter().any(|missing| missing.contains("sky")), "a world misses the built-in sky: {:?}", stats.missing);
+		let mut framed = world.clone();
+		framed.in_viewport_frame(crate::scene::environment::ViewportLighting { ambient: Vec3::ONE, light_color: Vec3::ZERO, light_direction: Vec3::NEG_Z, sky: None });
+		let (_, stats) = renderer.render(&framed, std::slice::from_ref(&request)).unwrap();
+		assert!(stats.missing.is_empty(), "a ViewportFrame without a Sky misses nothing: {:?}", stats.missing);
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
 	}
 
 	/// A ViewportFrame's target (`Background::Frame`) is cleared to the frame's background colour at its

@@ -47,7 +47,10 @@ A snapshot is what one ViewportFrame shows:
   scaled by `Size / InitialSize`.
 
 Meshes and textures load as for `ror render`: from the caches, the local Roblox install and the
-downloads ([assets.md](assets.md)). A picture whose assets can't be had is an error that names them.
+downloads ([assets.md](assets.md)). A picture whose assets can't be had is an error that names them. The
+built-in textures of materials (Plastic's, Wood's...) come only from a Roblox Studio or Player install, so
+without one only parts whose materials need none (SmoothPlastic, for one) can be drawn. A ViewportFrame
+without a Sky child shows no sky and takes no light from one, so it never needs the sky's textures.
 
 The worker gives back what it holds for the next requests after 30 seconds without one (the renderer's
 leftovers and the downloads held in memory); the GPU device and the textures stay warm.

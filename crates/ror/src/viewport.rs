@@ -335,12 +335,14 @@ mod tests {
 		let _ = std::fs::remove_dir_all(&state);
 	}
 
-	/// The picture is the world over the frame's fill, at the snapshot's size.
+	/// The picture is the world over the frame's fill, at the snapshot's size, with nothing but the
+	/// snapshot to draw from: offline, and no Roblox install to read built-in textures from.
 	#[test]
 	fn a_viewport_request_draws_the_world_over_its_fill() {
 		let state = std::env::temp_dir().join(format!("ror-viewport-worker-render-{}", std::process::id()));
-		std::fs::create_dir_all(&state).unwrap();
-		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let no_install = state.join("no-roblox-install");
+		std::fs::create_dir_all(&no_install).unwrap();
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, studio_content: Some(no_install), ..ror_assets::AssetConfig::new(&state) });
 		let mut host = ();
 		let mut worker = Worker::new(assets, &mut host);
 		let out = state.join("frame.png");
