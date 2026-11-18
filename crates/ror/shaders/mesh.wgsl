@@ -772,9 +772,10 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 	}
 	// a MeshPart's FileMesh vertex colours multiply its colour before the decode, so its albedo by
 	// their square (mesh-vertex-colors: gray 117 vertices darken lit Plastic to 0.21-0.23, Neon to
-	// 0.044-0.054 = 0.21²)
+	// 0.044-0.054 = 0.21²); its own colour map's too (TEX_VERTEX_TINT_MAP, below)
+	let vertex_tint = input.color.rgb * input.color.rgb;
 	if ((flags & TEX_VERTEX_TINT) != 0u) {
-		base *= input.color.rgb * input.color.rgb;
+		base *= vertex_tint;
 	}
 	// Keep the coordinate derivatives above the material branches; maps whose values are unused
 	// need no reads, even though their bind slots still hold the defaults.
@@ -861,8 +862,18 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 			// the part colour and the tinted map mixed by the map's alpha in Roblox's gamma-2 colour
 			// space, then squared (particle-sa-blend neon-overlay: a dark gray part under the cones'
 			// orange-tinted map, every tenth of alpha within 1 of 255 of Studio's, where the linear mix read
-			// up to 15 over; overlay-light: a light gray part under it tinted dark blue)
-			let mixed = mix(sqrt(base), sqrt(texel.rgb * instance.tint.rgb), texel.a);
+			// up to 15 over; overlay-light: a light gray part under it tinted dark blue). The vertex
+			// colours tint a MeshPart's TextureID / TextureContent as they tint its colour, so a white
+			// map leaves them as they are; under a SurfaceAppearance in Overlay only the part colour its
+			// map reveals (fixtures/vertex-colour-maps.luau in a Roblox 0.747 client: quads of four vertex
+			// colours under white and (204, 153, 102) EditableImages and a white built-in TextureID within
+			// 1 of 255 of ror's texel² x 0.971 x colour², whatever the part's Color; an Overlay map at alpha
+			// 0.5 as the gamma-2 mix of Color x colour and the map, within 3 %)
+			var map = texel.rgb * instance.tint.rgb;
+			if ((flags & TEX_VERTEX_TINT_MAP) != 0u) {
+				map *= vertex_tint;
+			}
+			let mixed = mix(sqrt(base), sqrt(map), texel.a);
 			base = mixed * mixed;
 		} else if ((flags & TEX_ALPHA_TINTMASK) != 0u && (flags & TEX_MATERIAL) != 0u) {
 			// built-in packs: the part colour mixed towards white by the alpha in Roblox's gamma-2

@@ -41,6 +41,26 @@ takes them) and `shaders/mesh.wgsl`. The general light and colour rules are in
 - Metals keep (1 - metalness)(1 - k s F) of the sky's diffuse light with EnvironmentSpecularScale s
   on, so a white cube's diffuse plus specular equals diffuse alone.
 
+## MeshPart colour
+
+- An untextured MeshPart shows its Color. Its mesh's vertex colours (a FileMesh's, or an
+  EditableMesh's from AddColor and SetFaceColors) multiply that colour before it decodes, so the
+  albedo by their square: Color² · v² per channel.
+- A TextureID or TextureContent replaces Color, and the vertex colours multiply it the same way:
+  texel² · 0.971 · v² (the 0.971 is every colour texture's loss). A white texture leaves the vertex
+  colours as they are; Color does not show where the texture is opaque.
+- Under a SurfaceAppearance it depends on the AlphaMode. In Overlay the vertex colours tint the part
+  colour the map's alpha reveals (all of it without a ColorMap), never the map. In Transparency and
+  TintMask they do nothing.
+- Measured in a Roblox 0.747 client on `fixtures/vertex-colour-maps.luau` under flat ambient light
+  (its header has the setup), at the centres of quads of four vertex colours: under white and (204,
+  153, 102) EditableImages and a white built-in TextureID, at two part Colors and at Transparency 0
+  and 0.5, ror's render is within 1 of 255 of the client's (it drew the texture alone before, up to
+  155 off), the corner-coloured quads within 1 (100 before). In Overlay at alpha 0.5 the client's
+  albedo fits the gamma-2 mix of Color · v and the map within 3 %; tinting the map as well predicts
+  0.030 where a cell of v 0.25 reads 0.105. ror there is within 4 of 255, as it is for the same quads
+  with white vertex colours (the map's own decode), and was up to 157 off.
+
 ## Neon
 
 - Unlit: the sun and ambient light do not change it; ExposureCompensation does.

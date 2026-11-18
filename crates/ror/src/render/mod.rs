@@ -740,6 +740,7 @@ const TEX_DECAL_BIND: u32 = 16777216;
 const TEX_DECAL_UV: u32 = 33554432;
 const TEX_DECAL_DOMINANT: u32 = 67108864;
 const TEX_EMISSIVE_RED: u32 = 134217728;
+const TEX_VERTEX_TINT_MAP: u32 = 268435456;
 
 /// Colour textures land this much darker than their decode (texture-decode; the shader's
 /// TEXTURE_ALBEDO_SCALE), and so do Humanoid body parts' colours.
@@ -5329,6 +5330,11 @@ impl Renderer {
 			if !matches!(part.geometry, Geometry::Special { .. }) {
 				material.flags |= TEX_ALPHA_OVERLAY;
 			}
+			// a FileMesh's vertex colours multiply a MeshPart's TextureID / TextureContent as they do its
+			// colour (mesh.wgsl: a white map leaves them unchanged)
+			if matches!(part.geometry, Geometry::MeshPart { .. }) {
+				material.flags |= TEX_VERTEX_TINT_MAP;
+			}
 		} else if !matches!(part.geometry, Geometry::Special { .. }) {
 			// material textures: the part's MaterialVariant (or the base material's override), else
 			// the built-in material's pack; the colour map's texels sRGB-encoded (PNGs) or gamma 2
@@ -5460,8 +5466,16 @@ impl Renderer {
 		if matches!(part.geometry, Geometry::Union { use_part_color: false, .. } | Geometry::Collision { .. }) {
 			material.flags |= TEX_VERTEX_COLOR;
 		}
-		// FileMesh vertex colours on MeshParts (unmeasured under a SurfaceAppearance: left out there)
-		if matches!(part.geometry, Geometry::MeshPart { .. }) && part.surface_appearance.is_none() {
+		// FileMesh vertex colours on MeshParts tint the part colour; under a SurfaceAppearance only in
+		// AlphaMode Overlay (the colour its map reveals, with or without a ColorMap), and nothing in
+		// Transparency or TintMask, where the appearance's Color and map make the colour
+		// (fixtures/vertex-colour-maps.luau in a Roblox 0.747 client: EditableMesh quads under
+		// EditableImage maps; docs/materials.md "MeshPart colour")
+		let tinted = match &part.surface_appearance {
+			None => true,
+			Some(appearance) => appearance.alpha_mode == 0,
+		};
+		if matches!(part.geometry, Geometry::MeshPart { .. }) && tinted {
 			material.flags |= TEX_VERTEX_TINT;
 		}
 		material
@@ -5999,6 +6013,123 @@ mod tint_mask_tests {
 				assert!(masked.iter().zip(own).all(|(masked, own)| (masked - own).abs() <= 2), "{label}: its stored mask under EmissiveTint {} glows {masked:?}, {original:?}'s own {own:?}", color.x);
 			}
 		}
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+}
+
+#[cfg(test)]
+mod vertex_colour_tests {
+	use super::*;
+	use rbx_dom_weak::types::{Content, Vector3};
+
+	/// A 4 x 4 stud quad facing -Z (both sides) as a FileMesh 2.00 whose every vertex has `color`.
+	fn quad_mesh(color: [u8; 4]) -> Vec<u8> {
+		let mut bytes = b"version 2.00\n".to_vec();
+		bytes.extend_from_slice(&12u16.to_le_bytes());
+		bytes.extend_from_slice(&[40, 12]);
+		bytes.extend_from_slice(&4u32.to_le_bytes());
+		bytes.extend_from_slice(&4u32.to_le_bytes());
+		for (x, y) in [(-2.0f32, -2.0f32), (2.0, -2.0), (2.0, 2.0), (-2.0, 2.0)] {
+			for value in [x, y, 0.0, 0.0, 0.0, -1.0, (x + 2.0) / 4.0, (y + 2.0) / 4.0] {
+				bytes.extend_from_slice(&value.to_le_bytes());
+			}
+			bytes.extend_from_slice(&[255, 127, 127, 127]);
+			bytes.extend_from_slice(&color);
+		}
+		for face in [[0u32, 1, 2], [0, 2, 3], [0, 2, 1], [0, 3, 2]] {
+			for index in face {
+				bytes.extend_from_slice(&index.to_le_bytes());
+			}
+		}
+		bytes
+	}
+
+	/// A MeshPart's FileMesh vertex colours multiply its TextureID / TextureContent as they multiply its
+	/// colour, whatever its Color; under a SurfaceAppearance in AlphaMode Overlay they tint the part
+	/// colour its map reveals and not the map, and in AlphaMode Transparency they do nothing
+	/// (fixtures/vertex-colour-maps.luau in a Roblox 0.747 client). Each case draws as a quad without
+	/// vertex colours whose colour or texture holds that product does: before, a textured quad drew its
+	/// texture alone.
+	#[test]
+	fn vertex_colours_tint_a_mesh_parts_colour_map() {
+		let state = std::env::temp_dir().join(format!("ror-vertex-colour-map-test-{}", std::process::id()));
+		std::fs::create_dir_all(&state).unwrap();
+		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let uri = |path: &std::path::Path| format!("file:///{}", path.display().to_string().replace('\\', "/"));
+		let file = |name: &str, bytes: &[u8]| -> String {
+			let path = state.join(name);
+			std::fs::write(&path, bytes).unwrap();
+			uri(&path)
+		};
+		let image = |name: &str, rgba: [u8; 4]| -> String {
+			let path = state.join(format!("{name}.png"));
+			crate::output::write_png(&path, 8, 8, &rgba.repeat(64), false).unwrap();
+			uri(&path)
+		};
+		let vertex = [255u8, 128, 64];
+		let tinted_mesh = file("tinted.mesh", &quad_mesh([vertex[0], vertex[1], vertex[2], 255]));
+		let white_mesh = file("white.mesh", &quad_mesh([255; 4]));
+		let times = |a: [u8; 3], b: [u8; 3]| -> [u8; 3] { std::array::from_fn(|c| (a[c] as f32 * b[c] as f32 / 255.0).round() as u8) };
+		let size = 32u32;
+		let request = ViewRequest { width: size, height: size, camera: CameraSpec::LookAt { eye: [0.0, 0.0, -10.0], target: [0.0; 3], fov: 20.0 }, background: Background::Color([0.0; 3]), bloom: false, ..Default::default() };
+		// (mesh, Color, TextureContent, SurfaceAppearance (ColorMap, AlphaMode))
+		let draw = |name: &str, mesh: &str, color: [u8; 3], texture: Option<String>, appearance: Option<(String, u32)>| -> [i32; 3] {
+			let mut model = crate::scene::build::ModelBuilder::new("Model");
+			let part = model.part(&crate::scene::build::PartSpec { class: "MeshPart", name: "Quad".into(), size: glam::Vec3::new(4.0, 4.0, 0.05), color, material: 272, cast_shadow: false, ..Default::default() });
+			model.set(part, "MeshContent", Content::from_uri(mesh));
+			model.set(part, "InitialSize", Vector3::new(4.0, 4.0, 0.05));
+			if let Some(texture) = &texture {
+				model.set(part, "TextureContent", Content::from_uri(texture.as_str()));
+			}
+			let mut scene = crate::scene::extract::extract(&model.into_document());
+			scene.environment.brightness = 0.0;
+			scene.environment.ambient = Vec3::splat(0.7);
+			scene.environment.outdoor_ambient = Vec3::ZERO;
+			scene.environment.environment_diffuse_scale = 0.0;
+			scene.environment.environment_specular_scale = 0.0;
+			scene.environment.global_shadows = false;
+			if let Some((map, alpha_mode)) = appearance {
+				Arc::make_mut(&mut scene.parts[0]).surface_appearance = Some(crate::scene::SurfaceAppearance {
+					color_map: Some(map),
+					normal_map: None,
+					metalness_map: None,
+					roughness_map: None,
+					texture_pack: None,
+					alpha_mode,
+					color: Vec3::ONE,
+					emissive_mask: None,
+					emissive_strength: 1.0,
+					emissive_tint: Vec3::ONE,
+				});
+			}
+			let (images, stats) = renderer.render(&scene, std::slice::from_ref(&request)).unwrap();
+			assert!(stats.missing.iter().all(|reason| reason.contains("rbxasset://")), "{name}: missing {:?}", stats.missing);
+			let index = ((size / 2 * size + size / 2) * 4) as usize;
+			let pixel: [i32; 3] = std::array::from_fn(|c| images[0].rgba[index + c] as i32);
+			assert!(pixel.iter().any(|value| *value > 20), "{name}: the quad drawn {pixel:?}");
+			pixel
+		};
+		let same = |label: &str, got: [i32; 3], want: [i32; 3]| assert!(got.iter().zip(want).all(|(got, want)| (got - want).abs() <= 2), "{label}: {got:?}, expected {want:?}");
+		let cream = [204u8, 204, 128];
+		// a white map leaves the vertex colours as they are, a tan one takes them; the part's Color shows nowhere
+		for texel in [[255u8, 255, 255], [204, 153, 102]] {
+			let map = image(&format!("map-{}-{}-{}", texel[0], texel[1], texel[2]), [texel[0], texel[1], texel[2], 255]);
+			let product = times(texel, vertex);
+			let reference = draw("reference", &white_mesh, [255; 3], Some(image(&format!("product-{}-{}-{}", product[0], product[1], product[2]), [product[0], product[1], product[2], 255])), None);
+			same(&format!("map {texel:?} under vertex colour {vertex:?}"), draw("tinted", &tinted_mesh, [255; 3], Some(map.clone()), None), reference);
+			same(&format!("map {texel:?} under vertex colour {vertex:?} on a cream part"), draw("tinted-cream", &tinted_mesh, cream, Some(map), None), reference);
+		}
+		// an Overlay map at alpha 128 over the part colour: the vertex colours tint the colour, not the map
+		let overlay = image("overlay", [204, 153, 102, 128]);
+		let reference = draw("overlay-reference", &white_mesh, times(cream, vertex), None, Some((overlay.clone(), 0)));
+		same("Overlay over a vertex-coloured part", draw("overlay", &tinted_mesh, cream, None, Some((overlay, 0))), reference);
+		// in AlphaMode Transparency the map alone: no tint
+		let opaque = image("opaque", [204, 153, 102, 255]);
+		let reference = draw("transparency-reference", &white_mesh, cream, None, Some((opaque.clone(), 1)));
+		same("Transparency over a vertex-coloured part", draw("transparency", &tinted_mesh, cream, None, Some((opaque, 1))), reference);
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
 	}

@@ -293,6 +293,9 @@ const TEX_DECAL_UV: u32 = 33554432u;
 const TEX_DECAL_DOMINANT: u32 = 67108864u;
 // the emissive map is a SurfaceAppearance's own mask image: the mask in red (sa-emission-sweep)
 const TEX_EMISSIVE_RED: u32 = 134217728u;
+// a FileMesh's vertex colours tint the MeshPart's own colour map (TextureID / TextureContent) as well as
+// its colour (with TEX_VERTEX_TINT); a SurfaceAppearance's map they leave alone
+const TEX_VERTEX_TINT_MAP: u32 = 268435456u;
 
 // How material textures map onto the drawn shape (instance.flags.w; notes/materials.md "Mapping")
 // the mesh's own uv (SurfaceAppearance, MeshPart.TextureID)
