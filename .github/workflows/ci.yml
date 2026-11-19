@@ -33,6 +33,20 @@ jobs:
         with:
           toolchain: "1.90.0"
           components: clippy
+      # The runner image brings its own stable Rust, which these builds never use. rust-cache keys its
+      # cache by every installed toolchain, so each image with a newer stable found no cache and compiled
+      # everything. Removing the others leaves the pinned one in the key.
+      - name: Remove the runner image's other Rust toolchains
+        shell: bash
+        run: |
+          set -euo pipefail
+          for toolchain in $(rustup toolchain list --quiet | cut -d' ' -f1); do
+            case "$toolchain" in
+              1.90.0-*) ;;
+              *) rustup toolchain uninstall "$toolchain" ;;
+            esac
+          done
+          rustup toolchain list
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Its own cache, so the workspace's feature set never replaces the one the ror jobs restore.
@@ -66,6 +80,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
         with:
           toolchain: "1.90.0"
+      # As in the first job: only the pinned toolchain in rust-cache's key
+      - name: Remove the runner image's other Rust toolchains
+        shell: bash
+        run: |
+          set -euo pipefail
+          for toolchain in $(rustup toolchain list --quiet | cut -d' ' -f1); do
+            case "$toolchain" in
+              1.90.0-*) ;;
+              *) rustup toolchain uninstall "$toolchain" ;;
+            esac
+          done
+          rustup toolchain list
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # The library jobs' cache (see below); they store it.
@@ -111,6 +137,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
         with:
           toolchain: "1.90.0"
+      # As in the first job: only the pinned toolchain in rust-cache's key
+      - name: Remove the runner image's other Rust toolchains
+        shell: bash
+        run: |
+          set -euo pipefail
+          for toolchain in $(rustup toolchain list --quiet | cut -d' ' -f1); do
+            case "$toolchain" in
+              1.90.0-*) ;;
+              *) rustup toolchain uninstall "$toolchain" ;;
+            esac
+          done
+          rustup toolchain list
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # One cache for ror's test jobs, which all build the same features. Only the first library
