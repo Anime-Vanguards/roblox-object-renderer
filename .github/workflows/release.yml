@@ -1,4 +1,5 @@
 # Release builds use only public source, a pinned toolchain and clean runners, with no build cache.
+# The one cache is the Linux smoke job's apt downloads, which apt checks against Ubuntu's signed lists.
 #
 # A push to main that changes release files, or a manual run, builds and smoke-tests every platform
 # without publishing (a dry run). So does a nightly run at main's head, unless nothing that ships
@@ -193,8 +194,9 @@ jobs:
       RELEASE_ARCH: ${{ matrix.arch }}
       RELEASE_EXE: ${{ matrix.exe }}
     steps:
-      # This checkout supplies only the smoke script and the fixture, in a subfolder. The executable is
-      # extracted outside it, so ror cannot take this checkout for its own.
+      # This checkout supplies only the smoke script and the fixture, in a subfolder, and this workflow,
+      # whose hash names the apt cache below. The executable is extracted outside it, so ror cannot take
+      # this checkout for its own.
       - name: Check out the smoke script and fixture
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -203,18 +205,46 @@ jobs:
           sparse-checkout: |
             tools/release
             fixtures/shapes.rbxmx
+            .github/workflows/release.yml
           sparse-checkout-cone-mode: false
       - name: Download the zip
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ror-${{ matrix.os }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/release-assets
+      # The .deb files of the packages below, as an earlier run on main downloaded them: packages only,
+      # never a build output. Ubuntu's mirror for these runners is slow at times: on 2026-11-19 the
+      # same install took 76 to 299 seconds in four of seven of roblox-ui-renderer's runs, against 13
+      # to 25 here. apt checks every file against the signed package lists it has just fetched, so a
+      # cached file is installed only when it is exactly the package apt would download, and anything
+      # missing or newer is downloaded.
+      - name: Restore the apt packages of an earlier run on main
+        id: apt-cache
+        if: ${{ runner.os == 'Linux' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: ror-apt-v1-${{ matrix.runner }}-${{ hashFiles('inputs/.github/workflows/release.yml') }}
+          restore-keys: ror-apt-v1-${{ matrix.runner }}-
+          path: ~/apt-archives
+      # A mirror that does not answer is given up after 10 seconds and the next one tried: on
+      # 2026-11-19 one that kept each package waiting about 30 seconds made the same step in
+      # roblox-ui-renderer take five minutes.
       - name: Install a software Vulkan driver (Linux has no GPU)
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y mesa-vulkan-drivers
+          mkdir -p ~/apt-archives/partial
+          sudo apt-get -o Acquire::http::Timeout=10 -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::http::Timeout=10 -o Acquire::Retries=3 -o Dir::Cache::Archives="$HOME/apt-archives" \
+            install --no-install-recommends -y mesa-vulkan-drivers
+          # apt leaves its lock and the files root-owned; the cache step reads them as the runner user
+          sudo chown -R "$(id -u):$(id -g)" ~/apt-archives
+      - name: Store the apt packages for later runs on main
+        if: ${{ steps.apt-cache.outcome == 'success' && steps.apt-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: ${{ steps.apt-cache.outputs.cache-primary-key }}
+          path: ~/apt-archives
       - name: Extract the zip outside the checkout
         shell: pwsh
         run: |

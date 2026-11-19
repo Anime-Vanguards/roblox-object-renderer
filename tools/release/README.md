@@ -113,7 +113,8 @@ defaults to `GITHUB_WORKSPACE`, else this checkout. In the redirected home, only
 named Mesa, NVIDIA, AMD and Direct3D cache folders are allowed. Driver cache files are never opened
 for hashing, and the real user folders are never scanned.
 
-It needs a GPU or a software adapter; the workflow installs Mesa on Linux.
+It needs a GPU or a software adapter; the workflow installs Mesa on Linux, from the packages an
+earlier run on main downloaded where apt finds them still current, else from Ubuntu's mirror.
 
 ## Tests
 
@@ -121,7 +122,7 @@ It needs a GPU or a software adapter; the workflow installs Mesa on Linux.
 the zip's first entry, checksums, modes and full layout, the normal-dependency walk and crates
 without licence files, notes bounded by the previous tag with shell syntax in a subject, the canary's
 notes, the choice of a passing run, the nightly decision and which paths ship, and the workflow's
-rules (pinned actions, no cache, a publish job without repository code, no `${{ }}` in `run:` scripts,
-the nightly schedule and its concurrency, a nightly run that builds and uploads only when it should,
-a canary that never builds, is never latest and never moves its tag). The workflow runs them before
-building.
+rules (pinned actions, no build cache and no cache but the smoke job's apt downloads, a publish job
+without repository code, no `${{ }}` in `run:` scripts, the nightly schedule and its concurrency, a
+nightly run that builds and uploads only when it should, a canary that never builds, is never latest
+and never moves its tag). The workflow runs them before building.

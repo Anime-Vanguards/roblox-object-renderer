@@ -219,6 +219,19 @@ function runScripts(text) {
 test("workflow pins every action to a full commit SHA and uses no build cache", () => {
 	for (const match of workflow.matchAll(/uses: ([^\s]+)/g)) assert.match(match[1], /@[a-f0-9]{40}$/);
 	assert.doesNotMatch(workflow, /rust-cache|save-cache|restore-cache/);
+	// The one cache is the smoke job's apt downloads, which apt checks against Ubuntu's signed lists
+	const text = workflow.replace(/\r\n/g, "\n");
+	const smoke = text.slice(text.indexOf("\n  smoke:\n"), text.indexOf("\n  notes:\n"));
+	const steps = text.split(/\n(?=      - )/).filter((step) => /uses: [^\s]*cache/.test(step));
+	assert.equal(steps.length, 2, "one restore and one save of the apt cache");
+	for (const step of steps) {
+		assert.ok(smoke.includes(step), "only the smoke job uses a cache");
+		assert.match(step, /uses: actions\/cache\/(?:restore|save)@/);
+		// one folder, not a `path: |` list
+		assert.match(step, /\n {10}path: ~\/apt-archives(?:\n|$)/);
+	}
+	assert.match(steps[0], /if: \$\{\{ runner\.os == 'Linux' && github\.ref == 'refs\/heads\/main' \}\}/);
+	assert.match(steps[0], /key: ror-apt-v1-/);
 });
 
 test("workflow keeps the publish job free of repository code", () => {
