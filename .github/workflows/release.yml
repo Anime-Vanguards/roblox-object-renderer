@@ -1,11 +1,15 @@
 # Release builds use only public source, a pinned toolchain and clean runners, with no build cache.
 #
 # A push to main that changes release files, or a manual run, builds and smoke-tests every platform
-# without publishing (a dry run). So does a nightly run at main's head, unless the head already has a
-# passing run; then it does nothing. A push of a tag vMAJOR.MINOR.PATCH publishes the release: the zips
-# of the run that passed on main at the tagged commit when there is one (tools/release/dry-run.mjs;
-# the release command tags only such a commit), so a tag needs no second build of the same source;
-# otherwise it builds and smoke-tests every platform itself first.
+# without publishing (a dry run). So does a nightly run at main's head, unless nothing that ships
+# changed since the newest commit of main with a passing run that kept its zips: the head itself, or
+# an older commit when only docs, tests, CI or tools changed since (tools/release/README.md says which
+# paths ship). Then it builds and uploads nothing, and its summary names that run.
+#
+# A push of a tag vMAJOR.MINOR.PATCH publishes the release: the zips of the run that passed on main at
+# the tagged commit when there is one (tools/release/dry-run.mjs; the release command tags only such a
+# commit), so a tag needs no second build of the same source; otherwise it builds and smoke-tests
+# every platform itself first.
 #
 # The tag canary, moved by the export to the newest commit of main with a passing run, publishes that
 # run's zips as the rolling canary prerelease, a build of main between releases. It never builds: with
@@ -55,14 +59,15 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: read
-      actions: read # to find the passing run of this commit
+      actions: read # to find the passing run of this commit, or for the nightly run the newest on main
     outputs:
       version: ${{ steps.version.outputs.version }}
-      # the passing run whose zips a tag publishes, or because of which a nightly run does nothing;
-      # empty when this run builds them
+      # the passing run whose zips a tag publishes; empty when this run builds them
       dry-run: ${{ steps.dry-run.outputs.run-id }}
       # when that run started, for the canary's notes
       dry-run-date: ${{ steps.dry-run.outputs.run-date }}
+      # false when a nightly run has nothing to build; empty on every other run
+      nightly-build: ${{ steps.nightly.outputs.build }}
     steps:
       - name: Check out the full history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -89,27 +94,36 @@ jobs:
           fi
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
       # A tag publishes the zips the passing run of the same commit built and smoke-tested on every
-      # platform, and a nightly run whose commit has one does nothing; build and smoke below then
-      # have nothing to do. Without one they run, except for the canary, which then fails here.
+      # platform; build and smoke below then have nothing to do. Without one they run, except for the
+      # canary, which then fails here.
       - name: Find a passing dry run of this commit
         id: dry-run
-        if: ${{ (github.event_name == 'push' && github.ref_type == 'tag') || github.event_name == 'schedule' }}
+        if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           REQUIRED: ${{ github.event_name == 'push' && github.ref == 'refs/tags/canary' && '--required' || '' }}
         # $REQUIRED is unquoted so that, empty, it adds no argument
         run: node tools/release/dry-run.mjs --repository "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --artifacts ror-windows-x86_64,ror-linux-x86_64,ror-macos-aarch64 $REQUIRED >> "$GITHUB_OUTPUT"
-      - name: Say that main's head already has a passing run
-        if: ${{ github.event_name == 'schedule' && steps.dry-run.outputs.run-id != '' }}
+      # A nightly run builds main's head unless nothing that ships changed since the newest commit of
+      # main with a passing run that kept its zips (tools/release/nightly.mjs). Then build and smoke
+      # below have nothing to do, and the run uploads nothing.
+      - name: Decide whether the nightly run builds
+        id: nightly
+        if: ${{ github.event_name == 'schedule' }}
         shell: bash
         env:
-          RUN_ID: ${{ steps.dry-run.outputs.run-id }}
-        run: |
-          echo "Nothing to build: run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$RUN_ID passed at main's head, $GITHUB_SHA" | tee -a "$GITHUB_STEP_SUMMARY"
+          GH_TOKEN: ${{ github.token }}
+        run: node tools/release/nightly.mjs --repository "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --artifacts ror-windows-x86_64,ror-linux-x86_64,ror-macos-aarch64 >> "$GITHUB_OUTPUT"
+      - name: Say what the nightly run builds and why
+        if: ${{ github.event_name == 'schedule' }}
+        shell: bash
+        env:
+          REASON: ${{ steps.nightly.outputs.reason }}
+        run: printf '%s\n' "$REASON" | tee -a "$GITHUB_STEP_SUMMARY"
 
   build:
-    if: ${{ !github.event.repository.private && needs.version.outputs.dry-run == '' }}
+    if: ${{ !github.event.repository.private && needs.version.outputs.dry-run == '' && needs.version.outputs.nightly-build != 'false' }}
     needs: version
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
@@ -162,7 +176,7 @@ jobs:
           if-no-files-found: error
 
   smoke:
-    if: ${{ !github.event.repository.private && needs.version.outputs.dry-run == '' }}
+    if: ${{ !github.event.repository.private && needs.version.outputs.dry-run == '' && needs.version.outputs.nightly-build != 'false' }}
     needs: [version, build]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15

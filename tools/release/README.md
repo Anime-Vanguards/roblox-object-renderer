@@ -11,6 +11,7 @@ node tools/release/package.mjs --binary target/dist/ror.exe --version 0.1.0 --os
 node tools/release/notes.mjs --tag v0.1.0 --output release-notes.md
 node tools/release/canary.mjs --run 123 --built 2026-11-16T01:11:00Z --output release-notes.md
 node tools/release/dry-run.mjs --repository <owner/name> --sha <commit> --artifacts <name,...> [--required]
+node tools/release/nightly.mjs --repository <owner/name> --sha <main's head> --artifacts <name,...>
 node --test tools/release/*.test.mjs
 ```
 
@@ -22,9 +23,10 @@ node --test tools/release/*.test.mjs
 | `notes.mjs` | writes the release notes |
 | `canary.mjs` | writes the notes of the canary prerelease |
 | `dry-run.mjs` | finds the passing run whose zips a tag publishes |
+| `nightly.mjs` | decides whether the nightly run builds main's head |
 | `smoke.mjs` | runs a built binary the way a user gets it |
 | `release.test.mjs` | tests of the scripts and of the workflow's safety rules |
-| `canary.test.mjs`, `dry-run.test.mjs` | tests of the canary and of the choice of a passing run |
+| `canary.test.mjs`, `dry-run.test.mjs`, `nightly.test.mjs` | tests of the canary, of the choice of a passing run and of the nightly decision |
 
 ## licenses.mjs
 
@@ -51,7 +53,8 @@ every host, so the same input gives the same zip. The binary is the first entry,
 writes anything. `SOURCE.md` is written inside the zip and beside it.
 
 `--tag`, `--commit` and `--repository` are optional. They default to `v<version>`, HEAD and this
-public repository.
+public repository. `SOURCE.md` links that commit and its source archive, and names the tag as the
+version: a canary is a build of a later commit than its version's tag.
 
 ## notes.mjs
 
@@ -64,9 +67,25 @@ the source is.
 It lists the runs of the release workflow at one commit of main and takes the newest that a push, a
 manual start or the nightly schedule started, that passed every job but the tag-only ones and still
 has every zip. A version tag publishes that run's zips instead of building them again, and builds them
-itself when there is none. A nightly run that finds one has nothing to do. The canary tag passes
-`--required`: it only ever publishes such a run's zips, so without one, or when the API cannot be
-read, it fails. It prints `run-id=` and `run-date=` (when that run started) for `$GITHUB_OUTPUT`.
+itself when there is none. The canary tag passes `--required`: it only ever publishes such a run's
+zips, so without one, or when the API cannot be read, it fails. It prints `run-id=` and `run-date=`
+(when that run started) for `$GITHUB_OUTPUT`.
+
+## nightly.mjs
+
+The nightly run asks it whether to build main's head. It takes the newest commit of the head's
+first-parent history with a run that `dry-run.mjs` would take, and builds nothing when that commit is
+the head or when no path that ships changed since it (`git diff --name-only`, a renamed file counted
+under both names). Otherwise, or with no such commit among the newest passing runs, it builds. A
+nightly run that builds nothing uploads nothing, and its summary names the run that built that
+commit; one that builds names the changed paths that ship. Any failure to decide builds, with a
+warning.
+
+A path ships unless it is under `.github/`, a dot-file or in a dot-folder, Markdown, or under `docs/`,
+`notes/`, `tools/` or a `tests`, `benches`, `examples`, `fixtures` or `goldens` folder. The paths a
+push to main starts a dry run for (`on.push.paths` in the workflow, such as `tools/release/**` and
+`.cargo/config.toml`) always ship, except the workflow itself. This is the same rule that decides
+when a release is due. It prints `build=` and `reason=` for `$GITHUB_OUTPUT`.
 
 ## canary.mjs
 
@@ -101,6 +120,8 @@ It needs a GPU or a software adapter; the workflow installs Mesa on Linux.
 `node --test tools/release/*.test.mjs` checks every script: versions that disagree and a wrong tag,
 the zip's first entry, checksums, modes and full layout, the normal-dependency walk and crates
 without licence files, notes bounded by the previous tag with shell syntax in a subject, the canary's
-notes and the choice of a passing run, and the workflow's rules (pinned actions, no cache, a publish job
-without repository code, no `${{ }}` in `run:` scripts, the nightly schedule and its concurrency, a
-canary that never builds, is never latest and never moves its tag). The workflow runs them before building.
+notes, the choice of a passing run, the nightly decision and which paths ship, and the workflow's
+rules (pinned actions, no cache, a publish job without repository code, no `${{ }}` in `run:` scripts,
+the nightly schedule and its concurrency, a nightly run that builds and uploads only when it should,
+a canary that never builds, is never latest and never moves its tag). The workflow runs them before
+building.

@@ -73,16 +73,16 @@ export function identity(version, tag, commit, repository = REPOSITORY) {
 	return { version, tag, commit, repository };
 }
 
-/** SOURCE.md: where the Corresponding Source of a binary built from this tag is. */
+/** SOURCE.md: where the Corresponding Source of a binary is. It links the exact commit: a canary's is not its version tag's. */
 export function sourceText({ tag, commit, repository }) {
 	const repo = `https://github.com/${repository}`;
 	const paragraphs = [
 		"# Corresponding Source",
 		"This binary is distributed under GPL-3.0-or-later.",
-		`Source: ${repo}/tree/${tag}\nCommit: ${commit}\nSource archive: ${repo}/archive/refs/tags/${tag}.zip`,
+		`Source: ${repo}/tree/${commit}\nCommit: ${commit} (version ${tag})\nSource archive: ${repo}/archive/${commit}.tar.gz`,
 		"The source includes Cargo.lock and the release scripts. Obtain the Rust crates pinned in Cargo.lock from crates.io; the lockfile records their SHA-256 checksums. Any git dependencies are available from their public repository URLs at the commits pinned in Cargo.lock.",
 		"Build with Rust 1.90.0: cargo build --locked --profile dist --bin ror\nUse the public default features and the native target triple (--target <triple>). On Windows set RUSTFLAGS=\"-C target-feature=+crt-static\" to include the C runtime. No x264 library or other downloaded build archive is required.",
-		"See .github/workflows/release.yml at this tag for the target triples, runner setup, licence inventory and packaging commands.",
+		"See .github/workflows/release.yml at this commit for the target triples, runner setup, licence inventory and packaging commands.",
 	];
 	return paragraphs.join("\n\n") + "\n";
 }

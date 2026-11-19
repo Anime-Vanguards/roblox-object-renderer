@@ -8,9 +8,9 @@ from source. Windows with MSVC is the main development platform.
 
 Extract `ror.exe` or `ror` from the zip for your platform, put it on your PATH and run
 `ror --version`. Only the executable is needed at run time. The archive also holds the licence texts,
-the notices and `SOURCE.md`, which gives the source tag, the exact commit, the pinned dependencies and
-the rebuild command. A binary is distributed under GPL-3.0-or-later; the source stays
-GPL-2.0-or-later.
+the notices and `SOURCE.md`, which links the exact commit it was built from, names its version and
+gives the pinned dependencies and the rebuild command. A binary is distributed under
+GPL-3.0-or-later; the source stays GPL-2.0-or-later.
 
 On Linux and macOS use rokit 1.0 or later: rokit 0.2.x cannot select `ror` there because its name
 differs from the repository's. Aftman and foreman also work, because the binary is the zip's first

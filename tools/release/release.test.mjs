@@ -182,9 +182,15 @@ test("notes use public subjects as data and bound them by the preceding release"
 	assert.match(text, /Source archive:/);
 });
 
-test("source notice records the exact tag, commit, pinned crates and rebuild command", () => {
-	const text = sourceText({ tag: "v0.1.0", commit: "a".repeat(40), repository: REPOSITORY });
-	assert.match(text, /archive\/refs\/tags\/v0\.1\.0.zip/);
+test("source notice links the exact commit, names its version, and records the pinned crates and rebuild command", () => {
+	const commit = "a".repeat(40);
+	const text = sourceText({ tag: "v0.1.0", commit, repository: REPOSITORY });
+	// a canary build is not of its version tag's commit, so the links name the commit
+	assert.ok(text.includes(`Source: https://github.com/${REPOSITORY}/tree/${commit}\n`));
+	assert.ok(text.includes(`Commit: ${commit} (version v0.1.0)\n`));
+	assert.ok(text.includes(`Source archive: https://github.com/${REPOSITORY}/archive/${commit}.tar.gz\n`));
+	assert.doesNotMatch(text, /refs\/tags|tree\/v0\.1\.0/);
+	assert.match(text, /release\.yml at this commit/);
 	assert.match(text, /SHA-256/);
 	assert.match(text, /Rust 1\.90\.0/);
 	assert.match(text, /--locked --profile dist --bin ror/);
