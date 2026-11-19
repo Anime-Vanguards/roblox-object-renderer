@@ -77,14 +77,11 @@ pub fn record(script: &Path, seconds: f32, options: &Options, out: &Path) -> Res
 		command.arg("--mount").arg(mount);
 	}
 	let output = command.output().with_context(|| format!("running {}", ree.display()))?;
-	if !output.status.success() {
+	let summary = summary_of(&String::from_utf8_lossy(&output.stdout));
+	if !finished(output.status.code(), summary.as_ref()) {
 		bail!("ree record {} ({}): {}", script.display(), output.status, String::from_utf8_lossy(&output.stderr).trim());
 	}
-	let stdout = String::from_utf8_lossy(&output.stdout);
-	let summary: Value = stdout
-		.find('{')
-		.and_then(|start| serde_json::from_str(&stdout[start..]).ok())
-		.with_context(|| format!("ree record {}: {}", script.display(), String::from_utf8_lossy(&output.stderr).trim()))?;
+	let summary = summary.with_context(|| format!("ree record {}: {}", script.display(), String::from_utf8_lossy(&output.stderr).trim()))?;
 
 	let events_file = out.join("events.json");
 	let events: Value = serde_json::from_slice(&std::fs::read(&events_file).with_context(|| format!("reading {}", events_file.display()))?).with_context(|| format!("reading {}", events_file.display()))?;
@@ -112,4 +109,37 @@ pub fn record(script: &Path, seconds: f32, options: &Options, out: &Path) -> Res
 	});
 	crate::output::write_json_atomic(&out.join("script.json"), &report, true)?;
 	Ok(Recording { scene: out.join("scene.rbxm"), playback: out.join("playback.json"), report, errors })
+}
+
+/// The JSON summary `ree record` printed on stdout, if it printed one.
+fn summary_of(stdout: &str) -> Option<Value> {
+	stdout.find('{').and_then(|start| serde_json::from_str(&stdout[start..]).ok())
+}
+
+/// Whether `ree record` ran its script to an end: exit 0, or exit 1 with a summary whose status is `error` (ree exits 1
+/// when the script or a frame failed, its summary printed and the recording written as for any run). Anything else is
+/// ree failing.
+fn finished(code: Option<i32>, summary: Option<&Value>) -> bool {
+	code == Some(0) || (code == Some(1) && summary.is_some_and(|summary| summary["status"] == "error"))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// A script that errors after building something is drawn with its errors listed, whether ree exits 0 or, as it
+	/// does since its failed runs exit 1, 1 with status `error`; an exit 1 without that summary is still a failure.
+	#[test]
+	fn a_run_that_ended_in_error_is_a_finished_recording() {
+		let failed = summary_of("ree: record error; 31 frames\n{\"status\":\"error\",\"instances\":3,\"failure\":\"boom\"}\n").unwrap();
+		assert_eq!(failed["instances"], 3);
+		assert!(finished(Some(1), Some(&failed)));
+		assert!(finished(Some(0), Some(&failed)));
+		assert!(finished(Some(0), Some(&json!({ "status": "ok" }))));
+		assert!(!finished(Some(1), None));
+		assert!(!finished(Some(1), Some(&json!({ "status": "ok" }))));
+		assert!(!finished(Some(126), Some(&failed)));
+		assert!(!finished(None, Some(&failed)));
+		assert_eq!(summary_of("ree record: --harness is required\n"), None);
+	}
 }
