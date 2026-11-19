@@ -4,8 +4,8 @@
 //!   `content/`, then `ExtraContent/` (see `studio.rs` for detection and the evidence for the order)
 //! - `rbxassetid://N`, `rbxassetid://N?version=V`, `http(s)://www.roblox.com/asset/?id=N` (and the
 //!   other asset URL spellings), bare numeric ids → assetdelivery.roblox.com (public route first,
-//!   then the account cookie; a refusal carries assetdelivery's reason, [`RefusalReason`]), then the
-//!   CDN location it returns (never with the cookie)
+//!   then an Open Cloud API key's route, then the account cookie; a refusal carries assetdelivery's
+//!   reason, [`RefusalReason`]), then the CDN location it returns (never with a credential)
 //! - `rbxthumb://type=Asset&id=N&w=W&h=H` → thumbnails.roblox.com
 //! - a local file path → the file
 //!
@@ -26,11 +26,19 @@
 //! With an account broker's credentials (the `broker` module: a service that holds the account's
 //! session, used with a personal token) no cookie is read: the requests that would carry it go to the
 //! broker with the token instead, which is sent nowhere else and treated like the cookie.
+//!
+//! An Open Cloud API key (the `apikey` module: env `ROBLOX_ASSET_DELIVERY_API_KEY`, or that line in
+//! the cookie's env files) is tried before the account, the narrower credential first: only as
+//! `x-api-key`, only to `https://apis.roblox.com/asset-delivery-api/v1/assetId/{id}[/version/{n}]`,
+//! only after the public route refused, at the pace of its rate limit (the `ratelimit` module), and
+//! kept out of every log, error, cache and child process like the cookie ([`hide_api_key`]).
 
+mod apikey;
 mod broker;
 mod cache;
 mod cookie;
 mod http;
+mod ratelimit;
 mod sniff;
 pub mod store;
 mod studio;
@@ -82,6 +90,10 @@ pub struct AssetConfig {
 	/// found: env `ROBLOX_BROKER_TOKEN` with `ROBLOX_BROKER_URL`, then the JSON file
 	/// (`{ "url": ..., "token": ... }`) named by env `ROBLOX_BROKER_CREDENTIALS`, else
 	/// `~/.config/roblox-broker/credentials.json`.
+	///
+	/// An Open Cloud API key is looked for apart from both, and tried before them: env
+	/// `ROBLOX_ASSET_DELIVERY_API_KEY`, then a line `ROBLOX_ASSET_DELIVERY_API_KEY=...` in the same env
+	/// files as the cookie's.
 	pub repo_dir: Option<PathBuf>,
 	/// Byte budget of the in-memory cache.
 	pub memory_budget: usize,
@@ -280,6 +292,40 @@ struct Slot {
 	ready: Condvar,
 }
 
+/// Starts `command` without the Open Cloud API key in its environment (env
+/// `ROBLOX_ASSET_DELIVERY_API_KEY`), as every child process ror starts but its own render service. The
+/// env files it may be in are named by their paths, which children keep, as they keep the cookie's.
+pub fn hide_api_key(command: &mut std::process::Command) -> &mut std::process::Command {
+	command.env_remove(apikey::KEY)
+}
+
+/// The Open Cloud API key, when one was found, and where it came from.
+struct Key {
+	credential: Option<Credential>,
+	/// `env NAME`, `file <path>`: never a value
+	source: Option<String>,
+}
+
+impl Key {
+	fn find(found: Option<(cookie::Secret, apikey::KeySource)>) -> Key {
+		match found {
+			Some((secret, source)) => Key { credential: Some(Credential::ApiKey(secret)), source: Some(source.label()) },
+			None => Key { credential: None, source: None },
+		}
+	}
+}
+
+/// Where a download asks for an asset's location, in order while it is refused.
+#[derive(Clone, Copy)]
+enum Route<'a> {
+	/// assetdelivery without a credential
+	Public,
+	/// Open Cloud's asset delivery route with the API key
+	Key(&'a Credential),
+	/// assetdelivery with the account's credential (a broker's token, else the cookie)
+	Account(&'a Credential),
+}
+
 /// What authenticates downloads that need the account, and where it came from.
 struct Account {
 	credential: Option<Credential>,
@@ -315,6 +361,7 @@ struct Inner {
 	disk: DiskCache,
 	studio: OnceLock<Option<studio::StudioInstall>>,
 	account: OnceLock<Account>,
+	key: OnceLock<Key>,
 	memory: Mutex<MemoryCache>,
 	inflight: Mutex<HashMap<String, Arc<Slot>>>,
 	/// Network URIs already re-downloaded in refresh mode
@@ -329,14 +376,18 @@ pub struct Assets {
 
 impl Assets {
 	pub fn new(config: AssetConfig) -> Self {
-		Self::with_endpoints(config, Endpoints::production(), None)
+		Self::with_endpoints(config, Endpoints::production(), None, None)
 	}
 
-	fn with_endpoints(config: AssetConfig, endpoints: Endpoints, account: Option<Account>) -> Self {
+	fn with_endpoints(config: AssetConfig, endpoints: Endpoints, account: Option<Account>, key: Option<Key>) -> Self {
 		let client = Client::new(endpoints, config.max_concurrent_downloads, &config.assetdelivery_headers);
 		let account_cell = OnceLock::new();
 		if let Some(preset) = account {
 			let _ = account_cell.set(preset);
+		}
+		let key_cell = OnceLock::new();
+		if let Some(preset) = key {
+			let _ = key_cell.set(preset);
 		}
 		Assets {
 			inner: Arc::new(Inner {
@@ -345,6 +396,7 @@ impl Assets {
 				client,
 				studio: OnceLock::new(),
 				account: account_cell,
+				key: key_cell,
 				inflight: Mutex::new(HashMap::new()),
 				refreshed: Mutex::new(HashSet::new()),
 				config,
@@ -395,12 +447,25 @@ impl Assets {
 		self.account().source.clone()
 	}
 
+	/// Whether an Open Cloud API key is configured (reads the sources; never reveals a value).
+	pub fn has_api_key(&self) -> bool {
+		self.api_key().is_some()
+	}
+
+	/// Where the Open Cloud API key comes from (`env ROBLOX_ASSET_DELIVERY_API_KEY`, `file <path>`),
+	/// never a value itself.
+	pub fn api_key_source(&self) -> Option<String> {
+		self.key().source.clone()
+	}
+
 	/// One line per credential source with its status (`not set`, `missing`, `no cookie line`,
-	/// `invalid value`, `ok`, ...), in lookup order: the account broker's, then the cookie's. Never
-	/// contains a value.
+	/// `invalid value`, `ok`, ...), in the order they are tried: the Open Cloud API key's, then the
+	/// account broker's, then the cookie's. Never contains a value.
 	pub fn cookie_diagnostics(&self) -> Vec<String> {
-		let mut lines = broker::diagnose(&|name| std::env::var_os(name));
-		lines.extend(cookie::diagnose(self.inner.config.repo_dir.as_deref()));
+		let repo_dir = self.inner.config.repo_dir.as_deref();
+		let mut lines = apikey::diagnose(std::env::var_os(apikey::KEY), &cookie::env_files(repo_dir));
+		lines.extend(broker::diagnose(&|name| std::env::var_os(name)));
+		lines.extend(cookie::diagnose(repo_dir));
 		lines
 	}
 
@@ -416,8 +481,37 @@ impl Assets {
 		self.account().credential.as_ref()
 	}
 
-	/// The answer to a refusal no credential could be tried for: the refusal, or why the account
-	/// broker's credentials cannot be used.
+	fn key(&self) -> &Key {
+		self.inner.key.get_or_init(|| Key::find(apikey::load(self.inner.config.repo_dir.as_deref())))
+	}
+
+	fn api_key(&self) -> Option<&Credential> {
+		self.key().credential.as_ref()
+	}
+
+	/// Whether a refusal is final: a credential was tried too (the API key or the account's).
+	fn tried_credentials(&self) -> bool {
+		self.api_key().is_some() || self.credential().is_some()
+	}
+
+	/// The route a refused download asks next: the API key's after the public route, then the account's.
+	fn next_route(&self, after: Route<'_>) -> Option<Route<'_>> {
+		let key = matches!(after, Route::Public).then(|| self.api_key()).flatten().map(Route::Key);
+		key.or_else(|| (!matches!(after, Route::Account(_))).then(|| self.credential()).flatten().map(Route::Account))
+	}
+
+	/// assetdelivery's `GET /v1/assetId/{id}[/version/{v}][?query]`.
+	fn assetdelivery_url(&self, id: u64, version: Option<u64>, query: Option<&str>) -> String {
+		route_url(&self.inner.client.endpoints().assetdelivery, id, version, query)
+	}
+
+	/// Open Cloud's `GET /asset-delivery-api/v1/assetId/{id}[/version/{v}][?query]`, the API key's route.
+	fn key_url(&self, id: u64, version: Option<u64>, query: Option<&str>) -> String {
+		route_url(&format!("{}{}", self.inner.client.endpoints().open_cloud, apikey::PREFIX), id, version, query)
+	}
+
+	/// The answer to a refusal the account's credential could not be tried for (there is none, or the
+	/// API key was the last route): the refusal, or why the account broker's credentials cannot be used.
 	fn refused_without_credential(&self, uri: &str, status: u16, reason: Option<RefusalReason>) -> AssetError {
 		match &self.account().problem {
 			Some(problem) => AssetError::Network { uri: uri.to_string(), detail: problem.clone() },
@@ -621,8 +715,8 @@ impl Assets {
 					AssetError::NotFound(_) => Some((404, None)),
 					_ => None,
 				};
-				// an authorisation refusal is only final once the account's credential was tried too
-				let final_refusal = |status: u16| !matches!(status, 401 | 403 | 409) || self.credential().is_some();
+				// an authorisation refusal is only final once a credential was tried too
+				let final_refusal = |status: u16| !matches!(status, 401 | 403 | 409) || self.tried_credentials();
 				if let Some((status, reason)) = refusal
 					&& final_refusal(status)
 				{
@@ -647,30 +741,11 @@ impl Assets {
 		Ok(Fetched { uri: uri.to_string(), bytes, source: Source::Network })
 	}
 
-	/// assetdelivery `GET /v1/assetId/{id}[/version/{v}]` (public, then with the cookie, or through the
-	/// account broker, on an authorisation error), then the CDN location without either. Returns
-	/// (bytes, CDN host).
+	/// assetdelivery `GET /v1/assetId/{id}[/version/{v}]` (public, then Open Cloud's route with the API
+	/// key, then with the cookie or through the account broker, each on an authorisation error: [`Assets::find_location`]),
+	/// then the CDN location without any. Returns (bytes, CDN host).
 	fn download_asset(&self, id: u64, version: Option<u64>, uri: &str) -> Result<(Vec<u8>, String), AssetError> {
-		let client = &self.inner.client;
-		let base = &client.endpoints().assetdelivery;
-		let url = match version {
-			Some(v) => format!("{base}/v1/assetId/{id}/version/{v}"),
-			None => format!("{base}/v1/assetId/{id}"),
-		};
-
-		let location = match self.asset_location(&url, None, uri)? {
-			Located::Url(location) => location,
-			Located::Unauthorized(status, reason) => match self.credential() {
-				Some(credential) => match self.asset_location(&url, Some(credential), uri)? {
-					Located::Url(location) => location,
-					Located::Unauthorized(status, reason) => return Err(http(uri, status, reason)),
-					Located::Generating => return Err(http(uri, 406, None)),
-				},
-				None => return Err(self.refused_without_credential(uri, status, reason)),
-			},
-			Located::Generating => return Err(http(uri, 406, None)),
-		};
-
+		let location = self.find_location(id, version, None, uri, &[])?;
 		let reply = self.get(&location, None, "*/*", uri)?;
 		if reply.status != 200 {
 			return Err(http(uri, reply.status, None));
@@ -679,35 +754,11 @@ impl Assets {
 	}
 
 	/// assetdelivery `GET /v1/assetId/{id}[/version/{v}]` naming the transcode's pack in
-	/// `contentRepresentationPriorityList`, without falling back to the uploaded image (public, then
-	/// with the cookie on an authorisation error; while the transcode is being made, retried after
-	/// 0.5, 1, 2 and 4 s), then the CDN location without the cookie. Returns (KTX2 bytes, CDN host).
+	/// `contentRepresentationPriorityList`, without falling back to the uploaded image (the routes of
+	/// [`Assets::find_location`], the same query on each; while the transcode is being made, retried after
+	/// 0.5, 1, 2 and 4 s), then the CDN location without a credential. Returns (KTX2 bytes, CDN host).
 	fn download_transcode(&self, id: u64, version: Option<u64>, transcode: Transcode, pack: u32, uri: &str, waits: &[u64]) -> Result<(Vec<u8>, String), AssetError> {
-		let client = &self.inner.client;
-		let base = &client.endpoints().assetdelivery;
-		let path = match version {
-			Some(v) => format!("{base}/v1/assetId/{id}/version/{v}"),
-			None => format!("{base}/v1/assetId/{id}"),
-		};
-		let url = format!("{path}?contentRepresentationPriorityList={}&doNotFallbackToBaselineRepresentation=true", transcode::query_escape(&transcode.priority_list(pack)));
-
-		let mut credential = None;
-		let mut waits = waits.iter();
-		let location = loop {
-			match self.transcode_location(&url, credential, uri)? {
-				Located::Url(location) => break location,
-				Located::Unauthorized(status, reason) => match (credential, self.credential()) {
-					(None, Some(found)) => credential = Some(found),
-					(None, None) => return Err(self.refused_without_credential(uri, status, reason)),
-					_ => return Err(http(uri, status, reason)),
-				},
-				Located::Generating => match waits.next() {
-					Some(&ms) => std::thread::sleep(std::time::Duration::from_millis(ms)),
-					None => return Err(http(uri, 406, None)),
-				},
-			}
-		};
-
+		let location = self.find_location(id, version, Some(&transcode_query(transcode, pack)), uri, waits)?;
 		let reply = self.get(&location, None, "*/*", uri)?;
 		if reply.status != 200 {
 			return Err(http(uri, reply.status, None));
@@ -717,6 +768,56 @@ impl Assets {
 			return Err(AssetError::NoTranscode(uri.to_string()));
 		}
 		Ok((body, reply.host))
+	}
+
+	/// Where an asset's file is (with a transcode's `query`: only a reply naming its representation
+	/// counts, waited for while it is being made, `waits`), asking each route while it is refused: the
+	/// public route, then Open Cloud's with the API key, then assetdelivery's with the account's
+	/// credential ([`Assets::next_route`]). The key's route failing otherwise (not found to it, rate
+	/// limited, down) leaves the account's to try as well.
+	fn find_location(&self, id: u64, version: Option<u64>, query: Option<&str>, uri: &str, waits: &[u64]) -> Result<String, AssetError> {
+		let mut route = Route::Public;
+		// the public route's refusal: the answer when the key's route has none and nothing follows it
+		let mut refusal = (401, None);
+		let mut waits = waits.iter();
+		loop {
+			let (url, credential) = match route {
+				Route::Public => (self.assetdelivery_url(id, version, query), None),
+				Route::Key(key) => (self.key_url(id, version, query), Some(key)),
+				Route::Account(account) => (self.assetdelivery_url(id, version, query), Some(account)),
+			};
+			let located = match query {
+				Some(_) => self.transcode_location(&url, credential, uri),
+				None => self.asset_location(&url, credential, uri),
+			};
+			// not found to the key, which the public route said needs authentication: that refusal
+			let after_key = |error: AssetError, refusal: &(u16, Option<RefusalReason>)| match error {
+				AssetError::NotFound(_) => self.refused_without_credential(uri, refusal.0, refusal.1.clone()),
+				error => error,
+			};
+			match located {
+				Ok(Located::Url(location)) => return Ok(location),
+				Ok(Located::Generating) => match waits.next() {
+					Some(&ms) => std::thread::sleep(std::time::Duration::from_millis(ms)),
+					None => return Err(http(uri, 406, None)),
+				},
+				Ok(Located::Unauthorized(status, reason)) => {
+					if matches!(route, Route::Public) {
+						refusal = (status, reason.clone());
+					}
+					match self.next_route(route) {
+						Some(next) => route = next,
+						None if !matches!(route, Route::Account(_)) => return Err(self.refused_without_credential(uri, status, reason)),
+						None => return Err(http(uri, status, reason)),
+					}
+				}
+				Err(error) if matches!(route, Route::Key(_)) && !matches!(error, AssetError::NoTranscode(_)) => match self.next_route(route) {
+					Some(next) => route = next,
+					None => return Err(after_key(error, &refusal)),
+				},
+				Err(error) => return Err(error),
+			}
+		}
 	}
 
 	/// A transcode's location: only a reply naming the requested representation counts (without one
@@ -731,6 +832,7 @@ impl Assets {
 			return if named { Ok(Located::Url(location.clone())) } else { Err(AssetError::NoTranscode(uri.to_string())) };
 		}
 		let (status, reason) = error_status(parsed.as_ref().and_then(|p| p.errors.as_deref()), reply.status);
+		let reason = withhold_echo(reason, credential);
 		match status {
 			401 | 403 | 409 => Ok(Located::Unauthorized(status, reason)),
 			406 => Ok(Located::Generating),
@@ -747,6 +849,7 @@ impl Assets {
 		}
 		// Errors arrive as HTTP 200 with {"errors":[{"code":403,"customErrorCode":19,...}]} or as plain statuses
 		let (status, reason) = error_status(parsed.as_ref().and_then(|p| p.errors.as_deref()), reply.status);
+		let reason = withhold_echo(reason, credential);
 		match status {
 			401 | 403 | 409 => Ok(Located::Unauthorized(status, reason)),
 			404 => Err(AssetError::NotFound(uri.to_string())),
@@ -833,6 +936,32 @@ impl Assets {
 	}
 }
 
+/// `<base>/v1/assetId/{id}[/version/{v}][?query]`.
+fn route_url(base: &str, id: u64, version: Option<u64>, query: Option<&str>) -> String {
+	let path = match version {
+		Some(v) => format!("{base}/v1/assetId/{id}/version/{v}"),
+		None => format!("{base}/v1/assetId/{id}"),
+	};
+	match query {
+		Some(query) => format!("{path}?{query}"),
+		None => path,
+	}
+}
+
+/// The query naming a transcode's pack, without falling back to the uploaded image.
+fn transcode_query(transcode: Transcode, pack: u32) -> String {
+	format!("contentRepresentationPriorityList={}&doNotFallbackToBaselineRepresentation=true", transcode::query_escape(&transcode.priority_list(pack)))
+}
+
+/// A refusal's reason, but for a message from the API key's route that could echo the key
+/// ([`apikey::may_echo`]): that is never kept, printed or remembered.
+fn withhold_echo(reason: Option<RefusalReason>, credential: Option<&Credential>) -> Option<RefusalReason> {
+	match (reason, credential.and_then(Credential::api_key)) {
+		(Some(RefusalReason::Other(message)), Some(key)) if apikey::may_echo(&message, key.expose()) => Some(RefusalReason::Other("<message withheld>".into())),
+		(reason, _) => reason,
+	}
+}
+
 /// The same entry under the caller's spelling of the URI.
 fn respell(fetched: Arc<Fetched>, uri: &str) -> Arc<Fetched> {
 	if fetched.uri == uri {
@@ -874,15 +1003,19 @@ const TRANSCODE_WAITS_MS: [u64; 4] = [10, 10, 10, 10];
 
 #[derive(Deserialize)]
 struct AssetLocation {
+	#[serde(alias = "Location")]
 	location: Option<String>,
+	#[serde(alias = "Errors")]
 	errors: Option<Vec<ApiError>>,
 }
 
 #[derive(Deserialize)]
 struct TranscodeLocation {
+	#[serde(alias = "Location")]
 	location: Option<String>,
+	#[serde(alias = "Errors")]
 	errors: Option<Vec<ApiError>>,
-	#[serde(rename = "contentRepresentationSpecifier")]
+	#[serde(rename = "contentRepresentationSpecifier", alias = "ContentRepresentationSpecifier")]
 	specifier: Option<RepresentationSpecifier>,
 }
 

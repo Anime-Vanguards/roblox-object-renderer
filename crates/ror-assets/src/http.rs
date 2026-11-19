@@ -6,6 +6,10 @@
 //! - With an account broker's token instead of the cookie ([`Credential::Broker`]), that first hop
 //!   goes to the broker (`<broker>/rbx/<assetdelivery host>/<path>?<query>`) with the token, the only
 //!   request that carries it; what the broker redirects to is fetched without it, like any redirect.
+//! - An Open Cloud API key ([`Credential::ApiKey`]) is sent as `x-api-key` on the first hop alone, and
+//!   only when that URL is the Open Cloud asset delivery route on the Open Cloud origin
+//!   (`https://apis.roblox.com` in production; [`crate::apikey::route_allowed`]); its requests share
+//!   one pace ([`crate::ratelimit`]).
 //! - Errors carry status codes and short transport descriptions, never header values.
 //! - 429 / 5xx / transport failures are retried with exponential backoff (`Retry-After` honoured); a
 //!   broker's own refusal is not, but for its rate limit.
@@ -16,8 +20,10 @@ use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
 
+use crate::apikey;
 use crate::broker::Broker;
 use crate::cookie::Secret;
+use crate::ratelimit::{self, RateLimit};
 
 /// Largest accepted response body.
 const MAX_BODY: u64 = 1 << 30;
@@ -31,6 +37,8 @@ pub(crate) struct Endpoints {
 	pub assetdelivery: String,
 	pub thumbnails: String,
 	pub universes: String,
+	/// Open Cloud, whose asset delivery route takes an API key
+	pub open_cloud: String,
 	/// Plain http allowed (tests only)
 	pub allow_http: bool,
 }
@@ -41,25 +49,36 @@ impl Endpoints {
 			assetdelivery: "https://assetdelivery.roblox.com".into(),
 			thumbnails: "https://thumbnails.roblox.com".into(),
 			universes: "https://apis.roblox.com".into(),
+			open_cloud: apikey::ORIGIN.into(),
 			allow_http: false,
 		}
 	}
 }
 
-/// What authenticates a request to the assetdelivery origin.
+/// What authenticates a request: to the assetdelivery origin (the account's cookie or broker), or to
+/// Open Cloud's asset delivery route (an API key).
 #[derive(Debug)]
 pub(crate) enum Credential {
 	/// The account cookie, sent to assetdelivery itself
 	Cookie(Secret),
 	/// A token for an account broker, which holds the session: the request goes to the broker
 	Broker(Broker),
+	/// An Open Cloud API key, sent to Open Cloud's asset delivery route alone
+	ApiKey(Secret),
 }
 
 impl Credential {
 	fn broker(&self) -> Option<&Broker> {
 		match self {
 			Credential::Broker(broker) => Some(broker),
-			Credential::Cookie(_) => None,
+			Credential::Cookie(_) | Credential::ApiKey(_) => None,
+		}
+	}
+
+	pub(crate) fn api_key(&self) -> Option<&Secret> {
+		match self {
+			Credential::ApiKey(key) => Some(key),
+			Credential::Cookie(_) | Credential::Broker(_) => None,
 		}
 	}
 }
@@ -71,6 +90,8 @@ pub(crate) struct Reply {
 	/// Host that sent this response (after redirects)
 	pub host: String,
 	pub retry_after: Option<Duration>,
+	/// What the reply said of the rate limit (`x-ratelimit-*`)
+	pub limits: ratelimit::Headers,
 	/// The account broker refused the request itself (`X-Broker-Error`): what it said. The status is
 	/// then the broker's, not Roblox's, and the body is dropped.
 	pub broker_error: Option<String>,
@@ -178,6 +199,8 @@ pub(crate) struct Client {
 	permits: Permits,
 	/// Extra headers for assetdelivery requests (first hop only)
 	assetdelivery_headers: Vec<(String, String)>,
+	/// The pace of the requests with an API key
+	key_limit: RateLimit,
 }
 
 /// An agent that follows no redirects and takes statuses as answers. `local`: plain http allowed and
@@ -215,7 +238,14 @@ impl Client {
 			.collect();
 		// Tests talk to 127.0.0.1
 		let agent = agent(endpoints.allow_http);
-		Client { agent, loopback: OnceLock::new(), endpoints, permits: Permits { free: Mutex::new(max_concurrent.max(1)), cond: Condvar::new() }, assetdelivery_headers }
+		Client {
+			agent,
+			loopback: OnceLock::new(),
+			endpoints,
+			permits: Permits { free: Mutex::new(max_concurrent.max(1)), cond: Condvar::new() },
+			assetdelivery_headers,
+			key_limit: RateLimit::default(),
+		}
 	}
 
 	pub(crate) fn endpoints(&self) -> &Endpoints {
@@ -235,9 +265,21 @@ impl Client {
 		}
 	}
 
+	/// Whether an API key may be sent to `url`: exactly the Open Cloud origin (in production
+	/// `https://apis.roblox.com` alone, whatever the endpoints say) and its asset delivery route.
+	fn key_allowed(&self, url: &str) -> bool {
+		let (Some(origin), Some(open_cloud)) = (origin_of(url), origin_of(&self.endpoints.open_cloud)) else {
+			return false;
+		};
+		let secure = self.endpoints.allow_http || origin == apikey::ORIGIN;
+		let rest = url.split_once("://").map_or("", |(_, rest)| rest);
+		let path_and_query = rest.find(['/', '?', '#']).map_or("", |at| &rest[at..]);
+		origin == open_cloud && secure && apikey::route_allowed(path_and_query)
+	}
+
 	/// One GET, following redirects without any of the original headers. The credential goes only on
-	/// the first hop and only for the assetdelivery origin: the cookie to it, a broker's token to the
-	/// broker, which is sent the request in its place.
+	/// the first hop: the cookie to the assetdelivery origin, a broker's token to the broker, which is
+	/// sent an assetdelivery request in its place, an API key to Open Cloud's asset delivery route.
 	pub(crate) fn get(&self, url: &str, credential: Option<&Credential>, accept: &str) -> Result<Reply, Failure> {
 		let mut current = url.to_string();
 		for hop in 0..=MAX_REDIRECTS {
@@ -248,6 +290,7 @@ impl Client {
 
 			// Only the first hop to the assetdelivery origin carries the credential and extra headers
 			let to_assetdelivery = hop == 0 && self.cookie_allowed(&current);
+			let key = credential.and_then(Credential::api_key).filter(|_| hop == 0 && self.key_allowed(&current));
 			let broker = credential.filter(|_| to_assetdelivery).and_then(Credential::broker);
 			let mut request = match broker {
 				Some(broker) => self.broker_agent(broker).get(broker.forward(&current).ok_or(Failure::BadUrl("not an http(s) URL"))?),
@@ -261,8 +304,11 @@ impl Client {
 				request = match credential {
 					Some(Credential::Cookie(secret)) => request.header("Cookie", format!(".ROBLOSECURITY={}", secret.expose())),
 					Some(Credential::Broker(broker)) => request.header("Authorization", format!("Bearer {}", broker.token.expose())),
-					None => request,
+					Some(Credential::ApiKey(_)) | None => request,
 				};
+			}
+			if let Some(key) = key {
+				request = request.header("x-api-key", key.expose());
 			}
 
 			let _permit = self.permits.acquire();
@@ -270,17 +316,18 @@ impl Client {
 			let status = response.status().as_u16();
 			let header = |name: &str| response.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
 			let retry_after = header("retry-after").and_then(|v| v.trim().parse::<u64>().ok()).map(Duration::from_secs);
+			let limits = ratelimit::Headers::parse(header);
 
 			if let Some(broker) = broker
 				&& let Some(code) = header("x-broker-error")
 			{
 				let said = response.body_mut().with_config().limit(MAX_REFUSAL).read_to_vec().unwrap_or_default();
-				return Ok(Reply { status, body: Vec::new(), host: host_of(&current), retry_after, broker_error: Some(broker.refusal(&code, &said)) });
+				return Ok(Reply { status, body: Vec::new(), host: host_of(&current), retry_after, limits, broker_error: Some(broker.refusal(&code, &said)) });
 			}
 
 			if matches!(status, 301 | 302 | 303 | 307 | 308) {
 				let Some(location) = header("location") else {
-					return Ok(Reply { status, body: Vec::new(), host: host_of(&current), retry_after: None, broker_error: None });
+					return Ok(Reply { status, body: Vec::new(), host: host_of(&current), retry_after: None, limits, broker_error: None });
 				};
 				current = resolve_location(&current, &location).ok_or(Failure::BadUrl("redirect target"))?;
 				continue;
@@ -292,7 +339,7 @@ impl Client {
 				.limit(MAX_BODY)
 				.read_to_vec()
 				.map_err(|e| Failure::Transport(describe(&e)))?;
-			return Ok(Reply { status, body, host: host_of(&current), retry_after, broker_error: None });
+			return Ok(Reply { status, body, host: host_of(&current), retry_after, limits, broker_error: None });
 		}
 		Err(Failure::Transport("too many redirects".into()))
 	}
@@ -304,6 +351,9 @@ impl Client {
 	pub(crate) fn post_json(&self, url: &str, body: &[u8], credential: Option<&Credential>) -> Result<Reply, Failure> {
 		if !self.cookie_allowed(url) {
 			return Err(Failure::BadUrl("POST only to assetdelivery"));
+		}
+		if credential.and_then(Credential::api_key).is_some() {
+			return Err(Failure::BadUrl("an API key has no batch route"));
 		}
 		let broker = credential.and_then(Credential::broker);
 		let mut csrf: Option<String> = None;
@@ -320,7 +370,7 @@ impl Client {
 			request = match credential {
 				Some(Credential::Cookie(secret)) => request.header("Cookie", format!(".ROBLOSECURITY={}", secret.expose())),
 				Some(Credential::Broker(broker)) => request.header("Authorization", format!("Bearer {}", broker.token.expose())),
-				None => request,
+				Some(Credential::ApiKey(_)) | None => request,
 			};
 			if let Some(token) = &csrf {
 				request = request.header("X-CSRF-TOKEN", token.as_str());
@@ -330,11 +380,12 @@ impl Client {
 			let status = response.status().as_u16();
 			let header = |name: &str| response.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
 			let retry_after = header("retry-after").and_then(|v| v.trim().parse::<u64>().ok()).map(Duration::from_secs);
+			let limits = ratelimit::Headers::parse(header);
 			if let Some(broker) = broker
 				&& let Some(code) = header("x-broker-error")
 			{
 				let said = response.body_mut().with_config().limit(MAX_REFUSAL).read_to_vec().unwrap_or_default();
-				return Ok(Reply { status, body: Vec::new(), host: host_of(url), retry_after, broker_error: Some(broker.refusal(&code, &said)) });
+				return Ok(Reply { status, body: Vec::new(), host: host_of(url), retry_after, limits, broker_error: Some(broker.refusal(&code, &said)) });
 			}
 			if status == 403
 				&& csrf.is_none()
@@ -345,29 +396,37 @@ impl Client {
 				continue;
 			}
 			let body = response.body_mut().with_config().limit(MAX_BODY).read_to_vec().map_err(|e| Failure::Transport(describe(&e)))?;
-			return Ok(Reply { status, body, host: host_of(url), retry_after, broker_error: None });
+			return Ok(Reply { status, body, host: host_of(url), retry_after, limits, broker_error: None });
 		}
 		Err(Failure::Transport("CSRF token refused".into()))
 	}
 
 	/// [`Client::post_json`] with [`Client::get_retrying`]'s retries.
 	pub(crate) fn post_json_retrying(&self, url: &str, body: &[u8], credential: Option<&Credential>) -> Result<Reply, Failure> {
-		self.retrying(|| self.post_json(url, body, credential))
+		self.retrying(None, || self.post_json(url, body, credential))
 	}
 
 	/// [`Client::get`] with retries: 429 and 5xx responses and transport failures are retried with
 	/// exponential backoff (0.25 s doubling, `Retry-After` honoured up to 30 s), 5 attempts. What a
 	/// broker refuses itself is the answer at once (a signed-out account stays signed out), but for
-	/// its rate limit.
+	/// its rate limit. Requests with an API key go at the pace of its rate limit ([`crate::ratelimit`]),
+	/// which a 429 sets for all of them.
 	pub(crate) fn get_retrying(&self, url: &str, credential: Option<&Credential>, accept: &str) -> Result<Reply, Failure> {
-		self.retrying(|| self.get(url, credential, accept))
+		let limit = credential.and_then(Credential::api_key).map(|_| &self.key_limit);
+		self.retrying(limit, || self.get(url, credential, accept))
 	}
 
-	fn retrying(&self, request: impl Fn() -> Result<Reply, Failure>) -> Result<Reply, Failure> {
+	fn retrying(&self, limit: Option<&RateLimit>, request: impl Fn() -> Result<Reply, Failure>) -> Result<Reply, Failure> {
 		let mut attempt = 0u32;
 		loop {
 			attempt += 1;
+			if let Some(limit) = limit {
+				limit.wait();
+			}
 			let result = request();
+			if let (Some(limit), Ok(reply)) = (limit, &result) {
+				limit.observe(std::time::Instant::now(), reply.status, &reply.limits, reply.retry_after);
+			}
 			let retry_after = match &result {
 				Ok(reply) if reply.broker_error.is_some() && reply.status != 429 => None,
 				Ok(reply) if matches!(reply.status, 429 | 500 | 502 | 503 | 504) => Some(reply.retry_after),
@@ -379,6 +438,10 @@ impl Client {
 			};
 			if attempt >= MAX_ATTEMPTS {
 				return result;
+			}
+			// the rate limit's pause is the wait (limit.wait above), shared by every request with the key
+			if limit.is_some() && matches!(&result, Ok(reply) if reply.status == 429) {
+				continue;
 			}
 			let backoff = Duration::from_millis(250u64 << (attempt - 1).min(6)) + jitter();
 			std::thread::sleep(retry_after.map_or(backoff, |d| d.min(Duration::from_secs(30))));
@@ -445,5 +508,36 @@ mod tests {
 		assert!(!client.cookie_allowed("https://fts.rbxcdn.com/sc5/abc"));
 		assert!(!client.cookie_allowed("https://thumbnails.roblox.com/v1/assets"));
 		assert!(!client.cookie_allowed("https://www.roblox.com/asset/?id=1"));
+	}
+
+	#[test]
+	fn api_key_only_for_open_clouds_asset_route() {
+		let client = Client::new(Endpoints::production(), 1, &[]);
+		assert!(client.key_allowed("https://apis.roblox.com/asset-delivery-api/v1/assetId/1"));
+		assert!(client.key_allowed("https://APIS.roblox.com:443/asset-delivery-api/v1/assetId/1/version/2?contentRepresentationPriorityList=x&doNotFallbackToBaselineRepresentation=true"));
+		for refused in [
+			"http://apis.roblox.com/asset-delivery-api/v1/assetId/1",
+			"https://apis.roblox.com:8443/asset-delivery-api/v1/assetId/1",
+			"https://apis.roblox.com.evil.com/asset-delivery-api/v1/assetId/1",
+			"https://assetdelivery.roblox.com/v1/assetId/1",
+			"https://assetdelivery.roblox.com/asset-delivery-api/v1/assetId/1",
+			"https://apis.roblox.com/universes/v1/places/1/universe",
+			"https://apis.roblox.com/asset-delivery-api/v1/assets/batch",
+			"https://apis.roblox.com/asset-delivery-api/v1/assetId/1?id=2",
+			"https://fts.rbxcdn.com/asset-delivery-api/v1/assetId/1",
+			"https://thumbnails.roblox.com/asset-delivery-api/v1/assetId/1",
+		] {
+			assert!(!client.key_allowed(refused), "{refused}");
+		}
+		// userinfo names no host
+		const AT: char = '@';
+		assert!(!client.key_allowed(&format!("https://apis.roblox.com{AT}evil.com/asset-delivery-api/v1/assetId/1")));
+		// endpoints naming another Open Cloud origin outside the tests send it nowhere
+		let elsewhere = Client::new(Endpoints { open_cloud: "https://elsewhere.example".into(), ..Endpoints::production() }, 1, &[]);
+		assert!(!elsewhere.key_allowed("https://elsewhere.example/asset-delivery-api/v1/assetId/1"));
+		assert!(!elsewhere.key_allowed("https://apis.roblox.com/asset-delivery-api/v1/assetId/1"));
+		// a POST never carries it
+		let key = Credential::ApiKey(Secret::plain("TEST-API-KEY-0123456789").unwrap());
+		assert!(matches!(client.post_json("https://assetdelivery.roblox.com/v1/assets/batch", b"[]", Some(&key)), Err(Failure::BadUrl(_))));
 	}
 }

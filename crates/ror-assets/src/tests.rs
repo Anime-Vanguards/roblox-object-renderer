@@ -1,20 +1,23 @@
-//! Resolver tests against local mock HTTP servers (std `TcpListener`), with a fake cookie.
+//! Resolver tests against local mock HTTP servers (std `TcpListener`), with a fake cookie, broker token
+//! and API key. Every test presets the credentials it uses: none is read from the environment.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
+use crate::apikey::KeySource;
 use crate::broker::{Broker, BrokerSource, Unusable};
 use crate::cookie::{CookieSource, Secret};
 use crate::http::Endpoints;
-use crate::{Account, AssetConfig, AssetError, Assets, Source, Transcode};
+use crate::{Account, AssetConfig, AssetError, Assets, Key, Source, Transcode};
 
 const TEST_COOKIE: &str = "TEST-COOKIE-0123456789";
 const TEST_TOKEN: &str = "TEST-TOKEN-0123456789";
+const TEST_KEY: &str = "TEST-API-KEY-0123456789abcdefghij";
 
 #[derive(Clone, Debug)]
 struct Recorded {
@@ -22,6 +25,8 @@ struct Recorded {
 	path: String,
 	headers: Vec<(String, String)>,
 	body: Vec<u8>,
+	/// When the request arrived
+	at: Instant,
 }
 
 impl Recorded {
@@ -146,7 +151,7 @@ fn serve(mut stream: TcpStream, requests: &Mutex<Vec<Recorded>>, handler: &Handl
 			Ok(n) => body.extend_from_slice(&buf[..n]),
 		}
 	}
-	let recorded = Recorded { method, path, headers, body };
+	let recorded = Recorded { method, path, headers, body, at: Instant::now() };
 	requests.lock().push(recorded.clone());
 
 	let reply = handler(&recorded);
@@ -172,19 +177,19 @@ fn temp_state(name: &str) -> std::path::PathBuf {
 }
 
 fn endpoints(assetdelivery: &MockServer, thumbnails: &MockServer) -> Endpoints {
-	Endpoints { assetdelivery: assetdelivery.origin(), thumbnails: thumbnails.origin(), universes: thumbnails.origin(), allow_http: true }
+	Endpoints { assetdelivery: assetdelivery.origin(), thumbnails: thumbnails.origin(), universes: thumbnails.origin(), open_cloud: thumbnails.origin(), allow_http: true }
 }
 
 fn assets(config: AssetConfig, endpoints: Endpoints, cookie: bool) -> Assets {
 	let account = Account::find(None, || cookie.then(|| (Secret::new(TEST_COOKIE).unwrap(), CookieSource::Env("TEST"))));
-	Assets::with_endpoints(config, endpoints, Some(account))
+	Assets::with_endpoints(config, endpoints, Some(account), Some(Key::find(None)))
 }
 
 /// Assets whose account is used through `broker` with a fake token; reading a cookie source fails the test.
 fn via_broker(config: AssetConfig, endpoints: Endpoints, broker: &MockServer) -> Assets {
 	let found = Ok((Broker { base: broker.origin(), token: Secret::new(TEST_TOKEN).unwrap() }, BrokerSource::Env));
 	let account = Account::find(Some(found), || panic!("a cookie source was read with a broker's credentials"));
-	Assets::with_endpoints(config, endpoints, Some(account))
+	Assets::with_endpoints(config, endpoints, Some(account), Some(Key::find(None)))
 }
 
 /// The broker's path for a request to `path` on the mock assetdelivery.
@@ -201,6 +206,7 @@ fn no_cookie_anywhere(servers: &[&MockServer]) {
 		for r in server.requests() {
 			assert!(r.header("Cookie").is_none(), "cookie sent to {}{}", server.origin(), r.path);
 			assert!(r.header("Authorization").is_none());
+			assert!(r.header("x-api-key").is_none(), "API key sent to {}{}", server.origin(), r.path);
 		}
 	}
 }
@@ -1128,11 +1134,405 @@ fn unusable_broker_credentials_are_said_not_skipped() {
 	let ad = MockServer::start(|_| Reply::json(NEEDS_ACCOUNT));
 	let found = Err(Unusable { source: BrokerSource::Env, why: "the broker URL must be https (plain http only for 127.0.0.1 or localhost)" });
 	let account = Account::find(Some(found), || panic!("a cookie source was read with a broker's credentials"));
-	let a = Assets::with_endpoints(AssetConfig::new(temp_state("broker-unusable")), endpoints(&ad, &ad), Some(account));
+	let a = Assets::with_endpoints(AssetConfig::new(temp_state("broker-unusable")), endpoints(&ad, &ad), Some(account), Some(Key::find(None)));
 	assert!(!a.has_cookie());
 	assert_eq!(a.cookie_source(), None);
 	let error = a.fetch("rbxassetid://42").unwrap_err().to_string();
 	assert_eq!(error, "rbxassetid://42: account broker credentials (env ROBLOX_BROKER_TOKEN) not usable: the broker URL must be https (plain http only for 127.0.0.1 or localhost)");
 	assert_eq!(ad.requests().len(), 1, "the public route alone");
 	no_cookie_anywhere(&[&ad]);
+}
+
+// --- an Open Cloud API key ------------------------------------------------------------------------------
+
+/// Assets with the fake API key and, when `cookie`, the fake cookie as the account's credential.
+fn with_key(config: AssetConfig, endpoints: Endpoints, cookie: bool) -> Assets {
+	let account = Account::find(None, || cookie.then(|| (Secret::new(TEST_COOKIE).unwrap(), CookieSource::Env("TEST"))));
+	Assets::with_endpoints(config, endpoints, Some(account), Some(test_key()))
+}
+
+fn test_key() -> Key {
+	Key::find(Some((Secret::plain(TEST_KEY).unwrap(), KeySource::Env)))
+}
+
+/// `endpoints` with Open Cloud at `open_cloud`.
+fn with_open_cloud(endpoints: Endpoints, open_cloud: &MockServer) -> Endpoints {
+	Endpoints { open_cloud: open_cloud.origin(), ..endpoints }
+}
+
+/// The key's route for an asset on the mock Open Cloud.
+fn key_path(id: &str) -> String {
+	format!("/asset-delivery-api/v1/assetId/{id}")
+}
+
+fn no_key_anywhere(servers: &[&MockServer]) {
+	for server in servers {
+		for r in server.requests() {
+			assert!(r.header("x-api-key").is_none(), "API key sent to {}{}", server.origin(), r.path);
+		}
+	}
+}
+
+/// Every file under `dir`: neither its name nor its bytes hold the key.
+fn key_nowhere_in(dir: &std::path::Path) {
+	let mut stack = vec![dir.to_path_buf()];
+	let mut files = 0;
+	while let Some(dir) = stack.pop() {
+		for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+			let path = entry.path();
+			assert!(!path.to_string_lossy().contains(TEST_KEY), "{}", path.display());
+			if path.is_dir() {
+				stack.push(path);
+			} else {
+				files += 1;
+				let bytes = std::fs::read(&path).unwrap();
+				assert!(!bytes.windows(12).any(|run| TEST_KEY.as_bytes().windows(12).any(|part| part == run)), "the key in {}", path.display());
+			}
+		}
+	}
+	assert!(files > 0, "nothing was written to look at");
+}
+
+#[test]
+fn an_api_key_goes_only_to_open_clouds_route() {
+	let real = MockServer::start(|r| if r.path == "/real/42" { Reply::bytes(MESH) } else { Reply::status(404) });
+	let real_url = real.url("/real/42");
+	let cdn = MockServer::start(move |r| if r.path == "/obj/42" { Reply::redirect(&real_url) } else { Reply::status(404) });
+	let cdn_url = cdn.url("/obj/42");
+	let ad = {
+		let cdn_url = cdn_url.clone();
+		MockServer::start(move |r| if r.path == "/v1/assetId/5" { Reply::json(&format!("{{\"location\":\"{cdn_url}\"}}")) } else { Reply::json(NEEDS_ACCOUNT) })
+	};
+	let paths = [key_path("42"), format!("{}/version/3", key_path("42"))];
+	let oc = MockServer::start(move |r| {
+		if r.method == "GET" && paths.contains(&r.path) && r.header("x-api-key") == Some(TEST_KEY) {
+			Reply::json(&format!("{{\"location\":\"{cdn_url}\"}}"))
+		} else {
+			Reply::status(404)
+		}
+	});
+	let config = AssetConfig { assetdelivery_headers: vec![("Roblox-Place-Id".into(), "123".into())], ..AssetConfig::new(temp_state("key")) };
+	let a = with_key(config, with_open_cloud(endpoints(&ad, &cdn), &oc), false);
+	let fetched = a.fetch("rbxassetid://42").unwrap();
+	assert_eq!((fetched.bytes.as_slice(), fetched.source), (MESH, Source::Network));
+	assert_eq!(a.fetch("rbxassetid://42?version=3").unwrap().bytes, MESH);
+
+	// the public route first, then the same asset on the key's route with the key alone
+	assert_eq!(ad.requests().iter().map(|r| r.path.as_str()).collect::<Vec<_>>(), ["/v1/assetId/42", "/v1/assetId/42/version/3"]);
+	let through = oc.requests();
+	assert_eq!(through.len(), 2);
+	for r in &through {
+		assert_eq!(r.header("x-api-key"), Some(TEST_KEY));
+		assert_eq!(r.header("Cookie"), None);
+		assert_eq!(r.header("Authorization"), None);
+		assert_eq!(r.header("Roblox-Place-Id"), None, "assetdelivery's extra headers stay with assetdelivery");
+		assert_eq!(r.header("Accept"), Some("application/json"));
+	}
+	// a public asset never goes near the key's route
+	assert_eq!(a.fetch("rbxassetid://5").unwrap().bytes, MESH);
+	assert_eq!(oc.requests().len(), 2);
+	no_cookie_anywhere(&[&ad, &cdn, &real]);
+
+	// what is reported is where the key came from, never the key
+	assert!(a.has_api_key());
+	assert_eq!(a.api_key_source().as_deref(), Some("env ROBLOX_ASSET_DELIVERY_API_KEY"));
+	assert!(!a.has_cookie());
+	assert!(!format!("{:?}", a.api_key()).contains(TEST_KEY));
+}
+
+#[test]
+fn the_keys_route_keeps_the_transcode_query() {
+	use crate::transcode::query_escape;
+
+	let cdn = MockServer::start(|r| if r.path == "/ktx2" { Reply::bytes(KTX2) } else { Reply::status(404) });
+	let ktx_url = cdn.url("/ktx2");
+	let ad = MockServer::start(|_| Reply::json(NEEDS_ACCOUNT));
+	let oc = MockServer::start(move |r| {
+		let Some((path, query)) = r.path.split_once('?') else {
+			return Reply::status(400);
+		};
+		let named = query == format!("contentRepresentationPriorityList={}&doNotFallbackToBaselineRepresentation=true", query_escape(&Transcode::Image.priority_list(0)));
+		if path == format!("{}/version/2", key_path("6")) && named && r.header("x-api-key") == Some(TEST_KEY) {
+			Reply::json(&format!(r#"{{"location":"{ktx_url}","contentRepresentationSpecifier":{{"format":"ktx2","majorVersion":"7rdo"}}}}"#))
+		} else {
+			Reply::status(400)
+		}
+	});
+	let a = with_key(AssetConfig::new(temp_state("key-transcode")), with_open_cloud(endpoints(&ad, &cdn), &oc), false);
+	let pack = a.fetch_transcode("rbxassetid://6?version=2", Transcode::Image, 0).unwrap();
+	assert_eq!((pack.bytes.as_slice(), pack.source), (KTX2, Source::Network));
+	// the public route was asked with the same query first
+	let public = ad.requests();
+	assert_eq!(public.len(), 1);
+	assert_eq!(public[0].path.split_once('?').map(|(_, query)| query), oc.requests()[0].path.split_once('?').map(|(_, query)| query));
+	no_key_anywhere(&[&ad, &cdn]);
+}
+
+#[test]
+fn an_api_key_never_crosses_redirects() {
+	let real = MockServer::start(|_| Reply::bytes(MESH));
+	let real_url = real.url("/real");
+	let other = {
+		let real_url = real_url.clone();
+		MockServer::start(move |_| Reply::json(&format!("{{\"location\":\"{real_url}\"}}")))
+	};
+	let other_url = other.url("/json");
+	let ad = {
+		let real_url = real_url.clone();
+		MockServer::start(move |r| if r.path == "/again/9" { Reply::json(&format!("{{\"location\":\"{real_url}\"}}")) } else { Reply::json(NEEDS_ACCOUNT) })
+	};
+	let ad_again = ad.url("/again/9");
+	let oc = MockServer::start(move |r| {
+		let keyed = r.header("x-api-key") == Some(TEST_KEY);
+		match r.path.as_str() {
+			// to another host
+			path if path == key_path("7") && keyed => Reply::redirect(&other_url),
+			// back to the key's own route on the same origin, for another asset
+			path if path == key_path("8") && keyed => Reply::redirect(&key_path("80")),
+			path if path == key_path("80") && !keyed => Reply::json(&format!("{{\"location\":\"{real_url}\"}}")),
+			// to assetdelivery
+			path if path == key_path("9") && keyed => Reply::redirect(&ad_again),
+			_ => Reply::status(404),
+		}
+	});
+	let a = with_key(AssetConfig::new(temp_state("key-redirect")), with_open_cloud(endpoints(&ad, &other), &oc), false);
+	for id in [7, 8, 9] {
+		assert_eq!(a.fetch(&format!("rbxassetid://{id}")).unwrap().bytes, MESH, "{id}");
+	}
+	no_key_anywhere(&[&other, &real, &ad]);
+	let through = oc.requests();
+	assert_eq!(through.iter().filter(|r| r.header("x-api-key").is_some()).count(), 3, "the first hop of each");
+	let second: Vec<&Recorded> = through.iter().filter(|r| r.path == key_path("80")).collect();
+	assert_eq!(second.len(), 1);
+	assert_eq!(second[0].header("x-api-key"), None, "a redirected hop to the key's own route");
+}
+
+#[test]
+fn the_key_comes_before_the_account() {
+	let cdn = MockServer::start(|_| Reply::bytes(MESH));
+	let cdn_url = cdn.url("/obj");
+	let ad = {
+		let cdn_url = cdn_url.clone();
+		MockServer::start(move |r| if r.header("Cookie").is_some() { Reply::json(&format!("{{\"location\":\"{cdn_url}\"}}")) } else { Reply::json(NEEDS_ACCOUNT) })
+	};
+	let oc = {
+		let cdn_url = cdn_url.clone();
+		MockServer::start(move |r| match r.path.rsplit('/').next().unwrap_or("") {
+			"1" => Reply::json(&format!("{{\"location\":\"{cdn_url}\"}}")),
+			"2" => Reply::json(r#"{"errors":[{"code":403,"message":"User is not authorized to access Asset."}]}"#),
+			"3" => Reply::status(404),
+			_ => {
+				let mut reply = Reply::status(500);
+				reply.headers.push(("Retry-After".into(), "0".into()));
+				reply
+			}
+		})
+	};
+	let cookie_asked = |id: &str| ad.requests().iter().filter(|r| r.path == format!("/v1/assetId/{id}") && r.header("Cookie").is_some()).count();
+	let a = with_key(AssetConfig::new(temp_state("key-order")), with_open_cloud(endpoints(&ad, &cdn), &oc), true);
+
+	// the key has it: the cookie is never sent
+	assert_eq!(a.fetch("rbxassetid://1").unwrap().bytes, MESH);
+	assert_eq!(cookie_asked("1"), 0);
+	// refused to the key, or not found to it, or its route down: then the cookie
+	for id in ["2", "3", "4"] {
+		assert_eq!(a.fetch(&format!("rbxassetid://{id}")).unwrap().bytes, MESH, "{id}");
+		assert_eq!(cookie_asked(id), 1, "{id}");
+		let public = ad.requests().into_iter().find(|r| r.path == format!("/v1/assetId/{id}") && r.header("Cookie").is_none()).unwrap();
+		let keyed = oc.requests().into_iter().find(|r| r.path == key_path(id)).unwrap();
+		let cookie = ad.requests().into_iter().find(|r| r.path == format!("/v1/assetId/{id}") && r.header("Cookie").is_some()).unwrap();
+		assert!(public.at <= keyed.at && keyed.at <= cookie.at, "{id}: public, then the key, then the cookie");
+	}
+	no_key_anywhere(&[&ad, &cdn]);
+
+	// a broker's token comes after the key too
+	let broker = {
+		let cdn_url = cdn_url.clone();
+		MockServer::start(move |_| Reply::json(&format!("{{\"location\":\"{cdn_url}\"}}")))
+	};
+	let found = Ok((Broker { base: broker.origin(), token: Secret::new(TEST_TOKEN).unwrap() }, BrokerSource::Env));
+	let account = Account::find(Some(found), || panic!("a cookie source was read with a broker's credentials"));
+	let b = Assets::with_endpoints(AssetConfig::new(temp_state("key-broker")), with_open_cloud(endpoints(&ad, &cdn), &oc), Some(account), Some(test_key()));
+	assert_eq!(b.fetch("rbxassetid://1").unwrap().bytes, MESH);
+	assert!(broker.requests().is_empty());
+	assert_eq!(b.fetch("rbxassetid://2").unwrap().bytes, MESH);
+	assert_eq!(broker.requests().len(), 1);
+	no_key_anywhere(&[&broker]);
+}
+
+#[test]
+fn refused_to_the_key_alone() {
+	let ad = MockServer::start(|_| Reply::json(NEEDS_ACCOUNT));
+	let oc = MockServer::start(|r| match r.path.rsplit('/').next().unwrap_or("") {
+		"2" => Reply::json(r#"{"errors":[{"code":403,"message":"User is not authorized to access Asset.","customErrorCode":19}]}"#),
+		_ => Reply::status(404),
+	});
+	let state = temp_state("key-refused");
+	let a = with_key(AssetConfig::new(&state), with_open_cloud(endpoints(&ad, &ad), &oc), false);
+	// the key's refusal is the answer, and final: remembered
+	let error = a.fetch("rbxassetid://2").unwrap_err();
+	assert_eq!(error.to_string(), "rbxassetid://2: HTTP 403, rejected by Roblox moderation");
+	// not found to the key, which the public route said needs authentication: that refusal
+	let error = a.fetch("rbxassetid://3").unwrap_err();
+	assert_eq!(error.to_string(), "rbxassetid://3: HTTP 401, authentication required");
+	let asked = (ad.requests().len(), oc.requests().len());
+	let again = with_key(AssetConfig::new(&state), with_open_cloud(endpoints(&ad, &ad), &oc), false);
+	assert!(again.fetch("rbxassetid://2").is_err());
+	assert!(again.fetch("rbxassetid://3").is_err());
+	assert_eq!((ad.requests().len(), oc.requests().len()), asked, "both remembered");
+}
+
+#[test]
+fn the_key_never_shows() {
+	let cdn = MockServer::start(|_| Reply::bytes(MESH));
+	let cdn_url = cdn.url("/obj");
+	let ad = MockServer::start(|_| Reply::json(NEEDS_ACCOUNT));
+	let oc = MockServer::start(move |r| {
+		let echo = r.header("x-api-key").unwrap_or("").to_string();
+		match r.path.rsplit('/').next().unwrap_or("") {
+			"1" => Reply::json(&format!("{{\"location\":\"{cdn_url}\"}}")),
+			// a server echoing the key, whole or cut, in its error
+			"2" => Reply::json(&serde_json::json!({ "errors": [{ "code": 403, "message": format!("Invalid API key {echo}"), "customErrorCode": 77 }] }).to_string()),
+			"3" => Reply::json(&serde_json::json!({ "errors": [{ "code": 401, "message": format!("key {}", &echo[..16]), "customErrorCode": 5 }] }).to_string()),
+			// a plain one is kept
+			_ => Reply::json(r#"{"errors":[{"code":403,"message":"Something new","customErrorCode":77}]}"#),
+		}
+	});
+	let state = temp_state("key-hidden");
+	let a = with_key(AssetConfig::new(&state), with_open_cloud(endpoints(&ad, &cdn), &oc), false);
+	assert_eq!(a.fetch("rbxassetid://1").unwrap().bytes, MESH);
+	let mut shown = Vec::new();
+	for id in [2, 3, 4] {
+		let error = a.fetch(&format!("rbxassetid://{id}")).unwrap_err();
+		shown.push(format!("{error} {error:?}"));
+	}
+	assert_eq!(shown[0].split(" Http").next().unwrap(), "rbxassetid://2: HTTP 403, \"<message withheld>\"");
+	assert_eq!(shown[1].split(" Http").next().unwrap(), "rbxassetid://3: HTTP 401, \"<message withheld>\"");
+	assert_eq!(shown[2].split(" Http").next().unwrap(), "rbxassetid://4: HTTP 403, \"Something new\"");
+	for text in &shown {
+		assert!(!text.contains(&TEST_KEY[..12]), "{text}");
+	}
+	// a second instance answers from what was remembered: still without it
+	let again = with_key(AssetConfig::new(&state), with_open_cloud(endpoints(&ad, &cdn), &oc), false);
+	assert!(!again.fetch("rbxassetid://2").unwrap_err().to_string().contains(&TEST_KEY[..12]));
+	// the cache, the refusal records and their names never hold it
+	key_nowhere_in(&state);
+	// debug output of the credentials
+	assert!(!format!("{:?} {:?}", a.api_key(), test_key().credential).contains(TEST_KEY));
+	no_key_anywhere(&[&ad, &cdn]);
+}
+
+#[test]
+fn the_keys_rate_limit_is_waited_out() {
+	let cdn = MockServer::start(|_| Reply::bytes(MESH));
+	let cdn_url = cdn.url("/obj");
+	let ad = MockServer::start(|_| Reply::json(NEEDS_ACCOUNT));
+	let calls = Arc::new(AtomicUsize::new(0));
+	let oc = {
+		let calls = calls.clone();
+		MockServer::start(move |_| match calls.fetch_add(1, Ordering::SeqCst) {
+			// rate limited: try again at once
+			0 => {
+				let mut reply = Reply::status(429);
+				reply.headers.push(("Retry-After".into(), "0".into()));
+				reply
+			}
+			// nothing left of the window for a second
+			1 => {
+				let mut reply = Reply::json(&format!("{{\"location\":\"{cdn_url}\"}}"));
+				reply.headers.extend([("x-ratelimit-limit".into(), "1000".into()), ("x-ratelimit-remaining".into(), "0".into()), ("x-ratelimit-reset".into(), "1".into())]);
+				reply
+			}
+			_ => Reply::json(&format!("{{\"location\":\"{cdn_url}\"}}")),
+		})
+	};
+	let a = with_key(AssetConfig::new(temp_state("key-limit")), with_open_cloud(endpoints(&ad, &cdn), &oc), false);
+	assert_eq!(a.fetch("rbxassetid://1").unwrap().bytes, MESH);
+	assert_eq!(oc.requests().len(), 2, "the 429 was waited out, not the answer");
+	assert_eq!(a.fetch("rbxassetid://2").unwrap().bytes, MESH);
+	let requests = oc.requests();
+	assert_eq!(requests.len(), 3);
+	let waited = requests[2].at.duration_since(requests[1].at);
+	assert!(waited >= Duration::from_millis(900), "the next request waited for the window: {waited:?}");
+	// the public route is never held back by the key's limit
+	assert_eq!(ad.requests().len(), 2);
+}
+
+#[test]
+fn warm_asks_the_key_one_asset_at_a_time() {
+	let cdn = MockServer::start(|r| if r.path.starts_with("/cdn/") { Reply::bytes(MESH) } else { Reply::status(404) });
+	let cdn_origin = cdn.origin();
+	// the batch: 1 is public, the others need more; with the cookie, 3 too
+	let ad = MockServer::start(move |r| {
+		if r.method != "POST" || r.path != "/v1/assets/batch" {
+			return Reply::status(404);
+		}
+		let cookie = r.header("Cookie").is_some();
+		let requests: Vec<serde_json::Value> = serde_json::from_slice(&r.body).unwrap_or_default();
+		let replies: Vec<serde_json::Value> = requests
+			.iter()
+			.map(|request| {
+				let id = request["assetId"].as_u64().unwrap_or(0);
+				if id == 1 || (cookie && id == 3) {
+					serde_json::json!({ "requestId": request["requestId"], "location": format!("{cdn_origin}/cdn/{id}") })
+				} else {
+					serde_json::json!({ "requestId": request["requestId"], "errors": [{ "code": 403, "message": "no" }] })
+				}
+			})
+			.collect();
+		Reply::json(&serde_json::to_string(&replies).unwrap())
+	});
+	let cdn_url = cdn.url("/cdn/2");
+	// the key: 2 only
+	let oc = MockServer::start(move |r| {
+		if r.method == "GET" && r.path == key_path("2") && r.header("x-api-key") == Some(TEST_KEY) {
+			Reply::json(&format!("{{\"location\":\"{cdn_url}\"}}"))
+		} else {
+			Reply::json(r#"{"errors":[{"code":403,"message":"User is not authorized to access Asset."}]}"#)
+		}
+	});
+	let state = temp_state("key-warm");
+	let a = with_key(AssetConfig { max_concurrent_downloads: 4, ..AssetConfig::new(&state) }, with_open_cloud(endpoints(&ad, &cdn), &oc), true);
+	let downloads: Vec<crate::Download> = (1..=4).map(|id| crate::Download::Asset(format!("rbxassetid://{id}"))).collect();
+	let report = a.warm(&downloads, &|_| 0);
+	assert_eq!((report.downloaded, report.failed), (3, 1));
+
+	// a batch without the cookie, one request with the key per refused asset, a batch with the cookie for what the key was refused
+	let batches = ad.requests();
+	let ids = |r: &Recorded| serde_json::from_slice::<Vec<serde_json::Value>>(&r.body).unwrap().iter().map(|request| request["assetId"].as_u64().unwrap()).collect::<Vec<_>>();
+	assert_eq!(batches.len(), 2);
+	assert_eq!((batches[0].header("Cookie"), ids(&batches[0])), (None, vec![1, 2, 3, 4]));
+	assert_eq!((batches[1].header("Cookie"), ids(&batches[1])), (Some(format!(".ROBLOSECURITY={TEST_COOKIE}").as_str()), vec![3, 4]));
+	let mut keyed: Vec<String> = oc.requests().iter().map(|r| r.path.clone()).collect();
+	keyed.sort();
+	assert_eq!(keyed, [key_path("2"), key_path("3"), key_path("4")]);
+	assert!(oc.requests().iter().all(|r| r.method == "GET" && r.header("x-api-key") == Some(TEST_KEY) && r.header("Cookie").is_none()));
+	no_key_anywhere(&[&ad, &cdn]);
+	// the files are on disk, and 4's refusal is final (every credential tried): nothing is asked again
+	let asked = (ad.requests().len(), oc.requests().len());
+	for id in 1..=3 {
+		assert_eq!(a.fetch(&format!("rbxassetid://{id}")).unwrap().source, Source::DiskCache);
+	}
+	assert!(matches!(a.fetch("rbxassetid://4"), Err(AssetError::Http { status: 403, .. })));
+	assert_eq!((ad.requests().len(), oc.requests().len()), asked);
+	key_nowhere_in(&state);
+
+	// without an account, what the key is refused is final as well; nothing goes in a second batch
+	let ad_only = batch_server(cdn.origin(), Vec::new(), vec![(2, 403), (4, 403)]);
+	let b = with_key(AssetConfig::new(temp_state("key-warm-alone")), with_open_cloud(endpoints(&ad_only, &cdn), &oc), false);
+	let report = b.warm(&downloads, &|_| 0);
+	assert_eq!((report.downloaded, report.failed), (3, 1));
+	assert_eq!(ad_only.requests().len(), 1);
+	assert!(b.inner.disk.read_refusal("rbxassetid://4", 0).is_some());
+}
+
+#[test]
+fn child_processes_never_get_the_key() {
+	let mut command = std::process::Command::new("child");
+	command.env("ROBLOX_ASSET_DELIVERY_API_KEY", TEST_KEY).env("ROR_COOKIE_ENV", "cookie.env");
+	crate::hide_api_key(&mut command);
+	let envs: Vec<(String, Option<String>)> = command.get_envs().map(|(name, value)| (name.to_string_lossy().into_owned(), value.map(|value| value.to_string_lossy().into_owned()))).collect();
+	assert!(envs.contains(&("ROBLOX_ASSET_DELIVERY_API_KEY".into(), None)), "{envs:?}");
+	// the env file's path, which names no secret, is kept as the cookie's always was
+	assert!(envs.contains(&("ROR_COOKIE_ENV".into(), Some("cookie.env".into()))));
 }

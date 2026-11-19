@@ -99,6 +99,55 @@ pub fn available_memory() -> Option<u64> {
 }
 
 #[cfg(test)]
+mod child_environment_tests {
+	/// Every child process ror starts goes without the Open Cloud API key (`ror_assets::hide_api_key`)
+	/// but those that are ror itself, which download for it, marked "keeps the API key": a scan of the
+	/// sources, so that a new one cannot forget it.
+	#[test]
+	fn no_child_process_inherits_the_api_key() {
+		let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+		let (mut spawns, mut unguarded) = (0, Vec::new());
+		let mut folders = vec![root.join("src"), root.join("examples")];
+		while let Some(folder) = folders.pop() {
+			for entry in std::fs::read_dir(&folder).unwrap().flatten() {
+				let path = entry.path();
+				if path.is_dir() {
+					folders.push(path);
+					continue;
+				}
+				if path.extension().is_none_or(|extension| extension != "rs") {
+					continue;
+				}
+				let text = std::fs::read_to_string(&path).unwrap();
+				let lines: Vec<&str> = text.lines().collect();
+				let mut in_tests = false;
+				for (at, line) in lines.iter().enumerate() {
+					// a top-level test module (`#[cfg(test)]` or `#[cfg(all(test, ...))]`, then `mod name {`) ends at the next top-level `}`
+					if line.starts_with("#[cfg(test)]") || line.starts_with("#[cfg(all(test") {
+						in_tests = lines.get(at + 1).is_some_and(|next| next.starts_with("mod ") && next.trim_end().ends_with('{'));
+						continue;
+					}
+					if in_tests {
+						in_tests = *line != "}";
+						continue;
+					}
+					if !line.contains("Command::new(") || line.trim_start().starts_with("//") {
+						continue;
+					}
+					spawns += 1;
+					let near = &lines[at.saturating_sub(3)..(at + 4).min(lines.len())];
+					if !near.iter().any(|near| near.contains("hide_api_key(") || near.contains("keeps the API key")) {
+						unguarded.push(format!("{}:{}", path.strip_prefix(root).unwrap().display(), at + 1));
+					}
+				}
+			}
+		}
+		assert!(spawns >= 10, "the scan found only {spawns} child processes");
+		assert!(unguarded.is_empty(), "child processes started with the Open Cloud API key in their environment (ror_assets::hide_api_key): {unguarded:?}");
+	}
+}
+
+#[cfg(test)]
 mod memory_guard_tests {
 	use super::{memory_cap, memory_floor};
 	const GIB: u64 = 1 << 30;

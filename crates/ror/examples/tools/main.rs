@@ -93,6 +93,7 @@ fn main() -> ExitCode {
 	let wanted = args.next();
 	match wanted.as_deref().and_then(|wanted| TOOLS.iter().find(|(name, _)| *wanted == **name)) {
 		Some((name, _)) => match std::env::current_exe() {
+			// the tool is this executable again, ror's own code: it keeps the API key
 			Ok(exe) => run(Command::new(exe).args(args).env(TOOL, name)),
 			Err(error) => {
 				eprintln!("ror tools: {error}");

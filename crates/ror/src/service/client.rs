@@ -155,6 +155,7 @@ pub(super) fn start_dormant(state_dir: &Path, offline: bool, build: &str, source
 /// for the virus scanner to see it before the next call of it waits on that.
 pub fn start_successor(state_dir: &Path, source: &Path, build: &str, offline: bool) -> Result<u16> {
 	let mut scan = std::process::Command::new(source);
+	ror_assets::hide_api_key(&mut scan);
 	scan.arg("--version").stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
 	hide_window(&mut scan);
 	scan.status().context("starting the rebuilt executable")?;
@@ -174,6 +175,7 @@ fn hide_window(_: &mut std::process::Command) {}
 /// Starts `exe` as the service; `dormant_idle`: as a dormant copy with that long left before it exits.
 fn start_from(state_dir: &Path, offline: bool, build: &str, exe: PathBuf, source: Option<String>, dormant_idle: Option<Duration>) -> Result<u16> {
 	let log = OpenOptions::new().create(true).append(true).open(state_dir.join("serve.log")).context("opening serve.log")?;
+	// the service is ror itself and downloads for its callers: it keeps the API key, as it keeps the cookie
 	let mut command = std::process::Command::new(&exe);
 	command.arg("serve").arg("--state-dir").arg(state_dir).arg("--build").arg(build);
 	if let Some(source) = &source {

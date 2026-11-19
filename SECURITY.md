@@ -39,6 +39,16 @@ Handling rules:
 - Held in a memory type that cannot be printed/logged and is zeroed on drop.
 - Because a cookie grants full account access, use a dedicated throwaway account if possible.
 
+### Open Cloud API key
+
+`ror` can use an Open Cloud API key (scope `legacy-asset:manage`) instead of, or before, a cookie or broker ([docs/assets.md](docs/assets.md#open-cloud-api-key)). It reads the key at runtime only from the `ROBLOX_ASSET_DELIVERY_API_KEY` environment variable, or a `ROBLOX_ASSET_DELIVERY_API_KEY=` line in the same env files as the cookie.
+
+Handling rules:
+- Sent **only** as the `x-api-key` header, over HTTPS to `https://apis.roblox.com/asset-delivery-api/v1/assetId/{id}[/version/{n}]`, after a request without credentials was refused. Never to another host or path, and never across redirects.
+- Held in the same memory type as the cookie (cannot be printed or logged, zeroed on drop). Never part of URLs, errors, cache keys, file names or cached files; error messages from Roblox that could echo the key are withheld.
+- Removed from the environment of every child process `ror` starts (ffmpeg, Studio, rur, ree), except its own render service, which downloads for it.
+- Give the key only the `legacy-asset:manage` scope, and an IP allowlist if you can.
+
 ### Account broker
 
 Instead of storing a cookie locally, `ror` supports an account broker that holds the Roblox session and proxies asset requests using personal bearer tokens ([docs/assets.md](docs/assets.md#account-broker)).
@@ -52,4 +62,4 @@ Instead of storing a cookie locally, `ror` supports an account broker that holds
 
 ### Accidental leaks
 
-Never paste cookies, tokens, or keys into issues, PRs, or logs. If you accidentally expose a `.ROBLOSECURITY` cookie, immediately sign out of all sessions in your Roblox account settings to invalidate it, then contact us so we can scrub the post.
+Never paste cookies, tokens, or keys into issues, PRs, or logs. If you accidentally expose a `.ROBLOSECURITY` cookie, immediately sign out of all sessions in your Roblox account settings to invalidate it, then contact us so we can scrub the post. An exposed Open Cloud API key is revoked or regenerated on the Creator Dashboard's API Keys page.

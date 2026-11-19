@@ -59,6 +59,8 @@ pub fn record(script: &Path, seconds: f32, options: &Options, out: &Path) -> Res
 		"a .luau input runs in the engine emulator, which was not found: set ROR_REE to a roblox-engine-emulator checkout built with `cargo build --release`, or put one beside this checkout",
 	)?;
 	let mut command = Command::new(&ree);
+	// ree finds its credentials itself, through the env files' paths it inherits: never the API key's value
+	ror_assets::hide_api_key(&mut command);
 	command.arg("record").arg("--harness").arg(crate::output::plain_path(script)).arg("--out").arg(out).arg(format!("--seconds={seconds}"));
 	// An explicit service mount keeps ree from loading its unrelated default project or snapshots.
 	// A class mount at the service itself is a no-op (the service already exists).

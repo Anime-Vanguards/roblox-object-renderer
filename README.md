@@ -61,7 +61,7 @@ Requirements:
 - **Rust 1.90+**
 - **A GPU** supporting Vulkan, Direct3D 12, or Metal
 - **Optional:** A local Roblox Player or Studio installation (not running). `ror` reads built-in textures, skies, avatar meshes, and fonts from it, or from `ROR_ROBLOX_CONTENT`. Without it, `ror` still renders, but built-in skies, studs, and default particle textures will be missing.
-- **Optional:** Roblox Studio is only needed for `--studio` exports and parity checks (`ror compare`, `ror studio`). `ffmpeg`, `rur`, `ree`, and a Roblox cookie/broker are optional; see [docs/building.md](docs/building.md) for details and Cargo feature flags.
+- **Optional:** Roblox Studio is only needed for `--studio` exports and parity checks (`ror compare`, `ror studio`). `ffmpeg`, `rur`, `ree`, and a Roblox Open Cloud API key, cookie or broker are optional; see [docs/building.md](docs/building.md) for details and Cargo feature flags.
 
 ```sh
 cargo build --release
@@ -89,7 +89,7 @@ target/release/ror cost Map.rbxm --sweep 5                                      
 | [docs/cost-loop.md](docs/cost-loop.md) | Cost optimization workflow: per-instance phone ms attribution, findings, what-if edits, visual diffs, and Lune export |
 | [docs/service.md](docs/service.md) | Background render service, concurrency, HTTP API, job JSON, memory admission, and profiling |
 | [docs/viewport-worker.md](docs/viewport-worker.md) | `ror viewport-worker`: persistent 3D worker and JSON protocol for `ViewportFrame`s |
-| [docs/assets.md](docs/assets.md) | Asset downloads, account broker, GPU texture caches, shared content store, and disk management |
+| [docs/assets.md](docs/assets.md) | Asset downloads, Open Cloud API keys, account broker, GPU texture caches, shared content store, and disk management |
 | [docs/parity.md](docs/parity.md) | Measuring parity against Studio: capture place, comparisons, calibration experiments |
 | [docs/rendering.md](docs/rendering.md) | Renderer internals: scene extraction, color pipeline, lighting, shadows, sky, clouds, post effects, GUIs |
 | [docs/materials.md](docs/materials.md) | Built-in materials (2022 & pre-2022), SurfaceAppearance, MaterialVariants, Neon, Glass, ForceField, decals, characters |
@@ -112,7 +112,7 @@ Current limitations:
 ## Contributing, security, and license
 
 - **Contributing:** See [CONTRIBUTING.md](CONTRIBUTING.md) for how pull requests are synced from our internal repo, dev setup, and rules. Coding agents should read [AGENTS.md](AGENTS.md).
-- **Security:** See [SECURITY.md](SECURITY.md) for private vulnerability reporting, Roblox cookie/broker handling, and local HTTP listener security.
+- **Security:** See [SECURITY.md](SECURITY.md) for private vulnerability reporting, Roblox API key, cookie and broker handling, and local HTTP listener security.
 - **Support & conduct:** [SUPPORT.md](SUPPORT.md) · [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
 - **License:** Licensed under GPL-2.0-or-later ([LICENSE](LICENSE)). Because `ror` links third-party crates under licenses including Apache-2.0, compiled binaries are distributed under GPL-3.0-or-later; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 

@@ -7,10 +7,11 @@
 //! `--transcode` fetches a pack of the asset's KTX2 texture transcode instead (`image`: an image
 //! asset; `color`, `normal`, `mr`: a TexturePack's layers), pack 0 unless `--pack` says otherwise.
 //!
-//! The account's credential (for assets that need authentication) is read by the library from its
-//! documented sources: an account broker's credentials, e.g. `ROBLOX_BROKER_CREDENTIALS=<path to its
-//! JSON file>`, else the cookie, e.g. `ROR_COOKIE_ENV=<path to an env file>`. This program only ever
-//! prints where it came from, never the value.
+//! The credentials for assets that need authentication are read by the library from their documented
+//! sources: an Open Cloud API key (`ROBLOX_ASSET_DELIVERY_API_KEY`, or that line in an env file), and
+//! the account's, an account broker's credentials, e.g. `ROBLOX_BROKER_CREDENTIALS=<path to its JSON
+//! file>`, else the cookie, e.g. `ROR_COOKIE_ENV=<path to an env file>`. This program only ever prints
+//! where they came from, never a value.
 
 use std::time::Instant;
 
@@ -60,13 +61,17 @@ fn main() {
 		Some(dir) => println!("studio content: {}", dir.display()),
 		None => println!("studio content: not found"),
 	}
+	match assets.api_key_source() {
+		Some(source) => println!("API key: available ({source})"),
+		None => println!("API key: not configured"),
+	}
 	match assets.cookie_source() {
 		Some(source) => println!("account: available ({source})"),
-		None => {
-			println!("account: not configured");
-			for line in assets.cookie_diagnostics() {
-				println!("  {line}");
-			}
+		None => println!("account: not configured"),
+	}
+	if !assets.has_api_key() || !assets.has_cookie() {
+		for line in assets.cookie_diagnostics() {
+			println!("  {line}");
 		}
 	}
 

@@ -639,6 +639,7 @@ fn ffmpeg_encoders(ffmpeg: &Path) -> Result<Arc<String>> {
 		return Ok(listed);
 	}
 	let mut command = Command::new(ffmpeg);
+	ror_assets::hide_api_key(&mut command);
 	command.args(["-hide_banner", "-encoders"]).stdin(Stdio::null());
 	hide_console(&mut command);
 	let output = command.output().with_context(|| format!("running {}", ffmpeg.display()))?;
@@ -675,6 +676,7 @@ pub fn warm_ffmpeg() {
 			let Some(ffmpeg) = find_ffmpeg() else { return };
 			let _ = ffmpeg_encoders(&ffmpeg);
 			let mut command = Command::new(&ffmpeg);
+			ror_assets::hide_api_key(&mut command);
 			command.args(["-hide_banner", "-version"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
 			hide_console(&mut command);
 			let _ = command.status();
@@ -719,6 +721,7 @@ fn nvenc_available(ffmpeg: &Path, width: u32, height: u32) -> bool {
 		return works;
 	}
 	let mut command = Command::new(ffmpeg);
+	ror_assets::hide_api_key(&mut command);
 	command.args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", &format!("color=c=black:s={width}x{height}:r=1"), "-frames:v", "1"]);
 	nvenc_options(&mut command);
 	command.args(["-f", "null", "-"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
@@ -1662,6 +1665,7 @@ impl CopyRuns {
 			let rate = format!("{}", (fps * 1000.0).round() / 1000.0);
 			let tags = ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "iec61966-2-1", "-color_range", "tv", "-chroma_sample_location", "center"];
 			let mut command = Command::new(ffmpeg);
+			ror_assets::hide_api_key(&mut command);
 			command.args(["-hide_banner", "-nostats", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "nv12", "-s", &format!("{width}x{height}"), "-framerate", &rate]);
 			command.args(tags).args(["-i", "-"]).args(&copy.args).args(tags);
 			command.args(["-f", muxer]).arg(&temporary).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
@@ -1849,6 +1853,7 @@ impl Encoder {
 				let temporary = target.with_extension(format!("tmp{}", std::process::id()));
 				let rate = format!("{}", (fps * 1000.0).round() / 1000.0);
 				let mut command = Command::new(ffmpeg);
+				ror_assets::hide_api_key(&mut command);
 				let nv12 = format == VideoFormat::Mp4;
 				command.args(["-hide_banner", "-nostats", "-loglevel", "error", "-y", "-filter_threads", "2", "-f", "rawvideo", "-pix_fmt", if nv12 { "nv12" } else { "rgba" }, "-s", &format!("{width}x{height}"), "-framerate", &rate]);
 				if nv12 {

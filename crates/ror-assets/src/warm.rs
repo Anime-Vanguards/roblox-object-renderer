@@ -8,6 +8,11 @@
 //! hundreds of files waits on round trips, not bandwidth. Here a batch request (with the cookie when
 //! there is one, so private assets cost no extra trip) locates up to [`BATCH`] files at once.
 //!
+//! With an Open Cloud API key, which has no batch route and is tried before the account, the batch goes
+//! without a credential; each file it refuses is asked of the key's route alone (at the pace of the
+//! key's rate limit), and what that refuses too goes in a batch with the account's credential, when
+//! there is one.
+//!
 //! [`AssetConfig::max_concurrent_downloads`]: crate::AssetConfig::max_concurrent_downloads
 
 use std::collections::{HashSet, VecDeque};
@@ -16,9 +21,10 @@ use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::cache::Meta;
+use crate::http::Credential;
 use crate::transcode::{self, MAX_PACKS, Transcode};
 use crate::uri::ContentId;
-use crate::{ApiError, Assets, RefusalReason, RepresentationSpecifier, gunzip_if_needed, sniff_kind};
+use crate::{ApiError, AssetError, Assets, Located, RefusalReason, RepresentationSpecifier, gunzip_if_needed, sniff_kind, transcode_query};
 
 /// Items per batch request (assetdelivery answers 100 in one).
 pub const BATCH: usize = 100;
@@ -278,9 +284,53 @@ impl Assets {
 		outcomes.into_iter().map(|outcome| outcome.into_inner().unwrap_or(Outcome::Failed)).collect()
 	}
 
-	/// One batch request for `items`' locations (with the cookie when there is one, or through the
-	/// account broker), in their order.
+	/// `items`' locations, in their order: one batch request with the account's credential (the cookie
+	/// or the account broker) when there is one; with an API key, a batch without, the key's route for
+	/// each item it refused, then a batch with the account's credential for what is still refused.
 	fn locate(&self, items: &[Item]) -> Vec<Place> {
+		let Some(key) = self.api_key() else {
+			return self.locate_batch(items, self.credential());
+		};
+		let refused = |place: &Place| matches!(place, Place::Refused(401 | 403 | 409, _));
+		let mut places = self.locate_batch(items, None);
+		let mut again = Vec::new();
+		for (index, place) in places.iter_mut().enumerate() {
+			if refused(place) {
+				*place = self.locate_with_key(&items[index], key);
+				// refused by the key too, or not answered: the account may have it
+				if refused(place) || matches!(place, Place::Unknown) {
+					again.push(index);
+				}
+			}
+		}
+		if let Some(account) = self.credential()
+			&& !again.is_empty()
+		{
+			let subset: Vec<Item> = again.iter().map(|&index| items[index].clone()).collect();
+			for (index, place) in again.into_iter().zip(self.locate_batch(&subset, Some(account))) {
+				places[index] = place;
+			}
+		}
+		places
+	}
+
+	/// One item's location from the API key's route (no batch route takes the key).
+	fn locate_with_key(&self, item: &Item, key: &Credential) -> Place {
+		let located = match item.kind {
+			Kind::Plain => self.asset_location(&self.key_url(item.id, item.version, None), Some(key), &item.uri),
+			Kind::Pack(transcode, pack) => self.transcode_location(&self.key_url(item.id, item.version, Some(&transcode_query(transcode, pack))), Some(key), &item.uri),
+		};
+		match located {
+			Ok(Located::Url(location)) => Place::Url(location),
+			Ok(Located::Unauthorized(status, reason)) => Place::Refused(status, reason),
+			Ok(Located::Generating) => Place::Generating,
+			Err(AssetError::NoTranscode(_)) => Place::NoTranscode,
+			Err(_) => Place::Unknown,
+		}
+	}
+
+	/// One batch request for `items`' locations with `credential` (the account's) or none, in their order.
+	fn locate_batch(&self, items: &[Item], credential: Option<&Credential>) -> Vec<Place> {
 		let requests: Vec<BatchRequest> = items
 			.iter()
 			.enumerate()
@@ -303,7 +353,7 @@ impl Assets {
 			return unknown();
 		};
 		let url = format!("{}/v1/assets/batch", self.inner.client.endpoints().assetdelivery);
-		let Ok(reply) = self.inner.client.post_json_retrying(&url, &body, self.credential()) else {
+		let Ok(reply) = self.inner.client.post_json_retrying(&url, &body, credential) else {
 			return unknown();
 		};
 		// an account broker's own refusal is left to a fetch, like any failure: it says why
@@ -354,8 +404,8 @@ impl Assets {
 				return Outcome::NoTranscode;
 			}
 			Place::Refused(status, reason) => {
-				// remembered only when final: an authorisation refusal once the account's credential was tried
-				if !matches!(status, 401 | 403 | 409) || self.credential().is_some() {
+				// remembered only when final: an authorisation refusal once a credential was tried
+				if !matches!(status, 401 | 403 | 409) || self.tried_credentials() {
 					self.remember_refusal(&item.key, status, reason, now());
 				}
 				return failed();

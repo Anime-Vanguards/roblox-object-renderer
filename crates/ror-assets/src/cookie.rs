@@ -27,6 +27,13 @@ impl Secret {
 		valid.then(|| Secret(value.to_string()))
 	}
 
+	/// Wraps a credential that is not a cookie (an API key, a token): the same check, no prefix taken off.
+	pub(crate) fn plain(raw: &str) -> Option<Secret> {
+		let value = raw.trim();
+		let valid = !value.is_empty() && value.bytes().all(|b| b.is_ascii_graphic() && b != b';' && b != b',' && b != b'"');
+		valid.then(|| Secret(value.to_string()))
+	}
+
 	pub(crate) fn expose(&self) -> &str {
 		&self.0
 	}
@@ -112,7 +119,7 @@ pub(crate) fn diagnose(repo_dir: Option<&Path>) -> Vec<String> {
 }
 
 /// Env file text: UTF-8 (BOM optional) or UTF-16 with a BOM (what Windows PowerShell 5 writes).
-fn read_env_file(path: &Path) -> Option<String> {
+pub(crate) fn read_env_file(path: &Path) -> Option<String> {
 	let bytes = std::fs::read(path).ok()?;
 	if let Some(rest) = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]) {
 		return String::from_utf8(rest.to_vec()).ok();
@@ -168,7 +175,7 @@ pub(crate) fn parse_env_file(text: &str) -> Option<Secret> {
 }
 
 /// Strips matching quotes, or a trailing ` # comment` from an unquoted value.
-fn unquote(value: &str) -> Option<&str> {
+pub(crate) fn unquote(value: &str) -> Option<&str> {
 	let value = value.trim();
 	for quote in ['"', '\''] {
 		if let Some(rest) = value.strip_prefix(quote) {

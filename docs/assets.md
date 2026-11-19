@@ -2,7 +2,7 @@
 
 This page explains how `ror` resolves and downloads Roblox assets, caches GPU textures, shares files across checkouts, and prevents disk usage from growing unbounded.
 
-Relevant code lives in `crates/ror-assets` (content URIs, HTTP downloads, disk cache, content store, Roblox install detection, cookies, and broker auth), `crates/ror-image`, and `crates/ror/src/render/texels.rs` (GPU texture preparation).
+Relevant code lives in `crates/ror-assets` (content URIs, HTTP downloads, disk cache, content store, Roblox install detection, cookies, broker auth, and Open Cloud API keys), `crates/ror-image`, and `crates/ror/src/render/texels.rs` (GPU texture preparation).
 
 Throughout this page, `<state dir>` refers to the active [state directory](building.md#standalone-commands-and-state) (`<checkout>/.cache` for source builds).
 
@@ -17,7 +17,32 @@ Built-in textures, skies, and avatar meshes are read directly from your local Ro
 When Roblox refuses an asset, `ror` records it as missing with the reason returned by `assetdelivery`:
 
 - **Permanent refusals** (`HTTP 403, rejected by Roblox moderation`, `archived by its creator`, `not yet reviewed by Roblox moderation`): refused for all accounts and places. Studio draws nothing for these assets, and `ror` matches that behavior.
-- **Authorization failures** (`not authorized for this account`, `authentication required`): require a `.ROBLOSECURITY` cookie, an account broker, or a different account with access ([building.md](building.md)).
+- **Authorization failures** (`not authorized for this account`, `authentication required`): require an [Open Cloud API key](#open-cloud-api-key), a `.ROBLOSECURITY` cookie, an [account broker](#account-broker), or a different account with access ([building.md](building.md)).
+
+### Which credential is tried
+
+`ror` asks for every asset without a credential first. Only when Roblox answers that the asset needs authentication (401, 403) does it try a credential, in this order, until one gets the asset:
+
+1. An [Open Cloud API key](#open-cloud-api-key), when one is set: it is the narrower credential.
+2. The account: an [account broker](#account-broker)'s token when broker credentials are found, else the `.ROBLOSECURITY` cookie.
+
+A refusal is remembered for a day once a credential was tried too; `--refresh` asks again.
+
+### Open Cloud API key
+
+An [Open Cloud API key](https://create.roblox.com/docs/cloud/auth/api-keys) with the `legacy-asset:manage` scope downloads the assets its owner can access, without a cookie. Lookup order:
+
+1. The `ROBLOX_ASSET_DELIVERY_API_KEY` environment variable.
+2. A `ROBLOX_ASSET_DELIVERY_API_KEY=<key>` line in the env files the cookie is read from: the file named by `ROR_COOKIE_ENV`, then a source checkout's `.env`.
+
+A value that is not a usable header value (whitespace, `;`, `,`, `"`) is skipped. `ror` reports where the key came from or why a source was skipped, never the key itself.
+
+How the key is used:
+- It is sent only as the `x-api-key` header, only over HTTPS to `https://apis.roblox.com/asset-delivery-api/v1/assetId/{id}` (or `.../version/{n}` for a versioned asset), with the same query `ror` sends assetdelivery for KTX2 transcodes, and only after the request without a credential was refused.
+- Redirects are followed without the header. The asset bytes come from the returned CDN URL without it.
+- That route has no batch endpoint, so prefetching asks the key one asset at a time: a batch without a credential first, then the key for each asset that batch refused, then a batch with the account's credential (if any) for what the key could not get.
+- Roblox documents a limit of 1000 requests a minute per key owner. `ror` paces its requests by the `x-ratelimit-remaining` and `x-ratelimit-reset` response headers, and on `HTTP 429` holds back every request with the key until `Retry-After` (or the window's reset) before retrying, never longer than a minute at a time.
+- Child processes `ror` starts (ffmpeg, Studio, rur, ree) do not inherit `ROBLOX_ASSET_DELIVERY_API_KEY`. `ror`'s own render service does, since it downloads for its callers. rur and ree are still given the env files' paths, as for the cookie.
 
 ### Account broker
 

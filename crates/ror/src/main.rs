@@ -1294,8 +1294,9 @@ fn studio(command: StudioCommand) -> Result<()> {
 			let mesh_lods = mesh_lods.map(|name| ["default", "disabled", "enabled"].iter().position(|item| *item == name).unwrap_or(0) as u32);
 			output::write_atomic(&path, &place::build_with(&environment, !pre2022, mesh_lods)?)?;
 			let exe = ror::studio::studio_executable().context("Roblox Studio is not installed")?;
-			// Studio must not inherit this process's pipes (a caller reading them would wait for Studio)
-			std::process::Command::new(exe)
+			// Studio must not inherit this process's pipes (a caller reading them would wait for Studio),
+			// nor the API key
+			ror_assets::hide_api_key(&mut std::process::Command::new(exe))
 				.arg(&path)
 				.stdin(std::process::Stdio::null())
 				.stdout(std::process::Stdio::null())

@@ -15,7 +15,7 @@ Reference guides for running `ror`, understanding its rendering rules, and exten
 | [cost-loop.md](cost-loop.md) | Optimization loop: phone ms cost attribution, findings, in-memory what-if edits, visual checks, Lune export, and budgets |
 | [service.md](service.md) | Background render service, concurrent callers, HTTP API, job JSON, caching, memory admission, and profiling |
 | [viewport-worker.md](viewport-worker.md) | `ror viewport-worker`: persistent `ViewportFrame` renderer and its JSON protocol |
-| [assets.md](assets.md) | Asset downloads, account broker, GPU texture caches, shared content store, and disk cleanup |
+| [assets.md](assets.md) | Asset downloads, Open Cloud API keys, account broker, GPU texture caches, shared content store, and disk cleanup |
 | [parity.md](parity.md) | Studio parity harness: capture Studio setup, pixel comparisons, agreement numbers, and calibration experiments |
 
 ## Rendering rules and architecture

@@ -134,6 +134,10 @@ does not, and keeps the library's original defaults:
 - Optional, in place of the cookie: an account broker's credentials (`ROBLOX_BROKER_TOKEN` with
   `ROBLOX_BROKER_URL`, or a JSON file: [assets.md](assets.md#account-broker)). They win over every
   cookie source.
+- Optional, with or without either: an Open Cloud API key (`ROBLOX_ASSET_DELIVERY_API_KEY`, in the
+  environment or as a line in the same env files as the cookie:
+  [assets.md](assets.md#open-cloud-api-key)). It is tried before the cookie or the broker, and only
+  ever sent to `https://apis.roblox.com`'s asset delivery route.
 - Optional, for parity work: Roblox Studio running on Windows and a Studio MCP bridge
   ([parity.md](parity.md)).
 

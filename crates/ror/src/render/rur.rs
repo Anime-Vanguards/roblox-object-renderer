@@ -353,6 +353,8 @@ struct Atlas<'a> {
 /// summary it prints, after checking that it drew a transparent background.
 fn render_through_node(rur: &Path, atlas: &Atlas) -> Result<serde_json::Value> {
 	let mut command = Command::new(node());
+	// rur finds its credentials itself, through the env files' paths it inherits: never the API key's value
+	ror_assets::hide_api_key(&mut command);
 	command
 		.arg(rur.join("cli").join("rur.mjs"))
 		.arg("render")
