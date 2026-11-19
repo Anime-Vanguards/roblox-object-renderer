@@ -1,246 +1,203 @@
-# The cost loop: finding what to cut in a map
+# The cost optimization loop
 
-`ror cost` attributes everything a view costs Roblox to draw to the instances that cause it, prices
-it in milliseconds of an average phone's frame, ranks what would save most with the edit that would
-do it, tries edits in memory against the same views, checks what they do to the picture, and writes
-accepted edits as a change list with Lune scripts for the real place. Everything it writes is JSON
-with a schema version, sorted and rounded so that the same input gives the same bytes and two runs
-diff cleanly. The code is `crates/ror/src/cost/agent.rs` (the loop), `attribute.rs` (who pays for
-what), `pixels.rs` (each view's pixels), `findings.rs`, `edits.rs`, `prices.rs` and `ids.rs`.
+`ror cost` breaks down every view's rendering cost down to individual Roblox instances, estimates the impact in phone frame milliseconds, suggests ranked edits, tests those edits in memory with visual diffs, and exports accepted changes as Lune scripts for your `.rbxl` place.
 
-## The loop
+All JSON outputs include a schema version and use deterministic sorting and rounding so identical inputs produce byte-identical files and clean diffs.
+
+Implementation: `crates/ror/src/cost/` (`agent.rs`, `attribute.rs`, `pixels.rs`, `findings.rs`, `edits.rs`, `prices.rs`, `ids.rs`).
+
+## End-to-end workflow
 
 ```sh
-# 1. measure: every view of a camera set, for a phone
+# 1. Measure all views for a phone target
 ror cost Map.rbxl --cameras cameras.json --preset phone --no-images --out out/map
-#    -> out/map/analysis.txt (read this first), analysis.json, tree.json
+# Writes: out/map/analysis.txt (start here), analysis.json, tree.json
 
-# 2. drill into what costs: one instance view by view
-ror cost Map.rbxl --cameras cameras.json --preset phone --no-images --out out/map --explain "Workspace.Map.Backdrop"
+# 2. Inspect a specific expensive instance across every view
+ror cost Map.rbxl --cameras cameras.json --preset phone --no-images --out out/map \
+  --explain "Workspace.Map.Backdrop"
 
-# 3. try edits: copy findings' edits into an edits file (several trials at once), cost and look
-ror cost Map.rbxl --cameras cameras.json --preset phone --no-images --out out/map --edits trials.json --look
-#    -> out/map/whatif.txt, whatif.json, look/<trial>/<view>.crop1.png ...
+# 3. Test candidate edits in memory and check visual impact
+ror cost Map.rbxl --cameras cameras.json --preset phone --no-images --out out/map \
+  --edits trials.json --look
+# Writes: out/map/whatif.txt, whatif.json, look/<trial>/<view>.crop1.png ...
 
-# 4. export what you keep, apply it to a saved copy of the place, revert key by key
-ror cost Map.rbxl --cameras cameras.json --preset phone --no-images --out out/map --edits keep.json --export out/map/kit
+# 4. Export accepted edits and apply them to a copy of the place
+ror cost Map.rbxl --cameras cameras.json --preset phone --no-images --out out/map \
+  --edits keep.json --export out/map/kit
 lune run out/map/kit/edits/apply.luau Map.rbxl Map-cut.rbxl out/map/kit/edits/changes.json
 
-# 5. check it: the applied place costs what the what-if said
-ror cost Map-cut.rbxl --cameras cameras.json --preset phone --no-images --out out/map-cut --budget phone --fail-over-budget
+# 5. Verify the patched place against a budget
+ror cost Map-cut.rbxl --cameras cameras.json --preset phone --no-images --out out/map-cut \
+  --budget phone --fail-over-budget
 ```
 
-Each run costs every view in the warm render service: the place read, every view counted and drawn
-once at a third of the phone's resolution for its pixels. A large map's 16 views take a few seconds,
-each trial about as long again, and `--look` adds two full renders per view.
+Runs execute through the warm render service, rendering each view at 1/3 phone resolution for pixel attribution. Evaluating 16 views of a large map takes a few seconds, each what-if trial takes roughly the same time, and `--look` adds two full-resolution renders per view.
 
-## Camera sets
+## Choosing cameras
 
-Never judge one view: the analysis reports the mean over the views and the worst one. Use the
-cameras players see the map from:
+Always evaluate a representative set of player viewpoints rather than a single angle; the report tracks both the mean across views and the worst view.
 
-- `--cameras FILE`: named cameras, `[{"name", "eye": [x, y, z], "target": [x, y, z], "fov"}]` or a
-  game camera's `cframe`; for a place where players walk, cameras at the places they stand, looking
-  the ways they look.
-- `--paths N`: gameplay cameras along a match map's enemy paths, near and far, four ways.
-- `--sweep N`: the densest spots, four ways from eye height.
-- `--grid STUDS` makes no analysis: it paints each cell's draws and triangles from above
-  ([cost.md](cost.md)); the loop's flags need one of the others.
-- `--camera-from DIR`: an earlier run's views.
+| Option | Behavior |
+|---|---|
+| `--cameras FILE` | JSON array of named cameras: `[{"name", "eye": [x,y,z], "target": [x,y,z], "fov"}]` (or `"cframe"`). Best for walkable places where you know player vantage points. |
+| `--paths N` | Gameplay cameras along `N` points of a map's enemy paths (near and far, 4 directions). |
+| `--sweep N` | Eye-height cameras at the `N` densest spots (4 directions). |
+| `--camera-from DIR` | Reuse the exact cameras from an earlier run. |
 
-## Presets
+Note: `--grid STUDS` only generates top-down maps ([cost.md](cost.md)) and does not run the attribution loop.
 
-`--preset phone` counts for a phone: 2532 x 1170 pixels (844 x 390 points at 3x) at graphics quality
-2. `--preset desktop` counts 1920 x 1080 at quality 21. Without a preset the run's `--size` and
-`--quality` are used. What a quality draws, measured in Studio under Future at each level:
+## Target presets
 
-| quality | sun shadows | local lights | bloom |
+- `--preset phone`: 2532 x 1170 px (844 x 390 pt at 3x) at graphics quality **2**.
+- `--preset desktop`: 1920 x 1080 px at graphics quality **21**.
+- Without `--preset`, `ror` uses `--size` and `--quality`.
+
+What Roblox renders at each graphics quality level under `Future` lighting (measured in Studio):
+
+| Quality | Sun shadows | Local lights | Bloom |
 |---|---|---|---|
-| 1-5 | none | the voxel light grid: soft, no shadows, no per-pixel cost | none |
-| 6-8 | none | voxel | faint |
-| 10 | a short reach only | voxel | faint |
-| 12-14 | soft | voxel | full |
-| 16-21 | full | per pixel, with their shadows | full |
+| 1–5 | None | Voxel light grid (soft, no shadows, no per-pixel cost) | None |
+| 6–8 | None | Voxel light grid | Faint |
+| 10 | Short reach only | Voxel light grid | Faint |
+| 12–14 | Soft | Voxel light grid | Full |
+| 16–21 | Full | Per-pixel with shadows | Full |
 
-The model counts sun shadows from 12, per-pixel lights from 16 and bloom from 6. The quality also
-culls parts past its view distance (300 studs at 1-3) and the smallest on screen (measured,
-[cost.md](cost.md)), and a phone makes at most 100 particles a second per emitter (estimated). Prices are a phone's at every
-preset: the desktop preset shows what desktop quality draws, priced the same way, which ranks it but
-does not time a desktop.
+The cost model enables sun shadows at quality 12+, per-pixel local lights at 16+, and bloom at 6+. It also applies quality-based view distance culling (300 studs at quality 1–3) and small-part culling ([cost.md](cost.md)), and caps phone particle emission at an estimated 100 particles/s per emitter.
 
-## What is attributed
+Note that `--preset desktop` still uses phone millisecond pricing—it shows what desktop quality renders ranked on the same cost scale, rather than predicting desktop frame times.
 
-Every view's work, charged to the instance that causes it (`attribute.rs`):
+## Cost attribution
 
-| work | how it is counted | charged to |
+Every unit of work in each view is billed back to the instance responsible (`attribute.rs`):
+
+| Cost category | How it is measured | Billed to |
 |---|---|---|
-| draw calls | Roblox's batching as `ror cost` counts it; a batch's draws shared among the copies it draws | each copy |
-| triangles | each copy at its level of detail | the copy |
-| parts | every part in the place, drawn or not (culling and the render queue walk them all) | the part |
-| pixels | the opaque pixels a part is in front at (a render of the view's opaque parts' ids and depth), by how it shades: plain, textured, Neon, Glass | the part |
-| blended | every fragment of a see-through part or decal in front of the opaque surface (counted on the GPU), and every particle, beam and trail fragment (rasterized against the view's depth) | the part or effect |
-| light pixels | each opaque pixel inside a local light's range and cone (`lightPixels`) | the light; the surface lists them as `litPixels`, not charged |
-| shadow triangles | where the quality draws sun shadows, each caster within 400 studs at full detail | the caster |
-| the sky, clouds, Atmosphere, post effects | the sky's pixels, and each enabled effect's full-screen pass | its instance in Lighting (`(shared passes)` when `--lighting-from` lends another file's) |
-| legacy effects (Fire, Smoke, Sparkles, Explosion) | their particles' draws and fill | the Fire, Smoke or Sparkles instance |
+| Draw calls | Roblox batching rules; batch cost is split evenly across copies in the batch | Each copy |
+| Triangles | Triangles drawn at each copy's active LOD | The copy |
+| Parts | Every part in the place, visible or culled (culling and render queues touch all parts) | The part |
+| Opaque pixels | Frontmost opaque pixels owned by the part (from an ID+depth pass), weighted by shader class (`plain`, `textured`, `Neon`, `Glass`) | The part |
+| Blended pixels | Transparent part/decal fragments in front of opaque depth (GPU-counted), plus rasterized particle, beam, and trail fragments | The part or effect |
+| Local light pixels | Opaque pixels inside a light's range and cone (`lightPixels`) | The light (surfaces report `litPixels` for reference without double-billing) |
+| Shadow triangles | When sun shadows are active, full-detail triangles of casters within 400 studs | The caster |
+| Environment & post FX | Sky pixels and each enabled full-screen effect pass (`Sky`, `Clouds`, `Atmosphere`, post effects) | The `Lighting` child (or `(shared passes)` if lent via `--lighting-from`) |
+| Legacy effects | Particle draws and fill from `Fire`, `Smoke`, `Sparkles`, and `Explosion` | The effect instance |
 
-The tree (`tree.json`) sums each instance's work and its descendants', so a map's folders, models
-and parts can be read from the top down. Draw calls, triangles and blended pixels are also given as
-counts, so a finding can be checked against Roblox's own counters (`ror cost --check`).
+`tree.json` rolls costs up through parent models and folders so you can drill down from the top of the hierarchy. Raw counts (draws, triangles, blended pixels) are kept alongside milliseconds so findings can be cross-checked with `ror cost --check`.
 
-## Prices
+## Pricing model
 
-Every price says how it was found (`analysis.json` lists them as `prices`):
+All unit prices are recorded in `analysis.json` under `prices`:
 
-| price | value | basis |
+| Metric | Price | Basis |
 |---|---|---|
-| a draw call | 15.8 us of phone frame | fitted to phone measurements of a large place, where parts, draws and triangles were added and removed and the frame timed |
-| a part in the place | 0.26 us | the same fit |
-| 1,000 triangles drawn | 2.2 us | the same fit (phones rarely wait for their GPU: triangles barely move the frame) |
-| a phone GPU ms in the frame | 0.195 ms | measured: the share of the GPU's time the frame waits for |
-| a viewport of opaque Plastic | 0.42 phone GPU ms | anchored: the reference place's views average the GPU time the live game loses when its map is hidden |
-| per-pixel weights | textured 1.4, Neon 0.8, Glass 1.2, sky 0.3, blended 1.6 (2.0 for a SurfaceAppearance with alpha), particle 1.3, local light 0.25, sun shadow 0.2 | estimated: relative shading work, not measured on a phone |
-| shadow redraws | a quarter of the casters' triangles a frame | estimated (Roblox caches its shadow maps and redraws them as the camera moves) |
+| 1 draw call | 15.8 us phone frame | Fitted to live phone measurements adding/removing parts, draws, and triangles in a large place |
+| 1 part in place | 0.26 us | Same phone fit |
+| 1,000 triangles drawn | 2.2 us | Same phone fit (phones are rarely triangle-bound) |
+| 1 phone GPU ms | 0.195 ms frame time | Measured fraction of GPU time that blocks the frame |
+| 1 full viewport of opaque Plastic | 0.42 phone GPU ms | Anchored to GPU time dropped when hiding the map in the reference place |
+| Per-pixel shader weights | Textured `1.4`, Neon `0.8`, Glass `1.2`, Sky `0.3`, Blended `1.6` (`2.0` for alpha `SurfaceAppearance`), Particle `1.3`, Local light `0.25`, Sun shadow `0.2` | Estimated relative shader cost (not measured per shader on device) |
+| Shadow map redraws | 25% of caster triangles per frame | Estimated (Roblox caches shadow maps and redraws incrementally as the camera moves) |
 
-A finding's saving and a trial's delta are model numbers. The CPU prices come from phones; the GPU's
-relative weights are estimates. Read small differences (under about 0.05 ms a view) as ties.
+Because GPU shader weights are estimates, treat small differences (under ~0.05 ms per view) as noise.
 
-## Files
+## Output files and schemas
 
 ### `analysis.json` (`ror-cost-analysis/1`)
 
-- `preset`, `quality` (what the quality draws: sun shadows, per-pixel lights, the particle rate),
-  `prices`, `pixelsCounted`.
-- `views`: per view `name`, Roblox's `draws` and `triangles` (every pass but Shadows), its `work`
-  (below) and `overBudget`.
-- `mean` and `worst`: the work averaged over the views, and the costliest view.
-- `topInstances`: the costliest single instances.
-- `findings`: ranked (below).
+Top-level fields: `preset`, `quality` (active features), `prices`, `pixelsCounted`, `views` (per view: `name`, Roblox `draws`/`triangles` excluding Shadows, `work`, `overBudget`), `mean`, `worst`, `topInstances`, and `findings`.
 
-`work`, here and in the tree: `draws`, `triangles`, `pixels` and `blended` (at the preset's
-resolution), `lightPixels` (on a light: the pixels it lights), `litPixels` (on a surface: the lights
-over its pixels; the same evaluations, charged to the lights), `shadowTriangles`, `parts`, `cpuMs`,
-`gpuMs` and `ms` (the phone frame: CPU plus the GPU's share).
+Every `work` object (in `analysis.json` and `tree.json`) contains: `draws`, `triangles`, `pixels`, `blended` (at preset resolution), `lightPixels`, `litPixels`, `shadowTriangles`, `parts`, `cpuMs`, `gpuMs`, and `ms` (`cpuMs + gpuMs share`).
 
 ### `tree.json` (`ror-cost-tree/1`)
 
-`nodes`: every instance that costs anything in some view and each of its ancestors: `id`, `uid`,
-`class`, `name`, `parent`, `mean` work (itself and everything under it, per view), `worstView` and
-`worst` work, `views` (the views it draws or shades in), `leaves` (instances under it that cost
-anything). Sorted by mean ms; `(shared passes)` holds what no instance owns (the particle pass, the
-built-in bloom).
+Contains `nodes` sorted by `mean.ms`—every instance with non-zero cost in any view plus all its ancestors. Each node holds `id`, `uid`, `class`, `name`, `parent`, `mean` (self + descendants), `worstView`, `worst`, `views`, and `leaves`. Unowned full-screen passes (particle pass, built-in bloom) appear under `(shared passes)`.
 
-### Ids
+### Instance IDs
 
-An instance's id is its path from the file's root as ror writes paths, a name its siblings repeat
-numbered by its place among them from 1: `Workspace.Map.Rock[3]`, `Workspace.Map["Rock.001"][2]`.
-Two reads of one file give the same ids; edits name what they change by id; `uid` is Roblox's own
-UniqueId where the file keeps it. Ids are taken before edits: removing an instance renumbers nothing.
+Instance IDs are dotted paths from the file root. Duplicate sibling names are 1-indexed (e.g., `Workspace.Map.Rock[3]`, `Workspace.Map["Rock.001"][2]`). IDs are deterministic across reads of the same file and stay fixed during a trial (removing an instance never renumbers siblings). `uid` holds Roblox's `UniqueId` when present.
 
 ### Findings
 
-Each finding has a stable `id`, its `rank`, a `kind`, a `title`, its `targets` (the first few;
-`targetCount` all), `why` (what the targets cost now, per view), `saving` (`meanMs` per view over
-every view, `worstMs` and `worstView`, the draws, triangles and blended pixels saved, and `views`: ms
-per view), the `edit` that realises it, `look` (`none`: the same pixels; `unseen`: nothing these
-cameras show; `changes`: check it with `--look`), `basis` (`attribution`: the targets' share of the
-work, or `batches`: draw calls that would join) and a `note`.
+Each finding includes: `id`, `rank`, `kind`, `title`, `targets` (sample) and `targetCount`, `why`, `saving` (`meanMs`, `worstMs`, `worstView`, draws/triangles/blended saved, per-view `views`), `edit`, `look` (`none` = identical pixels, `unseen` = invisible in all given cameras, `changes` = visually different, check with `--look`), `basis` (`attribution` or `batches`), and `note`.
 
-| kind | what | edit |
+| Kind | What it detects | Suggested edit |
 |---|---|---|
-| `unseen` | parts no view shows at the highest quality (no opaque pixel in front, no blended fragment), grouped by the highest model all of whose parts are unseen | hide |
-| `seeThrough` | see-through parts and alpha SurfaceAppearances by the blended pixels they shade, by mesh | hide |
-| `appearance` | one geometry's copies in several appearances, a batch each | the most common appearance |
-| `duplicateMesh` | one mesh uploaded under several ids | the most used id |
-| `levelOfDetail` | meshes where RenderFidelity Performance saves more triangles than the batches it adds | RenderFidelity Performance |
-| `merge` | several meshes in one appearance under one model, each mesh's every copy there | merge (one draw) |
-| `emitterFill` | emitters by the blended pixels their particles shade | half the particles it makes (its Rate under the quality's cap, halved) |
-| `invisibleEffect` | beams and emitters that show nothing and still draw | Enabled false |
-| `lightRange` | local lights by the pixels they light, where the quality lights per pixel | Enabled false |
-| `lightReachesNothing` | local lights that reach no pixel any view shows | Enabled false |
-| `castShadow` | casters under a stud across, where the quality draws sun shadows | CastShadow false |
+| `unseen` | Parts never visible in any camera at quality 21 (no opaque pixel, no blended fragment), grouped to the highest fully unseen model | `hide` |
+| `seeThrough` | Transparent parts and alpha `SurfaceAppearance` meshes ranked by blended pixel overdraw | `hide` |
+| `appearance` | Same geometry using multiple appearances (splitting batches) | Unify to most common appearance |
+| `duplicateMesh` | Identical mesh uploaded under multiple asset IDs | Point all to most common `MeshId` |
+| `levelOfDetail` | Meshes where `RenderFidelity = Performance` saves more triangles than the extra LOD batches cost | Set `RenderFidelity = Performance` |
+| `merge` | Multiple meshes sharing one appearance under a single model | `merge` into one draw |
+| `emitterFill` | Particle emitters ranked by blended pixel fill | Halve `Rate` (under quality cap) |
+| `invisibleEffect` | Invisible beams/emitters still submitting draws | `Enabled = false` |
+| `lightRange` | Per-pixel local lights ranked by lit pixels (at quality 16+) | `Enabled = false` |
+| `lightReachesNothing` | Local lights that hit no visible pixel in any view | `Enabled = false` |
+| `castShadow` | Small shadow casters (< 1 stud across) when sun shadows are active | `CastShadow = false` |
 
-"Unseen" means unseen from the cameras given, drawn at the highest quality (an edit reaches every
-device: a part a phone culls past its view distance still shows on a desktop; the run draws the views
-a second time without the preset's culling for this). Use a camera set that covers where players go
-before removing anything. A hidden or removed part no longer occludes either, which can add draws
-behind it: try it with `--edits`.
+> [!NOTE]
+> `unseen` checks visibility at quality 21 without preset distance culling so you don't delete parts that are hidden on mobile but visible on desktop. Still, make sure your camera set covers all playable areas—and test with `--edits`, because hiding an occluder can reveal geometry behind it and increase draw calls.
 
-### Edits (`ror-edits/1`)
+## Testing edits (`--edits` and `--look`)
+
+Pass a JSON file (`ror-edits/1`) containing one or more trials:
 
 ```json
-{"schema": "ror-edits/1", "trials": [
-  {"name": "fog off", "edits": [{"op": "hide", "targets": ["mesh:1234567890"]}]},
-  {"name": "lamps", "edits": [{"op": "set", "targets": ["under:Workspace.Map.Lamps"], "classes": ["PointLight"], "properties": {"Shadows": false, "Range": 12}}]},
-  {"name": "rocks", "edits": [{"op": "appearance", "targets": ["Workspace.Map.Rock[2]"], "from": "Workspace.Map.Rock[1]"}]}
-]}
+{
+  "schema": "ror-edits/1",
+  "trials": [
+    { "name": "fog off", "edits": [{ "op": "hide", "targets": ["mesh:1234567890"] }] },
+    { "name": "lamps", "edits": [{ "op": "set", "targets": ["under:Workspace.Map.Lamps"], "classes": ["PointLight"], "properties": { "Shadows": false, "Range": 12 } }] },
+    { "name": "rocks", "edits": [{ "op": "appearance", "targets": ["Workspace.Map.Rock[2]"], "from": "Workspace.Map.Rock[1]" }] }
+  ]
+}
 ```
 
-- `remove`: the instances and everything under them.
-- `hide`: every part at or under the targets takes Transparency 1 and no shadow, its decals
-  Transparency 1; collision, joints, scripts, effects and lights stay.
-- `set`: properties by name (`Transparency`, `CastShadow`, `Material`, `MaterialVariant`, `Color`,
-  `RenderFidelity`, `MeshId`, `TextureID`, `Enabled`, `Range`, `Brightness`, `Shadows`, `Rate`, any
-  other the class has): numbers, booleans, strings, enum item names, `[r, g, b]` in 0-1 or `"#rrggbb"`.
-- `appearance`: the targets take `from`'s Material, MaterialVariant, MeshPart texture and
-  SurfaceAppearance (what Roblox batches by; Color stays).
-- `merge`: the parts at or under the targets counted as one mesh: copies of one appearance draw
-  once. The cost model counts it; building the mesh is a merge tool's job.
+(A file with a top-level `"edits"` array instead of `"trials"` runs as a single trial named `"edits"`.)
 
-Targets are ids, `mesh:<asset>` (every MeshPart or FileMesh of that mesh the scene draws) or
-`under:<id>` (everything below); `classes` keeps those of the listed classes. A file's top-level
-`edits` are one trial named `edits`. A part's `MeshId` or `TextureId` set where the part has none goes
-to its SpecialMesh. A property set twice in a trial is one change, from the file's value to the last.
-Edits to the place's own Lighting (GlobalShadows, Technology, effects) and Terrain's Clouds count in
-a trial; a Lighting or MaterialService lent with `--lighting-from` or `--materials-from` stays as the
-baseline drew it.
+**Supported operations:**
+- `remove`: deletes target instances and their descendants.
+- `hide`: sets `Transparency = 1` and `CastShadow = false` on parts (and `Transparency = 1` on their decals) while keeping collision, joints, scripts, effects, and lights intact.
+- `set`: sets properties by name (`Transparency`, `CastShadow`, `Material`, `MaterialVariant`, `Color`, `RenderFidelity`, `MeshId`, `TextureID`, `Enabled`, `Range`, `Brightness`, `Shadows`, `Rate`, etc.). Values accept numbers, booleans, strings, enum names, `[r, g, b]` (0–1), or `"#rrggbb"`. Setting `MeshId` or `TextureId` on a primitive `Part` forwards to its child `SpecialMesh`. Multiple sets to the same property collapse into one change.
+- `appearance`: copies `Material`, `MaterialVariant`, `MeshPart.TextureID`, and `SurfaceAppearance` from `from` (preserving `Color`).
+- `merge`: models target parts as one combined mesh per appearance for costing (actually merging geometry requires an external mesh tool).
+
+**Target selectors:** exact instance IDs, `mesh:<asset>` (all MeshParts/FileMeshes using that asset), or `under:<id>` (all descendants). Add `"classes": [...]` to filter by class.
+
+Edits to the place's own `Lighting` (`GlobalShadows`, `Technology`, post effects) and `Terrain.Clouds` apply during trials; environments lent via `--lighting-from` or `--materials-from` stay fixed.
 
 ### `whatif.json` (`ror-cost-whatif/1`)
 
-The look is drawn at the highest quality and full detail (what the highest graphics setting shows), so
-a change any device would see shows. Per trial: its `edits`, the number of `changes`, `mean` work `before`, `after` and `delta`,
-`worstSaving` and `worstLook` views, `changedInstances` (the instances whose cost moved most, by id),
-and per view `before`, `after`, `delta`, Roblox's draws and triangles before and after, and with
-`--look` the `look`: `changed` (the share of pixels more than 8 of 255 apart in any channel), `max`,
-and `crops` (before | after | the changed pixels in red, the three regions that changed most, in
-`look/<trial>/`, with each view's whole `before.png` and `after.png`).
+Records each trial's `edits`, `changes` count, `mean` (`before`, `after`, `delta`), `worstSaving`, `worstLook`, `changedInstances`, and per-view `before`/`after`/`delta` draws and triangles.
 
-### `--explain ID`
+With `--look`, `ror` renders before/after comparisons at **quality 21 and full mesh detail** (so any visual change visible on desktop is caught) and adds a `look` object per view:
+- `changed`: fraction of pixels differing by more than 8/255 in any channel.
+- `max`: maximum channel delta.
+- `crops`: paths to the 3 most-changed regions (`before | after | diff in red`) in `look/<trial>/`, alongside full `before.png` and `after.png`.
 
-Per view the instance's work, how many of its parts drew, were hidden by occlusion or were culled
-(out of view or by the quality), and the batches its parts are in; then the costliest instances under
-it. Written to `explain-<id>.json` and printed.
+## Other cost-loop flags
 
-### `--export DIR`
+- **`--explain ID`:** Prints and writes `explain-<id>.json` detailing per-view work, counts of drawn/occluded/culled parts, batch membership, and the most expensive descendants under `ID`.
+- **`--export DIR`:** Writes a self-contained patch kit per trial under `DIR/<trial>/`:
+  - `changes.json` (`ror-cost-changes/1`, with unique keys, ops, IDs, paths, classes, properties, before/after values, and predicted savings)
+  - `changes.tsv`
+  - `apply.luau` and `revert.luau` (requires Lune 0.10.5+)
+  - `README.md`
+  `apply.luau` validates every target path before modifying anything, moves removed instances to `ServerStorage.RorCostRemoved`, and tags edited instances with `RorCostKeys` so `revert.luau` can undo individual keys or everything. Merge ops are listed in the manifest but not auto-built.
+- **`--budget SPEC` / `--fail-over-budget`:** Flags views exceeding thresholds (exits with status `2` when `--fail-over-budget` is set). Presets:
+  - `phone`: 600 draws, 800,000 triangles, 10 ms frame time.
+  - `desktop`: double the phone limits.
+  - Custom: `draws=N,triangles=N,ms=N` (supports suffixes like `500k`).
+- **`--heat`:** Writes diagnostic heatmaps over each view (for visual inspection; use `analysis.json` for automation):
+  - `<view>.heat-cost.png`: GPU cost per pixel in viewport-units (log scale, green `1` to red `16`).
+  - `<view>.heat-overdraw.png`: blended overdraw layers (log scale, `1` to `16+`).
+  - `<view>.heat-lights.png`: overlapping local lights per pixel (`1` to `8+`).
+  - `<view>.heat-density.png`: triangles per pixel (`0.001` to `1`, log scale).
 
-Per trial `DIR/<trial>/`: `changes.json` (`ror-cost-changes/1`: every change with its key, op, id,
-the id's `steps`, class, property, `before` and `after`, and the trial's predicted saving),
-`changes.tsv`, `apply.luau` and `revert.luau` (Lune 0.10.5 or later), and a README. `apply.luau`
-resolves every id against the place as read before changing anything, moves removed instances to
-`ServerStorage.RorCostRemoved` and marks changed ones (`RorCostKeys`); `revert.luau` undoes any keys,
-or all. Merges are listed, not built.
+## Model limits
 
-### Budgets
-
-`--budget phone` flags views over 600 draws, 800,000 triangles (Roblox's guidance for most devices)
-or 10 ms of the model's phone frame (a suggestion); `desktop` doubles them; `draws=N,triangles=N,ms=N`
-sets them (`500k`). `--fail-over-budget` exits with status 2 when a view is over, for a check.
-
-### Heat images (`--heat`)
-
-Over each view's picture (grey where nothing counts): `<view>.heat-cost.png` (each pixel's GPU cost in
-viewport-units on a log scale, 1 green to 16 red), `-overdraw` (blended layers on a log scale, 1 to 16
-and more), `-lights` (local lights holding the pixel, 1 to 8 and more) and `-density` (its part's
-triangles per pixel, a thousandth to one, log). They are for reading,
-not the interface: `analysis.json` holds the numbers.
-
-## Limits
-
-- Lights cost per pixel only where the quality lights per pixel (16 and up); a light's light-grid
-  CPU is not priced.
-- See-through parts are lit and blended at the weights above; their lights are not counted.
-- A merge keeps its members' triangles and pixels; only the draws change.
-- Pixels are counted at the preset's resolution scaled from a third of it (a half for desktop):
-  details under about three phone pixels can be missed. `--pixel-scale 1` counts every pixel (and
-  draws the heat images at full size), slower.
-- `ror cost --check` measures draws and triangles against Studio; the frame ms are the model's.
+- Local lights only incur per-pixel cost at quality 16+; voxel light-grid CPU overhead is not modeled.
+- Transparent parts use fixed shading weights; local lighting on transparent surfaces is not counted.
+- `merge` reduces draw calls only; triangles and pixel fill remain unchanged.
+- Pixel attribution defaults to 1/3 resolution on phone (1/2 on desktop), so sub-3-pixel details may be missed. Pass `--pixel-scale 1` for full-resolution pixel attribution and heatmaps (slower).
+- `ror cost --check` validates draw and triangle counts against Studio; millisecond estimates remain model outputs.

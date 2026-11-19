@@ -1,36 +1,32 @@
 # ror documentation
 
-Guides to ror's commands and to the rules and formats it follows, for using it and for reading and
-extending the code. The [README](../README.md) is the short tour.
+Reference guides for running `ror`, understanding its rendering rules, and extending the codebase. For an overview and quick start, see the [README](../README.md).
 
-Using ror:
+## Using ror
 
-| page | what it covers |
+| Guide | Topics |
 |---|---|
-| [building.md](building.md) | release installs, verification, state paths, building, Cargo features and the x264 encoder |
-| [render.md](render.md) | `ror render`: inputs, cameras, levels of detail, maps, the collision view, output, lints, inspect and diff, GUIs |
-| [playback.md](playback.md) | effects over time: the playback flags and JSON, emit modes, the Lighting while an effect plays |
-| [video.md](video.md) | `ror video`: cameras, formats, encoders, the x264 feature, the contact sheet, copies, summary metrics and lints |
-| [scripts.md](scripts.md) | `.luau` scripts as input, run in the engine emulator |
-| [cost.md](cost.md) | `ror cost`: how Roblox batches draws, counts triangles, picks levels of detail and culls by occlusion |
-| [cost-loop.md](cost-loop.md) | the cost loop for agents: where a map's cost goes per instance in phone ms, ranked findings with edits, what-if edits with look checks, export to Lune, budgets |
-| [service.md](service.md) | the render service, many callers at once, its HTTP API, the job JSON, caches, memory admission, profiling |
-| [viewport-worker.md](viewport-worker.md) | `ror viewport-worker`: ViewportFrames drawn for roblox-ui-renderer and other programs, its JSON protocol |
-| [assets.md](assets.md) | downloads, texture caches, refused assets, the content store and disk use |
-| [parity.md](parity.md) | how agreement with Studio is measured: the capture Studio, compares, agreement figures, calibration experiments |
+| [building.md](building.md) | Release binaries, verification, state directories, source builds, Cargo features, and x264 |
+| [render.md](render.md) | `ror render`: inputs, cameras, LODs, map backdrops, collision view, outputs, lints, inspect/diff, and GUIs |
+| [playback.md](playback.md) | Effect timelines: CLI playback flags, JSON format, emit modes, and dynamic Lighting |
+| [video.md](video.md) | `ror video`: cameras, output formats, encoders, contact sheets, parallel copies, and VFX lints |
+| [scripts.md](scripts.md) | Running `.luau` scripts via `ree` as inputs to `render` and `video` |
+| [cost.md](cost.md) | `ror cost`: draw call batching, triangle counts, LODs, and software occlusion culling |
+| [cost-loop.md](cost-loop.md) | Optimization loop: phone ms cost attribution, findings, in-memory what-if edits, visual checks, Lune export, and budgets |
+| [service.md](service.md) | Background render service, concurrent callers, HTTP API, job JSON, caching, memory admission, and profiling |
+| [viewport-worker.md](viewport-worker.md) | `ror viewport-worker`: persistent `ViewportFrame` renderer and its JSON protocol |
+| [assets.md](assets.md) | Asset downloads, account broker, GPU texture caches, shared content store, and disk cleanup |
+| [parity.md](parity.md) | Studio parity harness: capture Studio setup, pixel comparisons, agreement numbers, and calibration experiments |
 
-The rules behind the pictures, and the code:
+## Rendering rules and architecture
 
-| page | what it covers |
+| Guide | Topics |
 |---|---|
-| [rendering.md](rendering.md) | the scene model, what draws, the colour pipeline, light, shadows, sky, atmosphere, fog, clouds, post effects, GUIs |
-| [materials.md](materials.md) | built-in materials of both generations, SurfaceAppearance, MaterialVariants, Neon, Glass, ForceField, decals |
-| [particles.md](particles.md) | particles, beams, trails and legacy effects |
-| [layout.md](layout.md) | where things are in this repository |
+| [rendering.md](rendering.md) | Scene extraction, supported objects, color pipeline, lighting, shadows, sky, atmosphere, fog, clouds, post effects, and GUIs |
+| [materials.md](materials.md) | 2022 and pre-2022 materials, SurfaceAppearance, MaterialVariants, Neon, Glass, ForceField, decals, and characters |
+| [particles.md](particles.md) | Particle emitters, beams, trails, and legacy effects |
+| [layout.md](layout.md) | Repository crates, tools, and directory structure |
 
-How the rules were found: each one comes from captures of a dedicated Studio instance, compared
-with ror pixel by pixel or read through Studio's own counters, and from Roblox's public
-documentation and talks. Constants in the code are fitted to those measurements; the experiment that
-measured a rule is named next to it in the code (`ror studio calibrate <experiment>`, see
-[parity.md](parity.md)). Code comments also cite the maintainers' lab notes (`notes/<area>.md`), which
-are not part of this repository; these pages summarize the rules those notes established.
+## Where the rendering rules come from
+
+Every rendering and cost rule is derived from controlled captures in a dedicated Roblox Studio instance—diffed pixel by pixel or checked against Studio's own render counters—supplemented by public Roblox documentation and talks. Constants in the shaders and Rust code are fitted directly to those measurements. Code comments name the calibration experiment (`ror studio calibrate <experiment>`, see [parity.md](parity.md)) that produced each constant. Comments may also cite unpublished internal lab notes (`notes/<area>.md`); the pages here summarize every rule those notes established.

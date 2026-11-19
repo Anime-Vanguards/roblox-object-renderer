@@ -1,99 +1,87 @@
 # Contributing to ror
 
-Thanks for helping out! This guide covers how changes get in, what we need from you, and what we can't accept.
+Thanks for contributing. This guide explains how changes are accepted, how to set up a local build, and what we cannot merge.
 
-## How changes land here
+## How pull requests are merged
 
-This repository is published from the maintainers' internal repository by an automated sync, so `main` only moves through sync commits.
+This public repository is published from an internal repository via an automated sync tool, so `main` only advances through sync commits.
 
-Pull requests are still the way in, and they're reviewed here like anywhere else. Once a maintainer accepts yours, they apply it internally. It then comes back in the next sync commit with you as its author, and the PR is closed with a link to that commit. So a closed PR with a "Landed in ..." comment means it was merged.
+You still open pull requests here and go through normal review. Once approved, a maintainer imports your diff into the internal repo. The next sync pushes it back to public `main` with you preserved as the commit author, and closes your PR with a link to that commit. A closed PR with a `"Landed in ..."` comment means it was merged.
 
-## Before you start
+## Before you open a PR
 
-- **Small fixes** (typos, an obvious bug with a test): open a PR straight away.
-- **Anything bigger** (new features, new flags, behavior changes, refactors): open an issue first and wait for a maintainer to agree on the approach. PRs that skip this step may be closed so nobody's time is wasted.
-- **Differences from Roblox Studio**: use the "Looks different from Studio" issue form, and include Studio's output next to ours. Parity claims need evidence; see [Measuring against Studio](#measuring-against-studio).
-- **Security problems**: never in a public issue. See [SECURITY.md](SECURITY.md).
+- **Small fixes** (typos, clear bugs with a test): open a PR directly.
+- **Larger changes** (new features, CLI flags, behavior changes, refactors): open an issue first to align on the design. Unsolicited large PRs may be closed to avoid wasted effort.
+- **Visual differences from Studio:** use the "Looks different from Studio" issue template and attach side-by-side Studio output. See [Measuring against Studio](#measuring-against-studio).
+- **Security vulnerabilities:** never report publicly. Follow [SECURITY.md](SECURITY.md).
 
-Search existing issues before filing. A thumbs-up on an existing issue helps more than a duplicate.
+Search open issues before filing a new one.
 
 ## Development setup
 
-1. Install Rust 1.90 or later (on Windows the MSVC toolchain; rust-lld, which comes with it, links
-   the Windows target) and clone this repository.
-2. `cargo build --release` builds `target/release/ror`. `cargo test --release --workspace` runs every
-   test; the team runs ror's own with `cargo test --release -p ror -- --test-threads=1`.
-3. What the tests need:
-   - nothing extra: ror-image, ror-mesh's synthetic tests, ror-assets' unit and mock-server tests,
-     and most of ror's scene, playback, lint, budget and cost tests;
-   - a GPU, or a software adapter (WARP on Windows, which ror falls back to): ror's render, video,
-     service and job tests;
-   - an installed Roblox (the Player or Studio): one ror-assets test, which skips without it, and renders that use
-     built-in content (skies, avatar meshes, fonts);
-   - the Roblox client's local cache: ror-mesh's `local_cache` test, which skips without it;
-   - Roblox Studio running with a Studio MCP bridge: nothing in `cargo test`, only parity work
-     ([docs/parity.md](docs/parity.md)).
-4. Optional: [rur](https://github.com/Anime-Vanguards/roblox-ui-renderer) (GUIs) and
-   [ree](https://github.com/Anime-Vanguards/roblox-engine-emulator) (`.luau` inputs) checked out
-   beside this checkout, ffmpeg on the PATH (WebM, GIF, MP4), and the `x264` feature
-   ([docs/building.md](docs/building.md)).
-5. The scripts in `tools/` use Python 3.10+ with numpy, scipy, Pillow and opencv-python
-   (`tools/perf_suite.py` also psutil and pywin32).
+1. Install **Rust 1.90+** (on Windows, use the MSVC toolchain; the bundled `rust-lld` handles linking) and clone this repository.
+2. Build and test:
+   ```sh
+   cargo build --release --workspace --all-targets
+   cargo test --release --workspace -- --test-threads=1
+   cargo clippy --release --workspace --all-targets
+   ```
+   (Run `cargo test --release -p ror -- --test-threads=1` to test just the `ror` crate.)
+3. **What different test suites need:**
+   - **No extra dependencies:** `ror-image`, synthetic `ror-mesh` tests, `ror-assets` unit/mock-server tests, and most `ror` scene, playback, lint, budget, and cost tests.
+   - **GPU or software adapter:** `ror` render, video, service, and job tests (falls back to WARP on Windows if no hardware GPU is available).
+   - **Installed Roblox Player or Studio:** one `ror-assets` test (auto-skips if absent) and renders relying on built-in skies, avatar meshes, or fonts.
+   - **Local Roblox client cache:** `ror-mesh`'s `local_cache` test (auto-skips if absent).
+   - **Running Studio + MCP bridge:** not required by `cargo test`; only needed for parity work ([docs/parity.md](docs/parity.md)).
+4. **Optional sibling tools:**
+   - [rur](https://github.com/Anime-Vanguards/roblox-ui-renderer) for GUI rendering and [ree](https://github.com/Anime-Vanguards/roblox-engine-emulator) for `.luau` inputs, checked out alongside this repo.
+   - `ffmpeg` on `PATH` for WebM, GIF, and default MP4 encoding, or the optional `x264` feature ([docs/building.md](docs/building.md)).
+5. **Analysis scripts in `tools/`:** require Python 3.10+ with `numpy`, `scipy`, `Pillow`, and `opencv-python` (`tools/perf_suite.py` also needs `psutil` and `pywin32`).
 
-Before you open a PR, run:
+## Pull request guidelines
 
-```sh
-cargo build --release --workspace --all-targets
-cargo test --release --workspace -- --test-threads=1
-cargo clippy --release --workspace --all-targets
-```
-
-## Making a change
-
-- Keep a PR to one change. Unrelated fixes go in their own PRs.
-- Add or update tests for every change in behavior. Run the whole test command above before you push, and say in the PR what you ran.
-- Follow the style of the surrounding code (tabs for indentation, the existing naming). Rust uses hard tabs and long lines, and there is no rustfmt configuration: don't run `cargo fmt` over the tree, it would rewrite every file. Clippy's existing warnings are tolerated; don't add new ones. Doc comments say what a thing is and the rule it follows, with the experiment that measured it where there is one.
-- Update the docs (README, `docs/`) when flags, outputs or behavior change.
-- Write commit messages and PR titles as one plain sentence saying what changed ("Particles with ZOffset move by view depth").
-- Don't commit generated output, build folders, renders or logs.
+- **One focused change per PR.** Split unrelated fixes into separate PRs.
+- **Include tests for behavior changes.** Run the full build, test, and clippy commands above before pushing, and note what you ran in the PR description.
+- **Match existing code style.** This repo uses hard tabs and long lines with no `rustfmt` config—do **not** run `cargo fmt`, as it will reformat the entire tree. Existing Clippy warnings are tolerated, but do not introduce new ones. Write doc comments explaining what code does, the Studio rule it implements, and the calibration experiment that measured it if applicable.
+- **Update documentation.** Keep `README.md` and `docs/` in sync when flags, outputs, or behavior change.
+- **Clear titles and commit messages.** Use one plain sentence describing the change (e.g., `"Offset particle depth sorting by ZOffset"`).
+- **Keep the tree clean.** Do not commit build artifacts, renders, logs, or generated files.
 
 ### Measuring against Studio
 
-These tools aim to match Roblox Studio exactly, so a change that claims parity needs:
+Because `ror` aims to match Roblox Studio directly, parity PRs must include:
 
-- the Studio version and graphics settings you compared against;
-- a minimal scene or script that shows the difference, built from scratch (parts, a script, a small .rbxm you made yourself);
-- the numbers or images before and after, side by side with Studio's.
+- The Roblox Studio version and graphics settings used for comparison.
+- A minimal, self-contained scene or script built from scratch (primitive parts, a small `.rbxm`, or a short script) that reproduces the difference.
+- Before-and-after metrics or images compared side by side against Studio.
 
-Never copy code, shaders, tables or other data out of Roblox's binaries or installed files. Fit values from measurements instead.
+Never copy code, shaders, lookup tables, or assets from Roblox binaries or installation directories. Fit constants from black-box measurements instead.
 
-## Content and code we can't accept
+## What we cannot accept
 
-- Models, places, images, meshes, audio, fonts or text you don't own or have the right to share. That includes assets from Roblox games (ours included) and Roblox's own fonts and textures. Tests and fixtures build their own scenes.
-- Code copied from Roblox, decompiled or reverse-engineered from Roblox's binaries, or taken from projects whose license isn't compatible with GPL-2.0-or-later.
-- Network calls to anything other than the Roblox endpoints the tools already use, telemetry, or anything that sends user data elsewhere.
-- Credentials of any kind in code, tests, logs or screenshots (never paste a `.ROBLOSECURITY` cookie anywhere).
+- Models, places, images, meshes, audio, fonts, or text you do not have the right to distribute—including assets from Roblox games (ours included) or Roblox's built-in content. Tests and fixtures must construct their own scenes.
+- Code copied, decompiled, or reverse-engineered from Roblox binaries, or code under licenses incompatible with GPL-2.0-or-later.
+- Telemetry or outbound network requests to hosts other than the Roblox endpoints `ror` already uses.
+- Secrets or credentials anywhere in code, tests, logs, or screenshots (never paste a `.ROBLOSECURITY` cookie).
 
 ## AI-assisted contributions
 
-You're welcome to use AI tools. The maintainers use coding agents heavily too. The rules:
+AI coding tools are welcome—the maintainers use them heavily as well—under these rules:
 
-- **You're responsible for every line.** Read and understand the change before you open the PR, and be ready to explain it. Don't submit code you couldn't defend in review.
-- **Say so in the PR.** The template asks which tool you used and how.
-- **No unattended bulk PRs.** Agent-generated drive-by PRs across many files, or PRs opened in batches with no issue behind them, will be closed without review.
-- **Agents follow [AGENTS.md](AGENTS.md).** Point your agent at it.
-- **Tests are required.** Generated code with no test, or tests that don't fail without the fix, won't be merged.
+- **You own every line.** Read, understand, and verify your changes before opening a PR. Don't submit code you cannot explain in review.
+- **Disclose AI use.** Fill out the PR template section noting which tools you used and how.
+- **No drive-by bulk PRs.** Unattended agent PRs touching many files or opened in batches without a backing issue will be closed without review.
+- **Point agents at [AGENTS.md](AGENTS.md).**
+- **Tests are mandatory.** Generated fixes without a test that fails before the fix will not be merged.
 
-## Review
+## Review process
 
-Issues and pull requests are triaged and reviewed by the maintainers' automated review, so a first reply usually comes within the hour; anything it can't decide goes to a maintainer. Bugs and requests filed as issues are fixed by the maintainers: you don't need to send a pull request for them.
+Issues and pull requests receive an initial automated triage and review (usually within an hour). Anything requiring judgment is escalated to a maintainer. If you file a bug or feature request as an issue, you don't need to submit a PR—maintainers handle fixes directly.
 
-Every pull request is screened for security first, then reviewed for quality and fit with the project. You make the changes a review asks for: push them to the same PR, which is reviewed again. Changes to build scripts, CI, dependencies or agent instructions always need a maintainer's sign-off.
+PRs undergo security screening first, then code review. Push requested changes to the same PR branch to trigger re-review. Edits to build scripts, CI workflows, dependencies, or agent instructions always require direct maintainer sign-off.
 
-## License
+## License and conduct
 
-ror is licensed under the GNU General Public License, version 2 or (at your option) any later version ([LICENSE](LICENSE)). By submitting a contribution you agree that it's licensed under the same terms, and you confirm that you have the right to submit it.
+`ror` is licensed under GPL-2.0-or-later ([LICENSE](LICENSE)). By submitting a contribution, you confirm you have the right to contribute it under those terms.
 
-## Code of conduct
-
-Everyone taking part follows our [Code of Conduct](CODE_OF_CONDUCT.md).
+All participants must follow the [Code of Conduct](CODE_OF_CONDUCT.md).

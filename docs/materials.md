@@ -1,109 +1,67 @@
-# Materials and lighting rules
+# Materials and shading rules
 
-The material code is `crates/ror/src/render/materials.rs`, `render/texels.rs` (textures as the GPU
-takes them) and `shaders/mesh.wgsl`. The general light and colour rules are in
-[rendering.md](rendering.md).
+This page documents how `ror` reproduces Roblox materials, `SurfaceAppearance`, vertex colors, special materials (`Neon`, `Glass`, `ForceField`), decals, characters, and `Highlight`s.
+
+Implementation: `crates/ror/src/render/materials.rs`, `render/texels.rs`, and `shaders/mesh.wgsl`. For general lighting, tone mapping, and the color pipeline, see [rendering.md](rendering.md).
 
 ## Built-in materials
 
-- Two generations: the 2022 materials and the pre-2022 ones. A place chooses with
-  `MaterialService.Use2022Materials` (`--materials-from <place>` takes a place's choice and its
-  MaterialVariants; without it ror draws the 2022 materials).
-- Each material's textures are a texture pack: a small XML asset (`texturepack_version`, `usage`,
-  `alphamode`, `tiling`, and asset ids for `color`, `normal`, `metalness`, `roughness`, `emissive`,
-  any of them missing). SurfaceAppearance and MaterialVariant `TexturePack` properties point at the
-  same kind of asset. `render::materials::PACKS_2022` lists the built-in materials' packs.
-- Studio draws Roblox's KTX2 transcodes of these packs (BC1 / BC3 with Roblox's mips), not the
-  uploaded PNGs, and so does ror (`ror-image`, `render::transcode`; `ROR_TRANSCODES=0` draws the
-  uploads).
-- SmoothPlastic, Neon and ForceField have no textures; Plastic and Foil only a normal map.
-- How a material's texture maps onto a part (studs per tile, the Organic pattern's per-part offsets,
-  the Wang tiling of some materials) is measured per material and kept in the table with its pack.
+- **Material generations:** `ror` supports both 2022 and pre-2022 materials, controlled by `MaterialService.Use2022Materials` (load a place's setting and `MaterialVariant`s with `--materials-from <place>`; defaults to 2022).
+- **Texture packs:** Built-in materials, `SurfaceAppearance.TexturePack`, and `MaterialVariant.TexturePack` are defined by XML texture pack assets containing `texturepack_version`, `usage`, `alphamode`, `tiling`, and optional asset IDs for `color`, `normal`, `metalness`, `roughness`, and `emissive`. Built-in 2022 packs are listed in `render::materials::PACKS_2022`.
+- **KTX2 transcodes:** Like Studio, `ror` renders Roblox's KTX2 transcodes (BC1/BC3 with Roblox mips) rather than raw uploaded PNGs (`ROR_TRANSCODES=0` forces raw uploads).
+- **Textureless materials:** `SmoothPlastic`, `Neon`, and `ForceField` use no texture maps; `Plastic` and `Foil` use only a normal map.
+- **Tiling:** Per-material `StudsPerTile`, Organic per-part offsets, and Wang tiling parameters are measured from Studio and stored alongside each pack table.
 
 ## SurfaceAppearance and MaterialVariant
 
-- A SurfaceAppearance's ColorMap, NormalMap, MetalnessMap and RoughnessMap replace the part's
-  material entirely (its Material and TextureID no longer matter), tinted by its Color; AlphaMode
-  Overlay, Transparency and TintMask decide what its colour map's alpha does.
-- In AlphaMode TintMask the Color is mixed in by the map's alpha in stored (gamma-encoded) values:
-  texel x (1 - a + a · Color), both as stored, then decoded as the map is and lit as usual. Alpha 0
-  shows the texel unchanged, alpha 1 the texel times the Color. Measured on eight-step alpha ramps
-  against each candidate's predicted colour (`tintmask-ramp`): within 2.1 of 255 per cell on average,
-  against 3.4 for a gamma-2 mix and 6.8 for a mix in linear light. (A built-in material's TintMask
-  instead mixes the part colour in gamma 2.)
-- A TintMask appearance glows in that tinted colour, not in the stored texel: a texel O / C at alpha
-  1 under Color C glows as O at alpha 0 does, times the emissive mask's red channel, EmissiveTint and
-  EmissiveStrength (`tintmask-emission`). So a recoloured surface's glow follows its new colour, and
-  a mask made from the stored texels glows as the original's did once EmissiveTint carries C's red.
-- A MaterialVariant from the place's MaterialService replaces a base material's maps by name
-  (`MaterialVariant` on the part, or MaterialService's override for that material), with its own
-  StudsPerTile, pattern and emissive mask.
-- Metals keep (1 - metalness)(1 - k s F) of the sky's diffuse light with EnvironmentSpecularScale s
-  on, so a white cube's diffuse plus specular equals diffuse alone.
+- **`SurfaceAppearance` override:** When present, `ColorMap`, `NormalMap`, `MetalnessMap`, and `RoughnessMap` completely override the part's base `Material` and `TextureID`. `AlphaMode` (`Overlay`, `Transparency`, `TintMask`) determines how `ColorMap` alpha is interpreted.
+- **`AlphaMode = TintMask`:** Blends the part `Color` in stored (gamma-encoded) space before decoding: `texel * (1 - a + a * Color)`. At `a = 0`, the texel is untouched; at `a = 1`, it multiplies by `Color`.
+  - Measured on 8-step alpha ramps (`tintmask-ramp`): averages within 2.1/255 of Studio per cell (vs. 3.4/255 for gamma-2 mixing and 6.8/255 for linear mixing). Built-in materials using TintMask mix in gamma 2 instead.
+  - **Emission:** TintMask surfaces emit using the tinted color rather than the raw texel, scaled by the emissive mask red channel, `EmissiveTint`, and `EmissiveStrength` (`tintmask-emission`). Recoloring a part shifts its glow accordingly.
+- **`MaterialVariant`:** Loaded from `MaterialService` via the part's `MaterialVariant` property or `MaterialService` base-material overrides, bringing its own maps, `StudsPerTile`, pattern, and emissive mask.
+- **Metallic diffuse conservation:** When `EnvironmentSpecularScale` (`s`) is enabled, diffuse sky light scales by `(1 - metalness)(1 - k * s * F)` so diffuse + specular on a white cube matches diffuse alone.
 
-## MeshPart colour
+## MeshPart color and vertex colors
 
-- An untextured MeshPart shows its Color. Its mesh's vertex colours (a FileMesh's, or an
-  EditableMesh's from AddColor and SetFaceColors) multiply that colour before it decodes, so the
-  albedo by their square: Color² · v² per channel.
-- A TextureID or TextureContent replaces Color, and the vertex colours multiply it the same way:
-  texel² · 0.971 · v² (the 0.971 is every colour texture's loss). A white texture leaves the vertex
-  colours as they are; Color does not show where the texture is opaque.
-- Under a SurfaceAppearance it depends on the AlphaMode. In Overlay the vertex colours tint the part
-  colour the map's alpha reveals (all of it without a ColorMap), never the map. In Transparency and
-  TintMask they do nothing.
-- Measured in a Roblox 0.747 client on `fixtures/vertex-colour-maps.luau` under flat ambient light
-  (its header has the setup), at the centres of quads of four vertex colours: under white and (204,
-  153, 102) EditableImages and a white built-in TextureID, at two part Colors and at Transparency 0
-  and 0.5, ror's render is within 1 of 255 of the client's (it drew the texture alone before, up to
-  155 off), the corner-coloured quads within 1 (100 before). In Overlay at alpha 0.5 the client's
-  albedo fits the gamma-2 mix of Color · v and the map within 3 %; tinting the map as well predicts
-  0.030 where a cell of v 0.25 reads 0.105. ror there is within 4 of 255, as it is for the same quads
-  with white vertex colours (the map's own decode), and was up to 157 off.
+How `Part.Color`, mesh vertex colors (`FileMesh` or `EditableMesh` `AddColor`/`SetFaceColors`), textures, and `SurfaceAppearance` combine:
+
+| Setup | Resulting albedo |
+|---|---|
+| Untextured `MeshPart` | `Color² * v²` per channel (vertex colors multiply `Color` before gamma-2 decode) |
+| `TextureID` or `TextureContent` | `texel² * 0.971 * v²` (`0.971` is Roblox's color-texture attenuation). `Part.Color` does not show where the texture is opaque; a white texture reveals vertex colors directly. |
+| `SurfaceAppearance` (`Overlay`) | Vertex colors multiply `Part.Color` in areas revealed by `ColorMap` alpha (or everywhere if `ColorMap` is empty), never the `ColorMap` itself. |
+| `SurfaceAppearance` (`Transparency` or `TintMask`) | Vertex colors have no effect. |
+
+*Verification:* Measured in a Roblox 0.747 client using `fixtures/vertex-colour-maps.luau` under flat ambient light across white and `(204, 153, 102)` `EditableImage`s, a white built-in `TextureID`, two part colors, and `Transparency` 0 / 0.5. `ror` matches within 1/255 on textured/corner-colored quads and within 4/255 on `Overlay` at alpha 0.5.
 
 ## Neon
 
-- Unlit: the sun and ambient light do not change it; ExposureCompensation does.
-- Emission x = 25.75 · c⁴ per channel (c the colour in 0..1), clamped like every surface at 7.84
-  before it blends, so saturated colours clip to their channel ratios (orange shows yellow).
-- It feeds the bloom ([rendering.md](rendering.md)).
+- Unlit by sun or ambient light, but still affected by `Lighting.ExposureCompensation`.
+- Emissive radiance is `25.75 * c⁴` per channel (`c` in `0..1`), clamped at `7.84` before blending like all surfaces. Saturated colors shift toward white/yellow as channels clip (e.g., bright orange looks yellow).
+- Feeds into the bloom pass ([rendering.md](rendering.md#post-effects-and-bloom)).
 
 ## Glass
 
-- What shows through Glass is the opaque scene only, moved against the surface's normal: sampled at
-  P - k cos^p(θ) n⊥, n⊥ the shading normal's part across the view's axis and θ its angle to that
-  axis, at the glass's depth; k falls as Transparency rises. Particles, other transparent parts and
-  beams behind it do not show through it.
-- Over the bent scene: its tint, its sky reflection by Fresnel, and the sun's glint.
-- Past Transparency 1 Glass draws nothing, except under a Highlight (even a disabled one), where
-  Studio draws it as glass at its rim: faint rings.
+- **Refraction:** Samples only the opaque scene buffer, offset by `P - k * cos^p(θ) * n⊥` (where `n⊥` is the view-plane component of the shading normal and `θ` is the angle to the view axis; `k` decreases as `Transparency` rises). Transparent parts, particles, and beams behind Glass do not refract through it.
+- **Surface:** Composites tint, Fresnel sky reflection, and sun specular glint over the refracted background.
+- **Transparency > 1:** Draws nothing unless inside a `Highlight` (even a disabled one), where Studio still renders faint glass rim rings.
 
 ## ForceField
 
-- The ForceField material draws unlit, as Studio's pattern over the part's shape, stronger at
-  grazing angles; its colour and Transparency set its strength, and its pattern moves with time
-  (`shaders/mesh.wgsl`, the `forcefield-*` experiments).
-- The ForceField instance on a character draws Studio's own shield particles instead (a legacy
-  effect, [particles.md](particles.md)).
+- **Material:** Unlit procedural pattern animated over time (`shaders/mesh.wgsl`, `forcefield-*` experiments), strongest at grazing angles and scaled by `Color` and `Transparency`.
+- **`ForceField` instance:** On a character, draws Studio's legacy shield particles instead ([particles.md](particles.md)).
 
-## Decals and textures
+## Decals and Textures
 
-- Decals and Textures draw on their face with the part's lighting; a Texture tiles by its
-  StudsPerTileU / V and offsets. Transparency and Color3 tint them; ZIndex orders decals on one face.
-- A Decal's UVOffset and UVScale map the face's uv to its image's as uv * UVScale + UVOffset: at
-  UVScale (2, 2) the image fills the face's top-left quarter, at UVOffset (0.25, 0) it moves left by a
-  quarter of the face. The face still bounds it.
-- On MeshParts and SpecialMeshes a decal follows rules measured mesh by mesh (`fs_decal` in
-  `shaders/mesh.wgsl` and the decal code in `render/mod.rs` say which).
+- Rendered on their assigned face using the host part's lighting, tinted by `Color3` and `Transparency`, and ordered per face by `ZIndex`. `Texture` tiles via `StudsPerTileU` / `StudsPerTileV` and offsets.
+- **`Decal.UVOffset` and `UVScale`:** Map face UVs as `uv * UVScale + UVOffset`, clipped to the face bounds (e.g., `UVScale = (2, 2)` confines the image to the top-left quarter; `UVOffset = (0.25, 0)` shifts it left by a quarter).
+- On `MeshPart`s and `SpecialMesh`es, decals follow per-mesh projection rules implemented in `fs_decal` (`shaders/mesh.wgsl`) and `render/mod.rs`.
 
-## Characters
+## Characters and skinned meshes
 
-- R6 and R15 body parts from Studio's rigs (`rbxasset://avatar/...`), CharacterMeshes, and the
-  body colours composited under Shirts, Pants and ShirtGraphics on the classic clothing templates,
-  as Studio composites them (`render::skinning`, `scene::extract`).
-- Skinned meshes are posed by their Bones on the CPU and drawn with their parts' materials.
+- R6 and R15 characters load base rigs from `rbxasset://avatar/...`, apply `CharacterMesh`es, and composite `BodyColors` beneath `Shirt`, `Pants`, and `ShirtGraphic` on classic clothing templates (`render::skinning`, `scene::extract`).
+- Skinned meshes are posed by their `Bone` hierarchy on the CPU before drawing with their assigned materials.
 
 ## Highlights
 
-- Fill and outline drawn over everything under the Highlight's adornee (or parent), DepthMode
-  AlwaysOnTop or Occluded, FillTransparency and OutlineTransparency (`render::highlights`).
+Renders fill and outline passes over the `Adornee` (or parent) hierarchy respecting `DepthMode` (`AlwaysOnTop` or `Occluded`), `FillTransparency`, and `OutlineTransparency` (`render::highlights`).

@@ -1,10 +1,10 @@
-# Scripts as input
+# Running Luau scripts as input
 
-A model can be its code: `render` and `video` take a `.luau` script, run it in the engine emulator
-([roblox-engine-emulator](https://github.com/Anime-Vanguards/roblox-engine-emulator), ree) and draw
-what it puts in the Workspace, without Studio. A model or an effect is built and polished as a
-script, and the same script runs in Studio once it looks right. The code is
-`crates/ror/src/script.rs`.
+Both `ror render` and `ror video` accept a `.luau` script directly. `ror` executes the script in [roblox-engine-emulator](https://github.com/Anime-Vanguards/roblox-engine-emulator) (`ree`) and renders whatever it places in `Workspace`, letting you iterate on procedural models or scripted effects offline before bringing the same script into Studio.
+
+Implementation: `crates/ror/src/script.rs`.
+
+## Example
 
 ```luau
 -- Build.luau
@@ -23,29 +23,19 @@ end
 
 ```sh
 ror render Build.luau --views front,iso --context '{"Floors":3}'
-ror render Build.luau --time 1                   # after a second of its tweens and task.waits
-ror render Build.luau --mount ReplicatedStorage/Shared=src/shared   # its requires
+ror render Build.luau --time 1                   # After 1 s of tweens and task.wait()
+ror render Build.luau --mount ReplicatedStorage/Shared=src/shared
 ror video Build.luau --duration 2
 ```
 
-- The script is a ree harness: a ModuleScript returning `function(Context)` (or `{ Run = ... }`) that
-  parents what it builds to the Workspace, and may yield. `Context` holds `--context`'s fields. It
-  runs in play mode at 60 frames a second: TweenService, `task`, RunService events, `:Emit` and
-  AnimationTracks run; physics, the server and CSG (`UnionAsync`) do not (ree's
-  [docs/cli.md](https://github.com/Anime-Vanguards/roblox-engine-emulator/blob/main/docs/cli.md#what-is-not-simulated)
-  "What is not simulated").
-- `render` records the run to `--time` (default 0, what the script built at once) and draws that
-  moment; `video` records to the clip's end. The recording is the playback (`--playback` is refused;
-  `--emit`, `--set`, `--tween` and the rest add to it, [playback.md](playback.md)), and nothing else
-  is emitted.
-- Requires reach other code through services. `--mount Service/Name=<dir|file>` (repeatable) places
-  a source directory or model file at an instance path, as ree's `--mount` does. The run starts with
-  a fresh world; unrelated default projects and Studio snapshots are never mounted. `--offline` also
-  applies to the emulator.
-- Output: the render's or video's files in `--out` (default `<state dir>/out/<script name>`, `-video`
-  for a video), the recording (`scene.rbxm`, `playback.json`, `events.json`) in its `record/`, and a
-  `script` entry in the CLI summary: the run's status, frames, instances and error lines (also printed
-  as `ror: script error: ...`). This entry is saved in `record/script.json` too, including for
-  `--sheet-first` videos. A run that puts nothing in the Workspace is an error naming why.
-- ree is `ROR_REE` (its checkout), else `../roblox-engine-emulator` beside this checkout, built with
-  `cargo build --release`.
+## How script runs work
+
+- **Harness format:** Write a `ModuleScript` returning `function(Context)` (or `{ Run = function(Context) ... end }`). `Context` receives the JSON fields passed via `--context`. The script may yield (`task.wait`, etc.).
+- **Simulation scope:** Scripts run in play mode at 60 FPS with `TweenService`, `task`, `RunService` events, `:Emit()`, and `AnimationTrack`s active. Physics simulation, server scripts, and CSG (`UnionAsync`) are not emulated (see `ree`'s [What is not simulated](https://github.com/Anime-Vanguards/roblox-engine-emulator/blob/main/docs/cli.md#what-is-not-simulated)).
+- **Timeline capture:** `ror render` records up to `--time` (default `0`, capturing what the script builds synchronously) and renders that timestamp. `ror video` records through the clip duration. The generated recording serves as the playback—passing `--playback` is rejected, while CLI overrides like `--emit`, `--set`, and `--tween` layer on top ([playback.md](playback.md)).
+- **Mounting dependencies (`--mount`):** Pass `--mount Service/Name=<dir|file>` (repeatable) to mount Luau directories or model files for `require`, matching `ree --mount`. Script runs always start in a clean world without mounting unrelated default projects or Studio snapshots. `--offline` is forwarded to `ree`.
+- **Outputs:** Standard render/video outputs go to `--out` (default `<state dir>/out/<script>`, or `<script>-video` for video), along with the raw recording (`scene.rbxm`, `playback.json`, `events.json`, and `script.json`) under `<out>/record/`. The CLI summary includes a `script` block with status, frame count, instance count, and errors (also printed as `ror: script error: ...`). If the script leaves `Workspace` empty, `ror` fails with an error explaining why.
+
+## Locating `ree`
+
+`ror` looks for a release build (`cargo build --release`) of `ree` in `ROR_REE`, falling back to `../roblox-engine-emulator` alongside the `ror` checkout.

@@ -1,73 +1,49 @@
-# Playback: effects over time
+# Effect playback and timelines
 
-Effects draw at a moment of their timeline with a playback: what is emitted, switched, set, tweened
-and moved when, and the moment drawn (`time`, seconds after the effect is placed in the world, as a
-game clones its effects in). The code is `crates/ror/src/scene/playback.rs` and `scene/particles.rs`;
-how particles, beams and trails draw is in [particles.md](particles.md), and clips of a playback in
-[video.md](video.md).
+Playbacks let you render particles, beams, trails, tweens, property changes, and moving parts at any timestamp `t` (seconds after the effect enters the world).
 
-Without one a model draws as authored: each enabled emitter's steady state, beams at rest and no
-trails (they need motion). With one, particles are where and when they were emitted (each particle's
-position, size, colour, transparency, rotation and flipbook frame from its own age and random
-streams), trails follow the points their attachments left, and beams scroll by TextureSpeed from the
-frame they were enabled in. The world updates every 1/60 s unless the playback gives `frames`.
+Implementation: `crates/ror/src/scene/playback.rs` and `scene/particles.rs`. See [particles.md](particles.md) for how effects render and [video.md](video.md) for rendering full clips.
+
+Without a playback, enabled emitters render in steady state, beams sit at rest, and trails draw nothing. With a playback, `ror` steps the simulation at 60 Hz (1/60 s per frame, unless `frames` are specified explicitly in JSON), tracking every emitted particle's age and random streams, trail attachment history, and beam texture scroll from the frame it was enabled.
 
 ```sh
-ror render Effect.rbxm --emit VfxAttack.Shoot --time 0.3        # EmitCount attributes at 0
+ror render Effect.rbxm --emit VfxAttack.Shoot --time 0.3
 ror render Effect.rbxm --emit VfxAttack.Hit=20@0.1 --enable VfxAttack.Aura --disable VfxAttack.Aura@0.4 --time 0.5
 ror render Effect.rbxm --playback effect.json --time 0.25
-# the Lighting while it plays: an exposure flash, an impact frame the effect carries, its lights fading
-ror video Effect.rbxm --set "Lighting.ExposureCompensation+=4@0.2" \
+
+# Combine with Lighting flashes, impact frames, and fading lights
+ror video Effect.rbxm \
+  --set "Lighting.ExposureCompensation+=4@0.2" \
   --tween "Lighting.ExposureCompensation=initial@0.2+0.5" \
-  --parent "VfxAttack.ImpactFrame=Lighting@0.3" --parent "VfxAttack.ImpactFrame=nil@0.38" \
+  --parent "VfxAttack.ImpactFrame=Lighting@0.3" \
+  --parent "VfxAttack.ImpactFrame=nil@0.38" \
   --tween "VfxAttack.Brightness=0@0.4+0.9:class=Light"
 ```
 
-## Flags
+## CLI flags
 
-- `--emit <path>[=<count>|=<mode>][@<seconds>]` emits from every ParticleEmitter at or under the
-  dotted path from the file's root (empty: everything drawn): `count` particles, or by each emitter's
-  EmitCount / EmitDelay / EmitDuration attributes (`=attributes`, the default, or another mode,
-  [below](#emit-modes)).
-- `--enable` / `--disable <path>[@<seconds>]` switch the emitters, trails, beams, lights and
-  Highlights there (a post effect, Sky or Atmosphere only when the path or class names it), and win
-  over the playback from then on: its own switches, sets and tweens of Enabled no longer reach them,
-  wherever it parents them, and what it parents under the path is switched too; disabled, they emit
-  nothing more. So `--disable` takes a part of a recorded effect out of the picture however the
-  recording brings it in (bisecting a frame); a later forced switch takes over.
-- `--time` is the moment drawn. `--playback` takes the JSON ([below](#the-playback-json)), inline or
-  a file; the flags add to it. A job takes it as `"playback"`.
-- `--set <path>.<Property>[+|-]=<value>[@<seconds>]` sets a property from then on, `+=` / `-=`
-  relative to its value then.
-- `--tween <path>.<Property>[+|-]=<value>[@<start>[+<duration>]][:<EasingStyle>][:<In|Out|InOut>]
-  [:reverses][:repeat=<n>][:delay=<s>][:class=<Class>]` plays it as
-  `TweenService:Create(...):Play()` at the start (TweenInfo's 1 s, Quad, Out by default), from the
-  value it has then.
-- `--parent <path>=<new parent>[@<seconds>]` moves an instance (`""` or `nil`: out of the world).
-- Values: numbers, `true` / `false`, `#rrggbb` or `r,g,b` (0-1), a JSON array as the playback JSON
-  writes one (`[0.3,0,0.3,0]` a UDim2, `[[0,1,0],[1,0,0]]` a NumberSequence), text, `initial` (as in
-  the file).
-- Paths are dotted from the file's root; `*` is every child (`Lighting.*`); a name a dot, a bracket
-  or an edge space would split is quoted (`Impact.FX03["Exp4 [5]"]`), as ror writes paths and ree
-  writes a recording's.
+| Flag | Syntax and behavior |
+|---|---|
+| `--time` | Timestamp in seconds to render for `ror render`. |
+| `--playback` | Playback definition as an inline JSON string or path to a `.json` file ([schema below](#the-playback-json)). CLI flags below layer on top of it. In job JSON, pass `"playback"`. |
+| `--emit` | `<path>[=<count>\|=<mode>][@<seconds>]` — Emit from every `ParticleEmitter` at or under `<path>` (empty path targets the whole scene). Pass an integer count or an [emit mode](#emit-modes) (defaults to `=attributes`). |
+| `--enable` / `--disable` | `<path>[@<seconds>]` — Toggle emitters, trails, beams, lights, and Highlights under `<path>` (post effects, `Sky`, and `Atmosphere` toggle only when targeted explicitly by path or class). **CLI force-overrides win** over playback JSON switches/sets/tweens from that timestamp onward, even if reparented, until a later forced flag overrides them. Handy for bisecting parts of a recorded effect. |
+| `--set` | `<path>.<Property>[+\|-]=<value>[@<seconds>]` — Set a property at `<seconds>`. Use `+=` / `-=` for values relative to the current value at that moment. |
+| `--tween` | `<path>.<Property>[+\|-]=<value>[@<start>[+<duration>]][:<EasingStyle>][:<In\|Out\|InOut>][:reverses][:repeat=<n>][:delay=<s>][:class=<Class>]` — Play a `TweenService`-style tween starting at `<start>` from the current value (defaults to `1s`, `Quad`, `Out`). |
+| `--parent` | `<path>=<new parent>[@<seconds>]` — Reparent an instance (`""` or `nil` removes it from the world). |
 
-## The Lighting
+**CLI value syntax:** numbers, `true`/`false`, `#rrggbb`, `r,g,b` (0–1), JSON arrays matching playback JSON (`[0.3,0,0.3,0]` for `UDim2`, `[[0,1,0],[1,0,0]]` for `NumberSequence`), plain strings, or `initial` (reset to the value saved in the file).
 
-The Lighting is a target like any instance: `Lighting.<Property>`, `Lighting.<child>.<Property>`.
+**Instance paths:** dotted paths from the file root. `*` matches all children (`Lighting.*`). Quote names containing dots, brackets, or leading/trailing spaces (e.g., `Impact.FX03["Exp4 [5]"]`), matching `ror` and `ree` path formatting.
 
-- A place's own; a model's is a copy of `--lighting-from`'s, else one holding ror's default
-  environment, given to the model only when a playback names it.
-- Post effects, a Sky or an Atmosphere an effect carries take effect once parented into it, as an
-  effect's code parents them (a Sky or Atmosphere whose Enabled is false stays out, a playback's way
-  to hold one back).
-- A `parent` action on `Lighting` with a `class` moves the Lighting's own of that class (the lent
-  place's) out (`""`) or back (`"Lighting"`): ree's recordings write it when the run parks the
-  place's look, as cutscene scripts often do.
-- The Terrain's Clouds go with it, at their path in a place: `Workspace.Terrain.Clouds.<Property>`
-  (Color, Cover, Density, Enabled). They are the clouds ror draws: a copy of `--lighting-from`'s,
-  else the file's own, else a disabled Clouds (no clouds, as ror's default environment draws) that a
-  playback can switch on. ree's recordings write them when the run changes the Terrain's clouds, as
-  a weather script does; every frame of a clip reads them again.
+## Animating Lighting and Clouds
+
+`Lighting` and its children can be targeted like any other instance (`Lighting.<Property>`, `Lighting.<child>.<Property>`):
+
+- Places use their own `Lighting`. Models copy `--lighting-from` if supplied, or create a default `Lighting` environment whenever a playback references `Lighting`.
+- Post effects, `Sky`, and `Atmosphere` instances carried inside an effect model take effect as soon as they are parented into `Lighting` (a `Sky` or `Atmosphere` with `Enabled = false` remains inactive).
+- A `parent` action targeting `Lighting` with a `class` filter moves the scene's original instances of that class out (`""`) or back (`"Lighting"`). `ree` recordings emit this when a cutscene temporarily swaps out a map's lighting.
+- Terrain clouds are targeted at `Workspace.Terrain.Clouds.<Property>` (`Color`, `Cover`, `Density`, `Enabled`). They initialize from `--lighting-from`, then the input file, else a disabled `Clouds` instance that a playback can enable. Video clips re-read clouds every frame.
 
 ## The playback JSON
 
@@ -75,75 +51,84 @@ The Lighting is a target like any instance: `Lighting.<Property>`, `Lighting.<ch
 {
   "time": 0.3,
   "actions": [
-    {"at": 0, "target": "Effect.Shoot", "emit": "attributes"},
-    {"at": 0, "target": "Effect.Arrows", "enabled": false, "class": "Trail"},
-    {"at": 0.1, "target": "Effect.Charge", "emit": 12, "timeScale": 0.5},
-    {"at": 0.2, "target": "Effect.Ring", "set": {"Transparency": 0.5, "Color": [1, 0.5, 0]}}
+    { "at": 0, "target": "Effect.Shoot", "emit": "attributes" },
+    { "at": 0, "target": "Effect.Arrows", "enabled": false, "class": "Trail" },
+    { "at": 0.1, "target": "Effect.Charge", "emit": 12, "timeScale": 0.5 },
+    { "at": 0.2, "target": "Effect.Ring", "set": { "Transparency": 0.5, "Color": [1, 0.5, 0] } }
   ],
   "tweens": [
-    {"target": "Effect.Sphere", "property": "Size", "keys": [
-      {"at": 0, "value": [0.001, 0.001, 0.001]},
-      {"at": 0.35, "value": [20, 20, 20], "easing": "Quad", "direction": "Out"}]}
+    {
+      "target": "Effect.Sphere",
+      "property": "Size",
+      "keys": [
+        { "at": 0, "value": [0.001, 0.001, 0.001] },
+        { "at": 0.35, "value": [20, 20, 20], "easing": "Quad", "direction": "Out" }
+      ]
+    }
   ],
   "motion": [
-    {"target": "Effect.Arrow", "relative": true, "keys": [
-      {"at": 0, "cframe": [0, 0, 0]},
-      {"at": 0.15, "cframe": [0, 0, -30], "easing": "Quad", "direction": "Out"}]}
+    {
+      "target": "Effect.Arrow",
+      "relative": true,
+      "keys": [
+        { "at": 0, "cframe": [0, 0, 0] },
+        { "at": 0.15, "cframe": [0, 0, -30], "easing": "Quad", "direction": "Out" }
+      ]
+    }
   ],
   "prewarm": 0
 }
 ```
 
-- `actions`, at `at` seconds on the `target` path and the ParticleEmitters, Trails, Beams, lights,
-  Highlights and post effects under it (only those of `class`, or a class inheriting it, if given):
-  `emit` (a count or a mode, below; a count may carry `cframe`, the 12-number world CFrame of the
-  emitter's part or attachment at the call, and `partSize`: the burst leaves from there, as a script
-  moving an attachment between Emit calls in one frame leaves a burst at each place), `enabled`,
-  `timeScale` (emitters), `clear` (emitters' and trails' Clear()); `set` gives the target (with
-  `class`: each instance of it at or under the target) properties from then on; `parent` moves it
-  under another path (`""`: out of the world).
-- Values: numbers, enums by their item's number, booleans, `[x, y, z]` vectors and Color3s,
-  12-number CFrames, strings and content URIs, `[[t, v, envelope], ...]` NumberSequences,
-  `[[t, r, g, b], ...]` ColorSequences, `[min, max]` NumberRanges, a GUI's `[xScale, xOffset,
-  yScale, yOffset]` UDim2s, `[scale, offset]` UDims, `[x, y]` Vector2s, `[minX, minY, maxX, maxY]`
-  Rects, an instance reference as the dotted path of the instance it names, `null` for none;
-  `{"add": 4}` relative to the value then, `{"initial": true}` the value in the file. A property keeps
-  its type, as in Roblox: a value it cannot take stops the render with the property and the forms it
-  takes.
-- A content ID and the Content property that replaced it are one value (`Image` / `ImageContent`,
-  `Texture` / `TextureContent`, `MeshId` / `MeshContent`, ...), as in Roblox.
-- `tweens`: a property over time, with `keys` (between keyframes, each segment eased like TweenService
-  by its end key's `easing` and `direction`) or with `to` (as TweenService plays one: `"at"`,
-  `"duration"`, `"easing"`, `"direction"`, `"repeatCount"`, `"reverses"`, `"delay"`, from the value
-  the property has at `at`).
-- `motion`: a part's CFrame, a model's pivot or an attachment's world CFrame over time, everything
-  under it moving along; `relative` keys are in the target's own frame at rest.
-- `prewarm`: emitters and trails enabled in the file have run this long at time 0.
+### Top-level fields
 
-ree's recordings of a `.luau` script are playbacks in this format, with the frame times the run saw
-([scripts.md](scripts.md)).
+- **`time`:** Target render timestamp in seconds (for `ror render`).
+- **`prewarm`:** Seconds to pre-simulate emitters and trails that start enabled in the file before `t = 0`.
+- **`actions`:** Events firing at `at` seconds on `target` and matching descendants (optionally filtered by `class`, including subclasses):
+  - `emit`: integer burst count or an [emit mode](#emit-modes). Numeric bursts may also include `cframe` (12-component world CFrame of the part/attachment at emit time) and `partSize` so multiple emits in one frame at moving attachment positions spawn in the right spots.
+  - `enabled`: boolean toggle.
+  - `timeScale`: emitter `TimeScale`.
+  - `clear`: mimics `:Clear()` on emitters and trails.
+  - `set`: map of properties to apply to `target` (or matching `class` descendants).
+  - `parent`: destination path (`""` removes from world).
+- **`tweens`:** Property animations over time, defined either as `keys` (keyframe segments eased by the end key's `easing` and `direction`) or `to` (TweenService-style: `at`, `duration`, `easing`, `direction`, `repeatCount`, `reverses`, `delay`, interpolating from the property's value at `at`).
+- **`motion`:** Animates a part's `CFrame`, a model's pivot, or an attachment's world `CFrame` (moving all descendants along with it). Set `"relative": true` to interpret keyframes relative to the target's rest transform.
+
+### JSON value encodings
+
+| Roblox type | JSON form |
+|---|---|
+| Number / Bool / String / Content URI | JSON number / boolean / string |
+| Enum | Numeric enum item value |
+| `Vector3` / `Color3` | `[x, y, z]` or `[r, g, b]` |
+| `CFrame` | 12-number array `[x, y, z, R00..R22]` (or `[x, y, z]` translation) |
+| `NumberSequence` | `[[t, v, envelope], ...]` |
+| `ColorSequence` | `[[t, r, g, b], ...]` |
+| `NumberRange` | `[min, max]` |
+| `UDim2` / `UDim` | `[xScale, xOffset, yScale, yOffset]` / `[scale, offset]` |
+| `Vector2` / `Rect` | `[x, y]` / `[minX, minY, maxX, maxY]` |
+| Instance Ref | Dotted path string, or `null` |
+| Relative / Reset | `{"add": 4}` (offset from current value), `{"initial": true}` (file default) |
+
+Properties are strictly type-checked: passing an incompatible value fails the render with an error listing accepted forms. Legacy content string properties and newer `Content` properties alias to the same underlying value (`Image`/`ImageContent`, `Texture`/`TextureContent`, `MeshId`/`MeshContent`, etc.).
+
+Recordings produced by `ree` from `.luau` scripts use this exact JSON format (plus recorded frame timestamps); see [scripts.md](scripts.md).
 
 ## Emit modes
 
-Many effects carry their timing as attributes on each ParticleEmitter: `EmitCount`, `EmitDelay` and
-`EmitDuration`. An `emit` action (and `--emit` on the command line) can play them four ways
-(`scene::playback::ByAttributes`); each wait ends at the first frame at or after it:
+Many Roblox VFX models store timing in attributes on each `ParticleEmitter`: `EmitCount`, `EmitDelay`, and `EmitDuration`. An `emit` action or `--emit` flag supports four modes (`scene::playback::ByAttributes`). All delays snap to the first frame at or after the delay elapses:
 
-- `attributes`: EmitCount (5 without one) is emitted EmitDelay after the call (at once without one),
-  and the emitter is enabled from the call until EmitDuration after it, 0 without one: an emitter
-  enabled in the file is switched off at once. The default of `render --emit <path>` and of `video`.
-- `immediate`: the same without the delay: EmitCount at once whatever EmitDelay.
-- `cutscene`: after EmitDelay, an emitter with an EmitDuration above 0 is enabled for it, with no
-  burst; one without is emitted EmitCount (`ParticleEmitter:Emit`'s 16 without one). What is enabled in
-  the file runs on.
-- `delayed`: the timing the Studio calibration runs were captured with: EmitCount (5 without one)
-  after EmitDelay, then enabled from there for an EmitDuration above 0.
+| Mode | Behavior |
+|---|---|
+| `attributes` *(default)* | Emits `EmitCount` (default `5`) after `EmitDelay` (default `0`). Enables the emitter from the call until `EmitDuration` (default `0`, immediately turning off emitters that started enabled in the file). Default for `render --emit <path>` and `video`. |
+| `immediate` | Same as `attributes`, but ignores `EmitDelay` and fires `EmitCount` immediately. |
+| `cutscene` | After `EmitDelay`, if `EmitDuration > 0` enables the emitter for that duration (no burst); otherwise bursts `EmitCount` (default `16`, matching `ParticleEmitter:Emit()`). Leaves already-enabled file emitters running. |
+| `delayed` | Matches Studio calibration capture timing: waits `EmitDelay`, emits `EmitCount` (default `5`), then enables for `EmitDuration` if `> 0`. |
 
-## Against Studio
+## Calibrating playbacks against Studio
 
-`ror studio calibrate vfx-attack:<bundle.rbxm>|auto:<effect path>[|move|still][|<moment>,...]` plays
-any effect of a bundle (a model file of effects) by its emit attributes in the capture Studio frame
-by frame against ror's playback of the same frame, `vfx-emitter:...` copies one emitter per variant
-with one property varied, and `exposure:<timeline experiment>` averages a long exposure of many plays
-([parity.md](parity.md)).
+Use `ror studio calibrate` to verify effect playback frame by frame against Studio ([parity.md](parity.md)):
+- `vfx-attack:<bundle.rbxm>|auto:<effect path>[|move|still][|<moment>,...]`
+- `vfx-emitter:<bundle>|<emitter path>|<moment>|<variants>`
+- `exposure:<timeline experiment>`
 

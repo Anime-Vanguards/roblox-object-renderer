@@ -1,26 +1,25 @@
-# The viewport worker
+# Viewport worker (`ror viewport-worker`)
 
-`ror viewport-worker [--offline]` draws ViewportFrames for another program on a renderer it keeps warm
-between requests. [roblox-ui-renderer](https://github.com/Anime-Vanguards/roblox-ui-renderer) (rur)
-starts it to draw the 3D content of the ViewportFrames in its UI renders and storybooks: build ror beside a
-rur checkout, or set `RUR_VIEWPORT_WORKER` to a ror executable (a release's works), and rur finds it
-(rur's docs/viewports.md).
+`ror viewport-worker [--offline]` runs a persistent, single-request-at-a-time JSON worker over stdin/stdout that renders Roblox `ViewportFrame` snapshots using a warm GPU renderer.
 
-The protocol is one JSON request a line on stdin and one JSON reply a line on stdout, one request at a
-time. A failed request is answered with `{ "error": "..." }` and the worker goes on; it exits when stdin
-closes. `--offline` uses only what is already on disk.
+[roblox-ui-renderer](https://github.com/Anime-Vanguards/roblox-ui-renderer) (`rur`) spawns this worker automatically to render 3D `ViewportFrame` contents inside UI previews and its desktop storybook. Build `ror` beside a `rur` checkout, install `ror` on your `PATH`, or point `RUR_VIEWPORT_WORKER` at any `ror` binary (see `rur`'s `docs/viewports.md`).
+
+## Wire protocol
+
+Send one JSON request per line on `stdin`; receive one JSON reply per line on `stdout`. Errors return `{ "error": "..." }` without terminating the worker. The process exits cleanly when `stdin` closes. Pass `--offline` to restrict asset resolution to local caches and installs.
 
 | Request | Reply |
 |---|---|
-| `{ "viewport": <snapshot>, "out": "<file.png>" }` | `{ "file", "warnings", "background" }` once `out` holds the picture |
-| `{ "command": "asset", "uri": "<content id>", "out": "<file>" }` | `{ "file", "kind" }` once `out` holds the asset's bytes |
+| `{ "viewport": <snapshot>, "out": "<file.png>" }` | `{ "file", "warnings", "background" }` after writing the PNG |
+| `{ "command": "asset", "uri": "<content id>", "out": "<file>" }` | `{ "file", "kind" }` after writing the asset bytes |
 
-A snapshot is what one ViewportFrame shows:
+## Snapshot format
 
 ```json
 {
   "version": 1,
-  "width": 320, "height": 240,
+  "width": 320,
+  "height": 240,
   "camera": { "mode": "cFrame", "components": [0, 5, 10, 1, 0, 0, 0, 1, 0, 0, 0, 1], "fov": 70 },
   "background": { "color": [0.1, 0.1, 0.1], "transparency": 0 },
   "instances": [
@@ -30,31 +29,17 @@ A snapshot is what one ViewportFrame shows:
 }
 ```
 
-- `width` and `height`: the picture's size in pixels, the frame's logical size (Studio draws a
-  ViewportFrame at its logical size whatever the device scale), at most 2048 each.
-- `camera`: the frame's CurrentCamera, in any of ror's camera forms (`cFrame` with the CFrame's 12
-  components and FieldOfView is the one a Camera gives).
-- `background`: the frame's fill, BackgroundColor3 (0..1) and BackgroundTransparency. Studio draws the
-  world into a target cleared to it, so the picture holds it and the reply says `"background": true`;
-  a part's anti-aliased edge then averages its colour with the fill's at full strength, as in Studio.
-  Without it the picture is transparent around the world.
-- `instances`: the ViewportFrame first, with its `Ambient`, `LightColor` and `LightDirection` (its own
-  light: no shadows, fog or post effects; a Sky child gives reflections), then the instances under it,
-  each after its parent. `parent` 0 is the snapshot's root, so other roots the picture reads come after:
-  the place's MaterialService with its MaterialVariants. `properties` are rbx-dom's JSON forms of the
-  property values; `references` gives each Ref property as another instance's `id` (one the snapshot does
-  not hold is nil). WorldModels are containers like Models, and MeshParts keep `InitialSize`, so a mesh is
-  scaled by `Size / InitialSize`.
+- **`width` / `height`:** Output size in logical GUI pixels (Studio always renders `ViewportFrame`s at logical size regardless of device DPI scale), capped at 2048 per axis.
+- **`camera`:** Any `ror` camera object (typically `cFrame` with 12 CFrame components and `fov`).
+- **`background`:** Optional `BackgroundColor3` (`0..1`) and `BackgroundTransparency`. When provided, the render target clears to this color so anti-aliased geometry edges blend against the fill just like Studio, and the reply includes `"background": true`. When omitted, the background is transparent.
+- **`instances`:** Ordered parent-before-child. The `ViewportFrame` comes first (carrying its own `Ambient`, `LightColor`, and `LightDirection`; no shadows, fog, or post effects, though a child `Sky` supplies reflections), followed by its descendants. Additional roots (`parent: 0`) can follow—such as `MaterialService` with `MaterialVariant`s.
+  - `properties` use `rbx-dom` JSON encodings.
+  - `references` map `Ref` properties to another instance's `id` (unknown IDs resolve to `nil`).
+  - `WorldModel` acts as a container like `Model`, and `MeshPart`s preserve `InitialSize` so meshes scale by `Size / InitialSize`.
 
-Meshes and textures load as for `ror render`: from the caches, the local Roblox install and the
-downloads ([assets.md](assets.md)). A picture whose assets can't be had is an error that names them. The
-built-in textures of materials (Plastic's, Wood's...) come only from a Roblox Studio or Player install, so
-without one only parts whose materials need none (SmoothPlastic, for one) can be drawn. A ViewportFrame
-without a Sky child shows no sky and takes no light from one, so it never needs the sky's textures.
+## Assets, caching, and embedding
 
-The worker gives back what it holds for the next requests after 30 seconds without one (the renderer's
-leftovers and the downloads held in memory); the GPU device and the textures stay warm.
-
-A program that links the `ror` crate can run the same worker with commands of its own:
-`ror::viewport::serve(assets, &mut commands)`, where `commands` implements `ror::viewport::Commands`
-(its `handle` answers before ror's, and `release_idle` frees its own caches when the worker goes quiet).
+- Meshes and textures resolve through the same caches, local Roblox installation, and downloader as `ror render` ([assets.md](assets.md)). Missing required assets fail the request with an error naming them.
+- Built-in material textures (`Plastic`, `Wood`, etc.) require a local Roblox Studio or Player installation; without one, only textureless materials like `SmoothPlastic` can draw. A `ViewportFrame` without a child `Sky` needs no skybox textures.
+- After 30 seconds idle, the worker releases transient renderer state and in-memory download buffers while keeping the GPU device and texture caches warm.
+- **Rust library embedding:** Link the `ror` crate and call `ror::viewport::serve(assets, &mut commands)` with a custom `ror::viewport::Commands` implementation (`handle` intercepts requests before built-in handlers; `release_idle` frees custom caches on idle).

@@ -1,22 +1,19 @@
 # Repository layout
 
-- `crates/ror`: the `ror` binary: model loading and scene extraction (`scene/`), the wgpu renderer
-  (`render/`, shaders in `shaders/`), what a scene costs Roblox to draw (`cost/`), the render service
-  and its client (`service/`), the viewport worker (`viewport.rs`), and the Studio parity harness
-  (`studio/`).
-- `crates/ror/examples/tools`: ror's tools (scans, dumps, probes, one-off renders) in one example, so
-  checking or building them is one crate and one link instead of one of each per tool.
-  `cargo run -p ror --release --example tools -- <tool> [arguments]` runs one, and `--example tools`
-  alone lists them. A new tool is a file there, written like a standalone example (`pub fn main`, its
-  arguments from `std::env::args()`), with its name added to the list in `main.rs`.
-- `crates/ror-mesh`: Roblox mesh decoding: FileMesh versions 1.00-7.00 (Draco), union mesh data.
-- `crates/ror-image`: texture decoding: PNG, JPEG, WebP, GIF, BMP, TGA, DDS, KTX2 (zstd, BCn).
-- `crates/ror-assets`: content URIs (`rbxasset://`, `rbxassetid://`, asset URLs, files), downloads,
-  the disk cache and the shared content store, the Studio install, the cookie ([assets.md](assets.md)).
-- `tools/`: Python scripts for measurements and analysis (numpy, scipy, Pillow, opencv-python;
-  `tools/perf_suite.py` also psutil and pywin32), the cost and occlusion probes run in the capture
-  Studio, and `tools/perf-sampler`, a Windows sampling profiler in its own workspace.
-- `vendor/x264`: ror's entry points into x264 and the script that builds them into a library
-  ([building.md](building.md)).
-- `fixtures/`: small hand-made test models and scripts.
-- `docs/`: these pages; `docs/media/`, the README's pictures and clips, rendered by ror.
+This page maps out the crates, tools, and directories in `roblox-object-renderer`.
+
+- **`crates/ror`** — The `ror` CLI binary and library:
+  - `scene/`: model loading, scene extraction, playback timelines, GUIs, and collision geometry.
+  - `render/` and `shaders/`: the wgpu renderer and WGSL shaders.
+  - `cost/`: draw-call, triangle, LOD, and occlusion estimation.
+  - `service/`: the background render service and its client.
+  - `viewport.rs`: the `ror viewport-worker` JSON protocol for `ViewportFrame` rendering.
+  - `studio/`: the Studio parity harness and calibration experiments.
+- **`crates/ror/examples/tools`** — Diagnostic and probe utilities (scans, dumps, one-off renders) grouped into a single example binary so Cargo compiles and links them once instead of once per tool. Run `cargo run -p ror --release --example tools` to list available tools, or pass `-- <tool> [args]` to run one. To add a tool, create a file with a `pub fn main()` reading `std::env::args()` and register it in `main.rs`.
+- **`crates/ror-mesh`** — Roblox mesh decoder covering FileMesh versions 1.00–7.00 (including Draco-compressed meshes) and union mesh data.
+- **`crates/ror-image`** — Texture decoder supporting PNG, JPEG, WebP, GIF, BMP, TGA, DDS, and KTX2 (with zstd and BCn block compression).
+- **`crates/ror-assets`** — Content URI resolution (`rbxasset://`, `rbxassetid://`, asset URLs, local files), HTTP downloads, the disk cache and shared content store, Roblox install detection, and authentication ([assets.md](assets.md)).
+- **`tools/`** — Python measurement and analysis scripts (requires `numpy`, `scipy`, `Pillow`, and `opencv-python`; `tools/perf_suite.py` also uses `psutil` and `pywin32`), cost and occlusion probes for the capture Studio, and `tools/perf-sampler` (a standalone Windows sampling profiler workspace).
+- **`vendor/x264`** — Entry points and build script for the optional in-process x264 H.264 encoder ([building.md](building.md)).
+- **`fixtures/`** — Small hand-built test models and scripts.
+- **`docs/`** — Documentation and the rendered media in `docs/media/` shown in the README.
