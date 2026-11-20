@@ -42,7 +42,7 @@ pub struct Gui {
 	pub viewports: Vec<Viewport>,
 }
 
-/// A SurfaceGui's or BillboardGui's ViewportFrame that draws a world.
+/// A GUI's ViewportFrame that draws a world.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Viewport {
 	/// The frame's place in its GUI: each GuiObject's Size, Position and AnchorPoint from the GUI's child
@@ -67,7 +67,8 @@ pub enum ViewportKind {
 	Window,
 	/// What Roblox's ViewportFrame draws: its world through its own camera, fitted to the frame and
 	/// clipped to it, at the frame's place among what the GUI draws (an emote's portrait of the player in a
-	/// BillboardGui behind them, eyes and smoke over it).
+	/// BillboardGui behind them, eyes and smoke over it; a ScreenGui's frame over the whole screen whose
+	/// camera follows the player's).
 	Framed(Framed),
 }
 
@@ -447,9 +448,10 @@ fn skewed_camera(document: &Document, frame: Ref) -> bool {
 
 /// A GUI's visible ViewportFrames that draw a world ([`Viewport`]), each with its world extracted and
 /// lit as the frame lights it (Roblox's defaults: Ambient 200, LightColor 140, LightDirection (-1, -1,
-/// -1)): windows (a SurfaceGui's alone, `windows`), then the framed ones in the order the GUI draws
-/// them, each with what the GUI draws over it. A framed one drawing nothing (no camera, no parts, its
-/// image transparent) is left to rur, which draws its background.
+/// -1)): windows (a SurfaceGui's alone, `windows`; another GUI's window is left to rur), then the
+/// framed ones in the order the GUI draws them, each with what the GUI draws over it. A framed one
+/// drawing nothing (no camera, no parts, its image transparent) is left to rur, which draws its
+/// background.
 fn viewports(document: &Document, gui: Ref, windows: bool, global: bool, warnings: &mut Vec<String>) -> Vec<Viewport> {
 	let mut found = Vec::new();
 	let mut framed = Vec::new();
@@ -662,11 +664,10 @@ pub fn read(document: &Document, referent: Ref, instance: &Instance, warnings: &
 		}
 	};
 	let z_index_behavior = props::enum_value(instance, "ZIndexBehavior", 0);
-	let viewports = match &kind {
-		GuiKind::Surface(_) => viewports(document, referent, true, z_index_behavior == 0, warnings),
-		GuiKind::Billboard(_) => viewports(document, referent, false, z_index_behavior == 0, warnings),
-		GuiKind::Screen(_) => Vec::new(),
-	};
+	// windows are a SurfaceGui's alone; a ScreenGui's frames are framed as a billboard's are, its world
+	// through the frame's own camera (a portal arm drawn over the screen by a camera that follows the
+	// player's)
+	let viewports = viewports(document, referent, matches!(kind, GuiKind::Surface(_)), z_index_behavior == 0, warnings);
 	Some(Gui {
 		viewports,
 		path,
@@ -860,6 +861,56 @@ mod tests {
 		let over = names(over);
 		assert!(over.iter().any(|(_, name, background)| name == "Backdrop" && *background == Some(1.0)), "{over:?}");
 		assert!(over.iter().any(|(class, name, _)| class == "ImageLabel" && name == "Eye"));
+	}
+
+	#[test]
+	fn a_screen_guis_viewport_frame_draws_its_world_through_its_current_camera() {
+		// a portal arm in a ScreenGui ViewportFrame: the whole screen, no background, its own light, a
+		// Camera child as its CurrentCamera (followed by a script every frame); a part and a mask in its
+		// WorldModel
+		use rbx_dom_weak::types::{CFrame, Color3, Matrix3, Variant};
+		let mut model = ModelBuilder::new("Scene");
+		let player_gui = model.child(model.model, InstanceBuilder::new("PlayerGui").with_name("PlayerGui"));
+		let gui = model.child(player_gui, InstanceBuilder::new("ScreenGui").with_name("ArmView").with_property("ScreenInsets", Enum::from_u32(1)).with_property("DisplayOrder", -5i32));
+		let frame = model.child(
+			gui,
+			InstanceBuilder::new("ViewportFrame")
+				.with_property("Size", UDim2::new(UDim::new(1.0, 0), UDim::new(1.0, 0)))
+				.with_property("BackgroundTransparency", 1.0f32)
+				.with_property("Ambient", Color3::new(0.25, 0.5, 0.75))
+				.with_property("LightColor", Color3::new(1.0, 1.0, 1.0))
+				.with_property("LightDirection", Vector3::new(0.0, -1.0, 0.0))
+				// what a file without the reference keeps; the CurrentCamera wins where it is kept
+				.with_property("CameraCFrame", CFrame::new(Vector3::new(0.0, 20.0, 20.0), Matrix3::identity()))
+				.with_property("CameraFieldOfView", 70.0f32),
+		);
+		let world = model.child(frame, InstanceBuilder::new("WorldModel"));
+		model.child(world, InstanceBuilder::new("Part").with_name("Arm").with_property("Size", Vector3::new(2.0, 2.0, 6.0)));
+		model.child(world, InstanceBuilder::new("Part").with_name("Mask").with_property("Size", Vector3::new(8.0, 8.0, 0.1)).with_property("CFrame", CFrame::new(Vector3::new(0.0, 0.0, -1.0), Matrix3::identity())));
+		let camera = model.child(frame, InstanceBuilder::new("Camera").with_property("CFrame", CFrame::new(Vector3::new(1.0, 2.0, 12.0), Matrix3::identity())).with_property("FieldOfView", 35.0f32));
+		model.set(frame, "CurrentCamera", Variant::Ref(camera));
+		let scene = extract(model);
+		assert!(scene.parts.is_empty(), "the world is the frame's, not the Workspace's");
+		let [gui] = scene.guis.as_slice() else {
+			panic!("one GUI: {:?}", scene.guis.iter().map(|gui| &gui.path).collect::<Vec<_>>());
+		};
+		assert_eq!(gui.kind, GuiKind::Screen(super::ScreenGui { display_order: -5, inset: false }));
+		let [viewport] = gui.viewports.as_slice() else {
+			panic!("one ViewportFrame: {}", gui.viewports.len());
+		};
+		let super::ViewportKind::Framed(framed) = &viewport.kind else {
+			panic!("not framed");
+		};
+		assert_eq!((framed.camera, framed.fov), ([1.0, 2.0, 12.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], 35.0));
+		assert_eq!(viewport.rect([1323.0, 744.0]), [0.0, 0.0, 1.0, 1.0]);
+		assert_eq!(viewport.tint, [1.0; 4]);
+		assert!(framed.over.is_none() && framed.gradient.is_none());
+		assert_eq!(viewport.scene.parts.len(), 2);
+		let lighting = viewport.scene.environment.viewport.as_ref().expect("lit by the frame");
+		assert_eq!((lighting.ambient, lighting.light_color, lighting.light_direction), (Vec3::new(0.25, 0.5, 0.75), Vec3::ONE, Vec3::NEG_Y));
+		// rur draws the ScreenGui with the frame as a plain Frame, its world left out
+		let content = rbx_binary::from_reader(gui.content.as_slice()).unwrap();
+		assert!(content.descendants().all(|instance| !matches!(instance.class.as_str(), "ViewportFrame" | "WorldModel" | "Part" | "Camera")));
 	}
 
 	#[test]

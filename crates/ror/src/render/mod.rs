@@ -6024,7 +6024,7 @@ mod vertex_colour_tests {
 	use rbx_dom_weak::types::{Content, Vector3};
 
 	/// A 4 x 4 stud quad facing -Z (both sides) as a FileMesh 2.00 whose every vertex has `color`.
-	fn quad_mesh(color: [u8; 4]) -> Vec<u8> {
+	pub(super) fn quad_mesh(color: [u8; 4]) -> Vec<u8> {
 		let mut bytes = b"version 2.00\n".to_vec();
 		bytes.extend_from_slice(&12u16.to_le_bytes());
 		bytes.extend_from_slice(&[40, 12]);

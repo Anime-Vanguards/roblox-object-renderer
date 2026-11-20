@@ -440,12 +440,13 @@ impl GuiDraw {
 	}
 }
 
-/// A framed ViewportFrame's picture is drawn no smaller than this and no larger than a GUI image (pixels).
+/// A framed ViewportFrame's picture is drawn no smaller than this (pixels), and its longer side no
+/// longer than a GUI image's, at the frame's proportions.
 const FRAMED_MIN: f32 = 8.0;
 
 /// A GUI's framed ViewportFrames as a draw of it shows them: on a canvas of `canvas` GUI pixels, its
-/// image keyed as `key`, the frame's height on the screen given by `height` (its rect in canvas fractions
-/// and in GUI pixels → device pixels).
+/// image keyed as `key`, the picture's height given by `height` (the frame's rect in canvas fractions
+/// and in GUI pixels → pixels).
 fn plan_framed(gui: &Gui, canvas: [f32; 2], key: &GuiKey, height: &dyn Fn([f32; 4], [f32; 4]) -> f32) -> Vec<FramedDraw> {
 	gui.viewports
 		.iter()
@@ -460,8 +461,11 @@ fn plan_framed(gui: &Gui, canvas: [f32; 2], key: &GuiKey, height: &dyn Fn([f32; 
 			if !(width > 0.0 && tall > 0.0) {
 				return None;
 			}
-			// at the frame's own proportions (its camera's aspect), as tall as it shows
-			let rows = height(rect, pixels).round().clamp(FRAMED_MIN, MAX_TEXTURE);
+			// at the frame's own proportions (its camera's aspect), as tall as it shows: a smaller picture
+			// stretched across a wider frame would show its world squeezed
+			let shown = height(rect, pixels);
+			let fit = (MAX_TEXTURE / shown.max(shown * width / tall)).min(1.0);
+			let rows = (shown * fit).round().clamp(FRAMED_MIN, MAX_TEXTURE);
 			let columns = (rows * width / tall).round().clamp(FRAMED_MIN, MAX_TEXTURE);
 			let over = framed.over.as_ref().map(|(_, hash)| GuiKey { content: *hash, ..*key });
 			let plane = framed.gradient.as_ref().map_or([0.0; 3], |gradient| gradient.plane([width, tall]));
@@ -609,6 +613,12 @@ pub(super) fn plan(scene: &Scene, camera: &Camera, request: &ViewRequest) -> Vec
 				// pixels exact for cameras thousands of studs out)
 				let depth = (camera.near * 4.0).max(10.0);
 				let corner = |px: f32, py: f32| camera.eye - back * depth + right * ((px - width as f32 * 0.5) * depth / focal) + up * ((height as f32 * 0.5 - py) * depth / focal);
+				// a framed ViewportFrame's picture at the frame's size in GUI pixels, stretched over it: Studio
+				// draws a ScreenGui's ViewportFrame at its logical size whatever the device scale (rur's viewport
+				// probes, frames in a ScreenGui in Studio 0.747 at 1.5x: a part's edge ramps over about three
+				// device pixels); in an image smaller than Studio's view, at the pixels it covers (a picture
+				// minified would alias)
+				let framed = plan_framed(gui, key.canvas(), &key, &|_, pixels: [f32; 4]| pixels[3] * gui_scale.min(1.0));
 				draws.push(GuiDraw {
 					gui: index,
 					key,
@@ -619,7 +629,7 @@ pub(super) fn plan(scene: &Scene, camera: &Camera, request: &ViewRequest) -> Vec
 					z_offset: 0.0,
 					overlay: true,
 					screen: Some(screen.display_order),
-					framed: Vec::new(),
+					framed,
 				});
 			}
 		}
@@ -1703,6 +1713,144 @@ mod tests {
 		// what draws over it: an image of its own, the GUI's canvas and scale
 		assert_eq!(framed.over, Some(GuiKey { content: 99, ..draws[0].key }));
 		assert_eq!(draws[0].keys().collect::<Vec<_>>(), [draws[0].key, GuiKey { content: 99, ..draws[0].key }]);
+	}
+
+	#[test]
+	fn a_screen_guis_viewport_frame_is_planned_at_its_logical_size() {
+		// a ScreenGui's ViewportFrame over the whole view and one over its right half, below the top bar in
+		// a recording of play: each picture the frame's size in GUI pixels (its logical size, stretched over
+		// the frame), at its proportions however wide
+		use crate::render::camera::CameraSpec;
+		use crate::scene::guis::{Framed, Placement, ScreenGui, Viewport};
+
+		let framed = |size: [f32; 4], position: [f32; 4]| Viewport {
+			placement: vec![Placement { size, position, anchor: [0.0, 0.0] }],
+			tint: [1.0; 4],
+			scene: Arc::new(Scene::default()),
+			kind: ViewportKind::Framed(Framed { camera: [0.0, 0.0, 8.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], fov: 40.0, over: None, gradient: None }),
+			corner_radius: None,
+		};
+		let gui = |inset: bool| Gui {
+			path: "PlayerGui.View".into(),
+			kind: GuiKind::Screen(ScreenGui { display_order: -5, inset }),
+			content: Arc::new(Vec::new()),
+			content_hash: 7,
+			light_influence: 0.0,
+			brightness: 1.0,
+			always_on_top: false,
+			max_distance: 0.0,
+			clips: true,
+			z_index_behavior: 1,
+			viewports: vec![framed([1.0, 0.0, 1.0, 0.0], [0.0; 4]), framed([0.5, 0.0, 1.0, 0.0], [0.5, 0.0, 0.0, 0.0])],
+		};
+		// (744 GUI pixels tall: 1440 device pixels are 1.93 a GUI pixel, 112 of them the top bar's in play)
+		for (width, height, inset, whole, half) in [(2560, 1440, false, (1323, 744), (661, 744)), (2560, 1440, true, (1323, 686), (661, 686)), (5120, 1440, false, (2048, 576), (1323, 744))] {
+			let scene = Scene { guis: vec![gui(inset)], play: true, ..Default::default() };
+			let request = ViewRequest { width, height, camera: CameraSpec::LookAt { eye: [0.0, 0.0, -20.0], target: [0.0; 3], fov: 40.0 }, ..Default::default() };
+			let camera = request.camera.place(None, request.width, request.height);
+			let draws = plan(&scene, &camera, &request);
+			let [draw] = draws.as_slice() else {
+				panic!("one ScreenGui");
+			};
+			let sizes: Vec<(u32, u32)> = draw.framed.iter().map(|framed| framed.size).collect();
+			// (5120 x 1440: the whole frame's 2646 x 744 GUI pixels drawn 2048 x 576, its proportions kept)
+			assert_eq!(sizes, [whole, half], "{width} x {height}, inset {inset}");
+			assert!(draw.framed[1].rect.iter().zip([0.5, 0.0, 1.0, 1.0]).all(|(a, b)| (a - b).abs() < 1e-5), "{:?}", draw.framed[1].rect);
+			assert!(draw.overlay && draw.screen == Some(-5));
+		}
+	}
+
+	/// A ScreenGui's ViewportFrame over the whole screen, as a portal arm is drawn: its world through its
+	/// own camera, laid over the finished image at its ScreenGui's place among the others by DisplayOrder;
+	/// a mesh at vertex alpha 0 hides what lies behind it in that world and is a hole through the picture
+	/// to what is under the ScreenGui. Before, the frame drew its background alone (nothing here).
+	#[test]
+	fn a_screen_guis_viewport_frame_draws_its_world_over_the_screen() {
+		use crate::render::camera::CameraSpec;
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use rbx_dom_weak::InstanceBuilder;
+		use rbx_dom_weak::types::{CFrame, Color3, Content, Enum, Matrix3, UDim, UDim2, Variant, Vector3};
+
+		let state = std::env::temp_dir().join(format!("ror-screen-viewport-test-{}", std::process::id()));
+		std::fs::create_dir_all(&state).unwrap();
+		let gpu = Arc::new(super::super::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let mask_mesh = state.join("mask.mesh");
+		std::fs::write(&mask_mesh, super::super::vertex_colour_tests::quad_mesh([0, 0, 0, 0])).unwrap();
+		let mask_uri = format!("file:///{}", mask_mesh.display().to_string().replace('\\', "/"));
+		let whole = UDim2::new(UDim::new(1.0, 0), UDim::new(1.0, 0));
+		let (width, height) = (128u32, 64u32);
+		// a cover over the screen's top half in a ScreenGui at `cover_order`; the frame's at -5
+		let draw = |cover_order: i32| -> Vec<u8> {
+			let mut model = ModelBuilder::new("Scene");
+			let player_gui = model.child(model.model, InstanceBuilder::new("PlayerGui").with_name("PlayerGui"));
+			let view = model.child(player_gui, InstanceBuilder::new("ScreenGui").with_name("View").with_property("ScreenInsets", Enum::from_u32(1)).with_property("DisplayOrder", -5i32));
+			let frame = model.child(
+				view,
+				InstanceBuilder::new("ViewportFrame").with_property("Size", whole).with_property("BackgroundTransparency", 1.0f32).with_property("Ambient", Color3::new(1.0, 1.0, 1.0)).with_property("LightColor", Color3::new(0.0, 0.0, 0.0)),
+			);
+			let world = model.child(frame, InstanceBuilder::new("WorldModel"));
+			// a red plate 4 studs square at the origin, the mask's quad over its +X half a stud nearer
+			let plate = model.part(&PartSpec { name: "Plate".into(), size: glam::Vec3::new(4.0, 4.0, 0.2), color: [255, 0, 0], material: 272, cast_shadow: false, ..Default::default() });
+			let mask = model.part(&PartSpec { class: "MeshPart", name: "Mask".into(), cframe: glam::Affine3A::from_translation(glam::Vec3::new(2.0, 0.0, 1.0)), size: glam::Vec3::new(4.0, 4.0, 0.05), color: [0, 0, 0], material: 272, cast_shadow: false, ..Default::default() });
+			model.set(mask, "MeshContent", Content::from_uri(mask_uri.as_str()));
+			model.set(mask, "InitialSize", Vector3::new(4.0, 4.0, 0.05));
+			for part in [plate, mask] {
+				model.dom.transfer_within(part, world);
+			}
+			let camera = model.child(frame, InstanceBuilder::new("Camera").with_property("CFrame", CFrame::new(Vector3::new(0.0, 0.0, 10.0), Matrix3::identity())).with_property("FieldOfView", 40.0f32));
+			model.set(frame, "CurrentCamera", Variant::Ref(camera));
+			model.child(player_gui, InstanceBuilder::new("ScreenGui").with_name("Cover").with_property("ScreenInsets", Enum::from_u32(1)).with_property("DisplayOrder", cover_order));
+			let scene = crate::scene::extract::extract(&model.into_document());
+			assert_eq!(scene.guis.len(), 2, "{:?}", scene.warnings);
+			// (a GUI pixel a pixel: the frame's picture the view's size)
+			let request = ViewRequest { width, height, camera: CameraSpec::LookAt { eye: [0.0, 0.0, 10.0], target: [0.0; 3], fov: 40.0 }, background: super::super::Background::Color([0.0, 0.0, 1.0]), bloom: false, gui_scale: Some(1.0), ..Default::default() };
+			let camera = request.camera.place(None, width, height);
+			// rur's images of the two ScreenGuis: the frame's without a background, transparent; the cover's
+			// top half opaque white
+			let mut images = Vec::new();
+			for draw in plan(&scene, &camera, &request) {
+				let (columns, rows) = rur::image_size(draw.key.canvas(), draw.key.scale(), draw.key.margin());
+				let cover = scene.guis[draw.gui].path.ends_with("Cover");
+				let rgba: Vec<u8> = (0..rows).flat_map(|row| (0..columns).flat_map(move |_| if cover && row < rows / 2 { [255u8; 4] } else { [0u8; 4] })).collect();
+				images.push((draw.key, Arc::new(GuiImage::from_rgba(columns, rows, rgba).unwrap()), false));
+			}
+			let (mut textures, mut warnings) = (HashMap::new(), Vec::new());
+			renderer.upload_guis(images, &mut textures, &mut warnings);
+			assert!(warnings.is_empty(), "{warnings:?}");
+			let (pending, mut stats) = renderer.submit_views(&scene, std::slice::from_ref(&request), None, None, Some(textures), None, None).unwrap();
+			let image = pending.into_iter().next().unwrap().finish(&mut stats).unwrap();
+			// (the world itself is empty: the screen is the background's blue)
+			assert!(stats.warnings.iter().all(|warning| warning.starts_with("nothing to frame")), "{:?}", stats.warnings);
+			image.rgba
+		};
+		// a point of the frame's world on the screen (its camera is the view's): one stud is 8.8 pixels
+		let focal = height as f32 * 0.5 / 20f32.to_radians().tan();
+		let at = |image: &[u8], x: f32, y: f32| -> [u8; 3] {
+			let (column, row) = ((width as f32 * 0.5 + x * focal / 10.0) as u32, (height as f32 * 0.5 - y * focal / 10.0) as u32);
+			let index = ((row * width + column) * 4) as usize;
+			[image[index], image[index + 1], image[index + 2]]
+		};
+		let red = |pixel: [u8; 3]| pixel[0] > 200 && pixel[1] < 40 && pixel[2] < 40;
+		// the background's blue through the tone curve (184 of 255)
+		let blue = |pixel: [u8; 3]| pixel[0] < 40 && pixel[1] < 40 && pixel[2] > 150;
+		let white = |pixel: [u8; 3]| pixel.iter().all(|value| *value > 215);
+		for (cover_order, cover_over) in [(0, true), (-10, false)] {
+			let image = draw(cover_order);
+			let case = format!("cover at DisplayOrder {cover_order}");
+			// the plate where no mask hides it, over the screen; beside it and where the mask hides it the
+			// screen shows through
+			assert!(red(at(&image, -1.0, -1.0)), "{case}: the plate {:?}", at(&image, -1.0, -1.0));
+			assert!(blue(at(&image, 1.0, -1.0)), "{case}: the mask's hole {:?}", at(&image, 1.0, -1.0));
+			assert!(blue(at(&image, -3.0, -1.0)), "{case}: beside the plate {:?}", at(&image, -3.0, -1.0));
+			// the top half: the cover over the picture, or under it and seen through the mask's hole
+			let plate = at(&image, -1.0, 1.0);
+			assert!(if cover_over { white(plate) } else { red(plate) }, "{case}: the plate under the cover {plate:?}");
+			assert!(white(at(&image, 1.0, 1.0)), "{case}: the mask's hole over the cover {:?}", at(&image, 1.0, 1.0));
+		}
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
 	}
 
 	#[test]
