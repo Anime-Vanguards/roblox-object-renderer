@@ -7,8 +7,11 @@
 //!   cookie). Without a user id: `...RobloxStudioAuth.ROBLOSECURITY` alone, else the one account with a cookie
 //!   there. Older Studio builds kept it in the registry instead (`HKCU\Software\Roblox\RobloxStudioBrowser\roblox.com`,
 //!   value `.ROBLOSECURITY`: `SEC::<...>,EXP::<...>,COOK::<cookie>`), read when the Credential Manager has none.
-//! - macOS: the `.ROBLOSECURITY` cookie of a `roblox.com` domain in
-//!   `~/Library/HTTPStorages/com.Roblox.RobloxStudio.binarycookies`, Apple's binary cookie file.
+//! - macOS: `~/Library/HTTPStorages/com.Roblox.RobloxStudio.binarycookies`, Apple's binary cookie file, where
+//!   Studio keeps its sign-in as cookies of a `roblox.com` domain under the names its Windows credentials end
+//!   with: `/RobloxStudioAuth/userid` (the signed-in account's user id) and
+//!   `/RobloxStudioAuth/.ROBLOSECURITY<user id>` (its cookie), read as the Credential Manager's are. With none
+//!   of those, a cookie named `.ROBLOSECURITY` itself.
 //! - Elsewhere: not available.
 //!
 //! The OS calls only hand over the stored bytes; the parsing here is tested on synthetic data. The cookie is
@@ -367,12 +370,24 @@ fn parse_binary_cookies(file: &[u8]) -> Result<Option<Secret>, &'static str> {
 		domain.eq_ignore_ascii_case(&SUFFIX[1..]) || (domain.len() > SUFFIX.len() && domain[domain.len() - SUFFIX.len()..].eq_ignore_ascii_case(SUFFIX))
 	}
 
+	/// What Studio's own entries are named by: `<AUTH>userid`, `<AUTH>.ROBLOSECURITY<user id>` (the ends of its
+	/// Windows credentials' names, [`TARGET`])
+	const AUTH: &[u8] = b"/RobloxStudioAuth/";
+	fn digits(text: &[u8]) -> bool {
+		!text.is_empty() && text.iter().all(u8::is_ascii_digit)
+	}
+
 	if file.get(..4) != Some(b"cook".as_slice()) {
 		return Err("the macOS cookie file is not a binary cookie file");
 	}
 	let pages = word(file, 4, true)?;
 	let mut start = pages.checked_mul(4).and_then(|sizes| sizes.checked_add(8)).filter(|&start| start <= file.len()).ok_or(TRUNCATED)?;
+	// a cookie named `.ROBLOSECURITY` itself: the one that expires last
 	let mut best: Option<(f64, &[u8])> = None;
+	// Studio's own entries: the signed-in account's user id, and each account's cookie by its user id (none: the
+	// one a build with a single account keeps)
+	let mut user: Option<&[u8]> = None;
+	let mut accounts: Vec<(&[u8], &[u8])> = Vec::new();
 	for index in 0..pages {
 		let size = word(file, 8 + index * 4, true)?;
 		let page = file.get(start..start.checked_add(size).ok_or(TRUNCATED)?).ok_or(TRUNCATED)?;
@@ -390,14 +405,37 @@ fn parse_binary_cookies(file: &[u8]) -> Result<Option<Secret>, &'static str> {
 			let cookie = page.get(offset..offset.checked_add(length).ok_or(TRUNCATED)?).filter(|cookie| cookie.len() >= 48).ok_or(TRUNCATED)?;
 			let (domain, name, value) = (string(cookie, word(cookie, 16, false)?)?, string(cookie, word(cookie, 20, false)?)?, string(cookie, word(cookie, 28, false)?)?);
 			let expiry = f64::from_le_bytes(cookie[40..48].try_into().map_err(|_| TRUNCATED)?);
-			if name == b".ROBLOSECURITY" && roblox(domain) && best.is_none_or(|(latest, _)| expiry > latest) {
-				best = Some((expiry, value));
+			if !roblox(domain) {
+				continue;
+			}
+			if name == b".ROBLOSECURITY" {
+				if best.is_none_or(|(latest, _)| expiry > latest) {
+					best = Some((expiry, value));
+				}
+			} else if let Some(entry) = name.strip_prefix(AUTH) {
+				if entry == b"userid" {
+					user = Some(value);
+				} else if let Some(id) = entry.strip_prefix(b".ROBLOSECURITY").filter(|id| id.is_empty() || digits(id)) {
+					accounts.push((id, value));
+				}
 			}
 		}
 	}
-	match best {
+	// Studio's own entries, as its Windows store's are read (from_credentials): the signed-in account's cookie,
+	// else the one kept without a user id; with no user id at all, the cookie of the one account that has one
+	let of = |id: &[u8]| accounts.iter().find(|(account, _)| *account == id).map(|&(_, value)| value);
+	let studio = match user.filter(|id| digits(id)) {
+		Some(id) => of(id).or_else(|| of(b"")),
+		None => match (of(b""), accounts.as_slice()) {
+			(Some(value), _) => Some(value),
+			(None, []) => None,
+			(None, [(_, value)]) => Some(*value),
+			(None, _) => return Err("several Studio accounts have a cookie in the macOS cookie file and none is marked as signed in"),
+		},
+	};
+	match studio.or(best.map(|(_, value)| value)) {
 		None => Ok(None),
-		Some((_, value)) => std::str::from_utf8(value).ok().and_then(Secret::new).map(Some).ok_or("the macOS cookie file's .ROBLOSECURITY cookie holds no usable value"),
+		Some(value) => std::str::from_utf8(value).ok().and_then(Secret::new).map(Some).ok_or("the macOS cookie file's .ROBLOSECURITY cookie holds no usable value"),
 	}
 }
 
@@ -567,6 +605,36 @@ mod tests {
 		assert_eq!(parsed(&file).as_deref(), Some(COOKIE));
 		assert_eq!(parsed(&cookie_file(&[])), None);
 		assert_eq!(parsed(&cookie_file(&[page(&[])])), None);
+	}
+
+	/// Studio's own entries in the file, as it writes them on macOS (seen in Studio 0.748's file: cookies of
+	/// `www.roblox.com` named `/RobloxStudioAuth/userid` and `/RobloxStudioAuth/.ROBLOSECURITY<user id>`, and no
+	/// cookie named `.ROBLOSECURITY` itself), read by the rule its Windows credentials are.
+	#[test]
+	fn studios_own_entries_in_a_binary_cookie_file() {
+		const OTHER: &str = "TEST-OTHER-ACCOUNT-0123456789";
+		let account = |id: &str, value: &str| record("www.roblox.com", &format!("/RobloxStudioAuth/.ROBLOSECURITY{id}"), value, 9e8);
+		let user = |id: &str| record("www.roblox.com", "/RobloxStudioAuth/userid", id, 9e8);
+		let noise = || record("www.roblox.com", &format!("/RobloxStudioAuth/accessToken{USER}"), "TEST-NOT-A-COOKIE", 9e8);
+		// the signed-in account's cookie among several accounts', whatever order they are in and whatever page
+		let file = cookie_file(&[page(&[record(".roblox.com", "RBXEventTracker", "TEST-NOT-IT", 9e8)]), page(&[account("99999", OTHER), noise(), user(USER), account(USER, COOKIE)])]);
+		assert_eq!(parsed(&file).as_deref(), Some(COOKIE));
+		// before a cookie named `.ROBLOSECURITY` itself
+		let file = cookie_file(&[page(&[record(".roblox.com", ".ROBLOSECURITY", OTHER, 9e9), user(USER), account(USER, COOKIE)])]);
+		assert_eq!(parsed(&file).as_deref(), Some(COOKIE));
+		// a user id with no cookie of its own: the one kept without a user id, else `.ROBLOSECURITY` itself, else none
+		assert_eq!(parsed(&cookie_file(&[page(&[user(USER), account("", COOKIE), account("99999", OTHER)])])).as_deref(), Some(COOKIE));
+		assert_eq!(parsed(&cookie_file(&[page(&[user(USER), account("99999", OTHER), record(".roblox.com", ".ROBLOSECURITY", COOKIE, 9e8)])])).as_deref(), Some(COOKIE));
+		assert_eq!(parsed(&cookie_file(&[page(&[user(USER), account("99999", OTHER)])])), None);
+		// no user id: the one without a user id, else the one account that has a cookie; with several, none
+		assert_eq!(parsed(&cookie_file(&[page(&[account("", COOKIE), account("99999", OTHER)])])).as_deref(), Some(COOKIE));
+		assert_eq!(parsed(&cookie_file(&[page(&[noise(), account(USER, COOKIE)])])).as_deref(), Some(COOKIE));
+		let several = parse_binary_cookies(&cookie_file(&[page(&[account(USER, COOKIE), account("99999", OTHER)])]));
+		assert_eq!(several.as_ref().err().copied(), Some("several Studio accounts have a cookie in the macOS cookie file and none is marked as signed in"));
+		assert!(!format!("{several:?}").contains(COOKIE) && !format!("{several:?}").contains(USER));
+		// a user id that is not one names no account; another site's entries are not Studio's
+		assert_eq!(parsed(&cookie_file(&[page(&[user("not-an-id"), account(USER, COOKIE)])])).as_deref(), Some(COOKIE));
+		assert_eq!(parsed(&cookie_file(&[page(&[record("www.example.com", "/RobloxStudioAuth/userid", USER, 9e8), record("www.example.com", &format!("/RobloxStudioAuth/.ROBLOSECURITY{USER}"), COOKIE, 9e8)])])), None);
 	}
 
 	#[test]
