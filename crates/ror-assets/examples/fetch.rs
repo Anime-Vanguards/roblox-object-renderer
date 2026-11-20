@@ -10,8 +10,8 @@
 //! The credentials for assets that need authentication are read by the library from their documented
 //! sources: an Open Cloud API key (`ROBLOX_ASSET_DELIVERY_API_KEY`, or that line in an env file), and
 //! the account's, an account broker's credentials, e.g. `ROBLOX_BROKER_CREDENTIALS=<path to its JSON
-//! file>`, else the cookie, e.g. `ROR_COOKIE_ENV=<path to an env file>`. This program only ever prints
-//! where they came from, never a value.
+//! file>`, else the cookie, e.g. `ROR_COOKIE_ENV=<path to an env file>`, or with `ROR_STUDIO_COOKIE=1` the
+//! account signed in to Roblox Studio. This program only ever prints where they came from, never a value.
 
 use std::time::Instant;
 

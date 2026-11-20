@@ -252,6 +252,41 @@ fn cookie_goes_only_to_assetdelivery() {
 }
 
 #[test]
+fn studios_account_is_the_last_cookie_source() {
+	use crate::studiocookie::{Lookup, Store};
+	// a cookie from the environment or an env file wins, and Studio's store is then not read
+	let configured = crate::account_cookie(|| Some((Secret::new(TEST_COOKIE).unwrap(), CookieSource::Env("ROBLOSECURITY"))), || panic!("Studio's store was read with a cookie configured"));
+	assert_eq!(configured.map(|(_, source)| source), Some(CookieSource::Env("ROBLOSECURITY")));
+	// switched off, not found or unreadable: no cookie
+	for lookup in [Lookup::Off, Lookup::Unsupported, Lookup::NotFound, Lookup::Unreadable("Windows Credential Manager error 5".into())] {
+		assert!(crate::account_cookie(|| None, || lookup).is_none());
+	}
+	// found: a cookie like the others, named by its store and never by its value
+	let found = || crate::account_cookie(|| None, || Lookup::Found(Secret::new(TEST_COOKIE).unwrap(), Store::CredentialManager));
+	let account = Account::find(None, found);
+	assert_eq!(account.source.as_deref(), Some("studio (Windows Credential Manager)"));
+	assert!(!format!("{:?}", account.credential).contains(TEST_COOKIE));
+	// an account broker's credentials still come first
+	let broker = Ok((Broker { base: "https://broker.example".into(), token: Secret::new(TEST_TOKEN).unwrap() }, BrokerSource::Env));
+	let account = Account::find(Some(broker), || -> Option<(Secret, CookieSource)> { panic!("Studio's store was read with a broker's credentials") });
+	assert_eq!(account.source.as_deref(), Some("account broker (env ROBLOX_BROKER_TOKEN)"));
+
+	// and it goes where the cookie goes: assetdelivery alone, after the public route
+	let real = MockServer::start(|_| Reply::bytes(MESH));
+	let real_url = real.url("/real/42");
+	let ad = MockServer::start(move |r| match r.header("Cookie") {
+		Some(_) => Reply::json(&format!("{{\"location\":\"{real_url}\"}}")),
+		None => Reply::json(r#"{"errors":[{"code":401,"message":"Authentication required to access Asset."}]}"#),
+	});
+	let a = Assets::with_endpoints(AssetConfig::new(temp_state("studio-cookie")), endpoints(&ad, &real), Some(Account::find(None, found)), Some(Key::find(None)));
+	assert_eq!(a.cookie_source().as_deref(), Some("studio (Windows Credential Manager)"));
+	assert_eq!(a.fetch("rbxassetid://42").unwrap().bytes, MESH);
+	let asked = ad.requests();
+	assert_eq!((asked[0].header("Cookie"), asked[1].header("Cookie")), (None, Some(format!(".ROBLOSECURITY={TEST_COOKIE}").as_str())));
+	no_cookie_anywhere(&[&real]);
+}
+
+#[test]
 fn cookie_never_crosses_redirects() {
 	let real = MockServer::start(|_| Reply::bytes(MESH));
 	let real_url = real.url("/real");
@@ -1529,10 +1564,12 @@ fn warm_asks_the_key_one_asset_at_a_time() {
 #[test]
 fn child_processes_never_get_the_key() {
 	let mut command = std::process::Command::new("child");
-	command.env("ROBLOX_ASSET_DELIVERY_API_KEY", TEST_KEY).env("ROR_COOKIE_ENV", "cookie.env");
+	command.env("ROBLOX_ASSET_DELIVERY_API_KEY", TEST_KEY).env("ROR_COOKIE_ENV", "cookie.env").env("ROR_STUDIO_COOKIE", "1");
 	crate::hide_api_key(&mut command);
 	let envs: Vec<(String, Option<String>)> = command.get_envs().map(|(name, value)| (name.to_string_lossy().into_owned(), value.map(|value| value.to_string_lossy().into_owned()))).collect();
 	assert!(envs.contains(&("ROBLOX_ASSET_DELIVERY_API_KEY".into(), None)), "{envs:?}");
 	// the env file's path, which names no secret, is kept as the cookie's always was
 	assert!(envs.contains(&("ROR_COOKIE_ENV".into(), Some("cookie.env".into()))));
+	// and the switch to Studio's account, which holds none: a child that downloads reads the account itself
+	assert!(envs.contains(&("ROR_STUDIO_COOKIE".into(), Some("1".into()))));
 }

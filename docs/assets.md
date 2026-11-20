@@ -2,7 +2,7 @@
 
 This page explains how `ror` resolves and downloads Roblox assets, caches GPU textures, shares files across checkouts, and prevents disk usage from growing unbounded.
 
-Relevant code lives in `crates/ror-assets` (content URIs, HTTP downloads, disk cache, content store, Roblox install detection, cookies, broker auth, and Open Cloud API keys), `crates/ror-image`, and `crates/ror/src/render/texels.rs` (GPU texture preparation).
+Relevant code lives in `crates/ror-assets` (content URIs, HTTP downloads, disk cache, content store, Roblox install detection, cookies, Roblox Studio's signed-in account, broker auth, and Open Cloud API keys), `crates/ror-image`, and `crates/ror/src/render/texels.rs` (GPU texture preparation).
 
 Throughout this page, `<state dir>` refers to the active [state directory](building.md#standalone-commands-and-state) (`<checkout>/.cache` for source builds).
 
@@ -17,14 +17,14 @@ Built-in textures, skies, and avatar meshes are read directly from your local Ro
 When Roblox refuses an asset, `ror` records it as missing with the reason returned by `assetdelivery`:
 
 - **Permanent refusals** (`HTTP 403, rejected by Roblox moderation`, `archived by its creator`, `not yet reviewed by Roblox moderation`): refused for all accounts and places. Studio draws nothing for these assets, and `ror` matches that behavior.
-- **Authorization failures** (`not authorized for this account`, `authentication required`): require an [Open Cloud API key](#open-cloud-api-key), a `.ROBLOSECURITY` cookie, an [account broker](#account-broker), or a different account with access ([building.md](building.md)).
+- **Authorization failures** (`not authorized for this account`, `authentication required`): require an [Open Cloud API key](#open-cloud-api-key), a `.ROBLOSECURITY` cookie, [Roblox Studio's account](#roblox-studios-account), an [account broker](#account-broker), or a different account with access ([building.md](building.md)).
 
 ### Which credential is tried
 
 `ror` asks for every asset without a credential first. Only when Roblox answers that the asset needs authentication (401, 403) does it try a credential, in this order, until one gets the asset:
 
 1. An [Open Cloud API key](#open-cloud-api-key), when one is set: it is the narrower credential.
-2. The account: an [account broker](#account-broker)'s token when broker credentials are found, else the `.ROBLOSECURITY` cookie.
+2. The account: an [account broker](#account-broker)'s token when broker credentials are found, else the `.ROBLOSECURITY` cookie: from the environment or env files, else, only with `ROR_STUDIO_COOKIE=1`, [Roblox Studio's account](#roblox-studios-account).
 
 A refusal is remembered for a day once a credential was tried too; `--refresh` asks again.
 
@@ -64,6 +64,21 @@ The broker URL must use `https://`, or `http://` targeting `127.0.0.1` or `local
 - Requests targeting `https://assetdelivery.roblox.com/<path>?<query>` are sent to `<url>/rbx/assetdelivery.roblox.com/<path>?<query>` with `Authorization: Bearer <token>`, preserving the HTTP method, body, and `Content-Type`, and omitting cookies and CSRF tokens (the broker handles Roblox CSRF challenges).
 - `ror` proxies `GET /v1/assetId/{id}[/version/{n}]` (with query parameters) and `POST /v1/assets/batch`. The actual asset bytes are downloaded directly from the returned CDN URL without sending the bearer token.
 - Forward Roblox's HTTP status and response body as-is. If the broker itself rejects a request, include an `X-Broker-Error: <code>` header and a JSON body `{ "error", "message" }`. `ror` surfaces that message (e.g., `account broker: the shared account is signed out (HTTP 503)`) without caching it as a Roblox refusal. `HTTP 429` responses with `Retry-After` are retried after waiting.
+
+### Roblox Studio's account
+
+With `ROR_STUDIO_COOKIE=1`, `ror` uses the account signed in to Roblox Studio on this machine when no other account credential is set: no broker credentials and no cookie in the environment or env files. It is off by default, and any value other than `1` leaves it off. rur reads the same variable, so one setting covers both tools.
+
+`ror` reads that account's `.ROBLOSECURITY` cookie from where Studio keeps it:
+- **Windows:** Windows Credential Manager, in the generic credentials Studio writes under `https://www.roblox.com:RobloxStudioAuth` (the signed-in account's user id, then that account's cookie). Older Studio builds kept it in the registry (`HKCU\Software\Roblox\RobloxStudioBrowser\roblox.com`), which is read when the Credential Manager has none.
+- **macOS:** Studio's cookie file, `~/Library/HTTPStorages/com.Roblox.RobloxStudio.binarycookies`.
+- **Other platforms:** not available.
+
+From there it is handled like any other cookie: sent only to `https://assetdelivery.roblox.com`, never printed, logged, cached or written anywhere. `ror` reports where the account came from (`studio (Windows Credential Manager)`) and the source's status (`off (set ROR_STUDIO_COOKIE=1)`, `not found`, `found (<store>)`, `unreadable: <reason>`), never the value.
+
+Child processes keep `ROR_STUDIO_COOKIE` itself, which holds no credential, so `ror`'s render service and rur read the account themselves; the cookie never leaves the process that read it. A render service that is already running keeps the setting it was started with.
+
+The cookie is your own account, with all its access: turn this on only on a machine you alone use, and prefer an [Open Cloud API key](#open-cloud-api-key) where one is enough.
 
 ## Texture caches and streaming
 

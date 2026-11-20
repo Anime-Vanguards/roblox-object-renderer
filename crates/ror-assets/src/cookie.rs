@@ -5,6 +5,9 @@
 //! An env file line is `[export ]ROBLOX_ASSET_DELIVERY_COOKIE=value` or `[export ]ROBLOSECURITY=value`;
 //! values may be quoted and may carry a `.ROBLOSECURITY=` prefix; `#` starts a comment.
 //!
+//! Without a cookie in any of them, and only when env `ROR_STUDIO_COOKIE` is `1`, the account signed in to
+//! Roblox Studio on this machine is the last source: its cookie as Studio keeps it (the `studiocookie` module).
+//!
 //! The value is held in [`Secret`], which has no `Display`, a redacting `Debug`, and is zeroed on
 //! drop. Nothing in this module logs, prints or returns the value in an error.
 
@@ -62,6 +65,8 @@ impl Drop for Secret {
 pub(crate) enum CookieSource {
 	Env(&'static str),
 	File(PathBuf),
+	/// Roblox Studio's signed-in account, from where Studio keeps its cookie
+	Studio(crate::studiocookie::Store),
 }
 
 /// Loads the cookie from the documented sources. `repo_dir` enables the repo-relative env files.

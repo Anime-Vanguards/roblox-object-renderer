@@ -19,9 +19,11 @@
 //! concurrent fetches of one URI in a process download it once. Studio install and local files are
 //! read in place (not copied to the disk cache) and memory-cached.
 //!
-//! The account cookie is read from the environment or env files (see [`AssetConfig`]), only ever
-//! sent in the `Cookie` header of requests to `https://assetdelivery.roblox.com`, never forwarded
-//! across redirects, and never printed, logged, cached or written anywhere.
+//! The account cookie is read from the environment or env files (see [`AssetConfig`]), else, only
+//! when env `ROR_STUDIO_COOKIE` is `1`, from where Roblox Studio keeps its signed-in account's (the
+//! `studiocookie` module). It is only ever sent in the `Cookie` header of requests to
+//! `https://assetdelivery.roblox.com`, never forwarded across redirects, and never printed, logged,
+//! cached or written anywhere.
 //!
 //! With an account broker's credentials (the `broker` module: a service that holds the account's
 //! session, used with a personal token) no cookie is read: the requests that would carry it go to the
@@ -42,6 +44,7 @@ mod ratelimit;
 mod sniff;
 pub mod store;
 mod studio;
+mod studiocookie;
 mod transcode;
 mod uri;
 mod warm;
@@ -85,6 +88,10 @@ pub struct AssetConfig {
 	/// then the env files named by `ROR_COOKIE_ENV` and `RUR_COOKIE_ENV`, then `<repo_dir>/.env` (lines
 	/// `ROBLOX_ASSET_DELIVERY_COOKIE=...` or `ROBLOSECURITY=...`). Read lazily, on the first request
 	/// that needs authentication.
+	///
+	/// Last, only when env `ROR_STUDIO_COOKIE` is `1` and none of those has a cookie: the account signed
+	/// in to Roblox Studio on this machine, its cookie read from where Studio keeps it (the Windows
+	/// Credential Manager, else the registry key of older builds; on macOS Studio's cookie file).
 	///
 	/// An account broker's credentials come before all of them, and no cookie is read when they are
 	/// found: env `ROBLOX_BROKER_TOKEN` with `ROBLOX_BROKER_URL`, then the JSON file
@@ -295,6 +302,9 @@ struct Slot {
 /// Starts `command` without the Open Cloud API key in its environment (env
 /// `ROBLOX_ASSET_DELIVERY_API_KEY`), as every child process ror starts but its own render service. The
 /// env files it may be in are named by their paths, which children keep, as they keep the cookie's.
+/// Children also keep `ROR_STUDIO_COOKIE`, which holds no credential: a child that downloads (the
+/// render service, rur) then reads Studio's account itself, and the cookie never leaves the process
+/// that read it.
 pub fn hide_api_key(command: &mut std::process::Command) -> &mut std::process::Command {
 	command.env_remove(apikey::KEY)
 }
@@ -346,6 +356,7 @@ impl Account {
 					let source = match source {
 						cookie::CookieSource::Env(name) => format!("env {name}"),
 						cookie::CookieSource::File(path) => format!("file {}", path.display()),
+						cookie::CookieSource::Studio(store) => format!("studio ({})", store.label()),
 					};
 					Account { credential: Some(Credential::Cookie(secret)), source: Some(source), problem: None }
 				}
@@ -353,6 +364,13 @@ impl Account {
 			},
 		}
 	}
+}
+
+/// The account's cookie: the environment's or an env file's (`configured`), else Roblox Studio's account
+/// (`studio`, which [`studiocookie::load`] answers `Off` unless `ROR_STUDIO_COOKIE` is `1`), never read
+/// when there is one.
+fn account_cookie(configured: impl FnOnce() -> Option<(cookie::Secret, cookie::CookieSource)>, studio: impl FnOnce() -> studiocookie::Lookup) -> Option<(cookie::Secret, cookie::CookieSource)> {
+	configured().or_else(|| studio().into_found().map(|(secret, store)| (secret, cookie::CookieSource::Studio(store))))
 }
 
 struct Inner {
@@ -441,8 +459,8 @@ impl Assets {
 	}
 
 	/// A description of where the account's credential comes from (`env ROBLOSECURITY`,
-	/// `file <path>`; with a broker `account broker (env ROBLOX_BROKER_TOKEN)` or
-	/// `account broker (file <path>)`), never a value itself.
+	/// `file <path>`, `studio (Windows Credential Manager)`; with a broker
+	/// `account broker (env ROBLOX_BROKER_TOKEN)` or `account broker (file <path>)`), never a value itself.
 	pub fn cookie_source(&self) -> Option<String> {
 		self.account().source.clone()
 	}
@@ -460,12 +478,15 @@ impl Assets {
 
 	/// One line per credential source with its status (`not set`, `missing`, `no cookie line`,
 	/// `invalid value`, `ok`, ...), in the order they are tried: the Open Cloud API key's, then the
-	/// account broker's, then the cookie's. Never contains a value.
+	/// account broker's, then the cookie's, the last of them Roblox Studio's account
+	/// (`studio account: off (set ROR_STUDIO_COOKIE=1)`, `not found`, `found (<store>)`,
+	/// `unreadable: <why>`). Never contains a value.
 	pub fn cookie_diagnostics(&self) -> Vec<String> {
 		let repo_dir = self.inner.config.repo_dir.as_deref();
 		let mut lines = apikey::diagnose(std::env::var_os(apikey::KEY), &cookie::env_files(repo_dir));
 		lines.extend(broker::diagnose(&|name| std::env::var_os(name)));
 		lines.extend(cookie::diagnose(repo_dir));
+		lines.push(studiocookie::diagnose());
 		lines
 	}
 
@@ -474,7 +495,7 @@ impl Assets {
 	}
 
 	fn account(&self) -> &Account {
-		self.inner.account.get_or_init(|| Account::find(broker::load(), || cookie::load(self.inner.config.repo_dir.as_deref())))
+		self.inner.account.get_or_init(|| Account::find(broker::load(), || account_cookie(|| cookie::load(self.inner.config.repo_dir.as_deref()), studiocookie::load)))
 	}
 
 	fn credential(&self) -> Option<&Credential> {

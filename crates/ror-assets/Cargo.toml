@@ -19,7 +19,7 @@ ureq = { version = "3.4", default-features = false, features = ["rustls", "gzip"
 flate2 = "1.1"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Registry"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_System_Registry"] }
 
 [dev-dependencies]
 # asset_ids example: content references inside .rbxm / .rbxmx models

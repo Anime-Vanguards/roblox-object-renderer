@@ -88,7 +88,8 @@ goes under `<state dir>/out/`; `--out` names another folder. The service runs a 
   Its content store is where a host's is (listed below), so a store that already exists stays in
   place. On macOS that is `~/.cache/ror/store`, not the `~/Library/Caches` folder in the table above.
 - A standalone binary never loads a `.env` or looks for helper checkouts beside its executable or
-  in the current directory. Name them instead: `ROR_COOKIE_ENV` for a cookie file, `ROR_RUR` for a
+  in the current directory. Name them instead: `ROR_COOKIE_ENV` for a cookie file (or
+  `ROR_STUDIO_COOKIE=1` for Roblox Studio's signed-in account), `ROR_RUR` for a
   rur checkout and `ROR_REE` for a built ree checkout.
 - Without rur, GUIs are skipped with a warning. Without ree, `.luau` input reports that a built ree
   checkout is needed. Installing their native binaries is not enough: ror also uses rur's Node
@@ -129,8 +130,10 @@ does not, and keeps the library's original defaults:
   [ree](https://github.com/Anime-Vanguards/roblox-engine-emulator) (`ROR_REE`, or
   `../roblox-engine-emulator`) built with `cargo build --release` ([scripts.md](scripts.md)).
 - Optional: a Roblox account cookie for assets that need authentication, in a source checkout's `.env`
-  (`ROBLOX_ASSET_DELIVERY_COOKIE=...`, ignored by Git) or a file named by `ROR_COOKIE_ENV`. It is
-  only ever sent to assetdelivery.roblox.com ([SECURITY.md](../SECURITY.md)).
+  (`ROBLOX_ASSET_DELIVERY_COOKIE=...`, ignored by Git) or a file named by `ROR_COOKIE_ENV`, or, with
+  `ROR_STUDIO_COOKIE=1`, the account signed in to Roblox Studio on this machine
+  ([assets.md](assets.md#roblox-studios-account)). It is only ever sent to assetdelivery.roblox.com
+  ([SECURITY.md](../SECURITY.md)).
 - Optional, in place of the cookie: an account broker's credentials (`ROBLOX_BROKER_TOKEN` with
   `ROBLOX_BROKER_URL`, or a JSON file: [assets.md](assets.md#account-broker)). They win over every
   cookie source.

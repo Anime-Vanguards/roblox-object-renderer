@@ -33,11 +33,13 @@ Security fixes apply only to the latest commit on `main`. There are no long-term
 1. `ROBLOX_ASSET_DELIVERY_COOKIE` or `ROBLOSECURITY` environment variables
 2. The file path in `ROR_COOKIE_ENV`
 3. A local `.env` file in the checkout (git-ignored)
+4. Only when `ROR_STUDIO_COOKIE=1` is set and none of the above has a cookie: the account signed in to Roblox Studio on this machine, read from where Studio keeps it (Windows Credential Manager, or the registry key of older Studio builds; Studio's cookie file on macOS). Off by default ([docs/assets.md](docs/assets.md#roblox-studios-account)).
 
 Handling rules:
 - Sent **only** to `https://assetdelivery.roblox.com`—never to CDNs, the thumbnails API, or across redirects.
 - Held in a memory type that cannot be printed/logged and is zeroed on drop.
-- Because a cookie grants full account access, use a dedicated throwaway account if possible.
+- Studio's cookie never leaves the process that read it: child processes get only the `ROR_STUDIO_COOKIE` switch, and read the account themselves.
+- Because a cookie grants full account access, use a dedicated throwaway account if possible. Studio's account is your own: turn it on only on a machine you alone use.
 
 ### Open Cloud API key
 
