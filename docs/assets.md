@@ -71,7 +71,7 @@ With `ROR_STUDIO_COOKIE=1`, `ror` uses the account signed in to Roblox Studio on
 
 `ror` reads that account's `.ROBLOSECURITY` cookie from where Studio keeps it:
 - **Windows:** Windows Credential Manager, in the generic credentials Studio writes under `https://www.roblox.com:RobloxStudioAuth` (the signed-in account's user id, then that account's cookie). Older Studio builds kept it in the registry (`HKCU\Software\Roblox\RobloxStudioBrowser\roblox.com`), which is read when the Credential Manager has none.
-- **macOS:** Studio's cookie file, `~/Library/HTTPStorages/com.Roblox.RobloxStudio.binarycookies`.
+- **macOS:** Studio's cookie file, `~/Library/HTTPStorages/com.Roblox.RobloxStudio.binarycookies`: the entries Studio keeps its sign-in in (`/RobloxStudioAuth/userid`, the signed-in account's user id, and `/RobloxStudioAuth/.ROBLOSECURITY<user id>`, its cookie), read as the Credential Manager's are, else a cookie named `.ROBLOSECURITY` itself.
 - **Other platforms:** not available.
 
 From there it is handled like any other cookie: sent only to `https://assetdelivery.roblox.com`, never printed, logged, cached or written anywhere. `ror` reports where the account came from (`studio (Windows Credential Manager)`) and the source's status (`off (set ROR_STUDIO_COOKIE=1)`, `not found`, `found (<store>)`, `unreadable: <reason>`), never the value.
