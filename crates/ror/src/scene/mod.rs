@@ -37,6 +37,20 @@ pub use trails::Trail;
 /// (vfx-highlight-transparent: 0.01 highlighted, 0.015 not).
 pub const OPAQUE_TRANSPARENCY: f32 = 0.0125;
 
+/// Where a part's Transparency cuts its shadows (docs/rendering.md "Shadows and Transparency"): below
+/// it the sun's and local lights' full shadow, from it up none, whatever the Material (the engine,
+/// 0.747: plates 0.00005 apart cast the sun's full shadow up to 0.74795 and none from 0.748).
+pub const SHADOW_CUT_TRANSPARENCY: f32 = 0.748;
+
+/// Whether a part at this Transparency casts shadows ([`SHADOW_CUT_TRANSPARENCY`]; below 0 too).
+pub fn casts_shadow(transparency: f32) -> bool {
+	transparency < SHADOW_CUT_TRANSPARENCY
+}
+
+/// The attribute that makes a part shadow-only, set to the boolean `true` ([`Part::shadow_only`]):
+/// a hint to this renderer alone, which the Roblox engine does not know.
+pub const SHADOW_ONLY: &str = "RorShadowOnly";
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Scene {
 	pub parts: Vec<Arc<Part>>,
@@ -235,6 +249,9 @@ pub struct Part {
 	pub transparency: f32,
 	pub reflectance: f32,
 	pub cast_shadow: bool,
+	/// The [`SHADOW_ONLY`] attribute: nothing of the part is drawn, and with CastShadow it casts an
+	/// opaque part's shadows at any Transparency.
+	pub shadow_only: bool,
 	pub double_sided: bool,
 	/// `MeshPart.TextureID` / `SpecialMesh.TextureId`.
 	pub texture: Option<String>,

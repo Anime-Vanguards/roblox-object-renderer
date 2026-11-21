@@ -664,6 +664,7 @@ mod tests {
 			transparency: 0.0,
 			reflectance: 0.0,
 			cast_shadow: true,
+			shadow_only: false,
 			double_sided: false,
 			texture: None,
 			vertex_color: Vec3::ONE,

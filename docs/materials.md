@@ -49,6 +49,7 @@ How `Part.Color`, mesh vertex colors (`FileMesh` or `EditableMesh` `AddColor`/`S
 ## ForceField
 
 - **Material:** Unlit procedural pattern animated over time (`shaders/mesh.wgsl`, `forcefield-*` experiments), strongest at grazing angles and scaled by `Color` and `Transparency`.
+- **Shadows:** Cast by `Transparency` as for any other material: full below 0.748, none from it up ([rendering.md](rendering.md#lighting-and-shadows)).
 - **`ForceField` instance:** On a character, draws Studio's legacy shield particles instead ([particles.md](particles.md)).
 
 ## Decals and Textures

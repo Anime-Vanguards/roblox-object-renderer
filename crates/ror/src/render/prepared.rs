@@ -455,6 +455,7 @@ impl Key {
 			transparency,
 			reflectance,
 			cast_shadow,
+			shadow_only,
 			double_sided,
 			texture,
 			vertex_color,
@@ -480,6 +481,7 @@ impl Key {
 		self.text(material_variant);
 		self.floats(&[*transparency, *reflectance]);
 		self.number(*cast_shadow as u64);
+		self.number(*shadow_only as u64);
 		self.number(*double_sided as u64);
 		self.texture(texture);
 		self.vector(*vertex_color);

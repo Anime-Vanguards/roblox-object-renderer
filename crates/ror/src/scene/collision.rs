@@ -206,6 +206,7 @@ pub fn view(scene: &Scene, filter: Filter) -> (Scene, Summary) {
 			transparency: 0.0,
 			reflectance: 0.0,
 			cast_shadow: true,
+			shadow_only: false,
 			double_sided: true,
 			texture: None,
 			vertex_color: Vec3::ONE,

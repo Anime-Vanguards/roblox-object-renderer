@@ -794,6 +794,7 @@ mod surface_tests {
 			transparency: 0.0,
 			reflectance: 0.0,
 			cast_shadow: true,
+			shadow_only: false,
 			double_sided: false,
 			texture: None,
 			vertex_color: Vec3::ONE,
@@ -1225,7 +1226,7 @@ struct DrawItem {
 	transparent: bool,
 	double_sided: bool,
 	casts_shadow: bool,
-	/// Shadows local lights with Shadows (below Transparency 0.75, ForceField at any)
+	/// Shadows local lights with Shadows (as the sun: `scene::casts_shadow`)
 	casts_light_shadow: bool,
 	center: Vec3,
 	/// A sphere round what it draws, in world space (which sun cascades it can shadow)
@@ -1242,7 +1243,8 @@ struct DrawItem {
 	glass: bool,
 	/// (part index, ZIndex, decal index): decals of one part in ZIndex order
 	decal_order: (u32, i32, u32),
-	/// An invisible part a Highlight covers: drawn only into the Highlights' mask
+	/// An invisible part a Highlight covers, drawn only into the Highlights' mask, or a shadow-only
+	/// part, drawn only into the shadow maps
 	highlight_only: bool,
 }
 
@@ -3420,7 +3422,7 @@ impl Renderer {
 			// projection of the box face reached the silhouette; a Top one lies turned half round from the
 			// box's, as the material textures' faces are; a Texture tiles that face in its studs)
 			let face_only = !mesh_uv && matches!(part.geometry, Geometry::Ball | Geometry::Cylinder);
-			for (decal_index, decal) in part.decals.iter().enumerate() {
+			for (decal_index, decal) in part.decals.iter().enumerate().filter(|_| !part.shadow_only) {
 				use crate::scene::extract::mesh_type;
 				// without the head mesh (a cylinder) a classic head shows its Front decal only
 				if !mesh_uv && matches!(special_mesh, Some(mesh_type::HEAD | mesh_type::FILE_MESH)) && decal.face != 5 {
@@ -3521,9 +3523,13 @@ impl Renderer {
 			}
 			// an invisible part draws nothing, but a Highlight on it still draws (an invisible Glass part:
 			// scene::extract keeps those only for their Highlights), and draws it as Glass (`fs_glass`)
-			let highlight_only = part.transparency >= 1.0;
+			let highlight_only = part.transparency >= 1.0 && !part.shadow_only;
 			let kept_glass = highlight_only && place & 2 != 0;
 			if highlight_only && !kept_glass && place & 1 == 0 {
+				return out;
+			}
+			// a shadow-only part (scene::SHADOW_ONLY) is here for the shadow maps alone
+			if part.shadow_only && !part.cast_shadow {
 				return out;
 			}
 			let material = self.material_bind_group(&key, missing);
@@ -3623,7 +3629,10 @@ impl Renderer {
 				&& flags & TEX_COLOR != 0
 				&& key.color.as_deref().is_some_and(|uri| self.load_texture(uri, TextureUse::Color).is_ok_and(|texture| texture.has_alpha));
 			let texture_alpha = flags & TEX_ALPHA_TRANSPARENCY != 0 || special_alpha;
-			let transparent = forcefield || opacity < 1.0 || texture_alpha;
+			let transparent = forcefield || opacity < 1.0 || texture_alpha || part.shadow_only;
+			// the sun's and local lights' shadows alike (scene::casts_shadow); a shadow-only part's at any
+			// Transparency
+			let casts = part.cast_shadow && (part.shadow_only || (crate::scene::casts_shadow(part.transparency) && !highlight_only));
 			out.main = Some((index, draws.len()));
 			draws.push(DrawItem {
 				drawn_bounds: culling::Bounds::new(mesh.drawn, world),
@@ -3633,17 +3642,18 @@ impl Renderer {
 				instance: index,
 				material,
 				transparent,
-				// ForceField draws both faces (a quad shows from behind, a closed part two layers) and
-				// casts a full shadow at any Transparency below 1 (forcefield-geometry, -shadow); other
-				// parts cast a full one below Transparency 0.75 and none from it up (glass-shadows: Glass and
-				// SmoothPlastic blocks at 0.7 to 0.745 shadow the floor as an opaque block does, 129 / 182 /
-				// 210 against 124 / 177 / 206 on a floor lit at 221 / 231 / 238; at 0.75, 0.8 and up nothing)
+				// ForceField draws both faces (a quad shows from behind, a closed part two layers:
+				// forcefield-geometry). A part casts a full shadow below the cut in its Transparency and
+				// none from it up, whatever its Material (glass-shadows: Glass and SmoothPlastic blocks at
+				// 0.7 to 0.745 shadow the floor as an opaque block does, 129 / 182 / 210 against 124 / 177 /
+				// 206 on a floor lit at 221 / 231 / 238; at 0.75, 0.8 and up nothing; ForceField the same,
+				// where ror cast its full shadow up to Transparency 1)
 				double_sided: part.double_sided || forcefield,
-				casts_shadow: part.cast_shadow && (forcefield || (!texture_alpha && opacity > 0.25)) && !highlight_only,
-				// local lights' shadows follow the sun's opacity rule (light-transparency: SmoothPlastic at
-				// Transparency 0.25 and 0.5, Glass at 0 and 0.5 and ForceField shadow the floor fully, 0.75,
-				// 0.9, 0.98 and Glass at 0.9 not at all; ror cast them all, 9 of 255 too dark there)
-				casts_light_shadow: part.cast_shadow && (forcefield || opacity > 0.25) && !highlight_only,
+				casts_shadow: casts && (part.shadow_only || !texture_alpha),
+				// local lights' shadows follow the sun's cut (light-transparency: SmoothPlastic at
+				// Transparency 0.25 and 0.5, Glass at 0 and 0.5 and ForceField at 0 shadow the floor fully,
+				// 0.75, 0.9, 0.98 and Glass at 0.9 not at all; ror cast them all, 9 of 255 too dark there)
+				casts_light_shadow: casts,
 				center,
 				bound: {
 					let (low, high) = mesh_bounds;
@@ -3651,15 +3661,15 @@ impl Renderer {
 					(world.transform_point3((low + high) * 0.5), (high - low).length() * 0.5 * scale)
 				},
 				decal: false,
-				forcefield,
+				forcefield: forcefield && !part.shadow_only,
 				// a SurfaceAppearance in AlphaMode Transparency on a part at Transparency 0 hides what is
 				// behind its opaque texels, even what sorts after it: Studio shows none of the NPC aura's
 				// particles inside its legs' clothes, but the sparks pulled out in front of them
 				// (particle-model on a character; particle-occlusion still to be captured)
-				write_depth: !forcefield && opacity >= 1.0 && (flags & TEX_ALPHA_TRANSPARENCY != 0 || special_alpha),
-				glass: params.shading == materials::SHADING_GLASS && opacity < 1.0,
+				write_depth: !forcefield && opacity >= 1.0 && (flags & TEX_ALPHA_TRANSPARENCY != 0 || special_alpha) && !part.shadow_only,
+				glass: params.shading == materials::SHADING_GLASS && opacity < 1.0 && !part.shadow_only,
 				decal_order: (0, 0, 0),
-				highlight_only,
+				highlight_only: highlight_only || part.shadow_only,
 			});
 		}
 		out
@@ -3677,7 +3687,7 @@ impl Renderer {
 
 	/// Depth from shadowed local lights (each its origin and reach) through their six faces of `size`
 	/// texels, one layer per face: the faces of parts with CastShadow turned towards the light, those
-	/// below Transparency 0.75 (light-shadows, light-transparency), and of them only what reaches the
+	/// below the shadow cut in Transparency (light-shadows, light-transparency), and of them only what reaches the
 	/// light's sphere and the face's view.
 	fn render_light_shadow_maps(&self, prepared: &Prepared, lights: &[ShadowLight], size: u32, lease: &reuse::Lease, profile: &profile::Profile, encoder: &mut wgpu::CommandEncoder, publish: &mut Vec<PendingShadows>) -> wgpu::TextureView {
 		let key = shadow_reuse::local_key(lights, size);
@@ -6205,6 +6215,97 @@ mod viewport_frame_tests {
 			let blue = 1.0 * covered + colour[2] * (1.0 - covered);
 			assert!((edge[2] - blue).abs() < 3.0 / 255.0, "the edge's colour is the straight mean ({blue}): {edge:?}");
 		}
+		let _ = std::fs::remove_dir_all(&state);
+	}
+}
+
+#[cfg(test)]
+mod shadow_caster_tests {
+	use super::*;
+	use crate::scene::build::{ModelBuilder, PartSpec};
+	use rbx_dom_weak::types::{Attributes, Variant};
+
+	/// The cut itself (the engine, 0.747: plates in steps of 0.00005 cast the sun's full shadow up to
+	/// Transparency 0.74795 and none from 0.748, whatever their Material).
+	#[test]
+	fn a_part_casts_shadows_below_the_cut_in_its_transparency() {
+		for (transparency, casts) in [(-1.0, true), (0.0, true), (0.5, true), (0.747, true), (0.74795, true), (0.748, false), (0.75, false), (0.999, false), (1.0, false)] {
+			assert_eq!(crate::scene::casts_shadow(transparency), casts, "Transparency {transparency}");
+		}
+	}
+
+	/// A roof over a floor, lit by the sun alone and then by one shadowed PointLight above the roof
+	/// alone, no sky light either time: the floor under it is as dark as under an opaque roof or as
+	/// lit as without one, by the roof's Transparency and not its Material (ForceField at 0.9 cast a full
+	/// shadow before). A roof with the shadow-only attribute shades the floor at any Transparency and is
+	/// not in the picture from below; without CastShadow it does nothing.
+	#[test]
+	fn transparency_cuts_a_parts_shadows_and_a_shadow_only_part_casts_unseen() {
+		let state = std::env::temp_dir().join(format!("ror-shadow-caster-test-{}", std::process::id()));
+		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		// (Material, Transparency, CastShadow, the shadow-only attribute)
+		type Roof = (u32, f32, bool, bool);
+		let scene = |roof: Option<Roof>, lamp: bool| {
+			let mut model = ModelBuilder::new("Shade");
+			model.part(&PartSpec { name: "Floor".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, -0.5, 0.0)), size: Vec3::new(160.0, 1.0, 160.0), color: [255; 3], ..Default::default() });
+			if let Some((material, transparency, cast_shadow, shadow_only)) = roof {
+				let part = model.part(&PartSpec { name: "Roof".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, 20.0, 0.0)), size: Vec3::new(100.0, 1.0, 100.0), material, transparency, cast_shadow, ..Default::default() });
+				if shadow_only {
+					model.set(part, "Attributes", Attributes::new().with(crate::scene::SHADOW_ONLY, Variant::Bool(true)));
+				}
+			}
+			if lamp {
+				let carrier = model.part(&PartSpec { name: "Lamp".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, 30.0, 0.0)), size: Vec3::splat(0.2), transparency: 1.0, cast_shadow: false, ..Default::default() });
+				model.child(carrier, rbx_dom_weak::InstanceBuilder::new("PointLight").with_property("Shadows", true).with_property("Range", 60.0f32).with_property("Brightness", 5.0f32));
+			}
+			let mut scene = crate::scene::extract::extract(&model.into_document());
+			let environment = &mut scene.environment;
+			(environment.ambient, environment.outdoor_ambient, environment.environment_diffuse_scale, environment.environment_specular_scale) = (Vec3::ZERO, Vec3::ZERO, 0.0, 0.0);
+			if lamp {
+				environment.brightness = 0.0;
+			}
+			scene
+		};
+		// the floor under the roof's middle from below the roof, and the roof's underside from the floor
+		let view = |eye: [f32; 3], target: [f32; 3]| ViewRequest { width: 64, height: 64, camera: CameraSpec::LookAt { eye, target, fov: 40.0 }, background: Background::Color([0.0, 0.0, 1.0]), bloom: false, ..Default::default() };
+		let views = [view([0.0, 12.0, -3.0], [0.0; 3]), view([0.0, 2.0, -1.0], [0.0, 20.0, 0.0])];
+		let draw = |roof: Option<Roof>, lamp: bool| {
+			let (images, _) = renderer.render(&scene(roof, lamp), &views).unwrap();
+			let level = |image: &ViewImage| image.rgba.chunks(4).map(|pixel| pixel[..3].iter().map(|&channel| channel as f32).sum::<f32>() / 3.0).sum::<f32>() / (image.rgba.len() / 4) as f32;
+			(level(&images[0]), images[1].rgba.clone())
+		};
+		const SMOOTH_PLASTIC: u32 = 272;
+		const GLASS: u32 = 1568;
+		const FORCEFIELD: u32 = 1584;
+		for lamp in [false, true] {
+			let by = if lamp { "a PointLight" } else { "the sun" };
+			let (lit, sky) = draw(None, lamp);
+			let (dark, roofed) = draw(Some((SMOOTH_PLASTIC, 0.0, true, false)), lamp);
+			assert!(lit - dark > 40.0, "{by}: an opaque roof takes the light off the floor ({lit} lit, {dark} under it)");
+			assert!(roofed != sky, "{by}: an opaque roof is in the picture from below");
+			// (the roof, whether it shades the floor, whether it is in the picture from below: a ForceField one
+			// seen head-on shows nothing either way)
+			let cases: [(Roof, bool, Option<bool>); 9] = [
+				((SMOOTH_PLASTIC, 0.74, true, false), true, Some(true)),
+				((SMOOTH_PLASTIC, 0.75, true, false), false, Some(true)),
+				((GLASS, 0.74, true, false), true, Some(true)),
+				((GLASS, 0.9, true, false), false, Some(true)),
+				((FORCEFIELD, 0.5, true, false), true, None),
+				((FORCEFIELD, 0.9, true, false), false, None),
+				((FORCEFIELD, 0.999, true, true), true, Some(false)),
+				((SMOOTH_PLASTIC, 1.0, true, true), true, Some(false)),
+				((SMOOTH_PLASTIC, 0.0, false, true), false, Some(false)),
+			];
+			for (roof, shades, seen) in cases {
+				let (level, below) = draw(Some(roof), lamp);
+				let share = (lit - level) / (lit - dark);
+				assert!(if shades { share > 0.9 } else { share < 0.1 }, "{by}, roof {roof:?}: {share} of an opaque roof's shadow on the floor");
+				assert!(seen.is_none_or(|seen| seen == (below != sky)), "{by}, roof {roof:?}: in the picture from below, {}", below != sky);
+			}
+		}
+		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
 	}
 }

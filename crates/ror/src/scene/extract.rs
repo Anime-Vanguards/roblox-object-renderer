@@ -529,7 +529,7 @@ fn read_highlight(document: &Document, referent: Ref, part_indices: &std::collec
 	let mut parts: Vec<usize> = adorned_parts(document, referent)
 		.into_iter()
 		.filter_map(|adorned| part_indices.get(&adorned).copied())
-		.filter(|&index| scene_parts[index].transparency <= super::OPAQUE_TRANSPARENCY || scene_parts[index].material == GLASS)
+		.filter(|&index| !scene_parts[index].shadow_only && (scene_parts[index].transparency <= super::OPAQUE_TRANSPARENCY || scene_parts[index].material == GLASS))
 		.collect();
 	if parts.is_empty() {
 		return None;
@@ -671,6 +671,7 @@ fn extract_part(document: &Document, referent: Ref, instance: &Instance, skeleto
 		transparency: props::f32(instance, "Transparency", 0.0),
 		reflectance: props::f32(instance, "Reflectance", 0.0),
 		cast_shadow: props::bool(instance, "CastShadow", true),
+		shadow_only: props::attribute_flag(instance, super::SHADOW_ONLY),
 		double_sided: props::bool(instance, "DoubleSided", false),
 		texture: None,
 		vertex_color,
@@ -724,6 +725,8 @@ fn extract_part(document: &Document, referent: Ref, instance: &Instance, skeleto
 					offset: props::vec3(child, "Offset", Vec3::ZERO),
 				};
 			}
+			// a shadow-only part draws nothing: what covers its surface goes with it
+			"SurfaceAppearance" | "Decal" | "Texture" if part.shadow_only => {}
 			"SurfaceAppearance" => {
 				part.surface_appearance = Some(SurfaceAppearance {
 					color_map: props::content(child, &["ColorMapContent", "ColorMap"]),
@@ -784,6 +787,13 @@ fn extract_part(document: &Document, referent: Ref, instance: &Instance, skeleto
 		dress(&mut part, instance.name.as_str(), character);
 	}
 
+	// a shadow-only part is in the scene for its shadow alone, at any Transparency
+	if part.shadow_only {
+		if part.cast_shadow || document.keep_invisible {
+			scene.parts.push(Arc::new(part));
+		}
+		return None;
+	}
 	let visible = part.transparency < 1.0 || !part.decals.is_empty();
 	if visible || document.keep_invisible {
 		scene.parts.push(Arc::new(part));

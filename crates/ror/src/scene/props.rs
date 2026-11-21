@@ -61,6 +61,11 @@ pub fn bool(instance: &Instance, name: &str, fallback: bool) -> bool {
 	}
 }
 
+/// Whether an instance carries this attribute as the boolean `true` (not a number or a string).
+pub fn attribute_flag(instance: &Instance, name: &str) -> bool {
+	matches!(instance.properties.get(&rbx_dom_weak::ustr("Attributes")), Some(Variant::Attributes(attributes)) if matches!(attributes.get(name), Some(Variant::Bool(true))))
+}
+
 pub fn vec3(instance: &Instance, name: &str, fallback: Vec3) -> Vec3 {
 	match get(instance, name) {
 		Some(Variant::Vector3(value)) => Vec3::new(value.x, value.y, value.z),
