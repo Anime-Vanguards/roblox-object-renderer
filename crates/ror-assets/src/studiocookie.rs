@@ -346,8 +346,10 @@ mod os {
 	}
 }
 
-/// The `.ROBLOSECURITY` cookie of a `roblox.com` domain in Apple's binary cookie file, the one that expires last
-/// when there are several; None when the file holds none. An error says what is malformed, never a value.
+/// The Studio account's cookie in Apple's binary cookie file, from `roblox.com` domains only: Studio's own
+/// entries (`/RobloxStudioAuth/userid`, `/RobloxStudioAuth/.ROBLOSECURITY<user id>`) by the Credential Manager's
+/// rule, else a cookie named `.ROBLOSECURITY`, the one that expires last when there are several; None when the
+/// file holds none. An error says what is malformed or ambiguous, never a value.
 ///
 /// The format: `cook`, the page count and each page's size (big-endian u32s), then the pages. A page: the bytes
 /// `00 00 01 00`, its cookie count and each cookie's offset in the page (little-endian u32s from here on). A
