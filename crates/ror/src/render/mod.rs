@@ -727,6 +727,12 @@ const TEX_DECAL_TILED: u32 = 2048;
 const TEX_ORGANIC: u32 = 4096;
 const TEX_EMISSIVE: u32 = 8192;
 const TEX_SRGB: u32 = 16384;
+
+/// A `file://` snapshot written for an `EditableImage` (which the client decodes with the square
+/// rather than the sRGB curve on a `SurfaceAppearance` colour map).
+fn is_editable_image_uri(uri: &str) -> bool {
+	uri.starts_with("file://") && (uri.contains("/editable-images/") || uri.contains("\\editable-images\\"))
+}
 const TEX_DECAL_MESH_UV: u32 = 32768;
 const TEX_DECAL_CENTERED: u32 = 65536;
 const TEX_NORMAL_RG: u32 = 131072;
@@ -5296,8 +5302,14 @@ impl Renderer {
 				material.key = MaterialKey { color, normal, metalness, roughness, emissive, clamped: false };
 				if material.key.color.is_some() {
 					// sRGB like the material maps (close-up comparisons: within 8 of 255 on 78 % of
-					// a ship exterior's pixels instead of 70 %, 92 % instead of 88 % on a character)
-					material.flags |= TEX_COLOR | TEX_SRGB;
+					// a ship exterior's pixels instead of 70 %, 92 % instead of 88 % on a character);
+					// EditableImage snapshots decode with the square (fixtures/vertex-colour-maps.luau:
+					// saov-tan 0.615 / 0.347 / 0.156 against 0.621 / 0.350 / 0.155 squared, 0.586 /
+					// 0.309 / 0.129 sRGB)
+					material.flags |= TEX_COLOR;
+					if !material.key.color.as_deref().is_some_and(is_editable_image_uri) {
+						material.flags |= TEX_SRGB;
+					}
 				}
 			}
 			// the mask glows as a MaterialVariant's does (materials::VARIANT_EMISSION), in the appearance's
@@ -6139,7 +6151,136 @@ mod vertex_colour_tests {
 		// in AlphaMode Transparency the map alone: no tint
 		let opaque = image("opaque", [204, 153, 102, 255]);
 		let reference = draw("transparency-reference", &white_mesh, cream, None, Some((opaque.clone(), 1)));
-		same("Transparency over a vertex-coloured part", draw("transparency", &tinted_mesh, cream, None, Some((opaque, 1))), reference);
+		same("Transparency over a vertex-coloured part", draw("transparency", &tinted_mesh, cream, None, Some((opaque.clone(), 1))), reference);
+		// an EditableImage ColorMap on a SurfaceAppearance decodes with the square (matching MeshPart
+		// TextureContent), while an ordinary ColorMap decodes with the sRGB curve
+		let editable_dir = state.join("editable-images");
+		std::fs::create_dir_all(&editable_dir).unwrap();
+		let editable_path = editable_dir.join("1-0.png");
+		crate::output::write_png(&editable_path, 8, 8, &[204, 153, 102, 255].repeat(64), false).unwrap();
+		let editable_uri = uri(&editable_path);
+		let tex_ref = draw("editable-ref", &white_mesh, [255; 3], Some(opaque.clone()), None);
+		let editable_sa = draw("editable-sa", &white_mesh, [255; 3], None, Some((editable_uri, 0)));
+		let srgb_sa = draw("srgb-sa", &white_mesh, [255; 3], None, Some((opaque, 0)));
+		same("EditableImage SurfaceAppearance ColorMap decodes with the square", editable_sa, tex_ref);
+		assert!(editable_sa[1] - srgb_sa[1] >= 6, "ordinary ColorMap stays sRGB-decoded ({srgb_sa:?}) below square-decoded EditableImage ({editable_sa:?})");
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+}
+
+#[cfg(test)]
+mod reflectance_tests {
+	use super::*;
+	use crate::scene::build::{ModelBuilder, PartSpec};
+	use rbx_dom_weak::InstanceBuilder;
+
+	/// Part.Reflectance blends a mirror sky lit by half the diffuse light across flat ambient, sky
+	/// diffuse and sun alike, leaves direct specular unmixed on top, and scales Glass's subtracted
+	/// sky diffuse by (1 - Reflectance) so a reflective Glass part at T < 0.5 does not darken.
+	#[test]
+	fn reflectance_weights_diffuse_evenly_keeps_direct_specular_and_scales_glass_sky_diffuse() {
+		let state = std::env::temp_dir().join(format!("ror-reflectance-test-{}", std::process::id()));
+		std::fs::create_dir_all(&state).unwrap();
+		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let sky_uri = |name: &str, rgb: [u8; 3]| -> String {
+			let path = state.join(format!("{name}.png"));
+			crate::output::write_png(&path, 8, 8, &[rgb[0], rgb[1], rgb[2], 255].repeat(64), false).unwrap();
+			format!("file:///{}", path.display().to_string().replace('\\', "/"))
+		};
+		let white_sky = sky_uri("white-sky", [255, 255, 255]);
+		let black_sky = sky_uri("black-sky", [0, 0, 0]);
+		let set_sky = |scene: &mut Scene, face: &str| {
+			scene.environment.sky = Some(crate::scene::environment::Sky {
+				skybox: std::array::from_fn(|_| face.to_string()),
+				celestial_bodies_shown: false,
+				..Default::default()
+			});
+		};
+		let size = 32u32;
+		let render_center = |scene: &Scene, eye: [f32; 3]| -> [f32; 3] {
+			let request = ViewRequest { width: size, height: size, camera: CameraSpec::LookAt { eye, target: [0.0; 3], fov: 20.0 }, background: Background::Color([0.0; 3]), bloom: false, ..Default::default() };
+			let (images, _) = renderer.render(scene, std::slice::from_ref(&request)).unwrap();
+			let index = ((size / 2 * size + size / 2) * 4) as usize;
+			std::array::from_fn(|c| images[0].rgba[index + c] as f32)
+		};
+		// 1. Direct specular from a PointLight stays unmixed at Reflectance 1 over a black sky.
+		let glint_scene = |reflectance: f32| {
+			let mut model = ModelBuilder::new("Glint");
+			model.part(&PartSpec { name: "Wall".into(), size: Vec3::new(10.0, 10.0, 1.0), color: [0, 0, 0], material: 272, reflectance, cast_shadow: false, ..Default::default() });
+			let lamp = model.part(&PartSpec { name: "Lamp".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, 0.0, -6.0)), size: Vec3::splat(0.2), transparency: 1.0, cast_shadow: false, ..Default::default() });
+			model.child(lamp, InstanceBuilder::new("PointLight").with_property("Range", 30.0f32).with_property("Brightness", 4.0f32));
+			let mut scene = crate::scene::extract::extract(&model.into_document());
+			set_sky(&mut scene, &black_sky);
+			let env = &mut scene.environment;
+			(env.ambient, env.outdoor_ambient, env.brightness, env.environment_diffuse_scale, env.environment_specular_scale, env.global_shadows) = (Vec3::ZERO, Vec3::ZERO, 0.0, 0.0, 0.0, false);
+			scene
+		};
+		let glint_r0 = render_center(&glint_scene(0.0), [0.0, 0.0, -10.0]);
+		let glint_r1 = render_center(&glint_scene(1.0), [0.0, 0.0, -10.0]);
+		assert!(glint_r0[0] > 40.0, "expected a visible PointLight specular glint at R=0, got {glint_r0:?}");
+		assert!((glint_r1[0] - glint_r0[0]).abs() <= 2.0, "direct specular must survive Reflectance 1: R=0 {glint_r0:?}, R=1 {glint_r1:?}");
+
+		// 2. Diffuse light weights are equal (0.5) across flat ambient, sky diffuse and sun alone.
+		// Match each mode's R=0 white plate level from the same camera, ClockTime and reflection
+		// direction so mirror and tone curve are identical; R=1 black then lands on mirror * 0.5 * L.
+		let plate_scene = |color: [u8; 3], reflectance: f32, mode: &str, strength: f32| {
+			let mut model = ModelBuilder::new("Plate");
+			model.part(&PartSpec { name: "Plate".into(), size: Vec3::new(10.0, 1.0, 10.0), color, material: 272, reflectance, cast_shadow: false, ..Default::default() });
+			let mut scene = crate::scene::extract::extract(&model.into_document());
+			set_sky(&mut scene, &white_sky);
+			let env = &mut scene.environment;
+			(env.ambient, env.outdoor_ambient, env.brightness, env.environment_diffuse_scale, env.environment_specular_scale, env.global_shadows, env.clock_time) = (Vec3::ZERO, Vec3::ZERO, 0.0, 0.0, 0.0, false, 7.5);
+			match mode {
+				"ambient" => env.ambient = Vec3::splat(strength),
+				"sky" => env.environment_diffuse_scale = strength,
+				"sun" => env.brightness = strength,
+				_ => unreachable!(),
+			}
+			scene
+		};
+		let top_eye = [0.0, 10.0, 0.01];
+		let matched = |mode: &str, target: f32| {
+			let (mut lo, mut hi) = (0.0f32, 16.0f32);
+			for _ in 0..15 {
+				let mid = 0.5 * (lo + hi);
+				if render_center(&plate_scene([255, 255, 255], 0.0, mode, mid), top_eye)[0] < target {
+					lo = mid;
+				} else {
+					hi = mid;
+				}
+			}
+			let s = 0.5 * (lo + hi);
+			let r0 = render_center(&plate_scene([255, 255, 255], 0.0, mode, s), top_eye)[0];
+			let r1 = render_center(&plate_scene([0, 0, 0], 1.0, mode, s), top_eye)[0];
+			assert!((r0 - target).abs() <= 2.0, "{mode}: matched r0 {r0} to {target}");
+			r1
+		};
+		let target = 150.0;
+		let amb = matched("ambient", target);
+		let sky = matched("sky", target);
+		let sun = matched("sun", target);
+		assert!((sky - amb).abs() <= 2.0, "sky diffuse weight must match flat ambient (0.5): amb {amb:.1}, sky {sky:.1}");
+		assert!((sun - amb).abs() <= 2.0, "sun diffuse weight must match flat ambient (0.5): amb {amb:.1}, sun {sun:.1}");
+
+		// 3. Glass at Transparency 0.3, Reflectance 1 under sky diffuse alone: white and black parts
+		// have identical surface radiance (no unscaled sky_diffuse subtracted from the mirror).
+		let glass_scene = |color: [u8; 3]| {
+			let mut model = ModelBuilder::new("GlassRefl");
+			model.part(&PartSpec { name: "Pane".into(), size: Vec3::new(10.0, 10.0, 1.0), color, material: 1568, transparency: 0.3, reflectance: 1.0, cast_shadow: false, ..Default::default() });
+			let mut scene = crate::scene::extract::extract(&model.into_document());
+			set_sky(&mut scene, &white_sky);
+			let env = &mut scene.environment;
+			(env.ambient, env.outdoor_ambient, env.brightness, env.environment_diffuse_scale, env.environment_specular_scale, env.global_shadows) = (Vec3::ZERO, Vec3::ZERO, 0.0, 1.0, 0.0, false);
+			scene
+		};
+		let glass_white = render_center(&glass_scene([255, 255, 255]), [0.0, 0.0, -10.0]);
+		let glass_black = render_center(&glass_scene([0, 0, 0]), [0.0, 0.0, -10.0]);
+		assert!(glass_black[0] > 40.0, "reflective Glass under sky diffuse should be lit, got {glass_black:?}");
+		assert!((0..3).all(|c| (glass_white[c] - glass_black[c]).abs() <= 2.0), "white Glass at R=1 T=0.3 must match black Glass (no unscaled sky_diffuse subtraction): white {glass_white:?}, black {glass_black:?}");
+
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
 	}

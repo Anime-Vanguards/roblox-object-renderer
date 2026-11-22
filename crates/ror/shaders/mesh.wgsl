@@ -1021,14 +1021,20 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 	color += sky_diffuse;
 
 	let r = reflect(-v, n);
-	// Part.Reflectance (reflectance): a mirror image of the sky lit by the diffuse light there, over
-	// the rest of the shading; it does not need the sky specular, and metals show none
+	// Part.Reflectance (reflectance): a mirror image of the sky lit by half the diffuse light there,
+	// blended over the diffuse shading (direct and sky specular stay on top); metals show none
 	let reflectance = instance.params.z * (1.0 - map_metalness);
+	var direct_spec = vec3<f32>(0.0);
+	if (reflectance > 0.0 || shading == SHADING_GLASS) {
+		var bare = surface;
+		bare.albedo = vec3<f32>(0.0);
+		direct_spec = direct_light(bare, n, v, frame.sun_direction.xyz, frame.sun_color.rgb * shadow, 0.0) + local_lights(bare, input.world_position, n, v, geometric_normal, input.clip.xy);
+	}
 	if (reflectance > 0.0) {
 		let mirror = textureSampleLevel(environment_map, linear_sampler, r, SPECULAR_LOD_BIAS).rgb;
 		let sun_light = frame.sun_color.rgb * shadow * max(dot(n, frame.sun_direction.xyz), 0.0) / PI;
-		let light = 0.5 * flat_ambient + 0.6 * sky_irradiance * frame.environment.x + 0.36 * sun_light;
-		color = mix(color, mirror * light, reflectance);
+		let light = 0.5 * (flat_ambient + sky_irradiance * frame.environment.x + sun_light);
+		color = mix(color - direct_spec, mirror * light, reflectance) + direct_spec;
 	}
 	// the sky specular: the prefiltered sky (render::environment::prefilter_specular) times its Fresnel,
 	// s and the fade (ibl-spheres at 150 studs: a white mirror metal shows the default sky at 0.76, a
@@ -1037,13 +1043,11 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 	let prefiltered = textureSampleLevel(environment_map, linear_sampler, r, lod).rgb;
 	color += prefiltered * frame.sky_specular_colour.rgb * sky_fresnel * sky_specular * sky_reach;
 	if (shading == SHADING_GLASS) {
-		var bare = surface;
-		bare.albedo = vec3<f32>(0.0);
 		glass_normal = n;
 		glass_facing = n_dot_v;
 		glass_sky = prefiltered * sky_specular * sky_reach;
-		glass_sky_diffuse = sky_diffuse;
-		glass_glint = direct_light(bare, n, v, frame.sun_direction.xyz, frame.sun_color.rgb * shadow, 0.0) + local_lights(bare, input.world_position, n, v, geometric_normal, input.clip.xy);
+		glass_sky_diffuse = sky_diffuse * (1.0 - reflectance);
+		glass_glint = direct_spec;
 	}
 	color += surface.albedo * instance.params.w;
 	if ((flags & TEX_EMISSIVE) != 0u) {
