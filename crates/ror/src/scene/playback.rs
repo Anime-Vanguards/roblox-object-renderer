@@ -1960,8 +1960,8 @@ impl Resolved<'_> {
 				if at > time + 1e-6 || at < cleared {
 					continue;
 				}
-				let age = now - timeline.particle_time(start, at);
-				let lived = spawn_now - timeline.spawn_time(start, at);
+				let age = (now - timeline.particle_time(start, at)).max(0.0);
+				let lived = (spawn_now - timeline.spawn_time(start, at)).max(0.0);
 				// where the emitter was at the call when the playback says (several bursts of one frame from
 				// an attachment moved between them), else where its part or attachment is then
 				let cframe = emitted.from.unwrap_or_else(|| frame_at(at));
@@ -2015,10 +2015,11 @@ impl Resolved<'_> {
 						while accumulated >= 1.0 {
 							accumulated -= 1.0;
 							stream += 1;
-							if frame >= cleared && now - timeline.particle_time(start, frame) <= longest && births.len() < 4096 {
+							let age = (now - timeline.particle_time(start, frame)).max(0.0);
+							if frame >= cleared && age <= longest && births.len() < 4096 {
 								births.push(Birth {
-									age: now - timeline.particle_time(start, frame),
-									lived: spawn_now - timeline.spawn_time(start, frame),
+									age,
+									lived: (spawn_now - timeline.spawn_time(start, frame)).max(0.0),
 									cframe: frame_at(frame),
 									velocity: velocity_at(frame),
 									stream,
@@ -3336,6 +3337,64 @@ mod tests {
 		for point in &scene.trails[0].points {
 			assert!(point.position0.y > 15.0 && point.position1.y > 15.0, "trail stretched toward park: {point:?}");
 		}
+	}
+
+	#[test]
+	fn births_on_grid_frame_within_tolerance_are_not_dropped() {
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use rbx_dom_weak::InstanceBuilder;
+		use rbx_dom_weak::types::NumberRange;
+		let mut model = ModelBuilder::new("Fx");
+		let part = model.part(&PartSpec { name: "Part".into(), ..PartSpec::default() });
+		model.child(
+			part,
+			InstanceBuilder::new("ParticleEmitter")
+				.with_name("Stream")
+				.with_property("Enabled", true)
+				.with_property("Rate", 60.0f32)
+				.with_property("Lifetime", NumberRange::new(0.1, 0.1)),
+		);
+		model.child(
+			part,
+			InstanceBuilder::new("ParticleEmitter")
+				.with_name("Burst")
+				.with_property("Enabled", false)
+				.with_property("Rate", 0.0f32)
+				.with_property("Lifetime", NumberRange::new(0.1, 0.1)),
+		);
+		let mut document = model.into_document();
+		// A 4-decimal rounded clip start (e.g. 5.5833 for 335/60) lands 33 us before the 60 Hz frame,
+		// inside self.frames' 1e-4 tolerance; bursts within 1e-6 likewise admit float-rounded times.
+		// Neither may be silently dropped by age >= 0.0 after being admitted.
+		let tick = 423.0_f32 / 60.0; // 7.05
+		let playback = Playback {
+			time: tick - 3.3e-5,
+			actions: vec![Action { at: tick - 3.25e-5, target: "Fx.Part.Burst".into(), emit: Some(Emit::Count(2)), ..Default::default() }],
+			..Default::default()
+		};
+		let resolved = playback.resolve(&document).unwrap();
+		let undo = resolved.apply_state(&mut document).unwrap();
+		let mut scene = crate::scene::extract::extract(&document);
+		resolved.apply_history(&document, &mut scene);
+		undo.restore(&mut document);
+		let stream = scene.particles.iter().find(|emitter| emitter.path.ends_with(".Stream")).unwrap();
+		let stream_births = stream.births.as_ref().unwrap();
+		assert!(stream_births.iter().any(|birth| birth.age == 0.0), "Rate birth on admitted frame was dropped: {stream_births:?}");
+
+		let burst_playback = Playback {
+			time: 0.5 - 5e-7,
+			actions: vec![Action { at: 0.5, target: "Fx.Part.Burst".into(), emit: Some(Emit::Count(3)), ..Default::default() }],
+			..Default::default()
+		};
+		let resolved = burst_playback.resolve(&document).unwrap();
+		let undo = resolved.apply_state(&mut document).unwrap();
+		let mut scene = crate::scene::extract::extract(&document);
+		resolved.apply_history(&document, &mut scene);
+		undo.restore(&mut document);
+		let burst = scene.particles.iter().find(|emitter| emitter.path.ends_with(".Burst")).unwrap();
+		let burst_births = burst.births.as_ref().unwrap();
+		assert_eq!(burst_births.len(), 3, "Burst within 1e-6 tolerance was dropped: {burst_births:?}");
+		assert!(burst_births.iter().all(|birth| birth.age == 0.0));
 	}
 
 	#[test]
