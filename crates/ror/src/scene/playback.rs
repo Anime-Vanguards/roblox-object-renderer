@@ -1858,8 +1858,15 @@ impl Resolved<'_> {
 				fresh = false;
 				points.push(point);
 			}
-			// the head follows the attachments while enabled
+			// the head follows the attachments while enabled, unless the very next grid frame disables or
+			// clears the trail (a pooled part parked offscreen on its disable frame must not pull the head
+			// partway to the park position at moments just before that frame)
+			let next_frame = self.grid.iter().copied().find(|&frame| frame > time + 1e-6);
+			let stopping = next_frame.is_some_and(|next| {
+				!timeline.enabled_at(next) || timeline.clears.iter().any(|&clear| clear > previous && clear <= next + 1e-6)
+			});
 			if timeline.enabled_at(time)
+				&& !stopping
 				&& let Some(last) = points.last()
 				&& last.time < time - 1e-6
 			{
@@ -3288,6 +3295,47 @@ mod tests {
 		// a reference takes a path or null, and the path names an instance
 		assert!(Playback { actions: vec![set(0.1, "Attachment0", serde_json::json!(4))], ..Default::default() }.resolve(&document).is_err());
 		assert!(Playback { actions: vec![set(0.1, "Attachment0", serde_json::json!("Fx.Holder.C"))], ..Default::default() }.resolve(&document).is_err());
+	}
+
+	#[test]
+	fn a_trail_disabled_and_parked_on_the_next_frame_does_not_streak_to_park() {
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use rbx_dom_weak::InstanceBuilder;
+		use rbx_dom_weak::types::{CFrame, Matrix3, Vector3};
+		let mut model = ModelBuilder::new("Fx");
+		let arm = model.part(&PartSpec { name: "Arm".into(), ..PartSpec::default() });
+		let a0 = model.child(arm, InstanceBuilder::new("Attachment").with_name("A0").with_property("CFrame", CFrame::new(Vector3::new(0.0, 0.5, 0.0), Matrix3::identity())));
+		let a1 = model.child(arm, InstanceBuilder::new("Attachment").with_name("A1").with_property("CFrame", CFrame::new(Vector3::new(0.0, -0.5, 0.0), Matrix3::identity())));
+		model.child(arm, InstanceBuilder::new("Trail").with_name("Ribbon").with_property("Attachment0", Variant::Ref(a0)).with_property("Attachment1", Variant::Ref(a1)).with_property("Enabled", true).with_property("Lifetime", 0.5f32));
+		let mut document = model.into_document();
+		let frames = vec![0.0, 1.0 / 60.0, 2.0 / 60.0, 3.0 / 60.0];
+		let motion = vec![Motion {
+			target: "Fx.Arm".into(),
+			keys: vec![
+				MotionKey { at: 0.0, cframe: vec![0.0, 20.0, 0.0], ..Default::default() },
+				MotionKey { at: 1.0 / 60.0, cframe: vec![2.0, 20.0, 0.0], ..Default::default() },
+				MotionKey { at: 2.0 / 60.0, cframe: vec![4.0, 20.0, 0.0], ..Default::default() },
+				MotionKey { at: 3.0 / 60.0, cframe: vec![0.0, -100000.0, 0.0], ..Default::default() },
+			],
+			..Default::default()
+		}];
+		let actions = vec![
+			Action { at: 3.0 / 60.0, target: "Fx.Arm.Ribbon".into(), enabled: Some(false), ..Default::default() },
+			Action { at: 3.0 / 60.0, target: "Fx.Arm.Ribbon".into(), clear: true, ..Default::default() },
+		];
+		// Between frame 2 (2/60) and the disable+park frame 3 (3/60), the trail head must stay near Y = 20
+		// rather than interpolating partway down toward Y = -100000.
+		let playback = Playback { time: 2.5 / 60.0, frames: Some(frames), actions, motion, ..Default::default() };
+		let resolved = playback.resolve(&document).unwrap();
+		let undo = resolved.apply_state(&mut document).unwrap();
+		let mut scene = crate::scene::extract::extract(&document);
+		resolved.apply_history(&document, &mut scene);
+		undo.restore(&mut document);
+		assert_eq!(scene.trails.len(), 1);
+		assert!(!scene.trails[0].points.is_empty());
+		for point in &scene.trails[0].points {
+			assert!(point.position0.y > 15.0 && point.position1.y > 15.0, "trail stretched toward park: {point:?}");
+		}
 	}
 
 	#[test]
