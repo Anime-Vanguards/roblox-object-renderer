@@ -400,11 +400,28 @@ pub struct Cache<K, V> {
 	budget: u64,
 	pub hits: AtomicU64,
 	pub misses: AtomicU64,
+	/// Failures let go of before [`FAILURE_TTL`] ([`Cache::shrink_to`]): their next request retries them
+	dropped_failures: AtomicU64,
 }
 
 impl<K: Eq + Hash + Clone, V: Weighed> Cache<K, V> {
 	pub fn new(budget: u64) -> Self {
-		Self { entries: Mutex::new(HashMap::new()), tick: AtomicU64::new(0), budget, hits: AtomicU64::new(0), misses: AtomicU64::new(0) }
+		Self { entries: Mutex::new(HashMap::new()), tick: AtomicU64::new(0), budget, hits: AtomicU64::new(0), misses: AtomicU64::new(0), dropped_failures: AtomicU64::new(0) }
+	}
+
+	/// When the first failure it remembers now is retried (`None`: it remembers none), and
+	/// [`Cache::dropped_failures`]: what a preparation shaped by its failures may stand for a fresh one
+	/// until (render::prepared::Failures).
+	pub fn failures(&self) -> (Option<std::time::Instant>, u64) {
+		let now = std::time::Instant::now();
+		let entries = self.entries.lock();
+		let first = entries.values().filter(|entry| matches!(entry.cell.get(), Some(Err(_)))).map(|entry| entry.created + FAILURE_TTL).filter(|retried| *retried > now).min();
+		(first, self.dropped_failures())
+	}
+
+	/// How many failures it has let go of before their time ([`Cache::shrink_to`]).
+	pub fn dropped_failures(&self) -> u64 {
+		self.dropped_failures.load(Ordering::Relaxed)
 	}
 
 	/// The cached value for `key`, loading it with `load` if absent. Concurrent callers with the
@@ -508,10 +525,12 @@ impl<K: Eq + Hash + Clone, V: Weighed> Cache<K, V> {
 			if total <= budget {
 				break;
 			}
-			if let Some(entry) = entries.remove(&key)
-				&& let Some(Ok(value)) = entry.cell.get()
-			{
-				total = total.saturating_sub(value.bytes());
+			match entries.remove(&key).as_ref().and_then(|entry| entry.cell.get()) {
+				Some(Ok(value)) => total = total.saturating_sub(value.bytes()),
+				Some(Err(_)) => {
+					self.dropped_failures.fetch_add(1, Ordering::Relaxed);
+				}
+				None => {}
 			}
 		}
 		before - total
@@ -550,6 +569,27 @@ mod tests {
 		assert_eq!(cache.fit(), 0, "within the budget once let go");
 		assert_eq!(cache.shrink_to(0), 80);
 		assert_eq!(cache.len(), 0);
+	}
+
+	/// A failure is remembered until FAILURE_TTL after its load began (`failures`), and one the budget
+	/// lets go of before then is counted.
+	#[test]
+	fn failures_are_remembered_until_retried_and_counted_when_let_go_of() {
+		let cache: Cache<u32, Blob> = Cache::new(100);
+		assert_eq!(cache.failures(), (None, 0));
+		let before = std::time::Instant::now();
+		assert!(cache.get_or_load(&1, || Err(anyhow!("refused"))).is_err());
+		let (retried, dropped) = cache.failures();
+		let retried = retried.expect("the failure remembered");
+		assert!(retried >= before + FAILURE_TTL && retried <= std::time::Instant::now() + FAILURE_TTL);
+		assert_eq!(dropped, 0);
+		assert!(cache.get_or_load(&1, || panic!("retried while remembered")).is_err());
+		// past the budget, the least recently used go first: the failure, then the older blob
+		cache.get_or_load(&2, || Ok(Blob(80))).unwrap();
+		cache.get_or_load(&3, || Ok(Blob(40))).unwrap();
+		cache.fit();
+		assert_eq!(cache.failures(), (None, 1), "let go of, and counted");
+		assert!(cache.get(&2).is_none() && cache.get(&3).is_some());
 	}
 }
 

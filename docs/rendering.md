@@ -62,6 +62,16 @@ Public builds render clouds using a generic volumetric shader (`shaders/clouds.w
 
 `SurfaceGui`, `BillboardGui`, and `ScreenGui` subtrees are dispatched to [rur](https://github.com/Anime-Vanguards/roblox-ui-renderer), which returns rendered images that `ror` composites onto part faces, billboard planes, or the final screen (`render::rur`, `render::guis`). `ViewportFrame` 3D worlds are rendered directly by `ror`—either through the frame's own camera (using its `Ambient`, `LightColor`, and `LightDirection`, without sky light, shadows, or tone mapping) or through the main camera for portal/window setups.
 
+## Drawing a scene again
+
+`Renderer::render` keeps what does not depend on the camera between calls, so a host drawing the same `Scene` again and again from a moving camera (an editor's viewport) pays for it once:
+
+- **Geometry:** the parts' draws, instance buffer and light grid are kept by the scene's content (every part's properties, material variants, Highlight membership), not by the `Scene` value, so a scene edited in place or built anew is matched exactly: an unchanged scene reuses them, a changed one is prepared again from its unchanged parts' own preparations. `RenderStats::geometry_reused` says whether a render reused them. A scene some of whose assets could not be loaded is kept until the first failure is due to be retried (30 seconds after it), and its renders keep reporting them in `RenderStats::missing`.
+- **Local light shadows:** the maps of the shadowed local lights a view reaches are kept while the camera reaches the same ones.
+- **Every frame:** the sun's shadow cascades, ambient occlusion, the main pass and the post effects follow the camera.
+
+A live scene (`Scene::live`) is prepared every frame: its skinned meshes are written over in place.
+
 ## Code entry points
 
 - `render::Renderer::render_view` and `render/mod.rs` — Top-level view rendering and pass ordering.

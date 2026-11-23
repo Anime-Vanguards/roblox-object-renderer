@@ -1476,24 +1476,25 @@ const LOCAL_LIGHT_FAR_START: f32 = 580.0;
 const MAX_VIEW_LIGHTS: usize = 1024;
 
 /// The lights whose reach (Range around the light, past a SurfaceLight's face corners) meets the
-/// view frustum, nearest first, at most MAX_VIEW_LIGHTS.
-fn view_lights(lights: &[LightData], view_projection: Mat4, eye: Vec3) -> Vec<LightData> {
+/// view frustum, nearest first, at most MAX_VIEW_LIGHTS, each with its place among `lights`.
+fn view_lights(lights: &[LightData], view_projection: Mat4, eye: Vec3) -> Vec<(usize, LightData)> {
 	let rows = [view_projection.row(0), view_projection.row(1), view_projection.row(2), view_projection.row(3)];
 	// the four sides and the near plane (reversed Z: depth at most 1)
 	let planes = [rows[3] + rows[0], rows[3] - rows[0], rows[3] + rows[1], rows[3] - rows[1], rows[3] - rows[2]];
-	let mut visible: Vec<(f32, LightData)> = lights
+	let mut visible: Vec<(f32, usize, LightData)> = lights
 		.iter()
-		.filter_map(|light| {
+		.enumerate()
+		.filter_map(|(index, light)| {
 			let center = Vec3::new(light.position[0], light.position[1], light.position[2]);
 			// parts within Range, particles, beams and trails within the voxels' reach
 			let reach = light.color[3].max(light.voxel_color[3]) + glam::Vec2::new(light.right[3], light.up[3]).length();
 			let outside = planes.iter().any(|plane| plane.truncate().dot(center) + plane.w < -reach * plane.truncate().length());
-			(!outside).then(|| ((center.distance(eye) - reach).max(0.0), *light))
+			(!outside).then(|| ((center.distance(eye) - reach).max(0.0), index, *light))
 		})
 		.collect();
 	visible.sort_by(|a, b| a.0.total_cmp(&b.0));
 	visible.truncate(MAX_VIEW_LIGHTS);
-	visible.into_iter().map(|(_, light)| light).collect()
+	visible.into_iter().map(|(_, index, light)| (index, light)).collect()
 }
 
 /// Where a shadowed light's maps are drawn from: its origin (a SurfaceLight's apex behind its face),
@@ -2959,10 +2960,12 @@ impl Renderer {
 		// a clip's frame after one that moved starts from that frame (prepared::ClipGeometry): it is not
 		// a scene kept whole (moving scenes are not), and looking for one compared its whole key
 		let last = clip.and_then(|clip| clip.last.lock().take());
-		let found = if last.as_ref().is_some_and(|last| last.moving) { None } else { key.as_ref().and_then(|key| self.preparations.get(key)) };
+		let found = if last.as_ref().is_some_and(|last| last.moving) { None } else { key.as_ref().and_then(|key| self.preparations.get(key, self.dropped_failures())) };
 		let geometry = match found {
 			Some(geometry) => {
 				stats.geometry_reused = true;
+				// what its loads could not load, reported as its fresh preparation reported it
+				stats.missing.extend(geometry.missing.iter().cloned());
 				if let (Some(clip), Some(mut last)) = (clip, last) {
 					last.moving = false;
 					*clip.last.lock() = Some(last);
@@ -2970,15 +2973,24 @@ impl Renderer {
 				geometry
 			}
 			None => {
-				let (geometry, moving, frame) = self.prepare_geometry(scene, stats, neon_share, key.as_deref(), lease, views, defer_maps, last)?;
+				let failures = self.failures();
+				let (mut geometry, moving, frame, remembered) = self.prepare_geometry(scene, stats, neon_share, key.as_deref(), lease, views, defer_maps, last)?;
+				// A missing asset can succeed on a later request: a scene some of whose loads failed is kept
+				// only while the caches remember every failure it met, until the first of them is retried
+				// (prepared::Retry), keeping their ordinary retry policy. A scene some of whose parts
+				// changed since the last is moving: its next frame differs again (its parts are kept
+				// instead, `prepare_geometry`), unless it is drawn again unchanged (Preparations::repeated).
+				let retry = (!geometry.missing.is_empty() && remembered).then(|| prepared::Retry::of(failures, self.failures())).flatten();
+				let keep = (geometry.missing.is_empty() || retry.is_some()) && key.as_ref().is_some_and(|key| !moving || self.preparations.repeated(key));
+				if keep && moving {
+					// (prepare_geometry counts what a moving scene holds as nothing: it is not kept)
+					geometry.held = Self::held_by(&geometry.draws, geometry.organic_noise.as_ref(), geometry.surface_maps.as_ref());
+				}
 				let geometry = Arc::new(geometry);
 				if let (Some(clip), Some(frame), Some(key)) = (clip, frame, key.clone()) {
 					*clip.last.lock() = Some(frame.finish(key, geometry.clone(), moving));
 				}
-				// A missing asset can succeed on a later request: keep its ordinary retry policy. A scene
-				// some of whose parts changed since the last is moving: its next frame differs again
-				// (its parts are kept instead, `prepare_geometry`).
-				if stats.missing.is_empty() && !moving && let Some(key) = key && self.preparations.insert(key, geometry.clone()) {
+				if keep && let Some(key) = key && self.preparations.insert(key, geometry.clone(), retry) {
 					lease.forget_buffer(&geometry.instances);
 					lease.forget_buffer(&geometry.no_lights);
 					if let Some(texture) = &geometry.light_grid_texture {
@@ -3076,15 +3088,20 @@ impl Renderer {
 		made
 	}
 
-	/// The parts' draws, instance buffer and light grid, and whether the scene is moving (some of its
-	/// parts were kept from an earlier scene, others changed). A part kept from an earlier scene under
-	/// the same material configuration (`prepared::Preparations::parts`) is laid out again as it was
-	/// prepared; the others are prepared now and kept when their assets loaded. A live scene's parts
-	/// are not kept: its skinned meshes are written over in place.
+	/// The parts' draws, instance buffer and light grid, whether the scene is moving (some of its parts
+	/// were kept from an earlier scene, others changed), and whether every load that failed is a failure
+	/// the resource caches remember (prepared::Retry). A part kept from an earlier scene under the same
+	/// material configuration (`prepared::Preparations::parts`) is laid out again as it was prepared;
+	/// the others are prepared now and kept when their assets loaded. A live scene's parts are not
+	/// kept: its skinned meshes are written over in place.
 	#[allow(clippy::too_many_arguments)]
-	fn prepare_geometry(&self, scene: &Scene, stats: &mut RenderStats, neon_share: f32, key: Option<&prepared::SceneKey>, lease: &reuse::Lease, views: &[ViewRequest], defer_maps: bool, last: Option<prepared::LastFrame>) -> Result<(prepared::PreparedGeometry, bool, Option<prepared::FramePieces>)> {
+	fn prepare_geometry(&self, scene: &Scene, stats: &mut RenderStats, neon_share: f32, key: Option<&prepared::SceneKey>, lease: &reuse::Lease, views: &[ViewRequest], defer_maps: bool, last: Option<prepared::LastFrame>) -> Result<(prepared::PreparedGeometry, bool, Option<prepared::FramePieces>, bool)> {
 		let assets_start = Instant::now();
 		let profile = std::env::var_os("ROR_PROFILE").is_some();
+		let missing_before = stats.missing.len();
+		// the textures loaded whole below whose levels could not be read: not a failure the texture
+		// cache remembers
+		let mut remembered = true;
 		// without the atlas (no Studio install) surface types draw nothing
 		let mut surface_missing = None;
 		let surface_maps = scene
@@ -3094,6 +3111,7 @@ impl Renderer {
 			.then(|| {
 				let albedo = self.load_whole(SURFACE_ALBEDO, TextureUse::Data);
 				let normal = self.load_whole(SURFACE_NORMAL, TextureUse::Data);
+				remembered &= self.remembered(&albedo, SURFACE_ALBEDO) && self.remembered(&normal, SURFACE_NORMAL);
 				albedo.and_then(|albedo| normal.map(|normal| (albedo, normal))).map_err(|error| surface_missing = Some(format!("surface atlas: {error:#}"))).ok()
 			})
 			.flatten();
@@ -3202,6 +3220,7 @@ impl Renderer {
 		// without the noise texture (no Studio install) Organic materials tile regularly
 		let organic = kept.iter().flatten().any(|part| part.organic) || keys.iter().any(|material| material.flags & TEX_ORGANIC != 0);
 		let organic_noise = organic.then(|| self.load_whole(ORGANIC_NOISE, TextureUse::Data)).and_then(|noise| {
+			remembered &= self.remembered(&noise, ORGANIC_NOISE);
 			noise.map_err(|error| stats.missing.push(format!("Organic pattern noise: {error:#}"))).ok()
 		});
 		stats.missing.extend(surface_missing);
@@ -3293,7 +3312,7 @@ impl Renderer {
 		// what it owns, and what it holds that its caches own too (prepared::Preparations::insert)
 		let bytes = grid.as_ref().map_or(0, |grid| grid.bytes) + instance_buffer.size() + no_lights.size() + std::mem::size_of_val(draws.as_slice()) as u64;
 		// (counted for a scene kept whole: a moving one is not, prepare)
-		let held = if moving { 0 } else { Self::held_bytes(&draws) + organic_noise.as_ref().map_or(0, |texture| texture.bytes()) + surface_maps.as_ref().map_or(0, |(albedo, normal)| albedo.bytes() + normal.bytes()) };
+		let held = if moving { 0 } else { Self::held_by(&draws, organic_noise.as_ref(), surface_maps.as_ref()) };
 		let prepared = prepared::PreparedGeometry {
 			draws,
 			instances: instance_buffer,
@@ -3309,12 +3328,31 @@ impl Renderer {
 			instance_count,
 			bytes,
 			held,
+			missing: stats.missing[missing_before..].to_vec(),
 		};
 		if none {
 			instances.clear();
 		}
 		let frame = table.map(|context| prepared::FramePieces { context, flags, reusable, instances, drawn, offsets });
-		Ok((prepared, moving, frame))
+		Ok((prepared, moving, frame, remembered))
+	}
+
+	/// Whether a texture [`Renderer::load_whole`] gave (`loaded`) loaded, or failed as the texture cache
+	/// remembers (not its levels: the GPU's memory, its file), so a kept preparation may stand on the
+	/// failure until it is retried (prepared::Retry).
+	fn remembered<T>(&self, loaded: &Result<T>, uri: &str) -> bool {
+		loaded.is_ok() || self.load_texture(uri, TextureUse::Data).is_err()
+	}
+
+	/// What the resource caches a scene's preparation loads through remember of failed loads now
+	/// (prepared::Failures).
+	fn failures(&self) -> prepared::Failures {
+		prepared::Failures::default().and(self.meshes.failures()).and(self.textures.failures()).and(self.packs.failures())
+	}
+
+	/// The failures those caches let go of before their time, so far ([`Renderer::failures`]).
+	fn dropped_failures(&self) -> u64 {
+		self.meshes.dropped_failures() + self.textures.dropped_failures() + self.packs.dropped_failures()
 	}
 
 	/// The light grid (`lightgrid::build`), kept by the parts that fill it: a clip whose moving parts
@@ -3679,6 +3717,11 @@ impl Renderer {
 			});
 		}
 		out
+	}
+
+	/// What a preparation of these draws holds that its caches own too (prepared::PreparedGeometry::held).
+	fn held_by(draws: &[DrawItem], organic_noise: Option<&Arc<GpuTexture>>, surface_maps: Option<&(Arc<GpuTexture>, Arc<GpuTexture>)>) -> u64 {
+		Self::held_bytes(draws) + organic_noise.map_or(0, |texture| texture.bytes()) + surface_maps.map_or(0, |(albedo, normal)| albedo.bytes() + normal.bytes())
 	}
 
 	/// The meshes and the material textures `draws` hold, each once (the textures whole: what their
@@ -4071,23 +4114,26 @@ impl Renderer {
 		let environment = &scene.environment;
 		// the lights this view reaches, nearest first; the nearest MAX_SHADOW_LIGHTS with Shadows get
 		// shadow maps, of a size for how many there are
-		let mut lights = view_lights(&prepared.lights, camera.view_projection(width as f32 / height as f32), camera.eye);
+		let (places, mut lights): (Vec<usize>, Vec<LightData>) = view_lights(&prepared.lights, camera.view_projection(width as f32 / height as f32), camera.eye).into_iter().unzip();
 		let casts = |light: &LightData| {
 			let position = Vec3::new(light.position[0], light.position[1], light.position[2]);
 			light.shadow[1] > 0.0 && position.distance(camera.eye) - light.color[3] - light.shadow[2] - light.right[3].max(light.up[3]) < LOCAL_LIGHT_FAR_END
 		};
 		// six array layers a light: as many as the device holds (any GPU holds 42)
 		let most = MAX_SHADOW_LIGHTS.min(self.gpu.device.limits().max_texture_array_layers as usize / 6);
-		let shadowed = lights.iter().filter(|light| casts(light)).count().min(most);
-		let shadow_size = light_shadow_size(shadowed);
-		let mut shadow_lights: Vec<ShadowLight> = Vec::new();
-		for light in lights.iter_mut().filter(|light| casts(light)) {
-			if shadow_lights.len() < most {
-				light.shadow[0] = (shadow_lights.len() * 6) as f32;
-				light.shadow[3] = shadow_size as f32;
-				// from behind a SurfaceLight's face (light_data)
-				shadow_lights.push(shadow_light(light));
-			}
+		let mut shadowed: Vec<usize> = (0..lights.len()).filter(|&index| casts(&lights[index])).take(most).collect();
+		let shadow_size = light_shadow_size(shadowed.len());
+		// their maps' layers in the scene's order, not the camera's: a camera that moves draws with the
+		// maps kept for the last frame while the same lights cast (shadow_reuse::local_key); in its
+		// order, an orbit around a lit place drew every light's six faces again every frame
+		shadowed.sort_by_key(|&index| places[index]);
+		let mut shadow_lights: Vec<ShadowLight> = Vec::with_capacity(shadowed.len());
+		for index in shadowed {
+			let light = &mut lights[index];
+			light.shadow[0] = (shadow_lights.len() * 6) as f32;
+			light.shadow[3] = shadow_size as f32;
+			// from behind a SurfaceLight's face (light_data)
+			shadow_lights.push(shadow_light(light));
 		}
 		let shadow_matrices: Vec<Mat4> = shadow_lights.iter().flat_map(light_shadow_matrices_at).collect();
 		let lights_buffer = (!lights.is_empty()).then(|| lease.buffer("lights", wgpu::BufferUsages::STORAGE, bytemuck::cast_slice(&lights)));
@@ -6444,6 +6490,115 @@ mod shadow_caster_tests {
 				let share = (lit - level) / (lit - dark);
 				assert!(if shades { share > 0.9 } else { share < 0.1 }, "{by}, roof {roof:?}: {share} of an opaque roof's shadow on the floor");
 				assert!(seen.is_none_or(|seen| seen == (below != sky)), "{by}, roof {roof:?}: in the picture from below, {}", below != sky);
+			}
+		}
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+}
+
+#[cfg(test)]
+mod camera_reuse_tests {
+	use super::*;
+	use crate::scene::build::{ModelBuilder, PartSpec};
+	use rbx_dom_weak::InstanceBuilder;
+	use rbx_dom_weak::types::{Content, Vector3};
+
+	fn renderer(state: &std::path::Path) -> Renderer {
+		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(state) });
+		Renderer::new(gpu, assets).expect("a renderer")
+	}
+
+	fn view(eye: [f32; 3]) -> ViewRequest {
+		ViewRequest { width: 160, height: 96, camera: CameraSpec::LookAt { eye, target: [0.0, 1.0, 0.0], fov: 70.0 }, ..Default::default() }
+	}
+
+	/// A floor, a row of blocks, a mesh that cannot load (offline) and a decal whose image cannot load.
+	fn scene() -> Scene {
+		let mut model = ModelBuilder::new("Yard");
+		let part = |name: &str, at: Vec3, size: Vec3| PartSpec { name: name.into(), cframe: Affine3A::from_translation(at), size, ..Default::default() };
+		model.part(&part("Floor", Vec3::new(0.0, -0.5, 0.0), Vec3::new(40.0, 1.0, 40.0)));
+		for index in 0..6 {
+			model.part(&part(&format!("Block{index}"), Vec3::new(index as f32 * 4.0 - 10.0, 1.0, 2.0), Vec3::new(2.0, 2.0, 2.0)));
+		}
+		let broken = model.part(&PartSpec { class: "MeshPart", ..part("Broken", Vec3::new(4.0, 1.5, -4.0), Vec3::splat(3.0)) });
+		model.set(broken, "MeshContent", Content::from_uri("rbxassetid://4040404"));
+		model.set(broken, "InitialSize", Vector3::new(3.0, 3.0, 3.0));
+		let signed = model.part(&part("Sign", Vec3::new(-4.0, 1.5, -4.0), Vec3::new(3.0, 3.0, 0.4)));
+		model.child(signed, InstanceBuilder::new("Decal").with_property("TextureContent", Content::from_uri("rbxassetid://5050505")));
+		crate::scene::extract::extract(&model.into_document())
+	}
+
+	fn assert_fresh(state: &std::path::Path, scene: &Scene, views: &[ViewRequest], images: &[ViewImage], label: &str) {
+		let (fresh, _) = renderer(state).render(scene, views).unwrap();
+		assert!(images.iter().zip(&fresh).all(|(image, fresh)| image.rgba == fresh.rgba), "{label}: other pixels than a fresh renderer's");
+	}
+
+	/// A scene drawn again from another camera takes its preparation from the render before, also when
+	/// some of its loads failed (reported again, as a fresh preparation reports them; until they are
+	/// retried: prepared::retry_tests), and an edited one from its second preparation on; every render
+	/// draws what a fresh renderer draws. Before, a scene with one asset that could not load was
+	/// prepared anew for every camera.
+	#[test]
+	fn a_scene_drawn_from_a_moving_camera_reuses_its_preparation_through_failed_loads() {
+		let state = std::env::temp_dir().join(format!("ror-camera-reuse-test-{}", std::process::id()));
+		let renderer = renderer(&state);
+		let scene = scene();
+		let (first, first_stats) = renderer.render(&scene, &[view([14.0, 9.0, -16.0])]).unwrap();
+		assert!(!first_stats.geometry_reused);
+		assert!(first_stats.missing.iter().any(|reason| reason.contains("4040404")) && first_stats.missing.iter().any(|reason| reason.contains("5050505")), "the failed loads: {:?}", first_stats.missing);
+		assert_fresh(&state, &scene, &[view([14.0, 9.0, -16.0])], &first, "the first render");
+		for (index, eye) in [[-12.0, 7.0, -18.0], [0.0, 14.0, -20.0], [18.0, 5.0, 6.0]].into_iter().enumerate() {
+			let views = [view(eye), view([eye[2], eye[1], eye[0]])];
+			let (images, stats) = renderer.render(&scene, &views).unwrap();
+			assert!(stats.geometry_reused, "camera {index}: the preparation kept from the render before");
+			assert_eq!(stats.missing, first_stats.missing, "camera {index}: the same failures reported");
+			assert_fresh(&state, &scene, &views, &images, &format!("camera {index}"));
+		}
+		// an edited scene is prepared again, then kept once it is drawn again unchanged (its failed parts
+		// are prepared anew each time it is prepared, which made it a moving scene for good)
+		let mut edited = scene.clone();
+		Arc::make_mut(&mut edited.parts[2]).cframe.translation.y += 1.5;
+		let reused: Vec<bool> = [[10.0, 9.0, -14.0], [-9.0, 9.0, -14.0], [0.0, 12.0, -18.0], [6.0, 6.0, -12.0]]
+			.into_iter()
+			.map(|eye| {
+				let (images, stats) = renderer.render(&edited, &[view(eye)]).unwrap();
+				assert_eq!(stats.missing, first_stats.missing);
+				assert_fresh(&state, &edited, &[view(eye)], &images, "the edited scene");
+				stats.geometry_reused
+			})
+			.collect();
+		assert_eq!(reused, [false, false, true, true], "the edited scene kept from its second preparation");
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	/// Shadowed local lights' maps take their layers in the scene's order, so cameras that reach the
+	/// same lights draw with the same maps whichever is nearest; they draw what a fresh renderer draws.
+	/// Before, each camera's nearest-first order made maps of their own, kept for none.
+	#[test]
+	fn cameras_reaching_the_same_lights_share_their_shadow_maps() {
+		let state = std::env::temp_dir().join(format!("ror-camera-shadows-test-{}", std::process::id()));
+		let renderer = renderer(&state);
+		let mut model = ModelBuilder::new("Hall");
+		let part = |name: &str, at: Vec3, size: Vec3| PartSpec { name: name.into(), cframe: Affine3A::from_translation(at), size, ..Default::default() };
+		model.part(&part("Floor", Vec3::new(0.0, -0.5, 0.0), Vec3::new(60.0, 1.0, 30.0)));
+		for (index, x) in [-20.0f32, 0.0, 20.0].into_iter().enumerate() {
+			model.part(&part(&format!("Pillar{index}"), Vec3::new(x + 3.0, 2.0, 2.0), Vec3::new(1.0, 4.0, 1.0)));
+			let lamp = model.part(&PartSpec { cast_shadow: false, ..part(&format!("Lamp{index}"), Vec3::new(x, 6.0, 0.0), Vec3::splat(0.5)) });
+			model.child(lamp, InstanceBuilder::new("PointLight").with_property("Shadows", true).with_property("Range", 16.0f32).with_property("Brightness", 3.0f32));
+		}
+		let mut scene = crate::scene::extract::extract(&model.into_document());
+		// no sun: its cascades follow the camera
+		scene.environment.global_shadows = false;
+		scene.environment.clock_time = 0.0;
+		let (left, right) = (view([-45.0, 14.0, -30.0]), view([45.0, 14.0, -30.0]));
+		for (round, request) in [&left, &right, &left, &right].into_iter().enumerate() {
+			let (images, _) = renderer.render(&scene, std::slice::from_ref(request)).unwrap();
+			assert_fresh(&state, &scene, std::slice::from_ref(request), &images, &format!("render {round}"));
+			if round == 1 {
+				assert_eq!(renderer.shadows.stats().0, 1, "the second camera's maps are the first's, kept once seen twice");
 			}
 		}
 		drop(renderer);

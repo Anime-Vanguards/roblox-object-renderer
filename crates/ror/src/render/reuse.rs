@@ -113,14 +113,22 @@ impl Reuse {
 		Lease { reuse: self, gpu, textures: Mutex::new(Vec::new()), released: Mutex::new(Vec::new()), buffers: Mutex::new(Vec::new()), scratch: Mutex::new(Vec::new()), held: Mutex::new(Vec::new()) }
 	}
 
-	/// The `index`-th scratch target of `kind`, made as `desc` describes when there is none.
+	/// The `index`-th scratch target of `kind`: when there is none, one given back of its kind, else
+	/// one made as `desc` describes.
 	fn scratch(&self, gpu: &Gpu, kind: TextureKind, index: usize, desc: &wgpu::TextureDescriptor) -> wgpu::Texture {
+		// (the textures given back before the scratch targets, as `evict` takes them)
+		let mut given = self.textures.lock();
 		let mut scratch = self.scratch.lock();
 		if let Some(found) = scratch.iter_mut().find(|entry| entry.kind == kind && entry.index == index) {
 			found.holders += 1;
 			return found.texture.clone();
 		}
-		let texture = gpu.device.create_texture(desc);
+		// a kept shadow map takes the scratch target of its kind (Lease::kept), and the one the shadow
+		// cache lets go of for it comes back here: made anew instead, a camera moving past local lights
+		// allocated their maps' 100 MB again each time the lights it reached changed
+		let texture = given.iter().position(|kept| kept.kind == kind).map(|index| given.swap_remove(index).item);
+		drop(given);
+		let texture = texture.unwrap_or_else(|| gpu.device.create_texture(desc));
 		scratch.push(Scratch { kind, index, texture: texture.clone(), bytes: kind.bytes(), used: Instant::now(), holders: 1 });
 		texture
 	}
@@ -448,6 +456,22 @@ mod tests {
 		let lease = reuse.lease(&gpu);
 		let (first, second) = (lease.texture(&target(32)), lease.texture(&target(32)));
 		assert!(first == handed || second == handed, "given back by its holder");
+	}
+
+	/// A scratch target with none of its kind kept takes a texture given back of its kind (a shadow map
+	/// the shadow cache let go of) instead of making a new one.
+	#[test]
+	fn a_new_scratch_target_takes_one_given_back() {
+		let gpu = Gpu::new().expect("a GPU (or the software adapter)");
+		let reuse = Reuse::default();
+		let given = gpu.device.create_texture(&target(48));
+		reuse.give_back(given.clone());
+		let lease = reuse.lease(&gpu);
+		assert!(lease.scratch(&target(32)) != given, "another kind: a new one");
+		assert!(lease.scratch(&target(48)) == given, "the one given back");
+		assert!(lease.scratch(&target(48)) != given, "a second of the kind in the same render: a new one");
+		drop(lease);
+		assert!(reuse.lease(&gpu).scratch(&target(48)) == given, "the scratch target it became");
 	}
 
 	#[test]

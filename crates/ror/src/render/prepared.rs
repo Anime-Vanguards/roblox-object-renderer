@@ -6,6 +6,11 @@
 //! Three levels: a whole scene's preparation (its draws, instance buffer and light grid), each
 //! part's own preparation (what a scene whose other parts changed reuses: a clip's map around a few
 //! moving limbs), and the light grid by the parts that fill it.
+//!
+//! A scene some of whose loads failed is kept too, while the resource caches remember those failures:
+//! until the first is due to be retried ([`Retry`]), when it is prepared again and its loads with it.
+//! A library caller drawing one scene again and again from a moving camera (an editor's viewport)
+//! prepared a place with a few assets it could not load anew every frame.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -100,6 +105,8 @@ pub(super) struct PreparedGeometry {
 	/// The meshes and textures its draws hold, the organic noise and surface maps: their caches'
 	/// too, but kept alive by it past those caches' budgets
 	pub held: u64,
+	/// What its parts could not load, reported again by every render that draws it
+	pub missing: Vec<String>,
 }
 
 impl PreparedGeometry {
@@ -127,7 +134,54 @@ impl PreparedGeometry {
 			instance_count: self.instance_count,
 			bytes: 0,
 			held: 0,
+			missing: self.missing.clone(),
 		}
+	}
+}
+
+/// What the resource caches a scene's preparation loads through remember of failed loads now
+/// (`Renderer::failures`): when the first failure they remember is retried, and how many they have let
+/// go of before their time (each retried by its next request).
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Failures {
+	pub retried: Option<Instant>,
+	pub dropped: u64,
+}
+
+impl Failures {
+	/// These and one more cache's ([`super::resources::Cache::failures`]).
+	pub fn and(self, (retried, dropped): (Option<Instant>, u64)) -> Self {
+		let retried = match (self.retried, retried) {
+			(Some(a), Some(b)) => Some(a.min(b)),
+			(a, b) => a.or(b),
+		};
+		Self { retried, dropped: self.dropped + dropped }
+	}
+}
+
+/// How long a preparation some of whose loads failed stands for a fresh one: a fresh one meets the
+/// same failures while the caches remember them, so until the first of those is retried, as long as
+/// the caches let go of none.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Retry {
+	until: Instant,
+	dropped: u64,
+}
+
+impl Retry {
+	/// From the caches' failures before and after a preparation. None when they remember none after it
+	/// (a failure it met was not remembered, or was retried meanwhile), let go of one during it, or the
+	/// first is due already: then it is not kept, and the next render prepares the scene again.
+	pub fn of(before: Failures, after: Failures) -> Option<Self> {
+		let first = after.retried?;
+		let until = before.retried.map_or(first, |earlier| earlier.min(first));
+		(after.dropped == before.dropped && until > Instant::now()).then_some(Self { until, dropped: before.dropped })
+	}
+
+	/// Whether the failures it was made under are all still remembered at `now`, with `dropped` failures
+	/// let go of by then.
+	pub fn holds(&self, now: Instant, dropped: u64) -> bool {
+		now < self.until && dropped == self.dropped
 	}
 }
 
@@ -135,10 +189,22 @@ struct Kept {
 	key: Arc<SceneKey>,
 	geometry: Arc<PreparedGeometry>,
 	used: Instant,
+	/// Until when it stands for a fresh preparation, when some of its loads failed
+	retry: Option<Retry>,
+}
+
+impl Kept {
+	/// Whether it is still kept at `now` (with `dropped` failures let go of, when known).
+	fn live(&self, now: Instant, dropped: Option<u64>) -> bool {
+		now.duration_since(self.used) < KEPT_FOR && self.retry.is_none_or(|retry| dropped.map_or(now < retry.until, |dropped| retry.holds(now, dropped)))
+	}
 }
 
 pub(super) struct Preparations {
 	kept: Mutex<Vec<Kept>>,
+	/// The keys' hashes of scenes prepared lately and not kept whole, some of their parts prepared anew
+	/// ([`Preparations::repeated`])
+	seen: Mutex<Vec<(u64, Instant)>>,
 	parts: Mutex<Vec<PartTable>>,
 	grids: Mutex<Vec<KeptGrid>>,
 	/// Grids kept to be updated for a scene whose parts moved (`lightgrid::build_from`)
@@ -148,7 +214,26 @@ pub(super) struct Preparations {
 
 impl Preparations {
 	pub fn new(budget: u64) -> Self {
-		Self { kept: Mutex::default(), parts: Mutex::default(), grids: Mutex::default(), states: Mutex::default(), budget }
+		Self { kept: Mutex::default(), seen: Mutex::default(), parts: Mutex::default(), grids: Mutex::default(), states: Mutex::default(), budget }
+	}
+
+	/// Whether a scene with this key was prepared lately and not kept whole, as some of its parts were
+	/// prepared anew; notes it otherwise. A scene drawn again unchanged is kept from its second
+	/// preparation, though the parts that are never kept on their own (skinned ones, those whose loads
+	/// failed) are prepared anew each time: after an edit, an editor's scene with one was prepared anew
+	/// on every frame from then on. A clip's frames, each a scene of its own, are not kept.
+	pub fn repeated(&self, key: &SceneKey) -> bool {
+		let mut seen = self.seen.lock();
+		seen.retain(|(_, at)| at.elapsed() < KEPT_FOR);
+		if let Some(index) = seen.iter().position(|(hash, _)| *hash == key.hash) {
+			seen.swap_remove(index);
+			return true;
+		}
+		seen.push((key.hash, Instant::now()));
+		if seen.len() > KEPT_SCENES {
+			seen.remove(0);
+		}
+		false
 	}
 
 	/// Takes the most recently kept grid state with `fillers` fillers, to update for another scene.
@@ -281,26 +366,31 @@ impl Preparations {
 		true
 	}
 
-	pub fn get(&self, key: &SceneKey) -> Option<Arc<PreparedGeometry>> {
+	/// The preparation kept for `key`, the resource caches having let go of `dropped` failures by now
+	/// ([`Failures`]).
+	pub fn get(&self, key: &SceneKey, dropped: u64) -> Option<Arc<PreparedGeometry>> {
 		let mut kept = self.kept.lock();
-		kept.retain(|entry| entry.used.elapsed() < KEPT_FOR);
+		let now = Instant::now();
+		kept.retain(|entry| entry.live(now, Some(dropped)));
 		let entry = kept.iter_mut().find(|entry| entry.key.same(key))?;
-		entry.used = Instant::now();
+		entry.used = now;
 		Some(entry.geometry.clone())
 	}
 
 	/// Keeps a scene's preparation for its next frame or group of views when what it owns fits the
-	/// budget. The others kept go, the least recently used first, while what they all own and hold
-	/// (meshes and textures included) is past it: a map whose textures alone are past the budget
-	/// (a large place's 1.6 GB) is kept for its clip's next frame, and nothing else with it.
-	pub fn insert(&self, key: Arc<SceneKey>, geometry: Arc<PreparedGeometry>) -> bool {
+	/// budget (one some of whose loads failed, until `retry`). The others kept go, the least recently
+	/// used first, while what they all own and hold (meshes and textures included) is past it: a map
+	/// whose textures alone are past the budget (a large place's 1.6 GB) is kept for its clip's next
+	/// frame, and nothing else with it.
+	pub fn insert(&self, key: Arc<SceneKey>, geometry: Arc<PreparedGeometry>, retry: Option<Retry>) -> bool {
 		if geometry.bytes + key.bytes() > self.budget {
 			return false;
 		}
 		let cost = |entry: &Kept| entry.geometry.kept_bytes() + entry.key.bytes();
 		let mut kept = self.kept.lock();
-		kept.retain(|entry| entry.used.elapsed() < KEPT_FOR && !entry.key.same(&key));
-		kept.push(Kept { key, geometry, used: Instant::now() });
+		let now = Instant::now();
+		kept.retain(|entry| entry.live(now, None) && !entry.key.same(&key));
+		kept.push(Kept { key, geometry, used: now, retry });
 		let mut total: u64 = kept.iter().map(cost).sum();
 		while (total > self.budget && kept.len() > 1) || kept.len() > KEPT_SCENES {
 			// never the one just kept (the last)
@@ -312,7 +402,9 @@ impl Preparations {
 	}
 
 	pub fn trim(&self) {
-		self.kept.lock().retain(|entry| entry.used.elapsed() < KEPT_FOR);
+		let now = Instant::now();
+		self.kept.lock().retain(|entry| entry.live(now, None));
+		self.seen.lock().retain(|(_, at)| at.elapsed() < KEPT_FOR);
 		Self::expire_parts(&mut self.parts.lock(), Instant::now());
 		self.grids.lock().retain(|entry| entry.used.elapsed() < KEPT_FOR);
 		self.states.lock().retain(|entry| entry.used.elapsed() < KEPT_FOR);
@@ -321,6 +413,7 @@ impl Preparations {
 	/// Lets go of every kept preparation, part, grid and grid state; returns their bytes.
 	pub fn clear(&self) -> u64 {
 		let scenes: u64 = std::mem::take(&mut *self.kept.lock()).iter().map(|entry| entry.geometry.kept_bytes()).sum();
+		self.seen.lock().clear();
 		let parts: u64 = std::mem::take(&mut *self.parts.lock()).iter().map(|table| table.bytes).sum();
 		let grids: u64 = std::mem::take(&mut *self.grids.lock()).iter().map(|entry| entry.grid.bytes).sum();
 		let states: u64 = std::mem::take(&mut *self.states.lock()).iter().map(|entry| entry.state.bytes()).sum();
@@ -777,14 +870,46 @@ thread_local! {
 	/// Whether the part being encoded names a local file (its key carries the file's stamp then,
 	/// which can change while the part does not: [`key`] encodes such a part every time).
 	static LOCAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+	/// While [`key`] encodes a scene's parts: the local files' URIs it met, each with its file's stamp
+	/// as [`keyed`] writes it, read once a key rather than once for every part naming the file (a scene
+	/// of 3,000 parts, 800 of them naming 20 files, read the stamps 2,000 times a frame: 26 ms of its
+	/// key's 27)
+	static STAMPED: std::cell::RefCell<Option<HashMap<String, String>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// A content URI as [`Key::content`] writes it, noting a local file's.
 fn keyed(uri: &str) -> String {
-	if super::names_local_file(uri) {
-		LOCAL.set(true);
+	if !super::names_local_file(uri) {
+		return super::content_key(uri);
 	}
-	super::content_key(uri)
+	LOCAL.set(true);
+	STAMPED.with_borrow_mut(|stamped| {
+		let Some(stamped) = stamped else {
+			return super::content_key(uri);
+		};
+		if let Some(keyed) = stamped.get(uri) {
+			return keyed.clone();
+		}
+		let keyed = super::content_key(uri);
+		stamped.insert(uri.to_string(), keyed.clone());
+		keyed
+	})
+}
+
+/// [`STAMPED`] for as long as it lives (a panic past it leaves no stamps behind for later keys).
+struct Stamping;
+
+impl Stamping {
+	fn start() -> Self {
+		STAMPED.set(Some(HashMap::new()));
+		Self
+	}
+}
+
+impl Drop for Stamping {
+	fn drop(&mut self) {
+		STAMPED.set(None);
+	}
 }
 
 /// The key bytes of parts encoded lately, by the part's `Arc` ([`key`]): a clip's frames take its
@@ -829,6 +954,7 @@ pub(super) fn key(scene: &Scene, neon_share: f32, light_grid: bool) -> Arc<Scene
 	// the parts encoded now that can be found by their `Arc` later (no local file)
 	let mut fresh: Vec<usize> = Vec::new();
 	let mut encoded = Key(Vec::with_capacity(512));
+	let stamping = Stamping::start();
 	for (index, (part, found)) in scene.parts.iter().zip(found).enumerate() {
 		match found {
 			Some((bytes, hash)) => {
@@ -847,6 +973,7 @@ pub(super) fn key(scene: &Scene, neon_share: f32, light_grid: bool) -> Arc<Scene
 			}
 		}
 	}
+	drop(stamping);
 	if !fresh.is_empty() {
 		let mut cache = PART_KEYS.lock();
 		let cache = cache.get_or_insert_with(PartKeys::default);
@@ -920,6 +1047,7 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
 mod tests {
 	use super::*;
 	use crate::scene::{Decal, Highlight, Skeleton};
+	use std::time::Duration;
 
 	fn key(scene: &Scene, neon_share: f32, light_grid: bool) -> Vec<u8> {
 		super::key(scene, neon_share, light_grid).flat()
@@ -977,6 +1105,64 @@ mod tests {
 		Arc::make_mut(&mut base.parts[0]).skeleton = Some(Arc::new(Skeleton { bones: [("Bone".into(), Affine3A::IDENTITY)].into() }));
 		changed(&base, |scene| Arc::make_mut(Arc::make_mut(&mut scene.parts[0]).skeleton.as_mut().unwrap()).bones.get_mut("Bone").unwrap().translation.x += 1.0);
 		assert_eq!(key(&base, 1.0, true), key(&base.clone(), 1.0, true));
+	}
+
+	/// A preparation made under failures stands for a fresh one until the first of them is retried
+	/// (the earlier of before and after it), while the caches let go of none; none when they remember
+	/// none after it, let go of one during it, or the first is due already.
+	#[test]
+	fn a_retry_holds_until_the_first_failure_is_retried() {
+		let now = Instant::now();
+		let at = |seconds: u64| Some(now + Duration::from_secs(seconds));
+		let retry = Retry::of(Failures { retried: None, dropped: 3 }, Failures { retried: at(20), dropped: 3 }).unwrap();
+		assert!(retry.holds(now, 3));
+		assert!(!retry.holds(now, 4), "a failure let go of");
+		assert!(!retry.holds(now + Duration::from_secs(21), 3), "the first failure retried");
+		let earlier = Retry::of(Failures { retried: at(5), dropped: 0 }, Failures { retried: at(20), dropped: 0 }).unwrap();
+		assert!(earlier.holds(now + Duration::from_secs(4), 0) && !earlier.holds(now + Duration::from_secs(6), 0), "a failure met before the preparation");
+		assert!(Retry::of(Failures { retried: at(5), dropped: 0 }, Failures { retried: None, dropped: 0 }).is_none(), "no failure remembered after it");
+		assert!(Retry::of(Failures { retried: None, dropped: 0 }, Failures { retried: at(20), dropped: 1 }).is_none(), "one let go of during it");
+		assert!(Retry::of(Failures { retried: Some(now), dropped: 0 }, Failures { retried: at(20), dropped: 0 }).is_none(), "due already");
+		let both = Failures::default().and((at(9), 1)).and((None, 2)).and((at(4), 0));
+		assert_eq!((both.retried, both.dropped), (at(4), 3));
+	}
+
+	/// A scene prepared twice in a row without being kept is repeated the second time; a third is noted
+	/// anew.
+	#[test]
+	fn a_scene_prepared_again_is_repeated() {
+		let preparations = Preparations::new(1 << 20);
+		let first = super::key(&scene(), 1.0, true);
+		let mut other = scene();
+		Arc::make_mut(&mut other.parts[0]).size.x += 1.0;
+		let other = super::key(&other, 1.0, true);
+		assert!(!preparations.repeated(&first));
+		assert!(!preparations.repeated(&other));
+		assert!(preparations.repeated(&first));
+		assert!(!preparations.repeated(&first), "noted again after it repeated");
+		assert!(preparations.repeated(&other));
+	}
+
+	/// A key reads each local file's stamp once for all the parts naming it, and the next key reads it
+	/// again: a file rewritten between them changes the key.
+	#[test]
+	fn a_keys_local_files_are_stamped_for_that_key_alone() {
+		let state = std::env::temp_dir().join(format!("ror-key-stamps-test-{}", std::process::id()));
+		std::fs::create_dir_all(&state).unwrap();
+		let path = state.join("sign.png");
+		std::fs::write(&path, [1u8; 16]).unwrap();
+		let uri = format!("file:///{}", path.display().to_string().replace('\\', "/"));
+		let mut base = scene();
+		let decal = Decal { face: 5, texture: uri.clone(), color: Vec3::ONE, transparency: 0.0, z_index: 1, tiling: None, uv_offset: [0.0; 2], uv_scale: [1.0; 2] };
+		Arc::make_mut(&mut base.parts[0]).decals.push(decal);
+		base.parts.push(base.parts[0].clone());
+		let before = super::key(&base, 1.0, true);
+		assert!(before.parts[0][..] == before.parts[1][..], "both parts stamped alike");
+		assert!(STAMPED.with_borrow(Option::is_none), "no stamps kept past the key");
+		std::fs::write(&path, [2u8; 32]).unwrap();
+		let after = super::key(&base, 1.0, true);
+		assert!(before.parts[0][..] != after.parts[0][..], "the rewritten file's new stamp");
+		let _ = std::fs::remove_dir_all(&state);
 	}
 
 	#[test]
@@ -1038,6 +1224,60 @@ mod clip_tests {
 			patched += usize::from(kept.geometry.last.lock().as_ref().is_some_and(|last| last.moving));
 		}
 		assert!(patched >= 4, "frames were made from the last frame ({patched})");
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+}
+
+#[cfg(test)]
+mod retry_tests {
+	use std::sync::Arc;
+	use std::time::Instant;
+
+	use glam::{Affine3A, Vec3};
+	use rbx_dom_weak::types::{Content, Vector3};
+
+	use super::super::camera::CameraSpec;
+	use super::super::{Renderer, ViewRequest};
+
+	/// A scene kept with failed loads is prepared again once the first failure it met is due to be
+	/// retried, or once the caches let go of a failure, and drawn as before (its loads failing again
+	/// offline).
+	#[test]
+	fn a_scene_kept_with_failed_loads_is_prepared_again_when_they_are_retried() {
+		let state = std::env::temp_dir().join(format!("ror-retry-test-{}", std::process::id()));
+		let gpu = Arc::new(super::super::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let mut model = crate::scene::build::ModelBuilder::new("Yard");
+		model.part(&crate::scene::build::PartSpec { name: "Floor".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, -0.5, 0.0)), size: Vec3::new(20.0, 1.0, 20.0), ..Default::default() });
+		let broken = model.part(&crate::scene::build::PartSpec { class: "MeshPart", name: "Broken".into(), size: Vec3::splat(2.0), ..Default::default() });
+		model.set(broken, "MeshContent", Content::from_uri("rbxassetid://6060606"));
+		model.set(broken, "InitialSize", Vector3::new(2.0, 2.0, 2.0));
+		let scene = crate::scene::extract::extract(&model.into_document());
+		let request = ViewRequest { width: 96, height: 64, camera: CameraSpec::LookAt { eye: [8.0, 6.0, -10.0], target: [0.0; 3], fov: 70.0 }, ..Default::default() };
+		let (first, stats) = renderer.render(&scene, std::slice::from_ref(&request)).unwrap();
+		assert!(!stats.geometry_reused && !stats.missing.is_empty());
+		assert!(renderer.preparations.kept.lock().iter().all(|kept| kept.retry.is_some()), "kept until its failure is retried");
+		assert!(renderer.render(&scene, std::slice::from_ref(&request)).unwrap().1.geometry_reused);
+		// the failure due now
+		for kept in renderer.preparations.kept.lock().iter_mut() {
+			if let Some(retry) = &mut kept.retry {
+				retry.until = Instant::now();
+			}
+		}
+		let (again, stats) = renderer.render(&scene, std::slice::from_ref(&request)).unwrap();
+		assert!(!stats.geometry_reused, "prepared again once its failure is due");
+		assert!(first[0].rgba == again[0].rgba);
+		// (its failed part prepared anew beside the kept floor: kept from its second preparation on,
+		// Preparations::repeated)
+		assert!(!renderer.render(&scene, std::slice::from_ref(&request)).unwrap().1.geometry_reused);
+		assert!(renderer.render(&scene, std::slice::from_ref(&request)).unwrap().1.geometry_reused, "kept again");
+		// a failure the caches let go of meanwhile (Cache::shrink_to): the next request retries it
+		let key = super::super::scene_key(&scene).unwrap();
+		assert!(renderer.preparations.get(&key, renderer.dropped_failures()).is_some());
+		assert!(renderer.preparations.get(&key, renderer.dropped_failures() + 1).is_none(), "not kept past a failure let go of");
+		assert!(!renderer.render(&scene, std::slice::from_ref(&request)).unwrap().1.geometry_reused);
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
 	}
