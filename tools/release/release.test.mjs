@@ -7,7 +7,7 @@ import { once } from "node:events";
 import { pathToFileURL } from "node:url";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { test } from "node:test";
-import { ROOT, REPOSITORY, sourceText } from "./common.mjs";
+import { CORRECTIONS, ROOT, REPOSITORY, corrections, sourceText } from "./common.mjs";
 import { version } from "./version.mjs";
 import { crc32, inspect, packageRelease, zip } from "./package.mjs";
 import { inventory, normalPackages } from "./licenses.mjs";
@@ -180,6 +180,63 @@ test("notes use public subjects as data and bound them by the preceding release"
 	assert.ok(text.includes('$(echo bad) and `code`'));
 	assert.match(text, /gh attestation verify/);
 	assert.match(text, /Source archive:/);
+});
+
+test("notes print a commit's corrected subject by its SHA and leave the others as they are", (t) => {
+	const root = temporaryFolder(t);
+	writeWorkspace(root);
+	const git = (...argv) => execFileSync("git", argv, { cwd: root, encoding: "utf8" }).trim();
+	git("init", "--quiet");
+	git("config", "user.name", "Release tests");
+	git("config", "user.email", "release-test");
+	git("add", ".");
+	git("commit", "--quiet", "-m", "First change");
+	git("tag", "v0.0.1");
+	git("commit", "--quiet", "--allow-empty", "-m", "yes");
+	const wrong = git("rev-parse", "HEAD");
+	git("commit", "--quiet", "--allow-empty", "-m", "Second change");
+	git("tag", "v0.1.0");
+	const output = path.join(root, "notes.md");
+
+	// without the file, every subject is printed as it is
+	assert.ok(notes({ output, tag: "v0.1.0" }, root).includes("- yes\n- Second change\n"));
+
+	// with it, the corrected commit's bullet is the correction, escaped like a subject, and an unknown SHA is ignored
+	fs.mkdirSync(path.join(root, "tools/release"), { recursive: true });
+	const corrected = { [wrong]: "Kept <b> with $(echo bad)", ["f".repeat(40)]: "Not a commit here" };
+	fs.writeFileSync(path.join(root, CORRECTIONS), JSON.stringify(corrected));
+	const text = notes({ output, tag: "v0.1.0" }, root);
+	assert.ok(text.includes("- Kept &lt;b&gt; with $(echo bad)\n- Second change\n"));
+	assert.doesNotMatch(text, /- yes\n|Not a commit here|First change/);
+});
+
+test("the corrections file is JSON data of full SHAs to one-line subjects, and the committed one is valid", (t) => {
+	const root = temporaryFolder(t);
+	fs.mkdirSync(path.join(root, "tools/release"), { recursive: true });
+	const file = path.join(root, CORRECTIONS);
+	const read = (text) => {
+		fs.writeFileSync(file, text);
+		return corrections(root);
+	};
+	const sha = "a".repeat(40);
+	assert.deepEqual([...read(`${String.fromCharCode(0xfeff)}{ "${sha}": "A subject" }`)], [[sha, "A subject"]]);
+	// code is never run: a module or an expression is not JSON
+	const ran = path.join(root, "ran");
+	assert.throws(() => read(`export default (require("fs").writeFileSync(${JSON.stringify(ran)}, ""), {})`), /not valid JSON/);
+	assert.throws(() => read(`({ "${sha}": "A subject" })`), /not valid JSON/);
+	assert.ok(!fs.existsSync(ran));
+	assert.throws(() => read(`["${sha}"]`), /not an object/);
+	assert.throws(() => read(`{ "${sha.slice(0, 10)}": "A subject" }`), /not a full commit SHA/);
+	assert.throws(() => read(`{ "${sha.toUpperCase()}": "A subject" }`), /not a full commit SHA/);
+	assert.throws(() => read(`{ "${sha}": "Two\\nlines" }`), /not one line/);
+	assert.throws(() => read(`{ "${sha}": " " }`), /not one line/);
+	assert.throws(() => read(`{ "${sha}": 1 }`), /not one line/);
+	fs.rmSync(file);
+	assert.equal(corrections(root).size, 0);
+
+	// the public commit whose `Public:` trailer said only "yes"
+	const committed = corrections(ROOT);
+	assert.match(committed.get("befcf67f20b795bc81949bb0e02fa424c8cc4844"), /^Particles born on a frame admitted/);
 });
 
 test("source notice links the exact commit, names its version, and records the pinned crates and rebuild command", () => {

@@ -53,6 +53,53 @@ export function git(argv, cwd = ROOT) {
 	return execFileSync("git", argv, { cwd, encoding: "utf8", maxBuffer: 32 * 1024 * 1024 }).trimEnd();
 }
 
+// Subjects the notes print instead of a public commit's own, by the commit's full SHA: a subject that went out wrong
+// stays in the public history, which is never rewritten. The file is JSON, read as data and never run.
+export const CORRECTIONS = "tools/release/notes-corrections.json";
+
+/** The corrections of the checkout at `root`, a Map from full commit SHA to subject; empty when it has no file. */
+export function corrections(root = ROOT) {
+	let text;
+	try {
+		text = fs.readFileSync(path.join(root, CORRECTIONS), "utf8");
+	} catch (error) {
+		if (error.code === "ENOENT") return new Map();
+		throw error;
+	}
+	let data;
+	try {
+		// a byte order mark, which some Windows editors write, is not part of the JSON
+		data = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
+	} catch (error) {
+		throw new Error(`${CORRECTIONS} is not valid JSON: ${error.message}`);
+	}
+	if (data === null || typeof data !== "object" || Array.isArray(data)) {
+		throw new Error(`${CORRECTIONS} is not an object of full commit SHAs to subjects`);
+	}
+	const subjects = new Map();
+	for (const [sha, subject] of Object.entries(data)) {
+		if (!/^[a-f0-9]{40}$/.test(sha)) throw new Error(`${CORRECTIONS}: ${sha} is not a full commit SHA`);
+		if (typeof subject !== "string" || !subject.trim() || /[\u0000-\u001f\u007f]/.test(subject)) {
+			throw new Error(`${CORRECTIONS}: the subject for ${sha} is not one line of text`);
+		}
+		subjects.set(sha, subject);
+	}
+	return subjects;
+}
+
+/** The subjects of the commits in `range`, oldest first, each replaced by its correction if it has one. */
+export function commitSubjects(range, root = ROOT) {
+	const corrected = corrections(root);
+	return git(["log", "--reverse", "--format=%H%x09%s", range], root)
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => {
+			const tab = line.indexOf("\t");
+			return corrected.get(line.slice(0, tab)) ?? line.slice(tab + 1);
+		})
+		.filter(Boolean);
+}
+
 /** Writes a file, making its folder first. */
 export function write(file, text) {
 	fs.mkdirSync(path.dirname(file), { recursive: true });

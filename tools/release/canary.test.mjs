@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { test } from "node:test";
-import { ROOT } from "./common.mjs";
+import { CORRECTIONS, ROOT } from "./common.mjs";
 import { canary, canaryText, latestReleaseTag } from "./canary.mjs";
 import { notes } from "./notes.mjs";
 
@@ -93,6 +93,20 @@ test("the canary tag is never a version release, for the canary's notes or for a
 	assert.ok(release.includes("- After the release\n- After the canary"));
 	// and the canary at the released commit has no commits since it
 	assert.ok(canary({ run: "7", built: BUILT, output }, root).includes("## 0 commits since v0.1.0"));
+});
+
+test("the canary notes print a commit's corrected subject, as a release's do", (t) => {
+	const { root, git } = repository(t);
+	const output = path.join(root, "notes.md");
+	git("tag", "v0.0.1");
+	git("commit", "--quiet", "--allow-empty", "-m", "yes");
+	fs.mkdirSync(path.join(root, "tools/release"), { recursive: true });
+	fs.writeFileSync(path.join(root, CORRECTIONS), JSON.stringify({ [git("rev-parse", "HEAD")]: "What the commit changed" }));
+	git("commit", "--quiet", "--allow-empty", "-m", "After it");
+	const text = canary({ run: "7", built: BUILT, output }, root);
+	assert.ok(text.includes("## 2 commits since v0.0.1"));
+	assert.ok(text.includes("- What the commit changed\n- After it\n"));
+	assert.doesNotMatch(text, /- yes\n/);
 });
 
 test("the canary notes need the run and a build time", (t) => {

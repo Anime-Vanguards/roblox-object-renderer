@@ -1,6 +1,6 @@
 // Writes the release notes: the public commit subjects since the previous release, how to install and
 // verify the binaries, and where the source is. Needs the full git history and the release tags.
-import { ROOT, git, identity, main, sourceText, write } from "./common.mjs";
+import { ROOT, commitSubjects, git, identity, main, sourceText, write } from "./common.mjs";
 import { version } from "./version.mjs";
 
 const RELEASE_TAG = /^v\d+\.\d+\.\d+$/;
@@ -15,10 +15,9 @@ function previousReleaseTag(tag, commit, root) {
 	return tags.find((name) => git(["rev-parse", `${name}^{commit}`], root) !== commit);
 }
 
-/** One bullet per commit subject, oldest first. */
+/** One bullet per commit subject (its correction, if notes-corrections.json has one), oldest first. */
 function changelog(previous, root) {
-	const range = previous ? `${previous}..HEAD` : "HEAD";
-	const subjects = git(["log", "--reverse", "--format=%s", range], root).split("\n").filter(Boolean);
+	const subjects = commitSubjects(previous ? `${previous}..HEAD` : "HEAD", root);
 	// A subject is only ever text in a file, never a shell command or a workflow expression.
 	const escape = (subject) => subject.replace(/[<>]/g, (char) => (char === "<" ? "&lt;" : "&gt;"));
 	return subjects.map((subject) => `- ${escape(subject)}`).join("\n");

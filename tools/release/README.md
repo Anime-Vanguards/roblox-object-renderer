@@ -62,6 +62,12 @@ It needs the full git history and the release tags. The notes list the commit su
 previous release tag (all of them for the first release), then how to install and verify, and where
 the source is.
 
+A subject that went out wrong stays in the public history, which is never rewritten.
+`notes-corrections.json` maps the full SHA of such a commit to the subject to print instead,
+`{ "<sha>": "<subject>" }`, for these notes and the canary's. It is read as JSON data, never run; an
+entry that is not a full SHA and one line of text fails the notes, and a SHA outside the listed range
+is ignored.
+
 ## dry-run.mjs
 
 It lists the runs of the release workflow at one commit of main and takes the newest that a push, a
@@ -120,8 +126,8 @@ earlier run on main downloaded where apt finds them still current, else from Ubu
 
 `node --test tools/release/*.test.mjs` checks every script: versions that disagree and a wrong tag,
 the zip's first entry, checksums, modes and full layout, the normal-dependency walk and crates
-without licence files, notes bounded by the previous tag with shell syntax in a subject, the canary's
-notes, the choice of a passing run, the nightly decision and which paths ship, and the workflow's
+without licence files, notes bounded by the previous tag with shell syntax in a subject, corrected
+subjects and the corrections file read as data, the canary's notes, the choice of a passing run, the nightly decision and which paths ship, and the workflow's
 rules (pinned actions, no build cache and no cache but the smoke job's apt downloads, a publish job
 without repository code, no `${{ }}` in `run:` scripts, the nightly schedule and its concurrency, a
 nightly run that builds and uploads only when it should, a canary that never builds, is never latest

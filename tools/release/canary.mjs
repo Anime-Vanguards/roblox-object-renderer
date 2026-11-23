@@ -2,7 +2,7 @@
 // them, and the commits since the latest version release. Needs the full git history and the release tags.
 //
 //   node tools/release/canary.mjs --run <id> --built <run start, ISO 8601> --output release-notes.md [--repository <owner/name>]
-import { REPOSITORY, ROOT, git, main, write } from "./common.mjs";
+import { REPOSITORY, ROOT, commitSubjects, git, main, write } from "./common.mjs";
 
 // Only version tags are releases; the canary tag and any other tag are not.
 const RELEASE_TAG = /^v\d+\.\d+\.\d+$/;
@@ -51,7 +51,7 @@ export function canary(options, root = ROOT) {
 	if (!/^[\w.-]+\/[\w.-]+$/.test(repository)) throw new Error(`repository ${repository} is not owner/name`);
 	const commit = git(["rev-parse", "HEAD"], root);
 	const previous = latestReleaseTag(commit, root);
-	const subjects = git(["log", "--reverse", "--format=%s", previous ? `${previous}..${commit}` : commit], root).split("\n").filter(Boolean);
+	const subjects = commitSubjects(previous ? `${previous}..${commit}` : commit, root);
 	const text = canaryText({ repository, commit, run: options.run, built: options.built, previous, subjects });
 	write(options.output, text);
 	return text;
