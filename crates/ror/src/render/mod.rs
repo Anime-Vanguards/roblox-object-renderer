@@ -228,7 +228,8 @@ pub struct RenderStats {
 	pub parts: usize,
 	pub draws: usize,
 	pub triangles: u64,
-	/// Assets that could not be loaded, with the reason (the part draws without them).
+	/// Assets that could not be loaded, with the reason (the part draws without them), each reason once
+	/// however many views met it.
 	pub missing: Vec<String>,
 	/// GUI quads drawn (over every view) and the time spent getting their textures (rur's renders
 	/// included).
@@ -2280,6 +2281,10 @@ impl Renderer {
 			eprintln!("profile: frame prepare {:.3} ms (reused={}) grid {:.3} ms sun {:.3} ms local {:.3} ms encode {:.3} ms readback {:.3} ms", stats.prepare_ms, stats.geometry_reused, stats.light_grid_ms, stats.sun_shadow_ms, stats.light_shadow_ms, stats.draw_ms, stats.readback_ms);
 			eprintln!("profile: residency {:.3} ms (feedback {:.3} ms), {} maps read, {} MB", stats.residency_total_ms, stats.residency_ms, stats.residency_reads, stats.residency_read_bytes >> 20);
 		}
+		// each failure once, however many views met it: every view loads the sun's and the moon's textures
+		// and the clouds for itself, and a render of two views reported a sun that could not load twice
+		let mut reported = std::collections::HashSet::new();
+		stats.missing.retain(|reason| reported.insert(reason.clone()));
 		// as prepare_geometry's, for what loads after the parts (effects' textures, GUIs)
 		if let Some(full) = stats.missing.iter().find(|reason| reason.contains(GPU_FULL)) {
 			return Err(anyhow!("{} parts: {full}", scene.parts.len()));
@@ -6504,9 +6509,13 @@ mod camera_reuse_tests {
 	use rbx_dom_weak::InstanceBuilder;
 	use rbx_dom_weak::types::{Content, Vector3};
 
+	/// A renderer reading Roblox's built-in content from an empty folder, as on a machine without Studio or
+	/// the Player (CI's): the default sky's textures and the sun's cannot load wherever the tests run.
 	fn renderer(state: &std::path::Path) -> Renderer {
 		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
-		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(state) });
+		let no_install = state.join("no-roblox-install");
+		std::fs::create_dir_all(&no_install).unwrap();
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, studio_content: Some(no_install), ..ror_assets::AssetConfig::new(state) });
 		Renderer::new(gpu, assets).expect("a renderer")
 	}
 
@@ -6541,16 +6550,17 @@ mod camera_reuse_tests {
 		renderer
 	}
 
-	fn assert_fresh(state: &std::path::Path, scene: &Scene, views: &[ViewRequest], images: &[ViewImage], label: &str) {
-		let (fresh, _) = renderer(state).render(scene, views).unwrap();
+	fn assert_fresh(state: &std::path::Path, scene: &Scene, views: &[ViewRequest], (images, missing): (&[ViewImage], &[String]), label: &str) {
+		let (fresh, stats) = renderer(state).render(scene, views).unwrap();
 		assert!(images.iter().zip(&fresh).all(|(image, fresh)| image.rgba == fresh.rgba), "{label}: other pixels than a fresh renderer's");
+		assert_eq!(missing, stats.missing, "{label}: other failures than a fresh renderer reports");
 	}
 
 	/// A scene drawn again from another camera takes its preparation from the render before, also when
 	/// some of its loads failed (reported again, as a fresh preparation reports them; until they are
 	/// retried: prepared::retry_tests), and an edited one from its second preparation on; every render
-	/// draws what a fresh renderer draws. Before, a scene with one asset that could not load was
-	/// prepared anew for every camera.
+	/// draws and reports what a fresh renderer does. Before, a scene with one asset that could not load
+	/// was prepared anew for every camera.
 	///
 	/// The renders follow each other and are compared with fresh renderers' after: the preparation stands
 	/// for a fresh one only until the failed loads are retried, 30 s after the first render met them, and a
@@ -6563,19 +6573,19 @@ mod camera_reuse_tests {
 		let scene = scene();
 		let mut edited = scene.clone();
 		Arc::make_mut(&mut edited.parts[2]).cframe.translation.y += 1.5;
-		let mut drawn: Vec<(&Scene, Vec<ViewRequest>, Vec<ViewImage>, String)> = Vec::new();
+		let mut drawn = Vec::new();
 		let started = std::time::Instant::now();
 		let first_views = vec![view([14.0, 9.0, -16.0])];
 		let (first, first_stats) = renderer.render(&scene, &first_views).unwrap();
 		assert!(!first_stats.geometry_reused);
 		assert!(first_stats.missing.iter().any(|reason| reason.contains("4040404")) && first_stats.missing.iter().any(|reason| reason.contains("5050505")), "the failed loads: {:?}", first_stats.missing);
-		drawn.push((&scene, first_views, first, "the first render".into()));
+		drawn.push((&scene, first_views, (first, first_stats.missing.clone()), "the first render".to_string()));
 		for (index, eye) in [[-12.0, 7.0, -18.0], [0.0, 14.0, -20.0], [18.0, 5.0, 6.0]].into_iter().enumerate() {
 			let views = vec![view(eye), view([eye[2], eye[1], eye[0]])];
 			let (images, stats) = renderer.render(&scene, &views).unwrap();
 			assert!(stats.geometry_reused, "camera {index}: the preparation kept from the render before ({:.1} s after the first)", started.elapsed().as_secs_f32());
 			assert_eq!(stats.missing, first_stats.missing, "camera {index}: the same failures reported");
-			drawn.push((&scene, views, images, format!("camera {index}")));
+			drawn.push((&scene, views, (images, stats.missing), format!("camera {index}")));
 		}
 		// an edited scene is prepared again, then kept once it is drawn again unchanged (its failed parts
 		// are prepared anew each time it is prepared, which made it a moving scene for good)
@@ -6585,12 +6595,31 @@ mod camera_reuse_tests {
 			let (images, stats) = renderer.render(&edited, &views).unwrap();
 			assert_eq!(stats.missing, first_stats.missing);
 			reused.push(stats.geometry_reused);
-			drawn.push((&edited, views, images, format!("the edited scene, render {index}")));
+			drawn.push((&edited, views, (images, stats.missing), format!("the edited scene, render {index}")));
 		}
 		assert_eq!(reused, [false, false, true, true], "the edited scene kept from its second preparation ({:.1} s after the first render)", started.elapsed().as_secs_f32());
-		for (scene, views, images, label) in &drawn {
-			assert_fresh(&state, scene, views, images, label);
+		for (scene, views, (images, missing), label) in &drawn {
+			assert_fresh(&state, scene, views, (images, missing), label);
 		}
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	/// A render reports each failed load once, however many views it draws. Each view loads the sun's
+	/// texture for itself, and without Roblox's built-in content (`renderer`) a render of three views
+	/// reported the sun's texture missing three times: a scene drawn again from two cameras reported more
+	/// failures than its first render from one.
+	#[test]
+	fn a_render_reports_each_failure_once_however_many_views_it_draws() {
+		let state = std::env::temp_dir().join(format!("ror-failures-once-test-{}", std::process::id()));
+		let renderer = renderer(&state);
+		let scene = scene();
+		let views = [[14.0, 9.0, -16.0], [-12.0, 7.0, -18.0], [0.0, 14.0, -20.0]].map(view);
+		let (_, three) = renderer.render(&scene, &views).unwrap();
+		let sun = three.missing.iter().filter(|reason| reason.contains("sky/sun.jpg")).count();
+		assert_eq!(sun, 1, "the sun's texture reported missing once: {:?}", three.missing);
+		let (_, one) = renderer.render(&scene, &views[..1]).unwrap();
+		assert_eq!(three.missing, one.missing, "three views report what one does");
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
 	}
@@ -6620,14 +6649,14 @@ mod camera_reuse_tests {
 		let (left, right) = (view([-45.0, 14.0, -30.0]), view([45.0, 14.0, -30.0]));
 		let mut drawn = Vec::new();
 		for (round, request) in [&left, &right, &left, &right].into_iter().enumerate() {
-			let (images, _) = renderer.render(&scene, std::slice::from_ref(request)).unwrap();
+			let (images, stats) = renderer.render(&scene, std::slice::from_ref(request)).unwrap();
 			if round == 1 {
 				assert_eq!(renderer.shadows.stats().0, 1, "the second camera's maps are the first's, kept once seen twice");
 			}
-			drawn.push((request, images));
+			drawn.push((request, (images, stats.missing)));
 		}
-		for (round, (request, images)) in drawn.iter().enumerate() {
-			assert_fresh(&state, &scene, std::slice::from_ref(*request), images, &format!("render {round}"));
+		for (round, (request, (images, missing))) in drawn.iter().enumerate() {
+			assert_fresh(&state, &scene, std::slice::from_ref(*request), (images, missing), &format!("render {round}"));
 		}
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
