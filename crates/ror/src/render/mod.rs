@@ -6530,6 +6530,17 @@ mod camera_reuse_tests {
 		crate::scene::extract::extract(&model.into_document())
 	}
 
+	/// A renderer that has drawn a plain floor. A process's first render does work once for every renderer
+	/// after it (4 s on a desktop's software adapter), which the tests below would count against the 30 s
+	/// their renders must follow each other within.
+	fn warmed(state: &std::path::Path) -> Renderer {
+		let renderer = renderer(state);
+		let mut model = ModelBuilder::new("Warm");
+		model.part(&PartSpec { name: "Floor".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, -0.5, 0.0)), size: Vec3::new(40.0, 1.0, 40.0), ..Default::default() });
+		renderer.render(&crate::scene::extract::extract(&model.into_document()), &[view([14.0, 9.0, -16.0])]).unwrap();
+		renderer
+	}
+
 	fn assert_fresh(state: &std::path::Path, scene: &Scene, views: &[ViewRequest], images: &[ViewImage], label: &str) {
 		let (fresh, _) = renderer(state).render(scene, views).unwrap();
 		assert!(images.iter().zip(&fresh).all(|(image, fresh)| image.rgba == fresh.rgba), "{label}: other pixels than a fresh renderer's");
@@ -6540,36 +6551,46 @@ mod camera_reuse_tests {
 	/// retried: prepared::retry_tests), and an edited one from its second preparation on; every render
 	/// draws what a fresh renderer draws. Before, a scene with one asset that could not load was
 	/// prepared anew for every camera.
+	///
+	/// The renders follow each other and are compared with fresh renderers' after: the preparation stands
+	/// for a fresh one only until the failed loads are retried, 30 s after the first render met them, and a
+	/// renderer takes longer than that to start on CI's software adapter (its pipelines are compiled on the
+	/// CPU), so one started between two renders had the second prepare the scene again.
 	#[test]
 	fn a_scene_drawn_from_a_moving_camera_reuses_its_preparation_through_failed_loads() {
 		let state = std::env::temp_dir().join(format!("ror-camera-reuse-test-{}", std::process::id()));
-		let renderer = renderer(&state);
+		let renderer = warmed(&state);
 		let scene = scene();
-		let (first, first_stats) = renderer.render(&scene, &[view([14.0, 9.0, -16.0])]).unwrap();
+		let mut edited = scene.clone();
+		Arc::make_mut(&mut edited.parts[2]).cframe.translation.y += 1.5;
+		let mut drawn: Vec<(&Scene, Vec<ViewRequest>, Vec<ViewImage>, String)> = Vec::new();
+		let started = std::time::Instant::now();
+		let first_views = vec![view([14.0, 9.0, -16.0])];
+		let (first, first_stats) = renderer.render(&scene, &first_views).unwrap();
 		assert!(!first_stats.geometry_reused);
 		assert!(first_stats.missing.iter().any(|reason| reason.contains("4040404")) && first_stats.missing.iter().any(|reason| reason.contains("5050505")), "the failed loads: {:?}", first_stats.missing);
-		assert_fresh(&state, &scene, &[view([14.0, 9.0, -16.0])], &first, "the first render");
+		drawn.push((&scene, first_views, first, "the first render".into()));
 		for (index, eye) in [[-12.0, 7.0, -18.0], [0.0, 14.0, -20.0], [18.0, 5.0, 6.0]].into_iter().enumerate() {
-			let views = [view(eye), view([eye[2], eye[1], eye[0]])];
+			let views = vec![view(eye), view([eye[2], eye[1], eye[0]])];
 			let (images, stats) = renderer.render(&scene, &views).unwrap();
-			assert!(stats.geometry_reused, "camera {index}: the preparation kept from the render before");
+			assert!(stats.geometry_reused, "camera {index}: the preparation kept from the render before ({:.1} s after the first)", started.elapsed().as_secs_f32());
 			assert_eq!(stats.missing, first_stats.missing, "camera {index}: the same failures reported");
-			assert_fresh(&state, &scene, &views, &images, &format!("camera {index}"));
+			drawn.push((&scene, views, images, format!("camera {index}")));
 		}
 		// an edited scene is prepared again, then kept once it is drawn again unchanged (its failed parts
 		// are prepared anew each time it is prepared, which made it a moving scene for good)
-		let mut edited = scene.clone();
-		Arc::make_mut(&mut edited.parts[2]).cframe.translation.y += 1.5;
-		let reused: Vec<bool> = [[10.0, 9.0, -14.0], [-9.0, 9.0, -14.0], [0.0, 12.0, -18.0], [6.0, 6.0, -12.0]]
-			.into_iter()
-			.map(|eye| {
-				let (images, stats) = renderer.render(&edited, &[view(eye)]).unwrap();
-				assert_eq!(stats.missing, first_stats.missing);
-				assert_fresh(&state, &edited, &[view(eye)], &images, "the edited scene");
-				stats.geometry_reused
-			})
-			.collect();
-		assert_eq!(reused, [false, false, true, true], "the edited scene kept from its second preparation");
+		let mut reused = Vec::new();
+		for (index, eye) in [[10.0, 9.0, -14.0], [-9.0, 9.0, -14.0], [0.0, 12.0, -18.0], [6.0, 6.0, -12.0]].into_iter().enumerate() {
+			let views = vec![view(eye)];
+			let (images, stats) = renderer.render(&edited, &views).unwrap();
+			assert_eq!(stats.missing, first_stats.missing);
+			reused.push(stats.geometry_reused);
+			drawn.push((&edited, views, images, format!("the edited scene, render {index}")));
+		}
+		assert_eq!(reused, [false, false, true, true], "the edited scene kept from its second preparation ({:.1} s after the first render)", started.elapsed().as_secs_f32());
+		for (scene, views, images, label) in &drawn {
+			assert_fresh(&state, scene, views, images, label);
+		}
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
 	}
@@ -6577,10 +6598,13 @@ mod camera_reuse_tests {
 	/// Shadowed local lights' maps take their layers in the scene's order, so cameras that reach the
 	/// same lights draw with the same maps whichever is nearest; they draw what a fresh renderer draws.
 	/// Before, each camera's nearest-first order made maps of their own, kept for none.
+	///
+	/// The renders follow each other and are compared with fresh renderers' after: maps are kept once seen
+	/// twice within 30 s, which a renderer started between the two renders outlasted on CI.
 	#[test]
 	fn cameras_reaching_the_same_lights_share_their_shadow_maps() {
 		let state = std::env::temp_dir().join(format!("ror-camera-shadows-test-{}", std::process::id()));
-		let renderer = renderer(&state);
+		let renderer = warmed(&state);
 		let mut model = ModelBuilder::new("Hall");
 		let part = |name: &str, at: Vec3, size: Vec3| PartSpec { name: name.into(), cframe: Affine3A::from_translation(at), size, ..Default::default() };
 		model.part(&part("Floor", Vec3::new(0.0, -0.5, 0.0), Vec3::new(60.0, 1.0, 30.0)));
@@ -6594,12 +6618,16 @@ mod camera_reuse_tests {
 		scene.environment.global_shadows = false;
 		scene.environment.clock_time = 0.0;
 		let (left, right) = (view([-45.0, 14.0, -30.0]), view([45.0, 14.0, -30.0]));
+		let mut drawn = Vec::new();
 		for (round, request) in [&left, &right, &left, &right].into_iter().enumerate() {
 			let (images, _) = renderer.render(&scene, std::slice::from_ref(request)).unwrap();
-			assert_fresh(&state, &scene, std::slice::from_ref(request), &images, &format!("render {round}"));
 			if round == 1 {
 				assert_eq!(renderer.shadows.stats().0, 1, "the second camera's maps are the first's, kept once seen twice");
 			}
+			drawn.push((request, images));
+		}
+		for (round, (request, images)) in drawn.iter().enumerate() {
+			assert_fresh(&state, &scene, std::slice::from_ref(*request), images, &format!("render {round}"));
 		}
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
