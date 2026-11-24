@@ -358,13 +358,15 @@ fn ms(value: f64) -> String {
 fn summary_lines(input: &str, setup: &Setup, views: &[ViewLine], mean: &Work, worst: Option<&ViewWork>, tree: &[Node], found: &[Finding], budget: Option<&Budget>) -> Vec<String> {
 	let mut lines = Vec::new();
 	lines.push(format!("cost loop ({SCHEMA}): {input}, {} views, preset {} ({}x{}, quality {}{})", views.len(), setup.preset.name, setup.preset.width, setup.preset.height, setup.quality.level, if setup.quality.sun_shadows { ", sun shadows" } else { ", no sun shadows" }));
-	if setup.preset.phone {
+	let desktop = setup.preset.uses_desktop_pricing();
+	if !desktop {
+		let gpu_ms = mean.gpu_ms.unwrap_or(0.0);
 		lines.push(format!(
 			"per view, mean: {} phone frame (CPU {}, GPU {} of which the frame waits {}); {:.0} draws, {:.0}k triangles, {:.2} viewports blended, {:.0} parts",
 			ms(mean.ms),
 			ms(mean.cpu_ms),
-			ms(mean.gpu_ms),
-			ms(mean.gpu_ms * prices::GPU_TO_FRAME),
+			ms(gpu_ms),
+			ms(gpu_ms * prices::GPU_TO_FRAME),
 			mean.draws,
 			mean.triangles / 1000.0,
 			mean.blended / (setup.preset.width as f64 * setup.preset.height as f64),
@@ -375,7 +377,7 @@ fn summary_lines(input: &str, setup: &Setup, views: &[ViewLine], mean: &Work, wo
 		}
 	} else {
 		lines.push(format!(
-			"per view, mean: {} desktop CPU frame (GPU uncalibrated: {:.2} gpuUnits, 0.00 ms); {:.0} draws, {:.0}k triangles, {:.2} viewports blended, {:.0} parts",
+			"per view, mean: {} desktop CPU frame (GPU uncalibrated: {:.2} gpuUnits, gpuMs: null); {:.0} draws, {:.0}k triangles, {:.2} viewports blended, {:.0} parts",
 			ms(mean.ms),
 			mean.gpu_units,
 			mean.draws,
@@ -386,7 +388,7 @@ fn summary_lines(input: &str, setup: &Setup, views: &[ViewLine], mean: &Work, wo
 		if let Some(worst) = worst {
 			lines.push(format!("worst view: {} {} ({:.2} gpuUnits, {:.0} draws, {:.0}k triangles)", worst.name, ms(worst.total.ms), worst.total.gpu_units, worst.total.draws, worst.total.triangles / 1000.0));
 		}
-		lines.push("fidelity: desktop GPU ms is uncalibrated (gpuMs = 0); compare gpuUnits for shading/overdraw and check unmodeled in analysis.json".into());
+		lines.push("fidelity: desktop CPU ms is estimated from one reference PC ratio (1/2.224, not players' desktops); desktop GPU ms is uncalibrated (gpuMs = null); findings rank by combined CPU + gpuUnits share".into());
 	}
 	if let Some(budget) = budget {
 		let over: Vec<&ViewLine> = views.iter().filter(|view| !view.over_budget.is_empty()).collect();
@@ -410,8 +412,10 @@ fn summary_lines(input: &str, setup: &Setup, views: &[ViewLine], mean: &Work, wo
 	}
 	lines.push(format!("top findings ({} in analysis.json, each with its edit):", found.len()));
 	for finding in found.iter().take(10) {
-		if !setup.preset.phone && finding.saving.mean_ms <= 0.0 && finding.saving.mean_gpu_units > 0.0 {
+		if desktop && finding.saving.mean_ms <= 0.0 && finding.saving.mean_gpu_units > 0.0 {
 			lines.push(format!("  #{:<2} -{:.2} gpuUnits/view (worst {})  [{}] {}", finding.rank, finding.saving.mean_gpu_units, finding.saving.worst_view, finding.kind, finding.title));
+		} else if desktop && finding.saving.mean_gpu_units > 0.0 {
+			lines.push(format!("  #{:<2} -{:>8}/view, -{:.2} gpuUnits (worst -{} {})  [{}] {}", finding.rank, ms(finding.saving.mean_ms), finding.saving.mean_gpu_units, ms(finding.saving.worst_ms), finding.saving.worst_view, finding.kind, finding.title));
 		} else {
 			lines.push(format!("  #{:<2} -{:>8}/view (worst -{} {})  [{}] {}", finding.rank, ms(finding.saving.mean_ms), ms(finding.saving.worst_ms), finding.saving.worst_view, finding.kind, finding.title));
 		}
@@ -897,12 +901,14 @@ mod tests {
 	#[test]
 	fn desktop_preset_prices_cpu_as_desktop_and_refuses_gpu_ms() {
 		let state = std::env::temp_dir().join(format!("ror-desktop-pricing-test-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&state);
 		let gpu = std::sync::Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = crate::render::Renderer::new(gpu, assets).expect("a renderer");
 		let mut model = ModelBuilder::new("Map");
 		let at = |x: f32, y: f32, z: f32| Affine3A::from_translation(Vec3::new(x, y, z));
 		let wall = model.part(&PartSpec { name: "Wall".into(), size: Vec3::new(40.0, 20.0, 1.0), ..Default::default() });
+		model.part(&PartSpec { name: "Behind".into(), cframe: at(0.0, 0.0, -8.0), size: Vec3::new(3.0, 3.0, 3.0), material: 800, ..Default::default() });
 		model.part(&PartSpec { name: "Fog".into(), cframe: at(0.0, 0.0, 10.0), size: Vec3::new(30.0, 16.0, 0.2), transparency: 0.8, ..Default::default() });
 		model.child(
 			wall,
@@ -918,33 +924,69 @@ mod tests {
 		let options = CostOptions { attribute: true, pixels: true, ..Default::default() };
 
 		let phone_out = state.join("phone");
+		let custom_out = state.join("custom");
 		let desk_out = state.join("desktop");
 		std::fs::create_dir_all(&phone_out).unwrap();
+		std::fs::create_dir_all(&custom_out).unwrap();
 		std::fs::create_dir_all(&desk_out).unwrap();
 		let phone_preset = Preset::named("phone").unwrap();
+		let custom_preset = Preset::custom(320, 180, 21);
 		let desk_preset = Preset::named("desktop").unwrap();
 		let phone_setup = Setup { renderer: &renderer, options: &options, names: vec!["front".into()], shots: &shots, preset: phone_preset, quality: Quality::of(2, true), gpu: None, lent_lighting: false, lent_materials: false };
+		let custom_setup = Setup { renderer: &renderer, options: &options, names: vec!["front".into()], shots: &shots, preset: custom_preset, quality: Quality::of(21, false), gpu: None, lent_lighting: false, lent_materials: false };
 		let desk_setup = Setup { renderer: &renderer, options: &options, names: vec!["front".into()], shots: &shots, preset: desk_preset, quality: Quality::of(21, false), gpu: None, lent_lighting: false, lent_materials: false };
 		run(&phone_setup, &scene, &document, None, &phone_out, "map").unwrap();
+		run(&custom_setup, &scene, &document, None, &custom_out, "map").unwrap();
 		let (_, desk_lines) = run(&desk_setup, &scene, &document, None, &desk_out, "map").unwrap();
 
 		let phone_json: Value = serde_json::from_slice(&std::fs::read(phone_out.join("analysis.json")).unwrap()).unwrap();
+		let custom_json: Value = serde_json::from_slice(&std::fs::read(custom_out.join("analysis.json")).unwrap()).unwrap();
+		let custom_txt = std::fs::read_to_string(custom_out.join("analysis.txt")).unwrap();
 		let desk_json: Value = serde_json::from_slice(&std::fs::read(desk_out.join("analysis.json")).unwrap()).unwrap();
 		let desk_txt = std::fs::read_to_string(desk_out.join("analysis.txt")).unwrap();
 
+		// Phone preset: calibrated phone frame
+		assert_eq!(phone_json["fidelity"]["cpuCalibrated"], true);
 		assert_eq!(phone_json["fidelity"]["gpuCalibrated"], true);
 		assert!(phone_json["mean"]["gpuMs"].as_f64().unwrap() > 0.0);
 		assert!(phone_json["mean"]["gpuUnits"].as_f64().unwrap() > 0.0);
 
+		// Custom preset (no --preset): keeps phone frame pricing and rankings (matching 5f1abba)
+		assert_eq!(custom_json["fidelity"]["pricing"], "phone");
+		assert_eq!(custom_json["fidelity"]["cpuCalibrated"], true);
+		assert_eq!(custom_json["fidelity"]["gpuCalibrated"], true);
+		let custom_cpu = custom_json["mean"]["cpuMs"].as_f64().unwrap();
+		let custom_gpu = custom_json["mean"]["gpuMs"].as_f64().unwrap();
+		let custom_ms = custom_json["mean"]["ms"].as_f64().unwrap();
+		assert!(custom_gpu > 0.3, "no-preset custom run must keep phone gpuMs: {custom_json}");
+		assert!((custom_cpu - 0.0799).abs() <= 2e-4, "expected 5f1abba cpuMs 0.0799, got {custom_cpu}");
+		assert!((custom_gpu - 0.3853).abs() <= 5e-4, "expected 5f1abba gpuMs 0.3853, got {custom_gpu}");
+		assert!((custom_ms - 0.1551).abs() <= 2e-4, "expected 5f1abba ms 0.1551, got {custom_ms}");
+		assert!((custom_ms - (custom_cpu + custom_gpu * prices::GPU_TO_FRAME)).abs() <= 2e-4);
+		assert!(custom_txt.contains("phone frame"), "no-preset analysis.txt must keep phone frame wording:\n{custom_txt}");
+		assert_eq!(custom_json["findings"][0]["kind"], "seeThrough", "GPU-heavy Fog must rank #1 on no-preset phone frame");
+
+		// Desktop preset (--preset desktop): estimated CPU, refused gpuMs as null, GPU findings not buried behind CPU
+		assert_eq!(desk_json["fidelity"]["pricing"], "desktop");
+		assert_eq!(desk_json["fidelity"]["cpuCalibrated"], false);
+		assert_eq!(desk_json["fidelity"]["cpuBasis"], "estimated");
 		assert_eq!(desk_json["fidelity"]["gpuCalibrated"], false);
 		assert_eq!(desk_json["fidelity"]["status"], "partial");
 		assert!(desk_json["fidelity"]["gpuRefusal"]["settleWith"].is_string());
 		assert!(desk_json["unmodeled"].as_array().unwrap().iter().any(|u| u["kind"] == "desktopGpuMs"));
-		assert_eq!(desk_json["mean"]["gpuMs"].as_f64().unwrap(), 0.0);
+		assert!(desk_json["mean"]["gpuMs"].is_null(), "desktop gpuMs must be null, not 0: {}", desk_json["mean"]);
+		assert!(desk_json["views"][0]["work"]["gpuMs"].is_null());
+		assert!(desk_json["prices"].as_array().unwrap().iter().find(|p| p["key"] == "gpuUnit").unwrap()["value"].is_null());
+		assert!(desk_json["prices"].as_array().unwrap().iter().find(|p| p["key"] == "gpuToFrame").unwrap()["value"].is_null());
 		assert!(desk_json["mean"]["gpuUnits"].as_f64().unwrap() > 0.0);
 		assert!((desk_json["mean"]["ms"].as_f64().unwrap() - desk_json["mean"]["cpuMs"].as_f64().unwrap()).abs() <= 1e-4);
 		assert!(!desk_txt.to_ascii_lowercase().contains("phone"), "desktop analysis.txt mentioned phone:\n{desk_txt}");
-		let light_finding = desk_json["findings"].as_array().unwrap().iter().find(|f| f["kind"] == "lightRange").expect("desktop Q21 lightRange finding");
+		assert!(desk_txt.contains("gpuMs: null") && !desk_txt.contains("GPU 0.00 ms"), "desktop analysis.txt must refuse GPU ms as null:\n{desk_txt}");
+		let desk_findings = desk_json["findings"].as_array().unwrap();
+		let fog_rank = desk_findings.iter().find(|f| f["kind"] == "seeThrough").unwrap()["rank"].as_u64().unwrap();
+		let light_finding = desk_findings.iter().find(|f| f["kind"] == "lightRange").expect("desktop Q21 lightRange finding");
+		let unseen_rank = desk_findings.iter().find(|f| f["kind"] == "unseen").unwrap()["rank"].as_u64().unwrap();
+		assert!(fog_rank < unseen_rank, "desktop GPU+CPU seeThrough finding must not hide behind tiny unseen CPU finding: {desk_findings:?}");
 		assert!(light_finding["saving"]["meanGpuUnits"].as_f64().unwrap() > 0.0, "{light_finding}");
 		assert_eq!(light_finding["saving"]["worstView"], "front", "{light_finding}");
 		assert!(desk_lines.iter().any(|l| l.contains("gpuUnits/view") && l.contains("[lightRange]")), "{desk_lines:?}");

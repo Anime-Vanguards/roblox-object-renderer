@@ -48,7 +48,7 @@ pub fn feature_units(class: &str) -> Option<f64> {
 }
 
 /// Work and its price, for one instance in one view or summed.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Work {
 	pub draws: f64,
@@ -68,13 +68,39 @@ pub struct Work {
 	/// Relative GPU shading/overdraw work in viewport-units (1.0 = one viewport of opaque Plastic).
 	pub gpu_units: f64,
 	pub cpu_ms: f64,
-	/// Calibrated GPU ms (0 when the preset has no GPU calibration; see `gpu_units`).
-	pub gpu_ms: f64,
+	/// Calibrated GPU ms, or `None` (`null` in JSON) when the preset has no GPU calibration (see `gpu_units`).
+	pub gpu_ms: Option<f64>,
 	/// Frame ms: CPU plus the GPU's share of the waits when calibrated, else CPU ms only.
 	pub ms: f64,
 }
 
+impl Default for Work {
+	fn default() -> Self {
+		Self {
+			draws: 0.0,
+			triangles: 0.0,
+			pixels: 0.0,
+			blended: 0.0,
+			light_pixels: 0.0,
+			lit_pixels: 0.0,
+			shadow_triangles: 0.0,
+			parts: 0.0,
+			gpu_units: 0.0,
+			cpu_ms: 0.0,
+			gpu_ms: Some(0.0),
+			ms: 0.0,
+		}
+	}
+}
+
 impl Work {
+	pub fn empty_for(profile: &prices::Profile) -> Self {
+		Self {
+			gpu_ms: profile.gpu_ms_per_unit.map(|_| 0.0),
+			..Self::default()
+		}
+	}
+
 	pub fn add(&mut self, other: &Work) {
 		self.draws += other.draws;
 		self.triangles += other.triangles;
@@ -86,7 +112,10 @@ impl Work {
 		self.parts += other.parts;
 		self.gpu_units += other.gpu_units;
 		self.cpu_ms += other.cpu_ms;
-		self.gpu_ms += other.gpu_ms;
+		self.gpu_ms = match (self.gpu_ms, other.gpu_ms) {
+			(Some(a), Some(b)) => Some(a + b),
+			_ => None,
+		};
 		self.ms += other.ms;
 	}
 
@@ -102,7 +131,7 @@ impl Work {
 			parts: self.parts * by,
 			gpu_units: self.gpu_units * by,
 			cpu_ms: self.cpu_ms * by,
-			gpu_ms: self.gpu_ms * by,
+			gpu_ms: self.gpu_ms.map(|v| v * by),
 			ms: self.ms * by,
 		}
 	}
@@ -127,13 +156,13 @@ impl Work {
 			parts: r(self.parts, 0.01),
 			gpu_units: r(self.gpu_units, 1e-4),
 			cpu_ms: r(self.cpu_ms, 1e-4),
-			gpu_ms: r(self.gpu_ms, 1e-4),
+			gpu_ms: self.gpu_ms.map(|v| r(v, 1e-4)),
 			ms: r(self.ms, 1e-4),
 		}
 	}
 
 	/// The prices applied for `profile`: CPU from the counts, GPU units recorded always, GPU ms and
-	/// GPU wait share added only when the profile has GPU calibration.
+	/// GPU wait share added only when the profile has GPU calibration (otherwise `gpu_ms` is `None`).
 	fn priced(mut self, units: f64, profile: &prices::Profile) -> Work {
 		self.gpu_units += units;
 		self.cpu_ms += self.draws * profile.draw_ms
@@ -141,10 +170,11 @@ impl Work {
 			+ self.parts * profile.part_ms
 			+ self.shadow_triangles * SHADOW_REDRAW_SHARE / 1000.0 * profile.kilo_triangle_ms;
 		if let (Some(gpu_ms_per_unit), Some(gpu_to_frame)) = (profile.gpu_ms_per_unit, profile.gpu_to_frame) {
-			self.gpu_ms += self.gpu_units * gpu_ms_per_unit;
-			self.ms = self.cpu_ms + self.gpu_ms * gpu_to_frame;
+			let gpu_ms = self.gpu_ms.unwrap_or(0.0) + self.gpu_units * gpu_ms_per_unit;
+			self.gpu_ms = Some(gpu_ms);
+			self.ms = self.cpu_ms + gpu_ms * gpu_to_frame;
 		} else {
-			self.gpu_ms = 0.0;
+			self.gpu_ms = None;
 			self.ms = self.cpu_ms;
 		}
 		self
@@ -414,7 +444,7 @@ pub fn view(scene: &Scene, analysis: &Analysis, owners: &Owners, ids: &InstanceI
 	}
 	let profile = prices::Profile::for_preset(preset);
 	let mut by_instance = HashMap::new();
-	let mut total = Work::default();
+	let mut total = Work::empty_for(&profile);
 	let key_of = |referent: &Ref| ids.id(*referent).unwrap_or(SHARED).to_string();
 	let mut keys: Vec<Ref> = work.keys().chain(units.keys()).copied().collect();
 	keys.sort_by_key(key_of);
@@ -504,6 +534,7 @@ pub fn tree(ids: &InstanceIds, views: &[ViewWork]) -> Vec<Node> {
 			current = parent;
 		}
 	}
+	let uncalibrated_gpu = views.iter().any(|view| view.total.gpu_ms.is_none());
 	let mut nodes: Vec<Node> = sums
 		.into_iter()
 		.map(|(id, (per_view, referent, leaves))| {
@@ -511,14 +542,18 @@ pub fn tree(ids: &InstanceIds, views: &[ViewWork]) -> Vec<Node> {
 			for work in &per_view {
 				mean.add(work);
 			}
-			let mean = mean.scaled(1.0 / count.max(1) as f64);
-			let (worst_index, worst) = per_view.iter().enumerate().fold((0, Work::default()), |best, (index, work)| {
+			let mut mean = mean.scaled(1.0 / count.max(1) as f64);
+			let (worst_index, mut worst) = per_view.iter().enumerate().fold((0, Work::default()), |best, (index, work)| {
 				if work.ms > best.1.ms || (work.ms == best.1.ms && work.gpu_units > best.1.gpu_units) {
 					(index, *work)
 				} else {
 					best
 				}
 			});
+			if uncalibrated_gpu {
+				mean.gpu_ms = None;
+				worst.gpu_ms = None;
+			}
 			let in_view = per_view.iter().filter(|work| work.draws > 0.0 || work.pixels > 0.0 || work.blended > 0.0).count() as u32;
 			let info = ids.info(referent);
 			Node {

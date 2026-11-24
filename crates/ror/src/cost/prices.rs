@@ -31,7 +31,8 @@ pub enum Basis {
 #[serde(rename_all = "camelCase")]
 pub struct Price {
 	pub key: &'static str,
-	pub value: f64,
+	/// Numeric unit price, or `None` (`null` in JSON) when `basis == Basis::Uncalibrated`.
+	pub value: Option<f64>,
 	pub unit: &'static str,
 	pub basis: Basis,
 	pub source: &'static str,
@@ -58,9 +59,11 @@ pub const GPU_MS_PER_UNIT: f64 = 4.3 / 10.14;
 pub const DESKTOP_CPU_DIVISOR: f64 = 2.224;
 
 /// Pricing profile for one device preset: CPU prices in frame ms and optional GPU ms conversion.
+/// Only the named `desktop` preset uses desktop pricing; `phone` and no-`--preset` (`custom`) runs
+/// keep the calibrated phone frame pricing unless the caller asks for `--preset desktop`.
 #[derive(Clone, Copy, Debug)]
 pub struct Profile {
-	pub phone: bool,
+	pub desktop: bool,
 	pub draw_ms: f64,
 	pub part_ms: f64,
 	pub kilo_triangle_ms: f64,
@@ -70,23 +73,23 @@ pub struct Profile {
 
 impl Profile {
 	pub fn for_preset(preset: &Preset) -> Self {
-		if preset.phone {
+		if preset.uses_desktop_pricing() {
 			Self {
-				phone: true,
-				draw_ms: DRAW_MS,
-				part_ms: PART_MS,
-				kilo_triangle_ms: KILO_TRIANGLE_MS,
-				gpu_ms_per_unit: Some(GPU_MS_PER_UNIT),
-				gpu_to_frame: Some(GPU_TO_FRAME),
-			}
-		} else {
-			Self {
-				phone: false,
+				desktop: true,
 				draw_ms: DRAW_MS / DESKTOP_CPU_DIVISOR,
 				part_ms: PART_MS / DESKTOP_CPU_DIVISOR,
 				kilo_triangle_ms: KILO_TRIANGLE_MS / DESKTOP_CPU_DIVISOR,
 				gpu_ms_per_unit: None,
 				gpu_to_frame: None,
+			}
+		} else {
+			Self {
+				desktop: false,
+				draw_ms: DRAW_MS,
+				part_ms: PART_MS,
+				kilo_triangle_ms: KILO_TRIANGLE_MS,
+				gpu_ms_per_unit: Some(GPU_MS_PER_UNIT),
+				gpu_to_frame: Some(GPU_TO_FRAME),
 			}
 		}
 	}
@@ -191,10 +194,16 @@ impl Preset {
 		}
 	}
 
-	/// No preset named: the run's own size and quality, counted as a desktop.
+	/// No preset named: the run's own size and quality (400 particles/s rate cap, priced as phone
+	/// frame ms unless `--preset desktop` is explicitly requested).
 	pub fn custom(width: u32, height: u32, quality: u32) -> Self {
 		let scale = if width * height > 1_500_000 { 2 } else { 1 };
 		Self { name: "custom".into(), width, height, analysis_scale: scale, quality, phone: false }
+	}
+
+	/// Whether this preset explicitly requested desktop pricing (`--preset desktop`).
+	pub fn uses_desktop_pricing(&self) -> bool {
+		self.name == "desktop"
 	}
 
 	pub fn analysis_size(&self) -> (u32, u32) {
@@ -206,53 +215,63 @@ impl Preset {
 pub fn table() -> Vec<Price> {
 	let (fit, waits, anchor) = ("12 phone measurements of a large place (frame ms)", "phone measurements: 0.874 x 5.65 ms of GPU waits / 25.3 ms of GPU", "a reference place's 16 views on the phone preset = 4.3 ms, its GPU time with and without its map");
 	vec![
-		Price { key: "draw", value: DRAW_MS, unit: "phone frame ms per draw call", basis: Basis::Fitted, source: fit },
-		Price { key: "part", value: PART_MS, unit: "phone frame ms per part in the place", basis: Basis::Fitted, source: "the same fit" },
-		Price { key: "kiloTriangle", value: KILO_TRIANGLE_MS, unit: "phone frame ms per 1,000 triangles drawn", basis: Basis::Fitted, source: "the same fit" },
-		Price { key: "gpuToFrame", value: GPU_TO_FRAME, unit: "phone frame ms per phone GPU ms", basis: Basis::Measured, source: waits },
-		Price { key: "gpuUnit", value: GPU_MS_PER_UNIT, unit: "phone GPU ms per viewport of opaque Plastic", basis: Basis::Anchored, source: anchor },
-		Price { key: "weights", value: 1.0, unit: "relative per-pixel weights (textured 1.4, neon 0.8, glass 1.2, sky 0.3, blended 1.6, alpha SurfaceAppearance 2.0, particle 1.3, light 0.25, sun shadow 0.2)", basis: Basis::Estimated, source: "relative shading work, not measured on a phone" },
-		Price { key: "shadowRedraw", value: super::attribute::SHADOW_REDRAW_SHARE, unit: "share of the casters' shadow triangles charged a frame", basis: Basis::Estimated, source: "Roblox caches shadow maps and redraws them as the camera moves" },
+		Price { key: "draw", value: Some(DRAW_MS), unit: "phone frame ms per draw call", basis: Basis::Fitted, source: fit },
+		Price { key: "part", value: Some(PART_MS), unit: "phone frame ms per part in the place", basis: Basis::Fitted, source: "the same fit" },
+		Price { key: "kiloTriangle", value: Some(KILO_TRIANGLE_MS), unit: "phone frame ms per 1,000 triangles drawn", basis: Basis::Fitted, source: "the same fit" },
+		Price { key: "gpuToFrame", value: Some(GPU_TO_FRAME), unit: "phone frame ms per phone GPU ms", basis: Basis::Measured, source: waits },
+		Price { key: "gpuUnit", value: Some(GPU_MS_PER_UNIT), unit: "phone GPU ms per viewport of opaque Plastic", basis: Basis::Anchored, source: anchor },
+		Price { key: "weights", value: Some(1.0), unit: "relative per-pixel weights (textured 1.4, neon 0.8, glass 1.2, sky 0.3, blended 1.6, alpha SurfaceAppearance 2.0, particle 1.3, light 0.25, sun shadow 0.2)", basis: Basis::Estimated, source: "relative shading work, not measured on a phone" },
+		Price { key: "shadowRedraw", value: Some(super::attribute::SHADOW_REDRAW_SHARE), unit: "share of the casters' shadow triangles charged a frame", basis: Basis::Estimated, source: "Roblox caches shadow maps and redraws them as the camera moves" },
 	]
 }
 
-/// The prices for a specific device preset. Phone uses the calibrated phone fit and GPU wait anchor;
-/// desktop and custom presets scale CPU prices by [`DESKTOP_CPU_DIVISOR`] and leave GPU ms uncalibrated
-/// (shader and overdraw work are reported in `gpuUnits`).
+/// The prices for a specific device preset. Phone and no-`--preset` (`custom`) runs use the
+/// calibrated phone fit and GPU wait anchor; `--preset desktop` scales CPU prices by one reference-PC
+/// main-thread ratio (`1 / DESKTOP_CPU_DIVISOR`, estimated rather than per-term fitted) and refuses
+/// desktop GPU ms (`value: null`, `basis: "uncalibrated"`, work reported in `gpuUnits`).
 pub fn table_for(preset: &Preset) -> Vec<Price> {
-	if preset.phone {
+	if !preset.uses_desktop_pricing() {
 		return table();
 	}
 	let profile = Profile::for_preset(preset);
-	let cpu_source = "scaled from reference CPU fit by 1/2.224 (paired desktop main-thread ratio)";
+	let cpu_source = "estimated: one whole-frame main-thread ratio (1/2.224, reference PC vs live phones) applied alike to draw, part and triangle prices; estimates that reference PC, not players' desktops";
 	vec![
-		Price { key: "draw", value: profile.draw_ms, unit: "desktop CPU frame ms per draw call", basis: Basis::Estimated, source: cpu_source },
-		Price { key: "part", value: profile.part_ms, unit: "desktop CPU frame ms per part in the place", basis: Basis::Estimated, source: "the same desktop CPU ratio" },
-		Price { key: "kiloTriangle", value: profile.kilo_triangle_ms, unit: "desktop CPU frame ms per 1,000 triangles drawn", basis: Basis::Estimated, source: "the same desktop CPU ratio" },
-		Price { key: "gpuToFrame", value: 0.0, unit: "uncalibrated on desktop (GPU work reported in gpuUnits, not ms)", basis: Basis::Uncalibrated, source: "desktop GPU waits are not calibrated; compare gpuUnits directly" },
-		Price { key: "gpuUnit", value: 0.0, unit: "uncalibrated on desktop (1.0 gpuUnit = 1 viewport of opaque Plastic)", basis: Basis::Uncalibrated, source: "desktop GPU ms is not calibrated; compare gpuUnits directly" },
-		Price { key: "weights", value: 1.0, unit: "relative per-pixel weights in gpuUnits (textured 1.4, neon 0.8, glass 1.2, sky 0.3, blended 1.6, alpha SurfaceAppearance 2.0, particle 1.3, light 0.25, sun shadow 0.2)", basis: Basis::Estimated, source: "relative shading work, not measured per shader" },
-		Price { key: "shadowRedraw", value: super::attribute::SHADOW_REDRAW_SHARE, unit: "share of the casters' shadow triangles charged a frame", basis: Basis::Estimated, source: "Roblox caches shadow maps and redraws them as the camera moves" },
+		Price { key: "draw", value: Some(profile.draw_ms), unit: "desktop CPU frame ms per draw call", basis: Basis::Estimated, source: cpu_source },
+		Price { key: "part", value: Some(profile.part_ms), unit: "desktop CPU frame ms per part in the place", basis: Basis::Estimated, source: "the same single reference-PC CPU ratio (estimated)" },
+		Price { key: "kiloTriangle", value: Some(profile.kilo_triangle_ms), unit: "desktop CPU frame ms per 1,000 triangles drawn", basis: Basis::Estimated, source: "the same single reference-PC CPU ratio (estimated)" },
+		Price { key: "gpuToFrame", value: None, unit: "uncalibrated on desktop (GPU work reported in gpuUnits, not ms)", basis: Basis::Uncalibrated, source: "desktop GPU waits are not calibrated; compare gpuUnits directly" },
+		Price { key: "gpuUnit", value: None, unit: "uncalibrated on desktop (1.0 gpuUnit = 1 viewport of opaque Plastic)", basis: Basis::Uncalibrated, source: "desktop GPU ms is not calibrated; compare gpuUnits directly" },
+		Price { key: "weights", value: Some(1.0), unit: "relative per-pixel weights in gpuUnits (textured 1.4, neon 0.8, glass 1.2, sky 0.3, blended 1.6, alpha SurfaceAppearance 2.0, particle 1.3, light 0.25, sun shadow 0.2)", basis: Basis::Estimated, source: "relative shading work, not measured per shader" },
+		Price { key: "shadowRedraw", value: Some(super::attribute::SHADOW_REDRAW_SHARE), unit: "share of the casters' shadow triangles charged a frame", basis: Basis::Estimated, source: "Roblox caches shadow maps and redraws them as the camera moves" },
 	]
 }
 
 /// Calibration fidelity flags emitted in `analysis.json`.
 pub fn fidelity(preset: &Preset, pixels: bool) -> serde_json::Value {
+	let desktop = preset.uses_desktop_pricing();
 	let mut map = serde_json::Map::new();
 	map.insert("preset".into(), serde_json::json!(preset.name));
 	map.insert("phone".into(), serde_json::json!(preset.phone));
-	map.insert("status".into(), serde_json::json!(if preset.phone { "calibrated" } else { "partial" }));
-	map.insert("cpuCalibrated".into(), serde_json::json!(true));
-	map.insert("gpuCalibrated".into(), serde_json::json!(preset.phone));
+	map.insert("pricing".into(), serde_json::json!(if desktop { "desktop" } else { "phone" }));
+	map.insert("status".into(), serde_json::json!(if desktop { "partial" } else { "calibrated" }));
+	map.insert("cpuCalibrated".into(), serde_json::json!(!desktop));
+	map.insert("gpuCalibrated".into(), serde_json::json!(!desktop));
 	map.insert("pixelsCounted".into(), serde_json::json!(pixels));
-	map.insert("cpuBasis".into(), serde_json::json!(if preset.phone { "fitted" } else { "estimated" }));
-	map.insert("gpuBasis".into(), serde_json::json!(if preset.phone { "anchored" } else { "uncalibrated" }));
-	map.insert("msIncludesGpu".into(), serde_json::json!(preset.phone));
-	if !preset.phone {
+	map.insert("cpuBasis".into(), serde_json::json!(if desktop { "estimated" } else { "fitted" }));
+	map.insert("gpuBasis".into(), serde_json::json!(if desktop { "uncalibrated" } else { "anchored" }));
+	map.insert("msIncludesGpu".into(), serde_json::json!(!desktop));
+	if desktop {
+		map.insert(
+			"cpuEstimate".into(),
+			serde_json::json!({
+				"reason": "Desktop CPU ms applies one whole-frame main-thread ratio (1/2.224) from one reference PC against live phones to draw, part and triangle terms alike; it is an estimate for that reference PC, not players' desktops.",
+				"settleWith": "Per-term desktop knock-arm measurements (draws, parts, triangles) across target player desktop hardware.",
+			}),
+		);
 		map.insert(
 			"gpuRefusal".into(),
 			serde_json::json!({
-				"reason": "Desktop GPU milliseconds and GPU-to-frame wait conversion are uncalibrated; gpuMs is 0 and shading/overdraw work is reported in gpuUnits instead.",
+				"reason": "Desktop GPU milliseconds and GPU-to-frame wait conversion are uncalibrated; gpuMs is null and shading/overdraw work is reported in gpuUnits instead.",
 				"settleWith": "Paired desktop GPU MicroProfiler or GPU-capture timings across representative maps to fit ms per gpuUnit and GPU wait share.",
 			}),
 		);
@@ -282,11 +301,11 @@ pub fn unmodeled(preset: &Preset, quality: &Quality) -> Vec<serde_json::Value> {
 			"settleWith": "Device memory-pressure and streaming-budget benchmarks.",
 		}),
 	];
-	if !preset.phone {
+	if preset.uses_desktop_pricing() {
 		items.push(serde_json::json!({
 			"kind": "desktopGpuMs",
 			"scope": "gpu",
-			"reason": "Desktop GPU milliseconds and GPU-to-frame wait conversion are uncalibrated; gpuMs is 0 and shader/overdraw work is reported in gpuUnits instead.",
+			"reason": "Desktop GPU milliseconds and GPU-to-frame wait conversion are uncalibrated; gpuMs is null and shader/overdraw work is reported in gpuUnits instead.",
 			"settleWith": "Paired desktop GPU MicroProfiler or GPU-capture timings across representative maps to fit ms per gpuUnit and GPU wait share.",
 		}));
 	}
@@ -306,23 +325,32 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn desktop_preset_uses_scaled_cpu_prices_and_uncalibrated_gpu() {
+	fn desktop_preset_uses_scaled_cpu_prices_and_uncalibrated_gpu_while_custom_keeps_phone() {
 		let phone = Preset::named("phone").unwrap();
+		let custom = Preset::custom(1920, 1080, 21);
 		let desktop = Preset::named("desktop").unwrap();
 		let p_prof = Profile::for_preset(&phone);
+		let c_prof = Profile::for_preset(&custom);
 		let d_prof = Profile::for_preset(&desktop);
-		assert!(p_prof.gpu_ms_per_unit.is_some() && p_prof.gpu_to_frame.is_some());
-		assert!(d_prof.gpu_ms_per_unit.is_none() && d_prof.gpu_to_frame.is_none());
+		assert!(!p_prof.desktop && p_prof.gpu_ms_per_unit.is_some() && p_prof.gpu_to_frame.is_some());
+		assert!(!c_prof.desktop && c_prof.draw_ms == p_prof.draw_ms && c_prof.gpu_ms_per_unit == p_prof.gpu_ms_per_unit);
+		assert!(d_prof.desktop && d_prof.gpu_ms_per_unit.is_none() && d_prof.gpu_to_frame.is_none());
 		assert!((d_prof.draw_ms - DRAW_MS / DESKTOP_CPU_DIVISOR).abs() < 1e-12);
 		let d_table = table_for(&desktop);
 		assert!(d_table.iter().all(|p| !p.unit.to_ascii_lowercase().contains("phone")));
-		assert_eq!(d_table.iter().find(|p| p.key == "gpuUnit").unwrap().basis, Basis::Uncalibrated);
+		let gpu_unit = d_table.iter().find(|p| p.key == "gpuUnit").unwrap();
+		assert_eq!(gpu_unit.basis, Basis::Uncalibrated);
+		assert_eq!(gpu_unit.value, None);
+		assert_eq!(d_table.iter().find(|p| p.key == "gpuToFrame").unwrap().value, None);
 		let p_fid = fidelity(&phone, true);
+		let c_fid = fidelity(&custom, true);
 		let d_fid = fidelity(&desktop, true);
-		assert_eq!(p_fid["gpuCalibrated"], true);
-		assert_eq!(d_fid["gpuCalibrated"], false);
+		assert_eq!((p_fid["cpuCalibrated"].as_bool(), p_fid["gpuCalibrated"].as_bool()), (Some(true), Some(true)));
+		assert_eq!((c_fid["pricing"].as_str(), c_fid["gpuCalibrated"].as_bool()), (Some("phone"), Some(true)));
+		assert_eq!((d_fid["cpuCalibrated"].as_bool(), d_fid["cpuBasis"].as_str(), d_fid["gpuCalibrated"].as_bool()), (Some(false), Some("estimated"), Some(false)));
 		assert!(d_fid["gpuRefusal"]["settleWith"].is_string());
 		let d_unm = unmodeled(&desktop, &Quality::of(21, false));
 		assert!(d_unm.iter().any(|item| item["kind"] == "desktopGpuMs"));
+		assert!(!unmodeled(&custom, &Quality::of(21, false)).iter().any(|item| item["kind"] == "desktopGpuMs"));
 	}
 }

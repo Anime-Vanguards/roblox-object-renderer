@@ -37,7 +37,7 @@ ror cost Map.rbxm --paths 4 --check --profile    # Compare against Studio counte
 | `--full-detail` | Keep all meshes at LOD 0 (matching Studio's default `MeshPartDetailLevel`), while keeping distance/size culling active. |
 | `--check` | Load the scene into capture Studio (`ror studio open`, pass `--technology` to match) and print Studio's real counters beside `ror`'s estimates (`cost-check.json`). Requires a Studio MCP bridge ([parity.md](parity.md)). |
 | `--profile` | With `--check`, pull render-job CPU timings (`queryOcclusion`, render-thread wait, render-thread work) from Studio's MicroProfiler via LibMP. |
-| `--preset phone\|desktop`, `--edits`, `--look`, `--export`, `--explain`, `--budget`, `--heat` | Cost-loop flags for preset frame attribution (phone calibrated ms; desktop scaled CPU ms + uncalibrated `gpuUnits`), what-if edits, and Lune export; see [cost-loop.md](cost-loop.md). |
+| `--preset phone\|desktop`, `--edits`, `--look`, `--export`, `--explain`, `--budget`, `--heat` | Cost-loop flags for preset frame attribution (phone calibrated ms by default and on `--preset phone`; `--preset desktop` uses estimated reference-PC CPU ms + uncalibrated GPU refused as `null` with `gpuUnits`), what-if edits, and Lune export; see [cost-loop.md](cost-loop.md). Note: commit `871a83e` (2026-11-24 21:15) temporarily applied desktop CPU-only pricing (`gpuMs: 0`) to runs without `--preset`; the follow-up fix restored phone-frame pricing for runs without `--preset` and reports uncalibrated desktop GPU fields as `null`. |
 
 ## Output files
 

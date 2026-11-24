@@ -85,16 +85,20 @@ impl Inputs<'_> {
 		self.ids.id(referent).unwrap_or(super::attribute::SHARED).to_string()
 	}
 
+	fn empty_work(&self) -> Work {
+		Work::empty_for(self.profile)
+	}
+
 	/// The saving of taking away what `instances` cost (their attributed work) in each view.
 	fn saving_of(&self, instances: &HashSet<Ref>, keep_parts: bool) -> (Saving, Work) {
 		// summed in id order: the same run gives the same digits
 		let mut instances: Vec<Ref> = instances.iter().copied().collect();
 		instances.sort_by_key(|referent| self.id(*referent));
 		let mut saving = Saving::default();
-		let mut why = Work::default();
+		let mut why = self.empty_work();
 		let mut worst_gpu = (0.0, String::new());
 		for work in self.works {
-			let mut view = Work::default();
+			let mut view = self.empty_work();
 			for referent in &instances {
 				if let Some(entry) = work.by_instance.get(referent) {
 					view.add(entry);
@@ -179,7 +183,28 @@ pub fn find(inputs: &Inputs) -> Vec<Finding> {
 	found.extend(merges(inputs));
 	found.extend(shadows(inputs));
 	found.retain(|finding| finding.saving.mean_ms > 0.0 || finding.saving.mean_gpu_units > 0.0 || finding.kind == "lightReachesNothing");
-	found.sort_by(|a, b| b.saving.mean_ms.total_cmp(&a.saving.mean_ms).then_with(|| b.saving.mean_gpu_units.total_cmp(&a.saving.mean_gpu_units)).then_with(|| a.id.cmp(&b.id)));
+	if inputs.profile.gpu_ms_per_unit.is_some() {
+		found.sort_by(|a, b| b.saving.mean_ms.total_cmp(&a.saving.mean_ms).then_with(|| a.id.cmp(&b.id)));
+	} else {
+		// Desktop GPU ms is uncalibrated: rank by combined share of the view's mean CPU ms and
+		// mean gpuUnits so heavy GPU findings (fill, overdraw, local lights) are not hidden behind
+		// smaller CPU-only findings, without fabricating desktop GPU milliseconds.
+		let count = inputs.works.len().max(1) as f64;
+		let total_cpu: f64 = inputs.works.iter().map(|work| work.total.cpu_ms).sum::<f64>() / count;
+		let total_gpu: f64 = inputs.works.iter().map(|work| work.total.gpu_units).sum::<f64>() / count;
+		let share = |finding: &Finding| -> f64 {
+			let cpu = if total_cpu > 1e-6 { finding.saving.mean_ms / total_cpu } else { 0.0 };
+			let gpu = if total_gpu > 1e-6 { finding.saving.mean_gpu_units / total_gpu } else { 0.0 };
+			cpu + gpu
+		};
+		found.sort_by(|a, b| {
+			share(b)
+				.total_cmp(&share(a))
+				.then_with(|| b.saving.mean_ms.total_cmp(&a.saving.mean_ms))
+				.then_with(|| b.saving.mean_gpu_units.total_cmp(&a.saving.mean_gpu_units))
+				.then_with(|| a.id.cmp(&b.id))
+		});
+	}
 	found.truncate(KEPT);
 	for (rank, finding) in found.iter_mut().enumerate() {
 		finding.rank = rank + 1;
@@ -347,10 +372,10 @@ fn see_through(inputs: &Inputs) -> Vec<Finding> {
 			look: "changes",
 			basis: "attribution",
 			note: Some(
-				if inputs.profile.phone {
+				if !inputs.profile.desktop {
 					"blended layers are GPU work: on phones the frame pays it through the GPU waits (estimated weights)"
 				} else {
-					"blended layers are GPU work: desktop GPU ms is uncalibrated, so compare gpuUnits (estimated weights)"
+					"blended layers are GPU work: desktop GPU ms is uncalibrated (gpuMs = null), so compare gpuUnits (estimated weights)"
 				}
 				.into(),
 			),
@@ -431,10 +456,10 @@ fn emitters(inputs: &Inputs) -> Vec<Finding> {
 			look: "changes",
 			basis: "attribution",
 			note: Some(
-				if inputs.profile.phone {
+				if !inputs.profile.desktop {
 					"particle fill is GPU work, priced through the waits (estimated weights)"
 				} else {
-					"particle fill is GPU work: desktop GPU ms is uncalibrated, so compare gpuUnits (estimated weights)"
+					"particle fill is GPU work: desktop GPU ms is uncalibrated (gpuMs = null), so compare gpuUnits (estimated weights)"
 				}
 				.into(),
 			),
@@ -471,7 +496,7 @@ fn lights(inputs: &Inputs) -> Vec<Finding> {
 				edit: Edit::Set { targets: vec![id], classes: Vec::new(), properties: [("Enabled".to_string(), json!(false))].into_iter().collect() },
 				look: "changes",
 				basis: "attribution",
-				note: (!inputs.profile.phone).then(|| "per-pixel local light shading is GPU work: desktop GPU ms is uncalibrated, so compare gpuUnits (estimated weights)".into()),
+				note: inputs.profile.desktop.then(|| "per-pixel local light shading is GPU work: desktop GPU ms is uncalibrated (gpuMs = null), so compare gpuUnits (estimated weights)".into()),
 			});
 		}
 	}
@@ -485,7 +510,7 @@ fn lights(inputs: &Inputs) -> Vec<Finding> {
 			title: format!("{} local lights reach no pixel any of the {} views shows: disable them", dark.len(), inputs.works.len()),
 			targets: listed(&dark),
 			target_count: dark.len(),
-			why: Work::default(),
+			why: inputs.empty_work(),
 			saving: Saving::default(),
 			edit: Edit::Set { targets: dark, classes: Vec::new(), properties: [("Enabled".to_string(), json!(false))].into_iter().collect() },
 			look: "unseen",
@@ -547,7 +572,7 @@ fn appearances(inputs: &Inputs) -> Vec<Finding> {
 			title: format!("{name}: copies in {} appearances draw a batch each; {} copies taking {}'s ({}) join one batch", by_appearance.len(), targets.len(), from, analysis.labels[main as usize]),
 			targets: listed(&targets),
 			target_count: targets.len(),
-			why: Work::default(),
+			why: inputs.empty_work(),
 			saving,
 			edit: Edit::Appearance { targets, classes: Vec::new(), from },
 			look: "changes",
@@ -609,7 +634,7 @@ fn duplicate_meshes(inputs: &Inputs) -> Vec<Finding> {
 			title: format!("one mesh uploaded as {} assets: {} copies taking {uri} join its batches", geometries.len(), targets.len()),
 			targets: listed(&targets),
 			target_count: targets.len(),
-			why: Work::default(),
+			why: inputs.empty_work(),
 			saving,
 			edit: Edit::Set { targets, classes: Vec::new(), properties: [("MeshId".to_string(), json!(uri))].into_iter().collect() },
 			look: "none",
@@ -656,7 +681,7 @@ fn levels_of_detail(inputs: &Inputs) -> Vec<Finding> {
 			title: format!("{mesh}: RenderFidelity Performance draws its lower levels from 250 studs ({:.0} triangles fewer per view, {:.1} draws more)", saving.mean_triangles, -saving.mean_draws),
 			targets: vec![format!("mesh:{id}")],
 			target_count: 1,
-			why: Work::default(),
+			why: inputs.empty_work(),
 			saving,
 			edit: Edit::Set { targets: vec![format!("mesh:{id}")], classes: vec!["MeshPart".into()], properties: [("RenderFidelity".to_string(), json!("Performance"))].into_iter().collect() },
 			look: "changes",
@@ -752,7 +777,7 @@ fn merges(inputs: &Inputs) -> Vec<Finding> {
 			title: format!("{} parts of {} meshes under {parent} share one appearance ({}) and no copy elsewhere: one mesh of them draws once", targets.len(), labels.len(), analysis.labels[appearance as usize]),
 			targets: listed(&targets),
 			target_count: targets.len(),
-			why: Work::default(),
+			why: inputs.empty_work(),
 			saving,
 			edit: Edit::Merge { name: format!("merge {parent}"), targets },
 			look: "none",
@@ -812,7 +837,7 @@ fn shadows(inputs: &Inputs) -> Vec<Finding> {
 		look: "changes",
 		basis: "attribution",
 		note: Some(
-			if inputs.profile.phone {
+			if !inputs.profile.desktop {
 				"only where the quality draws sun shadows (none on phones below quality 4)"
 			} else {
 				"only where the quality draws sun shadows (quality 12 and up)"

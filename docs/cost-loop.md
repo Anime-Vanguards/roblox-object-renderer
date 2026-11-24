@@ -51,7 +51,7 @@ Note: `--grid STUDS` only generates top-down maps ([cost.md](cost.md)) and does 
 
 - `--preset phone`: 2532 x 1170 px (844 x 390 pt at 3x) at Studio edit graphics quality **2** (300-stud culling horizon; pass `--client-quality 2` for the Roblox client 10-bar slider bar 2, which maps to engine quality 4 / 450 studs with shadows and bloom still off).
 - `--preset desktop`: 1920 x 1080 px at graphics quality **21**.
-- Without `--preset`, `ror` uses `--size` and `--quality` (or `--client-quality <1-10>`). `analysis.json` records `quality.scale` (`"edit"` or `"client"`), `quality.clientLevel` (when client-scale), and `quality.viewDistance`.
+- Without `--preset`, `ror` uses `--size` and `--quality` (or `--client-quality <1-10>`) and prices the frame with the calibrated phone model (the same default as before `871a83e`, so baselines and GPU-led finding rankings stay unchanged unless `--preset desktop` is asked for). `analysis.json` records `quality.scale` (`"edit"` or `"client"`), `quality.clientLevel` (when client-scale), and `quality.viewDistance`.
 
 What Roblox renders at each graphics quality level under `Future` lighting (measured in Studio):
 
@@ -65,7 +65,7 @@ What Roblox renders at each graphics quality level under `Future` lighting (meas
 
 The cost model enables sun shadows at quality 12+, per-pixel local lights at 16+, and bloom at 6+. It also applies quality-based view distance culling (300 studs at quality 1–3) and small-part culling ([cost.md](cost.md)), and caps phone particle emission at an estimated 100 particles/s per emitter.
 
-`--preset desktop` (and custom presets without `--preset phone`) scales CPU prices by `1 / 2.224` (paired desktop main-thread ratio) and refuses to fabricate desktop GPU milliseconds (`gpuMs: 0`, `fidelity.gpuCalibrated: false`), reporting shader and overdraw work in `gpuUnits` instead. `analysis.json` includes `fidelity` and `unmodeled` sections on every preset so callers know which costs are calibrated versus unmodeled and what measurement settles each gap.
+Only `--preset desktop` applies desktop pricing: it estimates CPU prices by scaling the phone fit by one reference-PC main-thread ratio (`1 / 2.224`, `fidelity.cpuCalibrated: false`, `fidelity.cpuBasis: "estimated"`), refuses desktop GPU milliseconds (`gpuMs: null`, `prices` `gpuUnit`/`gpuToFrame` `value: null`, `fidelity.gpuCalibrated: false`), reports shader and overdraw work in `gpuUnits`, and ranks findings by combined CPU + `gpuUnits` share so GPU findings are not hidden behind smaller CPU savings. `analysis.json` includes `fidelity` and `unmodeled` sections on every preset so callers know which costs are calibrated versus unmodeled and what measurement settles each gap.
 
 ## Cost attribution
 
