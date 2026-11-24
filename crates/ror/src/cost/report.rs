@@ -143,9 +143,9 @@ pub fn opportunities(analysis: &Analysis, batches: &[Batch]) -> Vec<Opportunity>
 		let saves = (appearances.len() as u64 - 1) * each;
 		let instances: u64 = appearances.values().sum();
 		let mut ranked: Vec<(&str, u64)> = appearances.into_iter().collect();
-		ranked.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+		ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
 		let mut parts: Vec<&&Batch> = group.iter().collect();
-		parts.sort_by_key(|batch| std::cmp::Reverse(batch.instances));
+		parts.sort_by(|a, b| b.instances.cmp(&a.instances).then_with(|| a.label.cmp(&b.label)));
 		let name = &analysis.labels[*geometry as usize];
 		let called = named(parts[0]);
 		found.push(Opportunity {
@@ -240,7 +240,7 @@ pub fn opportunities(analysis: &Analysis, batches: &[Batch]) -> Vec<Opportunity>
 	}
 
 	// emitters under one parent with one texture could be one emitter
-	let mut emitters: HashMap<(String, String), Vec<&Batch>> = HashMap::new();
+	let mut emitters: BTreeMap<(String, String), Vec<&Batch>> = BTreeMap::new();
 	for batch in batches.iter().filter(|batch| batch.kind == Kind::Emitter) {
 		let path = &analysis.items[batch.items[0]].path;
 		let parent = path.rsplit_once('.').map(|(parent, _)| parent.to_string()).unwrap_or_default();
@@ -250,7 +250,7 @@ pub fn opportunities(analysis: &Analysis, batches: &[Batch]) -> Vec<Opportunity>
 	let emitter_count = batches.iter().filter(|batch| batch.kind == Kind::Emitter).count() as u64;
 	if emitter_count > 0 {
 		let mut crowded: Vec<_> = crowded.into_iter().map(|((parent, _), group)| (parent.clone(), group.len())).collect();
-		crowded.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+		crowded.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 		found.push(Opportunity {
 			id: "emitters".into(),
 			kind: "emitters",
@@ -343,7 +343,7 @@ pub fn opportunities(analysis: &Analysis, batches: &[Batch]) -> Vec<Opportunity>
 	}
 
 	// one mesh at several levels of detail: a batch per level
-	let mut levels: HashMap<&str, (u64, u64)> = HashMap::new();
+	let mut levels: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
 	for batch in batches.iter().filter(|batch| batch.kind == Kind::Part && !batch.sorted) {
 		let entry = levels.entry(batch.label.as_str()).or_default();
 		entry.0 += 1;
@@ -364,7 +364,7 @@ pub fn opportunities(analysis: &Analysis, batches: &[Batch]) -> Vec<Opportunity>
 
 	// the heaviest batches by triangles
 	let mut heavy: Vec<&Batch> = batches.iter().filter(|batch| batch.kind == Kind::Part && batch.triangles >= 50_000).collect();
-	heavy.sort_by_key(|batch| std::cmp::Reverse(batch.triangles));
+	heavy.sort_by(|a, b| b.triangles.cmp(&a.triangles).then_with(|| a.label.cmp(&b.label)));
 	for batch in heavy.into_iter().take(5) {
 		let first = item(batch);
 		let per = first.triangles[0];
@@ -387,7 +387,7 @@ pub fn opportunities(analysis: &Analysis, batches: &[Batch]) -> Vec<Opportunity>
 		});
 	}
 
-	found.sort_by(|a, b| b.saves.weight().total_cmp(&a.saves.weight()));
+	found.sort_by(|a, b| b.saves.weight().total_cmp(&a.saves.weight()).then_with(|| a.id.cmp(&b.id)));
 	found
 }
 
@@ -421,7 +421,7 @@ pub fn summarize(views: &[ViewCost]) -> Vec<Summary> {
 	}
 	let mut summaries: Vec<Summary> = by_id.into_values().collect();
 	let weight = |summary: &Summary| summary.mean_draws + summary.mean_triangles / super::TRIANGLES_PER_DRAW;
-	summaries.sort_by(|a, b| weight(b).total_cmp(&weight(a)));
+	summaries.sort_by(|a, b| weight(b).total_cmp(&weight(a)).then_with(|| a.id.cmp(&b.id)));
 	summaries
 }
 
@@ -521,7 +521,7 @@ pub fn lines(report: &CostReport) -> Vec<String> {
 			}
 		}
 		let mut by_emitter: Vec<(&str, (f64, f64))> = by_emitter.into_iter().filter(|(_, (fill, _))| *fill >= 0.01).collect();
-		by_emitter.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+		by_emitter.sort_by(|a, b| b.1.0.total_cmp(&a.1.0).then_with(|| a.0.cmp(b.0)));
 		if !by_emitter.is_empty() {
 			lines.push(format!("  fullest emitters (views covered{}, particles):", if report.views.len() > 1 { " per view on average" } else { "" }));
 			for (path, (fill, particles)) in by_emitter.iter().take(10) {
@@ -539,7 +539,7 @@ pub fn lines(report: &CostReport) -> Vec<String> {
 		}
 	}
 	let mut kinds: Vec<(&str, (f64, f64))> = kinds.into_iter().collect();
-	kinds.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+	kinds.sort_by(|a, b| b.1.0.total_cmp(&a.1.0).then_with(|| a.0.cmp(b.0)));
 	let parts: Vec<String> = kinds
 		.iter()
 		.filter(|(_, (draws, _))| *draws >= 0.5)
@@ -601,7 +601,7 @@ fn level_lines(report: &CostReport) -> Vec<String> {
 	}
 	let net = |(triangles, batches, _): (f64, f64, bool)| triangles - batches * super::TRIANGLES_PER_DRAW;
 	let mut pays: Vec<(&str, (f64, f64, bool))> = by_mesh.iter().map(|(mesh, value)| (*mesh, *value)).filter(|(_, value)| net(*value) > 1000.0).collect();
-	pays.sort_by(|a, b| net(b.1).total_cmp(&net(a.1)));
+	pays.sort_by(|a, b| net(b.1).total_cmp(&net(a.1)).then_with(|| a.0.cmp(b.0)));
 	let costs = by_mesh.values().filter(|value| net(**value) <= 0.0 && value.1 > 0.0).count();
 	let mut lines = vec![format!(
 		"levels of detail: {} meshes in view are not at RenderFidelity Performance (only it steps down a mesh's whole level-of-detail chain: full detail to 250 studs from the camera to the part's box at a 70-degree field of view, then the next levels past 500, 2,000 and 3,000; Automatic only its high-quality levels); Performance pays on {}{}",
@@ -746,4 +746,62 @@ fn occlusion_lines(report: &CostReport) -> Vec<String> {
 		}
 	}
 	lines
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::render::camera::CameraSpec;
+	use crate::scene::build::{ModelBuilder, PartSpec};
+	use glam::{Affine3A, Vec3};
+	use rbx_dom_weak::InstanceBuilder;
+	use rbx_dom_weak::types::NumberRange;
+
+	#[test]
+	fn opportunities_order_is_deterministic_on_tied_emitters() {
+		let mut model = ModelBuilder::new("Root");
+		for (index, folder_name) in ["Delta", "Beta", "Alpha", "Gamma"].iter().enumerate() {
+			let folder = model.child(model.model, InstanceBuilder::new("Folder").with_name(*folder_name));
+			let host = model.part(&PartSpec {
+				name: format!("Host{index}"),
+				cframe: Affine3A::from_translation(Vec3::new(index as f32 * 6.0 - 9.0, 2.0, 0.0)),
+				size: Vec3::splat(2.0),
+				..Default::default()
+			});
+			model.dom.transfer_within(host, folder);
+			for j in 0..3 {
+				model.child(
+					host,
+					InstanceBuilder::new("ParticleEmitter")
+						.with_name(format!("E{j}"))
+						.with_property("Rate", 15.0f32)
+						.with_property("Lifetime", NumberRange::new(1.0, 1.0))
+						.with_property("Enabled", true),
+				);
+			}
+		}
+		let document = model.into_document();
+		let scene = crate::scene::extract::extract(&document);
+		let state = std::env::temp_dir().join(format!("ror-report-det-test-{}", std::process::id()));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let options = super::super::CostOptions::default();
+		let analysis = Analysis::new(&scene, &document, &assets, &options);
+		let camera = CameraSpec::LookAt { eye: [0.0, 12.0, 30.0], target: [0.0, 2.0, 0.0], fov: 70.0 }.place(None, 1644, 1116);
+		let view = analysis.view("test", &camera, 1644.0 / 1116.0, &options);
+		let emitters = view.opportunities.iter().find(|o| o.kind == "emitters").expect("emitters opportunity");
+		assert_eq!(
+			emitters.detail,
+			vec![
+				"3 emitters under Root.Alpha.Host2",
+				"3 emitters under Root.Beta.Host1",
+				"3 emitters under Root.Delta.Host0",
+				"3 emitters under Root.Gamma.Host3",
+			]
+		);
+		let baseline = serde_json::to_string(&view.opportunities).unwrap();
+		for _ in 0..8 {
+			assert_eq!(serde_json::to_string(&opportunities(&analysis, &view.batches)).unwrap(), baseline);
+		}
+		let _ = std::fs::remove_dir_all(&state);
+	}
 }

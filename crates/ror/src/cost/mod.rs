@@ -1635,7 +1635,7 @@ impl Analysis {
 				Kind::NameTag => {}
 			}
 		}
-		fills.sort_by(|a, b| b.fill.total_cmp(&a.fill));
+		fills.sort_by(|a, b| b.fill.total_cmp(&a.fill).then_with(|| a.path.cmp(&b.path)));
 		if !options.all_emitters {
 			fills.truncate(FULLEST);
 		}
@@ -1720,7 +1720,7 @@ impl Analysis {
 		if fixed > 0 {
 			breakdown.insert("sky, clouds and shared passes", (fixed, 0));
 		}
-		batches.sort_by(|a, b| b.weight().total_cmp(&a.weight()));
+		batches.sort_by(|a, b| b.weight().total_cmp(&a.weight()).then_with(|| a.label.cmp(&b.label)).then_with(|| a.pass.cmp(&b.pass)).then_with(|| a.kind.cmp(&b.kind)));
 		occlusion.hidden = culled.occluded;
 		if options.no_occlusion {
 			occlusion.tested = 0;
@@ -1741,7 +1741,7 @@ impl Analysis {
 			}
 			let least = MISSED_MIN_SHARE * cull::BUFFER_WIDTH as f32 * cull::BUFFER_WIDTH as f32 / aspect.max(0.01);
 			missed.retain(|entry| entry.0 >= least);
-			missed.sort_by(|a, b| b.0.total_cmp(&a.0));
+			missed.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.5.cmp(b.5)));
 			for (pixels, _, cframe, size, reason, path) in missed.into_iter().take(MISSED_PER_VIEW) {
 				let mut trial = culler.clone();
 				for triangle in cull::block_triangles(cframe, size) {
@@ -1760,7 +1760,7 @@ impl Analysis {
 					occlusion.missed.push(entry);
 				}
 			}
-			occlusion.missed.sort_by(|a, b| b.would_hide.cmp(&a.would_hide));
+			occlusion.missed.sort_by(|a, b| b.would_hide.cmp(&a.would_hide).then_with(|| a.path.cmp(&b.path)));
 			let mut groups: Vec<TestedGroup> = tested_groups.into_iter().map(|(group, (tested, hidden))| TestedGroup { group: group.to_string(), tested, hidden }).collect();
 			groups.sort_by(|a, b| b.tested.cmp(&a.tested).then(a.group.cmp(&b.group)));
 			groups.truncate(12);

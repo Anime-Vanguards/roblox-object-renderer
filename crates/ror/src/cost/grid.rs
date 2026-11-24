@@ -171,11 +171,11 @@ pub fn lines(cells: &[Cell], spacing: f32, area: &str) -> Vec<String> {
 		triangles_high / 1000.0
 	));
 	let mut by_draws: Vec<&Cell> = cells.iter().collect();
-	by_draws.sort_by(|a, b| b.draws.total_cmp(&a.draws));
+	by_draws.sort_by(|a, b| b.draws.total_cmp(&a.draws).then_with(|| a.center[0].total_cmp(&b.center[0])).then_with(|| a.center[2].total_cmp(&b.center[2])));
 	let list: Vec<String> = by_draws.iter().take(5).map(|cell| format!("({:.0}, {:.0}) {:.0} draws (worst {} {})", cell.center[0], cell.center[2], cell.draws, cell.worst_view, cell.worst_draws)).collect();
 	lines.push(format!("  costliest cells by draws: {}", list.join(", ")));
 	let mut by_occlusion: Vec<&Cell> = cells.iter().collect();
-	by_occlusion.sort_by(|a, b| b.occlusion_ms.total_cmp(&a.occlusion_ms));
+	by_occlusion.sort_by(|a, b| b.occlusion_ms.total_cmp(&a.occlusion_ms).then_with(|| a.center[0].total_cmp(&b.center[0])).then_with(|| a.center[2].total_cmp(&b.center[2])));
 	let list: Vec<String> = by_occlusion.iter().take(5).map(|cell| format!("({:.0}, {:.0}) ~{:.2} ms, {:.0} tested", cell.center[0], cell.center[2], cell.occlusion_ms, cell.tested)).collect();
 	lines.push(format!("  most occlusion work: {}", list.join(", ")));
 	lines
