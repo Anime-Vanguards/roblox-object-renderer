@@ -32,7 +32,8 @@ ror cost Map.rbxm --paths 4 --check --profile    # Compare against Studio counte
 | `--top N` | Number of top batches, occluders, missed occluders, and tested groups included in `summary.json` (default: 24; `cost.json` always contains all). |
 | `--items` | Write `items.json`: every drawable item (path, part index, mesh, pass, triangles per LOD, bounds) and per-view draw/LOD/occlusion status. |
 | `--technology TECH` | Override `Lighting.Technology` (affects transparent Glass and character costs). |
-| `--quality N` / `--lod roblox:N` | Set Roblox graphics quality level (1–21, default 21), affecting LODs and distance/size culling. With `--check`, forces capture Studio to count with distance-based LODs instead of full detail. |
+| `--quality N` / `--lod roblox:N` | Set Roblox Studio edit graphics quality level (1–21, default 21), affecting LODs and distance/size culling. With `--check`, forces capture Studio to count with distance-based LODs instead of full detail. |
+| `--client-quality N` / `--lod client:N` | Set the Roblox client 10-bar graphics slider (`SavedQualityLevel` 1–10), mapped to engine levels `[1, 4, 6, 8, 10, 12, 14, 16, 18, 21]` (bar 1 = 300 studs, bar 2 = engine 4 / 450 studs without shadows or bloom). `analysis.json` records `quality.scale`, `quality.clientLevel`, and `quality.viewDistance`. |
 | `--full-detail` | Keep all meshes at LOD 0 (matching Studio's default `MeshPartDetailLevel`), while keeping distance/size culling active. |
 | `--check` | Load the scene into capture Studio (`ror studio open`, pass `--technology` to match) and print Studio's real counters beside `ror`'s estimates (`cost-check.json`). Requires a Studio MCP bridge ([parity.md](parity.md)). |
 | `--profile` | With `--check`, pull render-job CPU timings (`queryOcclusion`, render-thread wait, render-thread work) from Studio's MicroProfiler via LibMP. |

@@ -35,6 +35,27 @@ pub const LEVEL_DISTANCES: [f32; 4] = [250.0, 500.0, 2000.0, 3000.0];
 /// it at run time (l12: 8,192 triangles drawn as 4,016, 1,962, 812, 394).
 pub const RUNTIME_LEVELS: [f32; 5] = [1.0, 4016.0 / 8192.0, 1962.0 / 8192.0, 812.0 / 8192.0, 394.0 / 8192.0];
 
+/// Roblox client 10-bar `SavedQualityLevel` (bars 1–10) mapped to engine `EditQualityLevel` (1–21).
+/// Bar 1 maps to engine 1 (300 studs), bar 2 to engine 4 (450 studs, below the shadow/bloom switches),
+/// through bar 10 = engine 21.
+pub const CLIENT_TO_ENGINE_QUALITY: [u32; 10] = [1, 4, 6, 8, 10, 12, 14, 16, 18, 21];
+
+/// Maps a Roblox client graphics slider bar (1–10) to the engine quality level (1–21).
+pub fn client_to_engine_quality(bar: u32) -> u32 {
+	CLIENT_TO_ENGINE_QUALITY[(bar.clamp(1, 10) - 1) as usize]
+}
+
+/// If `text` specifies a client-scale `--lod` (`client` or `client:<1-10>`), returns the slider bar.
+pub fn parse_client_bar(text: &str) -> Option<u32> {
+	let text = text.trim();
+	let (model, bar) = text.split_once(':').unwrap_or((text, "10"));
+	if !model.eq_ignore_ascii_case("client") {
+		return None;
+	}
+	let bar: u32 = bar.trim().parse().ok()?;
+	(1..=10).contains(&bar).then_some(bar)
+}
+
 /// Draw what Roblox draws at a graphics quality level (1-21): each mesh's level of detail for the
 /// view's camera, and (`cull`) none of the parts the quality's view distance and size cull leave out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,21 +73,37 @@ impl Default for Lod {
 }
 
 impl Lod {
-	/// `roblox` (quality 21), `roblox:<quality>`, or `levels` (the levels alone, nothing culled).
+	/// `roblox` (quality 21), `roblox:<quality 1-21>`, `client` (bar 10), `client:<bar 1-10>`, or
+	/// `levels` (the levels alone, nothing culled).
 	pub fn parse(text: &str) -> anyhow::Result<Self> {
 		let text = text.trim();
 		if text.eq_ignore_ascii_case("levels") {
 			return Ok(Self { quality: 21, cull: false });
 		}
-		let (model, quality) = text.split_once(':').unwrap_or((text, "21"));
-		if !model.eq_ignore_ascii_case("roblox") {
-			anyhow::bail!("--lod takes roblox, roblox:<quality 1-21> or levels (got {text:?})");
+		if let Some((model, value)) = text.split_once(':') {
+			if model.eq_ignore_ascii_case("client") {
+				let bar: u32 = value.trim().parse().map_err(|_| anyhow::anyhow!("--lod client:<bar>: {value:?} is not a client quality bar 1-10"))?;
+				if !(1..=10).contains(&bar) {
+					anyhow::bail!("--lod client:<bar>: client quality bars are 1-10 (got {bar})");
+				}
+				return Ok(Self { quality: client_to_engine_quality(bar), cull: true });
+			}
+			if !model.eq_ignore_ascii_case("roblox") {
+				anyhow::bail!("--lod takes roblox, roblox:<quality 1-21>, client:<bar 1-10> or levels (got {text:?})");
+			}
+			let quality: u32 = value.trim().parse().map_err(|_| anyhow::anyhow!("--lod roblox:<quality>: {value:?} is not a quality level 1-21"))?;
+			if !(1..=21).contains(&quality) {
+				anyhow::bail!("--lod roblox:<quality>: quality levels are 1-21 (got {quality})");
+			}
+			return Ok(Self { quality, cull: true });
 		}
-		let quality: u32 = quality.trim().parse().map_err(|_| anyhow::anyhow!("--lod roblox:<quality>: {quality:?} is not a quality level 1-21"))?;
-		if !(1..=21).contains(&quality) {
-			anyhow::bail!("--lod roblox:<quality>: quality levels are 1-21 (got {quality})");
+		if text.eq_ignore_ascii_case("client") {
+			return Ok(Self { quality: client_to_engine_quality(10), cull: true });
 		}
-		Ok(Self { quality, cull: true })
+		if text.eq_ignore_ascii_case("roblox") {
+			return Ok(Self { quality: 21, cull: true });
+		}
+		anyhow::bail!("--lod takes roblox, roblox:<quality 1-21>, client:<bar 1-10> or levels (got {text:?})")
 	}
 
 	/// Beyond this distance from the camera to a part's box, the quality draws nothing (l10, l16).
@@ -211,8 +248,15 @@ mod tests {
 	fn parses_the_option() {
 		assert_eq!(Lod::parse("roblox").unwrap(), Lod { quality: 21, cull: true });
 		assert_eq!(Lod::parse("roblox:4").unwrap(), Lod { quality: 4, cull: true });
+		assert_eq!(Lod::parse("client").unwrap(), Lod { quality: 21, cull: true });
+		assert_eq!(Lod::parse("client:1").unwrap(), Lod { quality: 1, cull: true });
+		assert_eq!(Lod::parse("client:2").unwrap(), Lod { quality: 4, cull: true });
 		assert_eq!(Lod::parse("levels").unwrap(), Lod { quality: 21, cull: false });
+		assert_eq!(parse_client_bar("client:2"), Some(2));
+		assert_eq!(parse_client_bar("roblox:4"), None);
 		assert!(Lod::parse("roblox:22").is_err());
+		assert!(Lod::parse("client:0").is_err());
+		assert!(Lod::parse("client:11").is_err());
 		assert!(Lod::parse("studio").is_err());
 	}
 }

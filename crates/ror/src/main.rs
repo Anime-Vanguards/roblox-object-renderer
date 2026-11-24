@@ -143,19 +143,22 @@ struct CostArgs {
 	/// Count for this Lighting.Technology instead of the scene's (transparent Glass depends on it)
 	#[arg(long, value_parser = ["legacy", "voxel", "compatibility", "shadowmap", "future", "unified"])]
 	technology: Option<String>,
-	/// Graphics quality level 1-21 (default 21)
+	/// Graphics quality level 1-21 (Studio edit scale, default 21)
 	#[arg(long)]
 	quality: Option<u32>,
+	/// Client graphics slider level 1-10 (SavedQualityLevel bars mapped to engine 1-21: bar 1 -> 1 / 300 studs, bar 2 -> 4 / 450 studs, ..., bar 10 -> 21)
+	#[arg(long, value_name = "1-10", conflicts_with_all = ["quality", "lod"])]
+	client_quality: Option<u32>,
 	/// Frustum culling only (no occlusion culling)
 	#[arg(long)]
 	no_occlusion: bool,
 	/// Every mesh at full detail, as Studio draws by default
 	#[arg(long)]
 	full_detail: bool,
-	/// Count at a graphics quality as a game draws (roblox or roblox:<1-21>, as render --lod): sets
-	/// --quality, and with --check has the capture Studio count at the levels of detail too (its
+	/// Count at a graphics quality as a game draws (roblox[:1-21] or client[:1-10], as render --lod):
+	/// sets --quality, and with --check has the capture Studio count at the levels of detail too (its
 	/// MeshPartDetailLevel DistanceBased and edit quality set while it measures), not at full detail
-	#[arg(long, value_name = "roblox[:QUALITY]", conflicts_with_all = ["full_detail", "quality"])]
+	#[arg(long, value_name = "roblox[:QUALITY]|client[:1-10]", conflicts_with_all = ["full_detail", "quality", "client_quality"])]
 	lod: Option<String>,
 	/// Numbers only: no draws.png and heat.png
 	#[arg(long)]
@@ -1717,7 +1720,13 @@ fn cost(mut args: CostArgs) -> Result<()> {
 		}
 	}
 	let technology = args.technology.as_deref().map(|name| ["legacy", "voxel", "compatibility", "shadowmap", "future", "unified"].iter().position(|item| *item == name).unwrap_or(5) as u32);
+	if let Some(bar) = args.client_quality
+		&& !(1..=10).contains(&bar)
+	{
+		bail!("--client-quality takes a client graphics slider bar 1-10 (got {bar})");
+	}
 	let lod = args.lod.as_deref().map(ror::lod::Lod::parse).transpose()?;
+	let client_quality = args.client_quality.or_else(|| args.lod.as_deref().and_then(ror::lod::parse_client_bar));
 	let playback = playback_args(&TimelineArgs { playback: args.playback.as_deref(), time: args.time, emit: &args.emit, enable: &[], disable: &[], changes: None })?;
 	let out = match args.out.clone() {
 		Some(out) => out,
@@ -1740,7 +1749,8 @@ fn cost(mut args: CostArgs) -> Result<()> {
 		map: None,
 		cost: Some(ror::cost::CostOptions {
 			technology,
-			quality: lod.map(|lod| lod.quality).or(args.quality).or(preset.as_ref().map(|preset| preset.quality)),
+			quality: client_quality.map(ror::lod::client_to_engine_quality).or(lod.map(|lod| lod.quality)).or(args.quality).or(preset.as_ref().map(|preset| preset.quality)),
+			client_quality,
 			no_occlusion: args.no_occlusion,
 			// the capture Studio draws every mesh at full detail (its MeshPartDetailLevel setting)
 			// unless told to count as a game does

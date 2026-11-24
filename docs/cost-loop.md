@@ -49,9 +49,9 @@ Note: `--grid STUDS` only generates top-down maps ([cost.md](cost.md)) and does 
 
 ## Target presets
 
-- `--preset phone`: 2532 x 1170 px (844 x 390 pt at 3x) at graphics quality **2**.
+- `--preset phone`: 2532 x 1170 px (844 x 390 pt at 3x) at Studio edit graphics quality **2** (300-stud culling horizon; pass `--client-quality 2` for the Roblox client 10-bar slider bar 2, which maps to engine quality 4 / 450 studs with shadows and bloom still off).
 - `--preset desktop`: 1920 x 1080 px at graphics quality **21**.
-- Without `--preset`, `ror` uses `--size` and `--quality`.
+- Without `--preset`, `ror` uses `--size` and `--quality` (or `--client-quality <1-10>`). `analysis.json` records `quality.scale` (`"edit"` or `"client"`), `quality.clientLevel` (when client-scale), and `quality.viewDistance`.
 
 What Roblox renders at each graphics quality level under `Future` lighting (measured in Studio):
 

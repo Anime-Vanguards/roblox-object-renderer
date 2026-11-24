@@ -142,6 +142,10 @@ pub struct CostOptions {
 	pub technology: Option<u32>,
 	/// Graphics quality level 1-21 (21 when absent: Studio's edit quality, where most was measured).
 	pub quality: Option<u32>,
+	/// Client graphics slider bar 1-10 (`SavedQualityLevel`), mapped to engine quality 1-21 via
+	/// [`crate::lod::client_to_engine_quality`] (bar 2 -> engine 4, 450 studs).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub client_quality: Option<u32>,
 	/// Frustum culling only.
 	pub no_occlusion: bool,
 	/// Every mesh at full detail, as Studio draws by default (its MeshPartDetailLevel setting);
@@ -212,8 +216,12 @@ pub struct CostOptions {
 }
 
 impl CostOptions {
-	fn quality(&self) -> u32 {
-		self.quality.unwrap_or(21).clamp(1, 21)
+	pub(crate) fn quality(&self) -> u32 {
+		if let Some(bar) = self.client_quality {
+			crate::lod::client_to_engine_quality(bar)
+		} else {
+			self.quality.unwrap_or(21).clamp(1, 21)
+		}
 	}
 }
 
@@ -1894,7 +1902,7 @@ pub fn run(
 	// the cost loop: its own costing of every view (attributed, with pixels), the report's from it
 	let (analysis, costs, agent_lines, over_budget) = if options.attribute && options.grid.is_none() {
 		let preset = agent::preset_of(options, shots)?;
-		let quality = prices::Quality::of(options.quality(), preset.phone);
+		let quality = prices::Quality::of_scale(options.quality(), options.client_quality, preset.phone);
 		let setup = agent::Setup { renderer, options, names: views.iter().map(|view| view.name.clone()).collect(), shots, preset, quality, gpu, lent_lighting: lent.0, lent_materials: lent.1 };
 		let (costed, lines) = agent::run(&setup, scene, document, reload, out, input)?;
 		let over = options.budget.as_deref().map(agent::Budget::parse).transpose()?.map_or(0, |budget| {
@@ -2279,5 +2287,36 @@ mod tests {
 		assert_eq!(btex.iter().map(|b| b.draws).sum::<u64>(), 6);
 		assert_eq!(btex.iter().map(|b| b.triangles).sum::<u64>(), 12);
 		let _ = std::fs::remove_dir_all(&temp);
+	}
+
+	#[test]
+	fn client_quality_bar_2_uses_engine_4_450_studs_while_edit_quality_2_uses_300_studs() {
+		let mut model = ModelBuilder::new("QualityDist");
+		model.part(&PartSpec { name: "Near".into(), cframe: Affine3A::from_translation(Vec3::new(-40.0, 0.0, -100.0)), size: Vec3::splat(20.0), ..Default::default() });
+		model.part(&PartSpec { name: "Far".into(), cframe: Affine3A::from_translation(Vec3::new(40.0, 0.0, -380.0)), size: Vec3::splat(20.0), ..Default::default() });
+		let document = model.into_document();
+		let scene = crate::scene::extract::extract(&document);
+		let state = std::env::temp_dir().join(format!("ror-cost-qual-test-{}", std::process::id()));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let cam = crate::render::camera::CameraSpec::LookAt { eye: [0.0, 0.0, 0.0], target: [0.0, 0.0, -100.0], fov: 70.0 }.place(None, 1920, 1080);
+
+		let edit2 = CostOptions { quality: Some(2), ..Default::default() };
+		let client2 = CostOptions { client_quality: Some(2), ..Default::default() };
+		let client1 = CostOptions { client_quality: Some(1), ..Default::default() };
+
+		let v_e2 = Analysis::new(&scene, &document, &assets, &edit2).view("v", &cam, 16.0 / 9.0, &edit2);
+		let v_c2 = Analysis::new(&scene, &document, &assets, &client2).view("v", &cam, 16.0 / 9.0, &client2);
+		let v_c1 = Analysis::new(&scene, &document, &assets, &client1).view("v", &cam, 16.0 / 9.0, &client1);
+
+		assert_eq!(v_e2.visible.parts, 1);
+		assert_eq!(v_c2.visible.parts, 2);
+		assert_eq!(v_c1.visible.parts, 1);
+
+		let q_e2 = prices::Quality::of_scale(edit2.quality(), edit2.client_quality, true);
+		let q_c2 = prices::Quality::of_scale(client2.quality(), client2.client_quality, true);
+		assert_eq!((q_e2.scale, q_e2.view_distance), ("edit", 300.0));
+		assert_eq!((q_c2.scale, q_c2.client_level, q_c2.level, q_c2.view_distance), ("client", Some(2), 4, 450.0));
+		assert!(!q_c2.sun_shadows && !q_c2.per_pixel_lights && !q_c2.bloom);
+		let _ = std::fs::remove_dir_all(&state);
 	}
 }

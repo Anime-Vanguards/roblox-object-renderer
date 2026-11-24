@@ -84,6 +84,13 @@ pub mod weight {
 #[serde(rename_all = "camelCase")]
 pub struct Quality {
 	pub level: u32,
+	/// Quality scale requested: `"edit"` (Studio 1–21) or `"client"` (player 1–10 slider).
+	pub scale: &'static str,
+	/// Player slider bar (1–10) when `scale == "client"`.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub client_level: Option<u32>,
+	/// Distance culling horizon in studs for `level` (`crate::lod::Lod::view_distance`).
+	pub view_distance: f32,
 	/// Sun shadows: none at 1-8, a short reach at 10 (not to a caster 59 studs from the camera), soft
 	/// from 12, full from 16. Counted from 12.
 	pub sun_shadows: bool,
@@ -98,8 +105,23 @@ pub struct Quality {
 
 impl Quality {
 	pub fn of(level: u32, phone: bool) -> Self {
+		Self::of_scale(level, None, phone)
+	}
+
+	pub fn of_scale(level: u32, client_level: Option<u32>, phone: bool) -> Self {
 		let level = level.clamp(1, 21);
-		Self { level, sun_shadows: level >= 12, per_pixel_lights: level >= 16, bloom: level >= 6, max_rate: if phone { 100.0 } else { 400.0 } }
+		let client_level = client_level.map(|bar| bar.clamp(1, 10));
+		let view_distance = crate::lod::Lod { quality: level, cull: true }.view_distance();
+		Self {
+			level,
+			scale: if client_level.is_some() { "client" } else { "edit" },
+			client_level,
+			view_distance,
+			sun_shadows: level >= 12,
+			per_pixel_lights: level >= 16,
+			bloom: level >= 6,
+			max_rate: if phone { 100.0 } else { 400.0 },
+		}
 	}
 }
 
