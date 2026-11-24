@@ -134,16 +134,75 @@ fn default_unmodeled() -> Vec<MemoryUnmodeled> {
 	]
 }
 
+/// Where a loaded texture's dimensions and file bytes came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TextureSource {
+	/// Roblox KTX2 texture transcode (`fetch_transcode`).
+	Transcode,
+	/// Roblox uploaded image asset (`fetch` on `ContentId::Asset`): dimensions may differ from KTX2 transcodes.
+	Upload,
+	/// Local filesystem image (`file://` or path).
+	Local,
+	/// Built-in Studio install texture (`rbxasset://`).
+	Studio,
+}
+
+/// Byte subtotals for textures loaded from one [`TextureSource`].
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextureSourceTotals {
+	pub count: u64,
+	pub file_bytes: u64,
+	pub rgba8_mip_bytes: u64,
+	pub desktop_bc_mip_bytes: u64,
+	pub mobile_etc2_mip_bytes: u64,
+}
+
+/// Provenance breakdown showing how many unique textures and bytes came from each source.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextureSources {
+	pub transcode: TextureSourceTotals,
+	pub upload: TextureSourceTotals,
+	pub local: TextureSourceTotals,
+	pub studio: TextureSourceTotals,
+}
+
+/// Assets and progressive packs whose bytes could not be read or decoded.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissingMemory {
+	pub meshes: u64,
+	pub mesh_instances: u64,
+	pub textures: u64,
+	pub texture_references: u64,
+	/// Progressive KTX2 pack files whose encoded `fileBytes` could not be read.
+	pub transcode_packs: u64,
+	/// Total distinct missing assets (`meshes + textures`).
+	pub assets: u64,
+	/// Explanation of which bytes could not be counted (`None` when complete).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub uncounted_bytes: Option<String>,
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	pub mesh_ids: Vec<String>,
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	pub texture_ids: Vec<String>,
+}
+
 /// Complete deduplicated upper-bound memory estimate for a scene (or union of timeline scenes).
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryReport {
 	/// Always `"upper-bound-estimate"`: full asset chains, not measured client VRAM residency.
 	pub kind: &'static str,
+	/// True when any mesh, texture, or progressive KTX2 pack file failed to load (totals exclude them).
+	pub partial: bool,
 	/// Deduplication key: canonical asset ID / content URI (two distinct files with identical bytes count twice).
 	pub deduplicated_by: &'static str,
 	pub basis: MemoryBasis,
 	pub unmodeled: Vec<MemoryUnmodeled>,
+	pub missing: MissingMemory,
 	pub meshes: MeshMemory,
 	pub textures: TextureMemory,
 	pub total_gpu_bytes: TotalGpuBytes,
@@ -153,9 +212,11 @@ impl Default for MemoryReport {
 	fn default() -> Self {
 		Self {
 			kind: "upper-bound-estimate",
+			partial: false,
 			deduplicated_by: "canonical-asset-id",
 			basis: MemoryBasis::default(),
 			unmodeled: default_unmodeled(),
+			missing: MissingMemory::default(),
 			meshes: MeshMemory::default(),
 			textures: TextureMemory::default(),
 			total_gpu_bytes: TotalGpuBytes::default(),
@@ -167,6 +228,10 @@ impl Default for MemoryReport {
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TotalGpuBytes {
+	/// True when any mesh, texture, or pack failed to load; sums cover loaded assets only.
+	pub partial: bool,
+	/// Distinct meshes + textures whose bytes could not be counted.
+	pub uncounted_assets: u64,
 	/// Assumed mesh GPU bytes + derived uncompressed RGBA8 full mip-chain bytes.
 	pub rgba8: u64,
 	/// Assumed mesh GPU bytes + derived desktop BC1/BC3 full mip-chain bytes.
@@ -180,6 +245,8 @@ pub struct TotalGpuBytes {
 pub struct MeshMemory {
 	/// Distinct mesh assets referenced by the scene (counted once each).
 	pub unique: u64,
+	/// Distinct meshes that loaded and are included in the byte totals.
+	pub loaded: u64,
 	/// Total part instances referencing those meshes.
 	pub instances: u64,
 	/// Encoded file bytes across unique loaded meshes.
@@ -192,8 +259,10 @@ pub struct MeshMemory {
 	pub skinning_bytes: u64,
 	/// Total packed GPU geometry bytes (`vertexBytes + indexBytes + skinningBytes`).
 	pub gpu_bytes: u64,
-	/// Distinct meshes that failed to load or decode.
+	/// Distinct meshes that failed to load or decode (their bytes are uncounted).
 	pub missing: u64,
+	/// Part instances referencing missing meshes.
+	pub missing_instances: u64,
 	/// Heaviest unique meshes by GPU bytes (ties by id).
 	pub top: Vec<MeshEntry>,
 }
@@ -219,10 +288,14 @@ pub struct MeshEntry {
 pub struct TextureMemory {
 	/// Distinct authored texture assets referenced by the scene (counted once each).
 	pub unique: u64,
+	/// Distinct textures that loaded and are included in the byte totals.
+	pub loaded: u64,
 	/// Total texture references across parts, decals, surface appearances, effects and custom skies.
 	pub references: u64,
 	/// Encoded bytes on disk / downloaded across unique loaded textures.
 	pub file_bytes: u64,
+	/// True when any texture or progressive KTX2 pack file failed to load (making `fileBytes` partial).
+	pub file_bytes_partial: bool,
 	/// Uncompressed RGBA8 level-0 (base mip) GPU bytes across unique loaded textures.
 	pub rgba8_base_bytes: u64,
 	/// Uncompressed RGBA8 full mip-chain GPU bytes across unique loaded textures.
@@ -233,8 +306,14 @@ pub struct TextureMemory {
 	/// 8 B/4x4 block for opaque TexturePack layers, vkFormat 151 ETC2 RGBA8 16 B/4x4 block for
 	/// mobile rollout images and alpha/normal pack layers) at desktop transcode or upload sizes.
 	pub mobile_etc2_mip_bytes: u64,
-	/// Distinct textures that failed to load or decode.
+	/// Distinct textures that failed to load or decode (their bytes are uncounted).
 	pub missing: u64,
+	/// Scene references pointing to missing textures.
+	pub missing_references: u64,
+	/// Missing progressive KTX2 pack files across partially cached transcodes (`fileBytes` uncounted for those packs).
+	pub missing_packs: u64,
+	/// Counts and byte subtotals broken down by where each loaded texture came from.
+	pub sources: TextureSources,
 	/// Heaviest unique textures by RGBA8 mip-chain GPU bytes (ties by id).
 	pub top: Vec<TextureEntry>,
 }
@@ -244,6 +323,7 @@ pub struct TextureMemory {
 pub struct TextureEntry {
 	pub id: String,
 	pub references: u64,
+	pub source: TextureSource,
 	pub width: u32,
 	pub height: u32,
 	pub layers: u32,
@@ -252,6 +332,8 @@ pub struct TextureEntry {
 	pub desktop_bc_format: &'static str,
 	pub mobile_etc2_format: &'static str,
 	pub has_alpha: bool,
+	pub packs_loaded: u32,
+	pub packs_expected: u32,
 	pub file_bytes: u64,
 	pub rgba8_base_bytes: u64,
 	pub rgba8_mip_bytes: u64,
@@ -262,6 +344,7 @@ pub struct TextureEntry {
 /// Decoded metadata for one unique texture asset, cached across frames in timeline mode.
 #[derive(Clone, Debug)]
 pub struct TextureInfo {
+	pub source: TextureSource,
 	pub width: u32,
 	pub height: u32,
 	pub layers: u32,
@@ -269,6 +352,8 @@ pub struct TextureInfo {
 	pub format: PixelFormat,
 	pub has_alpha: bool,
 	pub file_bytes: u64,
+	pub packs_loaded: u32,
+	pub packs_expected: u32,
 }
 
 /// Cache of decoded texture metadata keyed by canonical texture key.
@@ -337,9 +422,11 @@ pub fn measure_many(scenes: &[&Scene], mesh_stats: &HashMap<String, Arc<MeshStat
 
 	let mut mesh_mem = MeshMemory { unique: mesh_instances.len() as u64, ..Default::default() };
 	let mut mesh_entries = Vec::with_capacity(mesh_instances.len());
+	let mut missing_mesh_ids = Vec::new();
 	for (id, instances) in mesh_instances {
 		mesh_mem.instances += instances;
 		if let Some(stats) = mesh_stats.get(&id) {
+			mesh_mem.loaded += 1;
 			mesh_mem.file_bytes += stats.file_bytes;
 			mesh_mem.vertex_bytes += stats.vertex_bytes;
 			mesh_mem.index_bytes += stats.index_bytes;
@@ -360,6 +447,10 @@ pub fn measure_many(scenes: &[&Scene], mesh_stats: &HashMap<String, Arc<MeshStat
 			});
 		} else {
 			mesh_mem.missing += 1;
+			mesh_mem.missing_instances += instances;
+			if missing_mesh_ids.len() < TOP_LIST {
+				missing_mesh_ids.push(id);
+			}
 		}
 	}
 	mesh_entries.sort_by(|a, b| b.gpu_bytes.cmp(&a.gpu_bytes).then_with(|| a.id.cmp(&b.id)));
@@ -419,30 +510,79 @@ pub fn measure_many(scenes: &[&Scene], mesh_stats: &HashMap<String, Arc<MeshStat
 
 	let mut tex_mem = TextureMemory { unique: wanted.len() as u64, ..Default::default() };
 	let mut tex_entries = Vec::with_capacity(wanted.len());
+	let mut missing_tex_ids = Vec::new();
 	for (id, item) in wanted {
 		tex_mem.references += item.references;
 		let Some(Some(info)) = cache.entries.get(&id) else {
 			tex_mem.missing += 1;
+			tex_mem.missing_references += item.references;
+			if missing_tex_ids.len() < TOP_LIST {
+				missing_tex_ids.push(id);
+			}
 			continue;
 		};
 		let entry = build_texture_entry(id, item.references, item.is_normal, item.pack_layer.is_some(), info);
+		tex_mem.loaded += 1;
 		tex_mem.file_bytes += entry.file_bytes;
 		tex_mem.rgba8_base_bytes += entry.rgba8_base_bytes;
 		tex_mem.rgba8_mip_bytes += entry.rgba8_mip_bytes;
 		tex_mem.desktop_bc_mip_bytes += entry.desktop_bc_mip_bytes;
 		tex_mem.mobile_etc2_mip_bytes += entry.mobile_etc2_mip_bytes;
+		tex_mem.missing_packs += u64::from(entry.packs_expected.saturating_sub(entry.packs_loaded));
+		let bucket = match entry.source {
+			TextureSource::Transcode => &mut tex_mem.sources.transcode,
+			TextureSource::Upload => &mut tex_mem.sources.upload,
+			TextureSource::Local => &mut tex_mem.sources.local,
+			TextureSource::Studio => &mut tex_mem.sources.studio,
+		};
+		bucket.count += 1;
+		bucket.file_bytes += entry.file_bytes;
+		bucket.rgba8_mip_bytes += entry.rgba8_mip_bytes;
+		bucket.desktop_bc_mip_bytes += entry.desktop_bc_mip_bytes;
+		bucket.mobile_etc2_mip_bytes += entry.mobile_etc2_mip_bytes;
 		tex_entries.push(entry);
 	}
+	tex_mem.file_bytes_partial = tex_mem.missing > 0 || tex_mem.missing_packs > 0;
 	tex_entries.sort_by(|a, b| b.rgba8_mip_bytes.cmp(&a.rgba8_mip_bytes).then_with(|| a.id.cmp(&b.id)));
 	tex_entries.truncate(TOP_LIST);
 	tex_mem.top = tex_entries;
 
+	let uncounted_assets = mesh_mem.missing + tex_mem.missing;
+	let partial = uncounted_assets > 0 || tex_mem.missing_packs > 0;
+	let uncounted_bytes = partial.then(|| {
+		let mut parts = Vec::new();
+		if mesh_mem.missing > 0 {
+			parts.push(format!("{} missing meshes ({} instances)", mesh_mem.missing, mesh_mem.missing_instances));
+		}
+		if tex_mem.missing > 0 {
+			parts.push(format!("{} missing textures ({} references)", tex_mem.missing, tex_mem.missing_references));
+		}
+		if tex_mem.missing_packs > 0 {
+			parts.push(format!("{} missing progressive KTX2 pack files (excluded from fileBytes)", tex_mem.missing_packs));
+		}
+		format!("unknown: bytes of {} could not be read; reported totals exclude them and are partial", parts.join(", "))
+	});
+	let missing = MissingMemory {
+		meshes: mesh_mem.missing,
+		mesh_instances: mesh_mem.missing_instances,
+		textures: tex_mem.missing,
+		texture_references: tex_mem.missing_references,
+		transcode_packs: tex_mem.missing_packs,
+		assets: uncounted_assets,
+		uncounted_bytes,
+		mesh_ids: missing_mesh_ids,
+		texture_ids: missing_tex_ids,
+	};
 	let total_gpu_bytes = TotalGpuBytes {
+		partial,
+		uncounted_assets,
 		rgba8: mesh_mem.gpu_bytes + tex_mem.rgba8_mip_bytes,
 		desktop_bc: mesh_mem.gpu_bytes + tex_mem.desktop_bc_mip_bytes,
 		mobile_etc2: mesh_mem.gpu_bytes + tex_mem.mobile_etc2_mip_bytes,
 	};
 	MemoryReport {
+		partial,
+		missing,
 		meshes: mesh_mem,
 		textures: tex_mem,
 		total_gpu_bytes,
@@ -456,33 +596,60 @@ pub fn summary_line(memory: &MemoryReport, phone: bool) -> String {
 	let m = &memory.meshes;
 	let t = &memory.textures;
 	let tot = &memory.total_gpu_bytes;
-	if phone {
-		format!(
-			"memory (upper-bound estimate; measured files, assumed mesh layout, derived full-chain ETC2 [vkFormat 147/151] & RGBA8, no ASTC recorded): {} unique meshes ({:.2} MB est GPU, {:.2} MB files), {} unique textures ({:.2} MB ETC2, {:.2} MB RGBA8, {:.2} MB files); total est GPU upper bound {:.2} MB ETC2 / {:.2} MB RGBA8 (excludes built-in materials, primitives, terrain, UI)",
-			m.unique,
-			mb(m.gpu_bytes),
-			mb(m.file_bytes),
-			t.unique,
-			mb(t.mobile_etc2_mip_bytes),
-			mb(t.rgba8_mip_bytes),
-			mb(t.file_bytes),
-			mb(tot.mobile_etc2),
-			mb(tot.rgba8)
-		)
+	let kind_label = if memory.partial { "PARTIAL upper-bound estimate" } else { "upper-bound estimate" };
+	let mesh_part = if m.missing > 0 {
+		format!("{} unique meshes ({} loaded, {} missing — bytes uncounted; {:.2} MB est GPU, {:.2} MB files)", m.unique, m.loaded, m.missing, mb(m.gpu_bytes), mb(m.file_bytes))
 	} else {
-		format!(
-			"memory (upper-bound estimate; measured files, assumed mesh layout, derived full-chain BC1/BC3 & RGBA8): {} unique meshes ({:.2} MB est GPU, {:.2} MB files), {} unique textures ({:.2} MB BCn, {:.2} MB RGBA8, {:.2} MB files); total est GPU upper bound {:.2} MB BCn / {:.2} MB RGBA8 (excludes built-in materials, primitives, terrain, UI)",
-			m.unique,
-			mb(m.gpu_bytes),
-			mb(m.file_bytes),
-			t.unique,
-			mb(t.desktop_bc_mip_bytes),
-			mb(t.rgba8_mip_bytes),
-			mb(t.file_bytes),
-			mb(tot.desktop_bc),
-			mb(tot.rgba8)
-		)
+		format!("{} unique meshes ({:.2} MB est GPU, {:.2} MB files)", m.unique, mb(m.gpu_bytes), mb(m.file_bytes))
+	};
+	let (format_tag, tex_compressed, tot_compressed) = if phone {
+		("ETC2", t.mobile_etc2_mip_bytes, tot.mobile_etc2)
+	} else {
+		("BCn", t.desktop_bc_mip_bytes, tot.desktop_bc)
+	};
+	let source_bytes = |s: &TextureSourceTotals| if phone { s.mobile_etc2_mip_bytes } else { s.desktop_bc_mip_bytes };
+	let mut prov = Vec::new();
+	if t.sources.transcode.count > 0 {
+		prov.push(format!("{} transcodes ({:.2} MB {format_tag})", t.sources.transcode.count, mb(source_bytes(&t.sources.transcode))));
 	}
+	if t.sources.upload.count > 0 {
+		prov.push(format!("{} uploads ({:.2} MB {format_tag}; dims may differ from KTX2)", t.sources.upload.count, mb(source_bytes(&t.sources.upload))));
+	}
+	if t.sources.local.count > 0 {
+		prov.push(format!("{} local", t.sources.local.count));
+	}
+	if t.sources.studio.count > 0 {
+		prov.push(format!("{} studio", t.sources.studio.count));
+	}
+	if t.missing > 0 {
+		prov.push(format!("{} missing — bytes uncounted", t.missing));
+	} else {
+		prov.push("0 missing".into());
+	}
+	if t.missing_packs > 0 {
+		prov.push(format!("{} pack files missing", t.missing_packs));
+	}
+	let total_prefix = if memory.partial { "PARTIAL total est GPU upper bound" } else { "total est GPU upper bound" };
+	let tail = if memory.partial {
+		format!("uncounted: {} meshes, {} textures, {} packs; excludes built-in materials, primitives, terrain, UI", m.missing, t.missing, t.missing_packs)
+	} else {
+		"excludes built-in materials, primitives, terrain, UI".into()
+	};
+	let basis_desc = if phone {
+		"measured files, assumed mesh layout, derived full-chain ETC2 [vkFormat 147/151] & RGBA8, no ASTC recorded"
+	} else {
+		"measured files, assumed mesh layout, derived full-chain BC1/BC3 & RGBA8"
+	};
+	format!(
+		"memory ({kind_label}; {basis_desc}): {mesh_part}, {} unique textures ({}; {:.2} MB {format_tag}, {:.2} MB RGBA8, {:.2} MB files); {total_prefix} {:.2} MB {format_tag} / {:.2} MB RGBA8 ({tail})",
+		t.unique,
+		prov.join(", "),
+		mb(tex_compressed),
+		mb(t.rgba8_mip_bytes),
+		mb(t.file_bytes),
+		mb(tot_compressed),
+		mb(tot.rgba8)
+	)
 }
 
 struct PackMaps {
@@ -611,14 +778,16 @@ fn collect_scene_textures(
 						add_uri(out, uri, true, is_normal);
 					}
 				}
-				if !any
-					&& let Some(pack) = appearance.texture_pack.as_deref()
-					&& let Some(xml) = pack_cache.entry(meshes::canonical(pack)).or_insert_with(|| assets.fetch(pack).ok().and_then(|f| parse_pack_xml(&f.bytes)))
-				{
-					for (map, is_normal) in [(&xml.color, false), (&xml.normal, true), (&xml.metalness, false), (&xml.roughness, false), (&xml.emissive, false)] {
-						if let Some(uri) = map {
-							add_uri(out, uri, true, is_normal);
+				if !any && let Some(pack) = appearance.texture_pack.as_deref() {
+					if let Some(xml) = pack_cache.entry(meshes::canonical(pack)).or_insert_with(|| assets.fetch(pack).ok().and_then(|f| parse_pack_xml(&f.bytes))) {
+						for (map, is_normal) in [(&xml.color, false), (&xml.normal, true), (&xml.metalness, false), (&xml.roughness, false), (&xml.emissive, false)] {
+							if let Some(uri) = map {
+								add_uri(out, uri, true, is_normal);
+							}
 						}
+					} else {
+						// Pack XML could not be read; record the pack itself so it surfaces under `missing`.
+						add_uri(out, pack, false, false);
 					}
 				}
 			}
@@ -642,14 +811,15 @@ fn collect_scene_textures(
 					add_uri(out, uri, false, is_normal);
 				}
 			}
-			if !any
-				&& let Some(pack) = variant.texture_pack.as_deref()
-				&& let Some(xml) = pack_cache.entry(meshes::canonical(pack)).or_insert_with(|| assets.fetch(pack).ok().and_then(|f| parse_pack_xml(&f.bytes)))
-			{
-				for (map, is_normal) in [(&xml.color, false), (&xml.normal, true), (&xml.metalness, false), (&xml.roughness, false), (&xml.emissive, false)] {
-					if let Some(uri) = map {
-						add_uri(out, uri, false, is_normal);
+			if !any && let Some(pack) = variant.texture_pack.as_deref() {
+				if let Some(xml) = pack_cache.entry(meshes::canonical(pack)).or_insert_with(|| assets.fetch(pack).ok().and_then(|f| parse_pack_xml(&f.bytes))) {
+					for (map, is_normal) in [(&xml.color, false), (&xml.normal, true), (&xml.metalness, false), (&xml.roughness, false), (&xml.emissive, false)] {
+						if let Some(uri) = map {
+							add_uri(out, uri, false, is_normal);
+						}
 					}
+				} else {
+					add_uri(out, pack, false, false);
 				}
 			}
 		}
@@ -698,11 +868,14 @@ fn inspect_transcode(uri: &str, layer: Transcode, assets: &Assets) -> Option<Tex
 			(first.width.checked_shl(shift).unwrap_or(first.width).max(1), first.height.checked_shl(shift).unwrap_or(first.height).max(1))
 		}
 	};
+	let packs_expected = (table.len() as u32).max(1);
+	let mut packs_loaded = 1u32;
 	let mut file_bytes = pack0.bytes.len() as u64;
 	if table.len() > 1 {
 		for pack in 1..table.len() as u32 {
 			if let Ok(fetched) = assets.fetch_transcode(uri, layer, pack) {
 				file_bytes += fetched.bytes.len() as u64;
+				packs_loaded += 1;
 			}
 		}
 	}
@@ -712,6 +885,7 @@ fn inspect_transcode(uri: &str, layer: Transcode, assets: &Assets) -> Option<Tex
 		first.has_alpha
 	};
 	Some(TextureInfo {
+		source: TextureSource::Transcode,
 		width,
 		height,
 		layers: first.layers.max(1),
@@ -719,6 +893,8 @@ fn inspect_transcode(uri: &str, layer: Transcode, assets: &Assets) -> Option<Tex
 		format: first.format,
 		has_alpha,
 		file_bytes,
+		packs_loaded,
+		packs_expected,
 	})
 }
 
@@ -726,7 +902,13 @@ fn inspect_raw(uri: &str, assets: &Assets) -> Option<TextureInfo> {
 	let fetched = assets.fetch(uri).ok()?;
 	let ext = uri.rsplit('.').next().filter(|ext| ext.len() <= 8).unwrap_or("");
 	let image = ror_image::decode_with_extension(&fetched.bytes, ext).ok()?;
+	let source = match ContentId::parse(uri) {
+		Ok(ContentId::StudioAsset(_)) => TextureSource::Studio,
+		Ok(ContentId::File(_)) => TextureSource::Local,
+		_ => TextureSource::Upload,
+	};
 	Some(TextureInfo {
+		source,
 		width: image.width,
 		height: image.height,
 		layers: image.layers.max(1),
@@ -734,6 +916,8 @@ fn inspect_raw(uri: &str, assets: &Assets) -> Option<TextureInfo> {
 		format: image.format,
 		has_alpha: image.has_alpha,
 		file_bytes: fetched.bytes.len() as u64,
+		packs_loaded: 1,
+		packs_expected: 1,
 	})
 }
 
@@ -809,6 +993,7 @@ fn build_texture_entry(id: String, references: u64, is_normal: bool, is_pack_lay
 	TextureEntry {
 		id,
 		references,
+		source: info.source,
 		width: info.width,
 		height: info.height,
 		layers: info.layers,
@@ -817,6 +1002,8 @@ fn build_texture_entry(id: String, references: u64, is_normal: bool, is_pack_lay
 		desktop_bc_format,
 		mobile_etc2_format,
 		has_alpha: info.has_alpha,
+		packs_loaded: info.packs_loaded,
+		packs_expected: info.packs_expected,
 		file_bytes: info.file_bytes,
 		rgba8_base_bytes,
 		rgba8_mip_bytes,
@@ -962,10 +1149,147 @@ mod tests {
 		assert!(json["totalGpuBytes"].get("mobileAstc4x4").is_none());
 		assert!(json["totalGpuBytes"].get("mobileAstc6x6").is_none());
 
+		assert!(!report.partial);
+		assert_eq!(report.missing.assets, 0);
+		assert_eq!(report.missing.uncounted_bytes, None);
+		assert_eq!(report.meshes.loaded, 1);
+		assert_eq!(report.textures.loaded, 3);
+		assert_eq!(report.textures.sources.local.count, 3);
+		assert_eq!(report.textures.sources.local.desktop_bc_mip_bytes, report.textures.desktop_bc_mip_bytes);
+		assert!(!report.textures.file_bytes_partial);
 		let phone_line = summary_line(&report, true);
 		let desktop_line = summary_line(&report, false);
-		assert!(phone_line.contains("upper-bound estimate") && phone_line.contains("ETC2") && phone_line.contains("no ASTC recorded") && !phone_line.contains("ASTC4x4"));
-		assert!(desktop_line.contains("upper-bound estimate") && desktop_line.contains("BC1/BC3") && !desktop_line.contains("ASTC") && !desktop_line.to_ascii_lowercase().contains("phone"));
+		assert!(phone_line.contains("upper-bound estimate") && !phone_line.contains("PARTIAL") && phone_line.contains("0 missing") && phone_line.contains("ETC2") && phone_line.contains("no ASTC recorded") && !phone_line.contains("ASTC4x4"));
+		assert!(desktop_line.contains("upper-bound estimate") && !desktop_line.contains("PARTIAL") && desktop_line.contains("0 missing") && desktop_line.contains("BC1/BC3") && !desktop_line.contains("ASTC") && !desktop_line.to_ascii_lowercase().contains("phone"));
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	fn cache_write_key(state_dir: &std::path::Path, key: &str, bytes: &[u8]) {
+		const OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
+		const PRIME: u128 = 0x0000000001000000000000000000013b;
+		let mut hash = OFFSET;
+		for b in key.as_bytes() {
+			hash ^= *b as u128;
+			hash = hash.wrapping_mul(PRIME);
+		}
+		let hex = format!("{hash:032x}");
+		let dir = state_dir.join("assets").join(&hex[..2]);
+		std::fs::create_dir_all(&dir).unwrap();
+		std::fs::write(dir.join(format!("{hex}.bin")), bytes).unwrap();
+	}
+
+	fn make_ktx2_bc(vk: u32, width: u32, height: u32, kv: &[(&str, &str)]) -> Vec<u8> {
+		let block_bytes = if vk == 131 { 8usize } else { 16usize };
+		let blocks = (width.div_ceil(4) * height.div_ceil(4)) as usize;
+		let payload = vec![0u8; blocks * block_bytes];
+		let mut kvd = Vec::new();
+		for (k, v) in kv {
+			let entry_len = k.len() + 1 + v.len() + 1;
+			kvd.extend_from_slice(&(entry_len as u32).to_le_bytes());
+			kvd.extend_from_slice(k.as_bytes());
+			kvd.push(0);
+			kvd.extend_from_slice(v.as_bytes());
+			kvd.push(0);
+			while kvd.len() % 4 != 0 {
+				kvd.push(0);
+			}
+		}
+		let mut dfd = Vec::new();
+		dfd.extend_from_slice(&28u32.to_le_bytes());
+		dfd.extend_from_slice(&0u32.to_le_bytes());
+		dfd.extend_from_slice(&((24u32 << 16) | 2).to_le_bytes());
+		dfd.extend_from_slice(&[128, 1, 1, 0, 3, 3, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0]);
+		let dfd_offset = 80 + 24;
+		let kvd_offset = dfd_offset + dfd.len();
+		let data_offset = kvd_offset + kvd.len();
+		let mut file = Vec::new();
+		file.extend_from_slice(&[0xab, b'K', b'T', b'X', b' ', b'2', b'0', 0xbb, b'\r', b'\n', 0x1a, b'\n']);
+		for v in [vk, 1, width, height, 0, 0, 1, 1, 0u32] {
+			file.extend_from_slice(&v.to_le_bytes());
+		}
+		for v in [dfd_offset as u32, dfd.len() as u32, kvd_offset as u32, kvd.len() as u32] {
+			file.extend_from_slice(&v.to_le_bytes());
+		}
+		file.extend_from_slice(&0u64.to_le_bytes());
+		file.extend_from_slice(&0u64.to_le_bytes());
+		file.extend_from_slice(&(data_offset as u64).to_le_bytes());
+		file.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+		file.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+		file.extend_from_slice(&dfd);
+		file.extend_from_slice(&kvd);
+		file.extend_from_slice(&payload);
+		file
+	}
+
+	#[test]
+	fn missing_assets_partial_packs_and_upload_provenance_are_reported_explicitly() {
+		let dir = std::env::temp_dir().join(format!("ror-memory-missing-test-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		let cache_dir = dir.join("cache");
+		std::fs::create_dir_all(&cache_dir).unwrap();
+
+		// Asset 1001: cached uploaded RGB PNG (no KTX2 transcode cached -> Upload provenance)
+		let upload_png = dir.join("u1001.png");
+		write_png(&upload_png, 32, 32, false);
+		cache_write_key(&cache_dir, "rbxassetid://1001", &std::fs::read(&upload_png).unwrap());
+
+		// Asset 1002: cached KTX2 pack 0 declaring 2 packs, pack 1 absent offline -> Transcode provenance + 1 missing pack
+		let ktx0 = make_ktx2_bc(131, 16, 16, &[("transcodedWidth", "32"), ("transcodedHeight", "32"), ("pack_0", "1,5"), ("pack_1", "0,1"), ("packIndex", "0")]);
+		let key1002_p0 = format!("rbxassetid://1002#ktx2/7rdo/{}", Transcode::Image.fidelity(0));
+		cache_write_key(&cache_dir, &key1002_p0, &ktx0);
+
+		let mut model = ModelBuilder::new("Partial");
+		// Missing mesh + missing texture 9999
+		model.child(
+			model.model,
+			InstanceBuilder::new("MeshPart")
+				.with_name("Broken")
+				.with_property("Size", Vector3::new(2.0, 2.0, 2.0))
+				.with_property("InitialSize", Vector3::new(2.0, 2.0, 2.0))
+				.with_property("MeshId", ContentId::from("rbxassetid://8888"))
+				.with_property("TextureID", ContentId::from("rbxassetid://9999"))
+				.with_property("CFrame", crate::scene::build::cframe(Affine3A::IDENTITY)),
+		);
+		// Loaded upload 1001 + partially-packed transcode 1002
+		let p = model.part(&PartSpec { name: "Holder".into(), ..Default::default() });
+		model.child(p, InstanceBuilder::new("Decal").with_property("Texture", ContentId::from("rbxassetid://1001")).with_property("Face", Enum::from_u32(1)));
+		model.child(p, InstanceBuilder::new("Decal").with_property("Texture", ContentId::from("rbxassetid://1002")).with_property("Face", Enum::from_u32(5)));
+
+		let document = model.into_document();
+		let scene = crate::scene::extract::extract(&document);
+		let assets = Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&cache_dir) });
+		let meshes = Meshes::load(&scene.parts, &assets);
+		let report = measure(&scene, &meshes, &assets);
+
+		assert!(report.partial);
+		assert!(report.total_gpu_bytes.partial);
+		assert_eq!(report.total_gpu_bytes.uncounted_assets, 2);
+		assert_eq!(report.meshes.missing, 1);
+		assert_eq!(report.meshes.loaded, 0);
+		assert_eq!(report.meshes.missing_instances, 1);
+		assert_eq!(report.missing.mesh_ids, vec!["rbxassetid://8888"]);
+		assert_eq!(report.textures.unique, 3);
+		assert_eq!(report.textures.loaded, 2);
+		assert_eq!(report.textures.missing, 1);
+		assert_eq!(report.textures.missing_references, 1);
+		assert_eq!(report.textures.missing_packs, 1);
+		assert!(report.textures.file_bytes_partial);
+		assert_eq!(report.missing.texture_ids, vec!["rbxassetid://9999"]);
+		assert!(report.missing.uncounted_bytes.as_deref().is_some_and(|s| s.contains("1 missing meshes") && s.contains("1 missing textures") && s.contains("1 missing progressive")));
+		assert_eq!(report.textures.sources.upload.count, 1);
+		assert_eq!(report.textures.sources.transcode.count, 1);
+		assert_eq!(
+			report.textures.sources.upload.desktop_bc_mip_bytes + report.textures.sources.transcode.desktop_bc_mip_bytes,
+			report.textures.desktop_bc_mip_bytes
+		);
+
+		let line = summary_line(&report, false);
+		assert!(line.contains("PARTIAL upper-bound estimate"), "{line}");
+		assert!(line.contains("1 missing — bytes uncounted"), "{line}");
+		assert!(line.contains("1 pack files missing"), "{line}");
+		assert!(line.contains("1 transcodes"), "{line}");
+		assert!(line.contains("1 uploads") && line.contains("dims may differ"), "{line}");
+		assert!(line.contains("PARTIAL total est GPU upper bound"), "{line}");
 		let _ = std::fs::remove_dir_all(&dir);
 	}
 }
