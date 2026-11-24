@@ -399,7 +399,7 @@ fn summary_lines(input: &str, setup: &Setup, views: &[ViewLine], mean: &Work, wo
 		}
 		lines.push("fidelity: desktop CPU ms is estimated from one reference PC ratio (1/2.224, not players' desktops); desktop GPU ms is uncalibrated (gpuMs = null); findings rank by combined CPU + gpuUnits share".into());
 	}
-	lines.push(memory::summary_line(memory, setup.preset.phone));
+	lines.push(memory::summary_line(memory, !desktop));
 	if let Some(budget) = budget {
 		let over: Vec<&ViewLine> = views.iter().filter(|view| !view.over_budget.is_empty()).collect();
 		lines.push(format!("budget {} ({} draws, {}k triangles, {} per view): {} of {} views over", budget.name, budget.draws, budget.triangles / 1000, ms(budget.ms), over.len(), views.len()));
@@ -1000,6 +1000,77 @@ mod tests {
 		assert!(light_finding["saving"]["meanGpuUnits"].as_f64().unwrap() > 0.0, "{light_finding}");
 		assert_eq!(light_finding["saving"]["worstView"], "front", "{light_finding}");
 		assert!(desk_lines.iter().any(|l| l.contains("gpuUnits/view") && l.contains("[lightRange]")), "{desk_lines:?}");
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	#[test]
+	fn stdout_prints_one_memory_line_matching_preset_pricing() {
+		let state = std::env::temp_dir().join(format!("ror-one-mem-line-test-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&state);
+		std::fs::create_dir_all(&state).unwrap();
+
+		let tex_path = state.join("tile64.png");
+		{
+			let file = std::fs::File::create(&tex_path).unwrap();
+			let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 64, 64);
+			enc.set_color(png::ColorType::Rgb);
+			enc.set_depth(png::BitDepth::Eight);
+			let mut w = enc.write_header().unwrap();
+			w.write_image_data(&vec![128u8; 64 * 64 * 3]).unwrap();
+		}
+		let tex_uri = format!("file://{}", tex_path.to_string_lossy().replace('\\', "/"));
+
+		let mut model = ModelBuilder::new("Map");
+		let wall = model.part(&PartSpec { name: "Wall".into(), size: Vec3::new(20.0, 10.0, 1.0), ..Default::default() });
+		model.child(
+			wall,
+			rbx_dom_weak::InstanceBuilder::new("Decal")
+				.with_property("Texture", rbx_dom_weak::types::ContentId::from(tex_uri))
+				.with_property("Face", rbx_dom_weak::types::Enum::from_u32(5)),
+		);
+		let document = model.into_document();
+		let scene = crate::scene::extract::extract(&document);
+		let gpu = std::sync::Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(state.join("cache")) });
+		let renderer = crate::render::Renderer::new(gpu, assets).expect("a renderer");
+
+		let spec = CameraSpec::LookAt { eye: [0.0, 2.0, 25.0], target: [0.0, 0.0, 0.0], fov: 60.0 };
+		let views = vec![crate::job::NamedView {
+			name: "front".into(),
+			view: crate::render::ViewRequest { width: 320, height: 180, camera: spec.clone(), ..Default::default() },
+		}];
+		let shots = vec![(spec.place(None, 320, 180), 320, 180)];
+
+		let run_case = |name: &str, options: CostOptions| -> (Vec<String>, Vec<String>) {
+			let out = state.join(name);
+			std::fs::create_dir_all(&out).unwrap();
+			let rep = crate::cost::run(&renderer, &scene, &document, &options, &views, &shots, &out, None, None, "map", (false, false)).unwrap();
+			(rep.lines, rep.agent)
+		};
+
+		let mem_lines = |lines: &[String], agent: &[String]| -> Vec<String> {
+			lines.iter().chain(agent.iter()).filter(|l| l.starts_with("memory (")).cloned().collect()
+		};
+
+		let (plain_lines, plain_agent) = run_case("plain", CostOptions { attribute: true, pixels: false, no_images: true, ..Default::default() });
+		let (phone_lines, phone_agent) = run_case("phone", CostOptions { attribute: true, pixels: false, no_images: true, preset: Some("phone".into()), ..Default::default() });
+		let (desk_lines, desk_agent) = run_case("desktop", CostOptions { attribute: true, pixels: false, no_images: true, preset: Some("desktop".into()), ..Default::default() });
+		let (no_agent_lines, no_agent) = run_case("no_agent", CostOptions { attribute: false, pixels: false, no_images: true, ..Default::default() });
+
+		let plain_mem = mem_lines(&plain_lines, &plain_agent);
+		let phone_mem = mem_lines(&phone_lines, &phone_agent);
+		let desk_mem = mem_lines(&desk_lines, &desk_agent);
+		let no_agent_mem = mem_lines(&no_agent_lines, &no_agent);
+
+		assert_eq!(plain_mem.len(), 1, "plain stdout must print one memory line: lines={plain_lines:?} agent={plain_agent:?}");
+		assert_eq!(phone_mem.len(), 1, "phone stdout must print one memory line: lines={phone_lines:?} agent={phone_agent:?}");
+		assert_eq!(desk_mem.len(), 1, "desktop stdout must print one memory line: lines={desk_lines:?} agent={desk_agent:?}");
+		assert_eq!(no_agent_mem.len(), 1, "non-attributed stdout must print one memory line: {no_agent_lines:?}");
+		assert_eq!(plain_mem[0], phone_mem[0], "plain (phone frame) and --preset phone must report the exact same memory line");
+		assert!(plain_mem[0].contains("ETC2") && !plain_mem[0].contains("BCn"), "plain phone-frame run must print ETC2: {}", plain_mem[0]);
+		assert!(desk_mem[0].contains("BCn") && !desk_mem[0].contains("ETC2"), "desktop run must print BCn: {}", desk_mem[0]);
+		assert!(!desk_mem[0].to_ascii_lowercase().contains("phone"), "desktop memory line must not mention phone: {}", desk_mem[0]);
+		assert_ne!(plain_mem[0], desk_mem[0], "phone and desktop memory lines must differ");
 		let _ = std::fs::remove_dir_all(&state);
 	}
 

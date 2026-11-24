@@ -544,7 +544,7 @@ pub fn tree(ids: &InstanceIds, views: &[ViewWork]) -> Vec<Node> {
 			}
 			let mut mean = mean.scaled(1.0 / count.max(1) as f64);
 			let (worst_index, mut worst) = per_view.iter().enumerate().fold((0, Work::default()), |best, (index, work)| {
-				if work.ms > best.1.ms || (work.ms == best.1.ms && work.gpu_units > best.1.gpu_units) {
+				if work.ms > best.1.ms || (uncalibrated_gpu && work.ms == best.1.ms && work.gpu_units > best.1.gpu_units) {
 					(index, *work)
 				} else {
 					best
@@ -570,7 +570,14 @@ pub fn tree(ids: &InstanceIds, views: &[ViewWork]) -> Vec<Node> {
 			}
 		})
 		.collect();
-	nodes.sort_by(|a, b| b.mean.ms.total_cmp(&a.mean.ms).then_with(|| b.mean.gpu_units.total_cmp(&a.mean.gpu_units)).then_with(|| a.id.cmp(&b.id)));
+	nodes.sort_by(|a, b| {
+		let ord = b.mean.ms.total_cmp(&a.mean.ms);
+		if uncalibrated_gpu {
+			ord.then_with(|| b.mean.gpu_units.total_cmp(&a.mean.gpu_units)).then_with(|| a.id.cmp(&b.id))
+		} else {
+			ord.then_with(|| a.id.cmp(&b.id))
+		}
+	});
 	nodes
 }
 
@@ -579,6 +586,47 @@ mod tests {
 	use super::*;
 	use crate::scene::build::{ModelBuilder, PartSpec};
 	use rbx_dom_weak::InstanceBuilder;
+
+	#[test]
+	fn tree_order_uses_id_tiebreak_when_calibrated_and_gpu_units_when_uncalibrated() {
+		let mut model = ModelBuilder::new("Map");
+		let alpha = model.part(&PartSpec { name: "Alpha".into(), ..Default::default() });
+		let beta = model.part(&PartSpec { name: "Beta".into(), ..Default::default() });
+		let gamma = model.part(&PartSpec { name: "Gamma".into(), ..Default::default() });
+		let document = model.into_document();
+		let ids = InstanceIds::new(&document);
+
+		let make_work = |ms: f64, gpu_units: f64, gpu_ms: Option<f64>| Work {
+			draws: 1.0,
+			gpu_units,
+			cpu_ms: ms,
+			gpu_ms,
+			ms,
+			..Default::default()
+		};
+
+		// Calibrated run (phone / default): Alpha and Beta tie on rounded ms (0.0302) while Beta
+		// has higher gpu_units; calibrated tree preserves id order (Alpha before Beta).
+		let mut cal_by = HashMap::new();
+		cal_by.insert(alpha, make_work(0.03021, 0.10, Some(0.01)));
+		cal_by.insert(beta, make_work(0.03024, 0.80, Some(0.01)));
+		cal_by.insert(gamma, make_work(0.03022, 0.80, Some(0.01)));
+		let cal_view = ViewWork { name: "v1".into(), total: make_work(0.0907, 1.70, Some(0.03)), by_instance: cal_by, pixels: true };
+		let cal_tree = tree(&ids, &[cal_view]);
+		let cal_ids: Vec<&str> = cal_tree.iter().map(|n| n.id.as_str()).collect();
+		assert_eq!(cal_ids, vec!["Map", "Map.Alpha", "Map.Beta", "Map.Gamma"]);
+
+		// Uncalibrated GPU run (--preset desktop, gpu_ms = None): ties on ms break by gpu_units
+		// descending so pure GPU work rises above lower-GPU items, then id ascending.
+		let mut desk_by = HashMap::new();
+		desk_by.insert(alpha, make_work(0.03021, 0.10, None));
+		desk_by.insert(beta, make_work(0.03024, 0.80, None));
+		desk_by.insert(gamma, make_work(0.03022, 0.80, None));
+		let desk_view = ViewWork { name: "v1".into(), total: make_work(0.0907, 1.70, None), by_instance: desk_by, pixels: true };
+		let desk_tree = tree(&ids, &[desk_view]);
+		let desk_ids: Vec<&str> = desk_tree.iter().map(|n| n.id.as_str()).collect();
+		assert_eq!(desk_ids, vec!["Map", "Map.Beta", "Map.Gamma", "Map.Alpha"]);
+	}
 
 	/// Two emitters named Dust on one part, the first at Rate 0 (fired by script, no item), and two
 	/// lights named Lamp, the first disabled (no scene light): what draws is charged to the second of

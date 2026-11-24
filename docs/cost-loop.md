@@ -111,7 +111,7 @@ Every `work` object (in `analysis.json` and `tree.json`) contains: `draws`, `tri
 
 ### `tree.json` (`ror-cost-tree/1`)
 
-Contains `nodes` sorted by `mean.ms`—every instance with non-zero cost in any view plus all its ancestors. Each node holds `id`, `uid`, `class`, `name`, `parent`, `mean` (self + descendants), `worstView`, `worst`, `views`, and `leaves`. Unowned full-screen passes (particle pass, built-in bloom) appear under `(shared passes)`.
+Contains `nodes` sorted by `mean.ms` descending then `id` ascending on calibrated runs (default and `--preset phone`, matching the historical order); on `--preset desktop` where `gpuMs` is `null`, ties on `mean.ms` break by `mean.gpuUnits` descending then `id` ascending. Every instance with non-zero cost in any view plus all its ancestors is listed. Each node holds `id`, `uid`, `class`, `name`, `parent`, `mean` (self + descendants), `worstView`, `worst`, `views`, and `leaves`. Unowned full-screen passes (particle pass, built-in bloom) appear under `(shared passes)`.
 
 ### Instance IDs
 
