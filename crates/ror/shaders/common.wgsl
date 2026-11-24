@@ -31,7 +31,8 @@ struct Frame {
 	counts: vec4<u32>,
 	// viewport size in pixels, 1 / size
 	viewport: vec4<f32>,
-	// the light grid (notes/render.md "Light grid"): xyz its minimum corner, w 1 when there is one
+	// the light grid (notes/render.md "Light grid"): xyz its minimum corner, w 1 when there is one, 2
+	// when it stops the sun as well (no shadow maps: scene::NO_SUN_SHADOW_MAPS)
 	light_grid: vec4<f32>,
 	// xyz 1 / its size in studs, w OutdoorAmbient's factor where the sky is open
 	light_grid_scale: vec4<f32>,

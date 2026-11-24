@@ -51,6 +51,10 @@ pub fn casts_shadow(transparency: f32) -> bool {
 /// a hint to this renderer alone, which the Roblox engine does not know.
 pub const SHADOW_ONLY: &str = "RorShadowOnly";
 
+/// The Lighting attribute that draws a scene without the sun's shadow maps, set to the boolean `true`
+/// ([`Environment::sun_shadow_maps`]): a hint to this renderer alone, which the Roblox engine does not know.
+pub const NO_SUN_SHADOW_MAPS: &str = "RorNoSunShadowMaps";
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Scene {
 	pub parts: Vec<Arc<Part>>,

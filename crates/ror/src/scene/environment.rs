@@ -29,6 +29,9 @@ pub struct Environment {
 	pub exposure_compensation: f32,
 	pub shadow_softness: f32,
 	pub global_shadows: bool,
+	/// The sun's shadow maps are drawn (off by the Lighting attribute [`super::NO_SUN_SHADOW_MAPS`]: a
+	/// view at a graphics quality without them, where only what fills the light grid stops the sun).
+	pub sun_shadow_maps: bool,
 	pub fog_color: Vec3,
 	pub fog_start: f32,
 	pub fog_end: f32,
@@ -105,6 +108,7 @@ impl Default for Environment {
 			exposure_compensation: 0.0,
 			shadow_softness: 0.2,
 			global_shadows: true,
+			sun_shadow_maps: true,
 			fog_color: Vec3::splat(0.75),
 			fog_start: 0.0,
 			fog_end: 100000.0,
@@ -214,6 +218,7 @@ impl Environment {
 			exposure_compensation: props::f32(lighting, "ExposureCompensation", fallback.exposure_compensation),
 			shadow_softness: props::f32(lighting, "ShadowSoftness", fallback.shadow_softness),
 			global_shadows: props::bool(lighting, "GlobalShadows", fallback.global_shadows),
+			sun_shadow_maps: !props::attribute_flag(lighting, super::NO_SUN_SHADOW_MAPS),
 			fog_color: props::color(lighting, "FogColor", fallback.fog_color),
 			fog_start: props::f32(lighting, "FogStart", fallback.fog_start),
 			fog_end: props::f32(lighting, "FogEnd", fallback.fog_end),

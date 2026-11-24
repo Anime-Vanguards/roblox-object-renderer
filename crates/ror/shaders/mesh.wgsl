@@ -976,7 +976,10 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 	let v = normalize(frame.camera_position.xyz - input.world_position);
 	// the geometric normal of the side drawn (double-sided meshes show both)
 	let geometric_normal = normalize(input.world_normal) * select(-1.0, 1.0, front_facing);
-	let shadow = shadow_factor(input.world_position, geometric_normal) * cloud_sun(input.world_position);
+	// OutdoorAmbient only as far as the light grid sees the sky (Ambient everywhere: lightgrid)
+	let sky_open = light_grid_visibility(input.world_position, geometric_normal);
+	// without the sun's shadow maps (frame.light_grid.w 2) the sun reaches as far as the grid sees the sky
+	let shadow = shadow_factor(input.world_position, geometric_normal) * cloud_sun(input.world_position) * select(1.0, sky_open, frame.light_grid.w > 1.5);
 	var color = direct_light(surface, n, v, frame.sun_direction.xyz, frame.sun_color.rgb * shadow, 0.0);
 	color += local_lights(surface, input.world_position, n, v, geometric_normal, input.clip.xy);
 
@@ -984,8 +987,6 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 	let n_dot_v = max(dot(n, v), 1e-4);
 	// flat ambient: no Fresnel or view dependence (ambient-cubes), the full albedo on metals whatever
 	// the sky specular (material-swatches; ibl-scale: what it adds is the same at every s).
-	// OutdoorAmbient only as far as the light grid sees the sky (Ambient everywhere: lightgrid)
-	let sky_open = light_grid_visibility(input.world_position, geometric_normal);
 	let flat_ambient = max(frame.ambient.rgb, frame.outdoor_ambient.rgb * (sky_open * frame.light_grid_scale.w));
 	// Studio's screen-space ambient occlusion darkens the flat ambient and the sky's diffuse light,
 	// not the sun or local lights (ao-gap: identical profiles under Ambient, OutdoorAmbient and the

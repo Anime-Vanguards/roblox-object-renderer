@@ -3094,7 +3094,7 @@ impl Renderer {
 			None => environment::direct_light(scene.environment.clock_time, scene.environment.geographic_latitude, scene.environment.environment_diffuse_scale),
 		};
 		let highlights = highlights::PreparedHighlights::new(lease.device(), &self.ids, &scene.highlights, &geometry.part_draws, geometry.instance_count);
-		Ok(Prepared { geometry, casters: None, immutable: !scene.live, lights, environment, sun_shadows: scene.environment.global_shadows && direct.strength.max_element() > 0.0, bounds, sun_direction: direct.direction, sun_strength: direct.strength, beam_textures, trail_textures, highlights, particles })
+		Ok(Prepared { geometry, casters: None, immutable: !scene.live, lights, environment, sun_shadows: scene.environment.global_shadows && scene.environment.sun_shadow_maps && direct.strength.max_element() > 0.0, bounds, sun_direction: direct.direction, sun_strength: direct.strength, beam_textures, trail_textures, highlights, particles })
 	}
 
 	/// The effects' textures and bind groups ([`EffectBindings`]): the last frames' when they drew the
@@ -4314,7 +4314,8 @@ impl Renderer {
 		// with GlobalShadows on, open OutdoorAmbient reads 0.986 of what it does with them off
 		// (lg-terms: 0.953 / 0.967 open, roofed and not)
 		if let Some((_, origin, size)) = &prepared.light_grid {
-			frame.light_grid = [origin.x, origin.y, origin.z, 1.0];
+			// (2: without the sun's shadow maps the grid's sky visibility stops the sun too, scene::NO_SUN_SHADOW_MAPS)
+			frame.light_grid = [origin.x, origin.y, origin.z, if environment.sun_shadow_maps { 1.0 } else { 2.0 }];
 			frame.light_grid_scale = [1.0 / size.x, 1.0 / size.y, 1.0 / size.z, LIGHT_GRID_OPEN];
 		} else {
 			frame.light_grid_scale = [0.0, 0.0, 0.0, if environment.global_shadows { LIGHT_GRID_OPEN } else { 1.0 }];
@@ -6598,6 +6599,51 @@ mod shadow_caster_tests {
 				assert!(if shades { share > 0.9 } else { share < 0.1 }, "{by}, roof {roof:?}: {share} of an opaque roof's shadow on the floor");
 				assert!(seen.is_none_or(|seen| seen == (below != sky)), "{by}, roof {roof:?}: in the picture from below, {}", below != sky);
 			}
+		}
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	/// A floor lit by the sun alone under a roof of blocks. With the sun's shadow maps (the default) any
+	/// roof shades it. Without them (the Lighting attribute scene::NO_SUN_SHADOW_MAPS) only the light grid
+	/// stops the sun: a roof 20 studs up closes the grid over the floor and still shades it, a roof 3 studs
+	/// up lies under the voxel the floor reads and leaves it lit, and an open floor is lit as before.
+	#[test]
+	fn without_the_suns_shadow_maps_only_the_light_grid_stops_the_sun() {
+		let state = std::env::temp_dir().join(format!("ror-no-sun-shadow-maps-test-{}", std::process::id()));
+		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let scene = |roof: Option<f32>, maps: bool| {
+			let mut model = ModelBuilder::new("Shade");
+			model.part(&PartSpec { name: "Floor".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, -0.5, 0.0)), size: Vec3::new(160.0, 1.0, 160.0), color: [255; 3], ..Default::default() });
+			if let Some(height) = roof {
+				model.part(&PartSpec { name: "Roof".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, height, 0.0)), size: Vec3::new(100.0, 1.0, 100.0), ..Default::default() });
+			}
+			let mut document = model.into_document();
+			if !maps {
+				let root = document.dom.root_ref();
+				let lighting = document.dom.insert(root, rbx_dom_weak::InstanceBuilder::new("Lighting").with_property("Attributes", Attributes::new().with(crate::scene::NO_SUN_SHADOW_MAPS, Variant::Bool(true))));
+				assert!(!crate::scene::Environment::from_lighting(&document.dom, document.dom.get_by_ref(lighting).unwrap()).sun_shadow_maps, "the attribute on Lighting turns the maps off");
+			}
+			let mut scene = crate::scene::extract::extract(&document);
+			let environment = &mut scene.environment;
+			(environment.ambient, environment.outdoor_ambient, environment.environment_diffuse_scale, environment.environment_specular_scale) = (Vec3::ZERO, Vec3::ZERO, 0.0, 0.0);
+			environment.sun_shadow_maps = maps;
+			scene
+		};
+		// the floor under the roof's middle, from under the lower roof
+		let views = [ViewRequest { width: 64, height: 64, camera: CameraSpec::LookAt { eye: [0.0, 2.0, -3.0], target: [0.0; 3], fov: 40.0 }, background: Background::Color([0.0, 0.0, 1.0]), bloom: false, ..Default::default() }];
+		let draw = |roof: Option<f32>, maps: bool| {
+			let (images, _) = renderer.render(&scene(roof, maps), &views).unwrap();
+			images[0].rgba.chunks(4).map(|pixel| pixel[..3].iter().map(|&channel| channel as f32).sum::<f32>() / 3.0).sum::<f32>() / (images[0].rgba.len() / 4) as f32
+		};
+		let (lit, dark) = (draw(None, true), draw(Some(20.0), true));
+		assert!(lit - dark > 40.0, "with the maps a roof takes the sun off the floor ({lit} lit, {dark} under it)");
+		// (the roof's height, the maps, whether the floor under it is shaded)
+		for (roof, maps, shades) in [(Some(3.0), true, true), (None, false, false), (Some(20.0), false, true), (Some(3.0), false, false)] {
+			let share = (lit - draw(roof, maps)) / (lit - dark);
+			assert!(if shades { share > 0.9 } else { share < 0.1 }, "roof {roof:?}, shadow maps {maps}: {share} of a roof's shadow on the floor");
 		}
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
