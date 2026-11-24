@@ -404,7 +404,15 @@ fn particle(emitter: &ParticleEmitter, frame: &glam::Affine3A, size: Vec3, inher
 	let acceleration = if emitter.locked_to_part { Vec3::from(rotation * glam::Vec3A::from(emitter.acceleration)) } else { emitter.acceleration };
 	// a ParticleEmitter has no mount; a legacy effect's system does
 	let (position, velocity) = motion(start, velocity, acceleration, emitter.drag, age, emitter.mount.is_none());
-	let spin = rng.range(emitter.rotation) + rng.range(emitter.rot_speed) * age;
+	// RotSpeed turns a particle by the life it has left, by its own drawn values: born at Rotation +
+	// RotSpeed · Lifetime, it turns clockwise for a positive RotSpeed (Rotation turns counterclockwise)
+	// and lies at Rotation when it dies (measured in a client: RotSpeed 180 over a 1 s life born at -179°
+	// and dying at 0.5°; Rotation 40, RotSpeed 90 born at 131°; RotSpeed 800 over 0.3 s born at -118.5°;
+	// with RotSpeed -200..200 five particles dying within 0.3° of their Rotation; flipbooks, flat and
+	// tilted alike). A legacy effect's systems keep turning by their age: their Rotation is drawn over the
+	// whole turn and their spin both ways alike, so the two give the same spread of angles.
+	let turned = if emitter.mount.is_none() { lifetime - age } else { age };
+	let spin = rng.range(emitter.rotation) + rng.range(emitter.rot_speed) * turned;
 	// envelopes: one random share per particle and sequence places every keypoint at that share of
 	// its range, value ± envelope cut to the property's own range (particle-envelope: at half life the
 	// sizes spread as widely as when young, where a share per keypoint would narrow them; Size 1 ± 1.5
@@ -1247,6 +1255,48 @@ mod tests {
 		// Loop at 2 frames a second wraps after 8 seconds
 		let looping = ParticleEmitter { flipbook_mode: 0, flipbook_framerate: (2.0, 2.0), ..emitter };
 		assert_eq!(flipbook(&looping, 8.75, 100.0, &mut rng).0, 1);
+	}
+
+	#[test]
+	fn rot_speed_turns_by_the_lifetime_left() {
+		// the particle's angle (degrees, counterclockwise on screen) at `age`, for one draw of the emitter
+		let angle = |emitter: &ParticleEmitter, age: f32, seed: u64| {
+			let mut rng = Rng::new(seed, 1);
+			particle(emitter, &glam::Affine3A::IDENTITY, Vec3::ZERO, Vec3::ZERO, age, age, &mut rng).expect("alive").rotation
+		};
+		let fixed = |rotation: f32, rot_speed: f32, lifetime: f32| ParticleEmitter { rotation: (rotation, rotation), rot_speed: (rot_speed, rot_speed), lifetime: (lifetime, lifetime), ..emitter() };
+		let near = |drawn: f32, measured: f32| ((drawn - measured + 180.0).rem_euclid(360.0) - 180.0).abs() < 2.5;
+		// a client's angles (a line fitted to 18-60 frames of each particle's life, against an arrow at
+		// Rotation 0) at birth, during the life and at death: (Rotation, RotSpeed, Lifetime, [(age, angle)])
+		type Measured = (f32, f32, f32, &'static [(f32, f32)]);
+		let measured: [Measured; 6] = [
+			(0.0, 180.0, 1.0, &[(0.0, -178.9), (0.25, 135.9), (1.0, 0.5)]),
+			(40.0, 90.0, 1.0, &[(0.0, 131.1), (1.0, 40.6)]),
+			(-70.0, -120.0, 1.0, &[(0.0, 170.2), (1.0, -71.1)]),
+			(0.0, 800.0, 0.3, &[(0.0, -118.5), (0.3, 1.9)]),
+			(0.0, -800.0, 0.3, &[(0.0, 119.4), (0.3, -2.3)]),
+			(0.0, 30.0, 10.0, &[(0.0, -59.8), (2.5, -134.6), (10.0, 1.4)]),
+		];
+		for (rotation, rot_speed, lifetime, points) in measured {
+			let emitter = fixed(rotation, rot_speed, lifetime);
+			for &(age, expected) in points {
+				let drawn = angle(&emitter, age, 1);
+				assert!(near(drawn, expected), "Rotation {rotation}, RotSpeed {rot_speed}, Lifetime {lifetime} at {age} s: {drawn}, measured {expected}");
+			}
+		}
+		// ranges: each particle by its own draws; with RotSpeed -200..200 they all die at Rotation, born apart
+		let ranged = ParticleEmitter { rotation: (20.0, 20.0), rot_speed: (-200.0, 200.0), lifetime: (1.0, 1.0), ..emitter() };
+		let born: Vec<f32> = (1..40).map(|seed| angle(&ranged, 0.0, seed)).collect();
+		assert!((1..40).all(|seed| near(angle(&ranged, 1.0, seed), 20.0)));
+		assert!(born.iter().cloned().fold(f32::MIN, f32::max) - born.iter().cloned().fold(f32::MAX, f32::min) > 300.0, "{born:?}");
+		// with Lifetime 0.5..1.5 a particle is born at RotSpeed times its own lifetime
+		let lives = ParticleEmitter { rot_speed: (180.0, 180.0), lifetime: (0.5, 1.5), ..emitter() };
+		let born: Vec<f32> = (1..40).map(|seed| angle(&lives, 0.0, seed)).collect();
+		assert!(born.iter().all(|angle| (90.0 - 1e-3..=270.0 + 1e-3).contains(angle)), "{born:?}");
+		assert!(born.iter().cloned().fold(f32::MIN, f32::max) - born.iter().cloned().fold(f32::MAX, f32::min) > 120.0, "{born:?}");
+		// a legacy effect's systems keep turning by their age
+		let legacy = ParticleEmitter { mount: Some(rbx_dom_weak::types::Ref::none()), ..fixed(0.0, 180.0, 1.0) };
+		assert!(near(angle(&legacy, 0.25, 1), 45.0));
 	}
 
 	#[test]
