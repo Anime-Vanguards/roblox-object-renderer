@@ -35,9 +35,10 @@ pub const LEVEL_DISTANCES: [f32; 4] = [250.0, 500.0, 2000.0, 3000.0];
 /// it at run time (l12: 8,192 triangles drawn as 4,016, 1,962, 812, 394).
 pub const RUNTIME_LEVELS: [f32; 5] = [1.0, 4016.0 / 8192.0, 1962.0 / 8192.0, 812.0 / 8192.0, 394.0 / 8192.0];
 
-/// Roblox client 10-bar `SavedQualityLevel` (bars 1–10) mapped to engine `EditQualityLevel` (1–21).
-/// Bar 1 maps to engine 1 (300 studs), bar 2 to engine 4 (450 studs, below the shadow/bloom switches),
-/// through bar 10 = engine 21.
+/// Roblox client 10-bar `SavedQualityLevel` (bars 1–10) mapped to engine `EditQualityLevel` (1–21),
+/// derived from Roblox's client settings script (`floor(21 * bar / 10)` with bar 1 held at 1) rather
+/// than measured directly in Studio or a player client. Bar 1 maps to engine 1 (300 studs), bar 2 to
+/// engine 4 (450 studs, below Studio's edit shadow/bloom switches), through bar 10 = engine 21.
 pub const CLIENT_TO_ENGINE_QUALITY: [u32; 10] = [1, 4, 6, 8, 10, 12, 14, 16, 18, 21];
 
 /// Maps a Roblox client graphics slider bar (1–10) to the engine quality level (1–21).
@@ -249,10 +250,14 @@ mod tests {
 		assert_eq!(Lod::parse("roblox").unwrap(), Lod { quality: 21, cull: true });
 		assert_eq!(Lod::parse("roblox:4").unwrap(), Lod { quality: 4, cull: true });
 		assert_eq!(Lod::parse("client").unwrap(), Lod { quality: 21, cull: true });
-		assert_eq!(Lod::parse("client:1").unwrap(), Lod { quality: 1, cull: true });
-		assert_eq!(Lod::parse("client:2").unwrap(), Lod { quality: 4, cull: true });
+		let expected_bars = [(1, 1), (2, 4), (3, 6), (4, 8), (5, 10), (6, 12), (7, 14), (8, 16), (9, 18), (10, 21)];
+		for (bar, engine) in expected_bars {
+			let spec = format!("client:{bar}");
+			assert_eq!(client_to_engine_quality(bar), engine, "client bar {bar}");
+			assert_eq!(Lod::parse(&spec).unwrap(), Lod { quality: engine, cull: true }, "parse {spec}");
+			assert_eq!(parse_client_bar(&spec), Some(bar), "parse_client_bar {spec}");
+		}
 		assert_eq!(Lod::parse("levels").unwrap(), Lod { quality: 21, cull: false });
-		assert_eq!(parse_client_bar("client:2"), Some(2));
 		assert_eq!(parse_client_bar("roblox:4"), None);
 		assert!(Lod::parse("roblox:22").is_err());
 		assert!(Lod::parse("client:0").is_err());

@@ -23,7 +23,7 @@ pub enum Basis {
 	Anchored,
 	/// Not measured: a stated assumption.
 	Estimated,
-	/// Not calibrated for this device preset (reported as 0 ms; see `fidelity` and `unmodeled`).
+	/// Not calibrated for this device preset (reported as null; see `fidelity` and `unmodeled`).
 	Uncalibrated,
 }
 
@@ -132,6 +132,9 @@ pub struct Quality {
 	/// Player slider bar (1–10) when `scale == "client"`.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub client_level: Option<u32>,
+	/// How `client_level` was mapped to `level` (explicitly unmeasured settings-script formula).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub mapping_basis: Option<&'static str>,
 	/// Distance culling horizon in studs for `level` (`crate::lod::Lod::view_distance`).
 	pub view_distance: f32,
 	/// Sun shadows: none at 1-8, a short reach at 10 (not to a caster 59 studs from the camera), soft
@@ -159,6 +162,7 @@ impl Quality {
 			level,
 			scale: if client_level.is_some() { "client" } else { "edit" },
 			client_level,
+			mapping_basis: client_level.map(|_| "unmeasured: Roblox settings-script formula floor(21*bar/10) with bar 1 = 1"),
 			view_distance,
 			sun_shadows: level >= 12,
 			per_pixel_lights: level >= 16,
@@ -315,6 +319,25 @@ pub fn unmodeled(preset: &Preset, quality: &Quality) -> Vec<serde_json::Value> {
 			"scope": "gpu",
 			"reason": "At graphics quality below 16, local lights use the voxel grid rather than per-pixel shading.",
 			"settleWith": "Measure at quality 16+ for per-pixel local light shading cost.",
+		}));
+	}
+	if let Some(bar) = quality.client_level {
+		items.push(serde_json::json!({
+			"kind": "clientQualityMapping",
+			"scope": "culling,shadows",
+			"reason": format!(
+				"Client bar {bar} -> engine quality {} comes from Roblox's client settings script (not measured directly), and sunShadows still uses Studio's edit switch (level >= 12) even though client sweeps have recorded shadow GPU time at bars 3-5 (engine 6-10).",
+				quality.level
+			),
+			"settleWith": "Measure client slider bars 1-10 directly in the Roblox client for both distance culling and sun-shadow switches.",
+		}));
+	}
+	if preset.name == "phone" && quality.level == 2 {
+		items.push(serde_json::json!({
+			"kind": "phoneViewDistance",
+			"scope": "culling",
+			"reason": "--preset phone uses edit quality 2 (300 studs) to preserve the reference GPU anchor; client runs pinned to engine level 4 cull at 450 studs.",
+			"settleWith": "Re-anchor the phone GPU reference at engine level 4 (or pass --client-quality 2 / --quality 4 to compare at 450 studs).",
 		}));
 	}
 	items

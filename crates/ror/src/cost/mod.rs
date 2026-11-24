@@ -513,12 +513,15 @@ fn part_triangles(part: &Part, meshes: &Meshes) -> Vec<u32> {
 	}
 }
 
-/// Triangles a Decal or Texture on a face of a part draws: the face's two, or a mesh's triangles
-/// facing that way (d1: 100 meshes with a Top decal, 39 triangles each of 238).
+/// Triangles a Decal or Texture on a face of a part draws: a MeshPart uses dominant box-face
+/// assignment (d1: 100 meshes with a Top decal, 39 triangles each of 238; exact for uniformly scaled
+/// MeshParts); Unions and SpecialMesh FileMeshes keep the positive-component rule because the renderer
+/// uses non-dominant rules for them and no Studio count is recorded; plain primitives draw 2.
 fn decal_triangles(part: &Part, face: u32, meshes: &Meshes) -> u32 {
 	match &part.geometry {
-		Geometry::MeshPart { .. } | Geometry::Union { .. } | Geometry::Special { mesh_type: mesh_type::FILE_MESH, .. } => {
-			meshes.of(&part.geometry).map(|stats| stats.facing[face.min(5) as usize]).unwrap_or(2)
+		Geometry::MeshPart { .. } => meshes.of(&part.geometry).map(|stats| stats.facing[face.min(5) as usize]).unwrap_or(2),
+		Geometry::Union { .. } | Geometry::Special { mesh_type: mesh_type::FILE_MESH, .. } => {
+			meshes.of(&part.geometry).map(|stats| stats.facing_positive[face.min(5) as usize]).unwrap_or(2)
 		}
 		_ => 2,
 	}
@@ -785,7 +788,7 @@ impl Analysis {
 			}
 			for decal in part.decals.iter().filter(|decal| decal.transparency < 1.0) {
 				let triangles = decal_triangles(part, decal.face, &meshes);
-				if triangles == 0 {
+				if triangles == 0 && matches!(part.geometry, Geometry::MeshPart { .. }) {
 					continue;
 				}
 				let (kind, class) = if decal.tiling.is_some() { (Kind::Texture, "Texture") } else { (Kind::Decal, "Decal") };
@@ -971,9 +974,9 @@ impl Analysis {
 		if !matches!(technology, 4 | 5) {
 			warnings.push(format!("Lighting.Technology {technology}: the rules were measured under Future and Unified"));
 		}
-		// Decals and Textures on meshes: each triangle is assigned to its single dominant box face
-		// (matching mesh.wgsl's `box_face`) and faces with zero triangles submit no draw (notes/cost.md
-		// "Decals and Textures on meshes", case e146).
+		// Decals and Textures on meshes: MeshParts use dominant-axis box-face assignment (matching
+		// mesh.wgsl's `box_face` on uniformly scaled MeshParts) and skip empty faces; calibrated on
+		// one probe mesh/face only (d1: 39/238) and uncalibrated generally (notes/cost.md, case e146).
 		let (mesh_decals, mesh_decal_triangles) = items
 			.iter()
 			.filter(|item| matches!(item.kind, Kind::Decal | Kind::Texture))
@@ -981,7 +984,7 @@ impl Analysis {
 			.fold((0u32, 0u32), |(count, sum), item| (count + 1, sum + item.triangles.first().copied().unwrap_or(0)));
 		if mesh_decals >= 20 && mesh_decal_triangles >= 20_000 {
 			warnings.push(format!(
-				"{mesh_decals} Decals or Textures on meshes count {mesh_decal_triangles} triangles: counted by dominant-axis face assignment (approximating Studio's per-face clipping)"
+				"{mesh_decals} Decals or Textures on meshes count {mesh_decal_triangles} triangles: dominant-axis face assignment is calibrated on one mesh/face only (uncalibrated generally; read those triangles and draws as an upper bound; non-uniformly scaled MeshParts can differ)"
 			));
 		}
 		let mesh_streaming = document
@@ -2314,9 +2317,67 @@ mod tests {
 
 		let q_e2 = prices::Quality::of_scale(edit2.quality(), edit2.client_quality, true);
 		let q_c2 = prices::Quality::of_scale(client2.quality(), client2.client_quality, true);
-		assert_eq!((q_e2.scale, q_e2.view_distance), ("edit", 300.0));
+		assert_eq!((q_e2.scale, q_e2.view_distance, q_e2.mapping_basis), ("edit", 300.0, None));
 		assert_eq!((q_c2.scale, q_c2.client_level, q_c2.level, q_c2.view_distance), ("client", Some(2), 4, 450.0));
+		assert!(q_c2.mapping_basis.is_some_and(|s| s.contains("unmeasured")));
 		assert!(!q_c2.sun_shadows && !q_c2.per_pixel_lights && !q_c2.bloom);
 		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	#[test]
+	fn special_mesh_decals_keep_positive_component_rule_and_many_mesh_decals_warn_uncalibrated() {
+		let temp = std::env::temp_dir().join(format!("ror-cost-special-decal-test-{}", std::process::id()));
+		let _ = std::fs::create_dir_all(&temp);
+		// Tilted triangle (normal ≈ (+0.577, +0.577, +0.577)): dominant axis assigns only 1 face,
+		// positive-component assigns 3 faces (Right, Top, Back).
+		let tilted_path = temp.join("tilted.mesh");
+		let mut tilted_body = String::from("version 1.01\n1000\n");
+		for _ in 0..1000 {
+			tilted_body.push_str("[1,0,0][0,1,0][0,0,0][0,1,0][0,1,0][1,0,0][0,0,1][0,1,0][0,1,0]");
+		}
+		tilted_body.push('\n');
+		std::fs::write(&tilted_path, &tilted_body).unwrap();
+		let mesh_uri = format!("file://{}", tilted_path.to_string_lossy().replace('\\', "/"));
+
+		// SpecialMesh FileMesh with 6 Textures: keeps positive-component (3 faces x 1000 = 3000 tris)
+		// and does not drop zero-tri faces under the MeshPart-only dominant rule.
+		let mut sp_model = ModelBuilder::new("SpecialDecal");
+		let part = sp_model.part(&PartSpec { size: Vec3::splat(4.0), ..Default::default() });
+		sp_model.child(
+			part,
+			InstanceBuilder::new("SpecialMesh")
+				.with_property("MeshType", Enum::from_u32(mesh_type::FILE_MESH))
+				.with_property("MeshId", rbx_dom_weak::types::ContentId::from(mesh_uri.clone())),
+		);
+		for face in 0..6u32 {
+			sp_model.child(part, InstanceBuilder::new("Texture").with_name(format!("T{face}")).with_property("Texture", "rbxasset://textures/face.png").with_property("Face", Enum::from_u32(face)));
+		}
+		let sp_v = view(&analyze(sp_model).0);
+		let sp_tex: Vec<&Batch> = sp_v.batches.iter().filter(|b| b.kind == Kind::Texture).collect();
+		assert_eq!(sp_tex.iter().map(|b| b.draws).sum::<u64>(), 6, "SpecialMesh must not skip faces via MeshPart dominant rule");
+		assert_eq!(sp_tex.iter().map(|b| b.triangles).sum::<u64>(), 3000, "SpecialMesh keeps positive-component rule (3 faces x 1000)");
+
+		// MeshPart with 24 textures (24 * 1000 = 24,000 tris) triggers honest uncalibrated upper-bound warning
+		let mut warn_model = ModelBuilder::new("WarnMeshDecal");
+		for i in 0..24 {
+			let mp = warn_model.child(
+				warn_model.model,
+				InstanceBuilder::new("MeshPart")
+					.with_name(format!("M{i}"))
+					.with_property("Size", rbx_dom_weak::types::Vector3::new(2.0, 2.0, 2.0))
+					.with_property("InitialSize", rbx_dom_weak::types::Vector3::new(2.0, 2.0, 2.0))
+					.with_property("MeshId", rbx_dom_weak::types::ContentId::from(mesh_uri.clone()))
+					.with_property("CFrame", crate::scene::build::cframe(Affine3A::from_translation(Vec3::new((i as f32) * 3.0, 0.0, 0.0)))),
+			);
+			// Face 0 (Right +X) wins the (+1,+1,+1) tie in box_face
+			warn_model.child(mp, InstanceBuilder::new("Texture").with_name("T0").with_property("Texture", "rbxasset://textures/face.png").with_property("Face", Enum::from_u32(0)));
+		}
+		let (warn_analysis, _) = analyze(warn_model);
+		assert!(
+			warn_analysis.warnings.iter().any(|w| w.contains("uncalibrated generally") && w.contains("upper bound")),
+			"expected honest uncalibrated upper-bound warning, got: {:?}",
+			warn_analysis.warnings
+		);
+		let _ = std::fs::remove_dir_all(&temp);
 	}
 }

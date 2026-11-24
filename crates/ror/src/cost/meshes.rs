@@ -26,9 +26,12 @@ pub struct MeshStats {
 	pub shape: u64,
 	/// The full-detail box in the mesh's own space (a MeshPart scales it to its Size).
 	pub bounds: (Vec3, Vec3),
-	/// Full-detail triangles facing each face, `Enum.NormalId` order (Right, Top, Back, Left, Bottom,
-	/// Front): what a Decal on that face of a MeshPart draws.
+	/// Full-detail triangles assigned to each dominant box face, `Enum.NormalId` order (Right, Top,
+	/// Back, Left, Bottom, Front): what a Decal or Texture on that face of a uniformly scaled MeshPart draws.
 	pub facing: [u32; 6],
+	/// Full-detail triangles with a positive normal component toward each face (`normal.dot(axis) > min`):
+	/// kept for Unions and SpecialMesh FileMeshes, where the renderer does not use dominant-face clipping.
+	pub facing_positive: [u32; 6],
 	/// Distinct vertex positions at full detail: what Roblox's occlusion counts of a mesh.
 	pub positions: u32,
 	/// The full-detail triangles of a mesh cheap enough to occlude ([`OCCLUDER_POSITIONS`]).
@@ -135,11 +138,14 @@ fn stats_of(mesh: &ror_mesh::Mesh) -> MeshStats {
 	let bounds = mesh.lod0_bounds().map(|(min, max)| (Vec3::from(min), Vec3::from(max))).unwrap_or((Vec3::ZERO, Vec3::ZERO));
 	const AXES: [Vec3; 6] = [Vec3::X, Vec3::Y, Vec3::Z, Vec3::NEG_X, Vec3::NEG_Y, Vec3::NEG_Z];
 	let mut facing = [0u32; 6];
-	// Default: assign each triangle to its single dominant box face (matching mesh.wgsl's `box_face`
-	// for MeshPart decals), so the six faces partition the mesh (~1x total, ~1/6 per face on an
-	// isotropic mesh) and faces with no matching triangles stay at 0. Setting `ROR_COST_FACING_MIN`
-	// overrides this with the legacy cosine threshold (`normal.dot(axis) > min`).
+	let mut facing_positive = [0u32; 6];
+	// Default: assign each MeshPart triangle to its single dominant box face (matching mesh.wgsl's
+	// `box_face` for uniformly scaled MeshPart decals), so the six faces partition the mesh (~1x total,
+	// ~1/6 per face on an isotropic mesh) and faces with no matching triangles stay at 0. Setting
+	// `ROR_COST_FACING_MIN` overrides this with the legacy cosine threshold (`normal.dot(axis) > min`).
+	// `facing_positive` keeps the positive-component rule for Unions and SpecialMesh FileMeshes.
 	let facing_min: Option<f32> = std::env::var("ROR_COST_FACING_MIN").ok().and_then(|value| value.parse().ok());
+	let pos_min = facing_min.unwrap_or(0.0);
 	let positions = indices
 		.iter()
 		.map(|&index| {
@@ -157,6 +163,11 @@ fn stats_of(mesh: &ror_mesh::Mesh) -> MeshStats {
 		if normal.length_squared() > 0.0 {
 			// NormalId order: Right +X, Top +Y, Back +Z, Left -X, Bottom -Y, Front -Z
 			let normal = normal.normalize();
+			for (face, axis) in AXES.iter().enumerate() {
+				if normal.dot(*axis) > pos_min {
+					facing_positive[face] += 1;
+				}
+			}
 			if let Some(min) = facing_min {
 				for (face, axis) in AXES.iter().enumerate() {
 					if normal.dot(*axis) > min {
@@ -171,7 +182,7 @@ fn stats_of(mesh: &ror_mesh::Mesh) -> MeshStats {
 			triangles.push([a, b, c]);
 		}
 	}
-	MeshStats { lods, shape: hash, bounds, facing, positions, occluder: full.then(|| Arc::new(triangles)), skinned: mesh.skinning.is_some(), high_quality: mesh.high_quality_lods }
+	MeshStats { lods, shape: hash, bounds, facing, facing_positive, positions, occluder: full.then(|| Arc::new(triangles)), skinned: mesh.skinning.is_some(), high_quality: mesh.high_quality_lods }
 }
 
 /// The box face (`Enum.NormalId` order: Right +X, Top +Y, Back +Z, Left -X, Bottom -Y, Front -Z)
@@ -203,6 +214,14 @@ mod tests {
 		mesh
 	}
 
+	fn tri_facing(dir: Vec3) -> [[f32; 3]; 3] {
+		let n = dir.normalize();
+		let ref_up = if n.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
+		let u = ref_up.cross(n).normalize();
+		let v = n.cross(u);
+		[Vec3::ZERO.into(), u.into(), v.into()]
+	}
+
 	#[test]
 	fn dominant_axis_assigns_each_triangle_to_one_face() {
 		// Flat +Y quad (2 triangles strictly facing Top / +Y)
@@ -212,6 +231,30 @@ mod tests {
 		]);
 		let stats = stats_of(&flat);
 		assert_eq!(stats.facing, [0, 2, 0, 0, 0, 0]);
+		assert_eq!(stats.facing_positive, [0, 2, 0, 0, 0, 0]);
+
+		// Asymmetric tilted mesh: distinct triangle count per NormalId face (Right=1, Top=2, Back=3,
+		// Left=4, Bottom=5, Front=6) so swapping any two faces fails, and tilted normals ensure
+		// facing_positive exceeds facing.
+		let dirs = [
+			(Vec3::new(1.0, 0.25, 0.1), 1usize),  // Right (+X)
+			(Vec3::new(0.1, 1.0, 0.25), 2),       // Top (+Y)
+			(Vec3::new(0.25, 0.1, 1.0), 3),       // Back (+Z)
+			(Vec3::new(-1.0, 0.25, -0.1), 4),     // Left (-X)
+			(Vec3::new(-0.1, -1.0, 0.25), 5),     // Bottom (-Y)
+			(Vec3::new(0.25, -0.1, -1.0), 6),     // Front (-Z)
+		];
+		let mut tris = Vec::new();
+		for (dir, count) in dirs {
+			for _ in 0..count {
+				tris.push(tri_facing(dir));
+			}
+		}
+		let asym = mesh_from_tris(&tris);
+		let asym_stats = stats_of(&asym);
+		assert_eq!(asym_stats.facing, [1, 2, 3, 4, 5, 6]);
+		assert_eq!(asym_stats.facing.iter().sum::<u32>(), 21);
+		assert!(asym_stats.facing_positive.iter().sum::<u32>() > 21, "tilted faces have positive dot on multiple axes: {:?}", asym_stats.facing_positive);
 
 		// Octahedron (8 tilted faces, none axis-aligned): dominant axis partitions all 8 triangles
 		let (px, nx) = ([1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]);

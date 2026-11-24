@@ -357,7 +357,11 @@ fn ms(value: f64) -> String {
 #[allow(clippy::too_many_arguments)]
 fn summary_lines(input: &str, setup: &Setup, views: &[ViewLine], mean: &Work, worst: Option<&ViewWork>, tree: &[Node], found: &[Finding], budget: Option<&Budget>) -> Vec<String> {
 	let mut lines = Vec::new();
-	lines.push(format!("cost loop ({SCHEMA}): {input}, {} views, preset {} ({}x{}, quality {}{})", views.len(), setup.preset.name, setup.preset.width, setup.preset.height, setup.quality.level, if setup.quality.sun_shadows { ", sun shadows" } else { ", no sun shadows" }));
+	let quality_label = match setup.quality.client_level {
+		Some(bar) => format!("quality {} (client bar {bar}, {:.0} studs)", setup.quality.level, setup.quality.view_distance),
+		None => format!("quality {}", setup.quality.level),
+	};
+	lines.push(format!("cost loop ({SCHEMA}): {input}, {} views, preset {} ({}x{}, {quality_label}{})", views.len(), setup.preset.name, setup.preset.width, setup.preset.height, if setup.quality.sun_shadows { ", sun shadows" } else { ", no sun shadows" }));
 	let desktop = setup.preset.uses_desktop_pricing();
 	if !desktop {
 		let gpu_ms = mean.gpu_ms.unwrap_or(0.0);
