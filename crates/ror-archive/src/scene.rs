@@ -31,6 +31,8 @@ pub(crate) const MAGIC: &[u8] = b"<roblox!\x89\xff\x0d\x0a\x1a\x0a";
 pub(crate) const HEADER_LEN: usize = 32;
 const CHUNK_HEADER_LEN: usize = 16;
 const ZSTD_MAGIC: &[u8] = &[0x28, 0xB5, 0x2F, 0xFD];
+/// The most a zstd frame holds for each byte of its own: a run-length block is four bytes for 128 KiB.
+const ZSTD_EXPANSION: usize = 32_768;
 
 /// The tag that introduces a column of object references in a `PROP` chunk.
 pub(crate) const TAG_EMBEDDED: u8 = 0x82;
@@ -124,6 +126,22 @@ pub(crate) fn data<'a>(scene: &'a [u8], chunk: &Chunk, scratch: &'a mut Vec<u8>,
 	}
 	scratch.clear();
 	if stored.starts_with(ZSTD_MAGIC) {
+		// A chunk holds one frame, and a frame says how much it holds when its writer knew, as the
+		// writers of these files do. A chunk that disagrees with its frame, or claims more than a frame
+		// of that length can hold, is corrupt, so do not allocate for it.
+		if let Ok(frame) = zstd::zstd_safe::find_frame_compressed_size(stored)
+			&& frame != stored.len()
+		{
+			return Err(invalid(format!("chunk {name} has {} bytes after its zstd frame", stored.len() - frame)));
+		}
+		if let Ok(Some(declared)) = zstd::zstd_safe::get_frame_content_size(stored)
+			&& declared != chunk.size as u64
+		{
+			return Err(invalid(format!("chunk {name} claims {} bytes, and its zstd frame declares {declared}", chunk.size)));
+		}
+		if chunk.size > stored.len().saturating_mul(ZSTD_EXPANSION) {
+			return Err(invalid(format!("chunk {name} claims {} bytes from {}", chunk.size, stored.len())));
+		}
 		*scratch = zstd::bulk::decompress(stored, chunk.size).map_err(|error| invalid(format!("chunk {name} zstd: {error}")))?;
 	} else {
 		// LZ4 expands at most ~255:1; a larger claim is corrupt, so do not allocate for it
@@ -454,6 +472,12 @@ fn charge(written: &mut u64, bytes: &[u8], limit: u64) -> Result<()> {
 pub(crate) fn flatten<'a>(scene: &'a [u8], scene_digest: &str, archive: &Archive<'a>) -> Result<(Cow<'a, [u8]>, Report)> {
 	let limits = archive.limits();
 	let (list, end) = chunks(scene)?;
+	// A chunk is decompressed once at most, so what the chunks claim together bounds the work. Each one
+	// has its own limit, but a scene can hold a great many of them.
+	let decompressed = list.iter().fold(0u64, |total, chunk| total.saturating_add(chunk.size as u64));
+	if decompressed > limits.max_scene_bytes {
+		return Err(Error::Limit("scene bytes"));
+	}
 	let mut report = Report::default();
 	let mut classes: BTreeMap<u32, Class> = BTreeMap::new();
 	let mut outputs: Vec<Out> = Vec::with_capacity(list.len());
@@ -646,6 +670,9 @@ pub(crate) fn flatten<'a>(scene: &'a [u8], scene_digest: &str, archive: &Archive
 	for output in &outputs {
 		match output {
 			Out::Verbatim(range) => out.extend_from_slice(&scene[range.clone()]),
+			// a chunk is written back within the limit it was read under, so the result reads under the
+			// same limits
+			Out::Rewritten(_, payload) if payload.len() > limits.max_chunk_bytes => return Err(Error::Limit("scene chunk bytes")),
 			Out::Rewritten(name, payload) => write_chunk(&mut out, name, payload)?,
 		}
 	}

@@ -78,7 +78,8 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Bounds on what a reader accepts. Members are stored uncompressed, so an archive cannot expand
-/// past its own size; the scene's chunks are compressed and are bounded by `max_chunk_bytes`.
+/// past its own size. The scene's chunks are compressed: `max_chunk_bytes` bounds one of them and
+/// `max_scene_bytes` all of them together.
 #[derive(Debug, Clone)]
 pub struct Limits {
 	/// The whole archive (default 4 GiB).
@@ -89,8 +90,11 @@ pub struct Limits {
 	pub max_record_bytes: usize,
 	/// ZIP members, and content records (default 1,000,000).
 	pub max_entries: usize,
-	/// One decompressed chunk of the scene (default 1 GiB).
+	/// One chunk of the scene, decompressed: as it is read, and as it is written back with its values
+	/// restored (default 1 GiB).
 	pub max_chunk_bytes: usize,
+	/// Every chunk of the scene, decompressed (default 8 GiB).
+	pub max_scene_bytes: u64,
 	/// Bytes written back into the scene from `objects/` (default 2 GiB). A string counts once for
 	/// each value that holds it, a shared string once however many values share it.
 	pub max_restored_bytes: u64,
@@ -104,6 +108,7 @@ impl Default for Limits {
 			max_record_bytes: 1 << 20,
 			max_entries: 1_000_000,
 			max_chunk_bytes: 1 << 30,
+			max_scene_bytes: 8 << 30,
 			max_restored_bytes: 2 << 30,
 		}
 	}

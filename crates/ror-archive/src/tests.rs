@@ -682,6 +682,170 @@ fn content_over_an_asset_id() -> Vec<u8> {
 	archive(&lines, &[&stored, &envelope])
 }
 
+/// One block of a zstd frame made by hand.
+enum Block<'a> {
+	/// These bytes as they are.
+	Raw(&'a [u8]),
+	/// This many zero bytes, as a run-length block.
+	Run(usize),
+	/// 128 KiB of zero bytes, as a compressed block: its literals are one run, and it has no sequences.
+	Zeros,
+}
+
+const BLOCK: usize = 128 * 1024;
+/// The start of a frame that declares no size and has a window of 128 KiB.
+const WINDOWED: &[u8] = &[0x00, 0x38];
+
+/// A zstd frame from what follows its magic number and its blocks.
+fn frame(header: &[u8], blocks: &[Block]) -> Vec<u8> {
+	let mut out = vec![0x28, 0xB5, 0x2F, 0xFD];
+	out.extend_from_slice(header);
+	for (index, block) in blocks.iter().enumerate() {
+		let (kind, size, body): (u32, usize, &[u8]) = match block {
+			Block::Raw(bytes) => (0, bytes.len(), bytes),
+			Block::Run(length) => (1, *length, &[0]),
+			Block::Zeros => (2, 5, &[0x0D, 0x00, 0x20, 0x00, 0x00]),
+		};
+		let last = (index + 1 == blocks.len()) as u32;
+		out.extend_from_slice(&((size as u32) << 3 | kind << 1 | last).to_le_bytes()[..3]);
+		out.extend_from_slice(body);
+	}
+	out
+}
+
+/// The archive with the compressed chunks of its scene that `pick` chooses, by name and data, stored
+/// as `store` says: it gets a chunk's data and returns the bytes to store and the size to claim.
+fn stored_as(archived: &[u8], pick: impl Fn(&[u8; 4], &[u8]) -> bool, store: impl Fn(&[u8]) -> (Vec<u8>, usize)) -> Vec<u8> {
+	let view = Archive::open(archived).unwrap();
+	let scene_bytes = view.root().unwrap().bytes;
+	let (list, end) = scene::chunks(scene_bytes).unwrap();
+	let mut out = scene_bytes[..scene::HEADER_LEN].to_vec();
+	for chunk in &list {
+		let mut scratch = Vec::new();
+		let payload = scene::data(scene_bytes, chunk, &mut scratch, usize::MAX).unwrap();
+		if chunk.compressed && pick(&chunk.name, payload) {
+			let (stored, size) = store(payload);
+			out.extend_from_slice(&chunk.name);
+			out.extend_from_slice(&(stored.len() as u32).to_le_bytes());
+			out.extend_from_slice(&(size as u32).to_le_bytes());
+			out.extend_from_slice(&[0; 4]);
+			out.extend_from_slice(&stored);
+		} else {
+			out.extend_from_slice(&scene_bytes[chunk.whole.clone()]);
+		}
+	}
+	out.extend_from_slice(&scene_bytes[end..]);
+	with_scene(archived, &out)
+}
+
+/// Picks the chunks that hold the script sources.
+fn sources(name: &[u8; 4], payload: &[u8]) -> bool {
+	let mut reader = Reader::new(payload);
+	name == b"PROP" && reader.u32("class").is_ok() && reader.sized("name").is_ok_and(|property| property == b"Source")
+}
+
+/// Every chunk as a frame that declares its size, the way Studio writes them.
+fn as_studio_writes(archived: &[u8]) -> Vec<u8> {
+	stored_as(archived, |_, _| true, |payload| (zstd::bulk::compress(payload, 3).unwrap(), payload.len()))
+}
+
+/// The script sources as a frame of raw blocks that declares no size.
+fn as_raw_blocks(archived: &[u8]) -> Vec<u8> {
+	stored_as(archived, sources, |payload| (frame(WINDOWED, &payload.chunks(48).map(Block::Raw).collect::<Vec<_>>()), payload.len()))
+}
+
+/// The script sources as a chunk that claims `size` bytes for a frame of these blocks.
+fn claiming(archived: &[u8], size: usize, header: &[u8], blocks: &[Block]) -> Vec<u8> {
+	stored_as(archived, sources, |_| (frame(header, blocks), size))
+}
+
+/// The script sources as two frames, one after the other, that hold the chunk's data between them.
+fn as_two_frames(archived: &[u8]) -> Vec<u8> {
+	stored_as(archived, sources, |payload| {
+		let (first, second) = payload.split_at(payload.len() / 2);
+		let mut stored = frame(WINDOWED, &[Block::Raw(first)]);
+		stored.extend(frame(WINDOWED, &[Block::Raw(second)]));
+		(stored, payload.len())
+	})
+}
+
+/// 64 blocks of 128 KiB each: 8 MiB from a few hundred bytes.
+fn many(block: fn() -> Block<'static>) -> Vec<Block<'static>> {
+	(0..64).map(|_| block()).collect()
+}
+
+/// Archives of four scripts whose sources sit in a zstd frame the chunk around it does not match:
+/// each one's file name for other readers, its bytes, and what this reader says when it refuses it.
+fn mismatched_frames() -> [(&'static str, Vec<u8>, &'static str); 6] {
+	let scripts = Builder::place(repeating_place(4, 0, 0)).externalize(64).build().unwrap();
+	[
+		// the chunk claims 64 bytes and the frame's run-length blocks hold 8 MiB: decoding stops at the 64th
+		("zstd-overfull.rbx", claiming(&scripts, 64, WINDOWED, &many(|| Block::Run(BLOCK))), "chunk PROP zstd"),
+		// the same in compressed blocks, which do not say what they hold
+		("zstd-blocks.rbx", claiming(&scripts, 64, WINDOWED, &many(|| Block::Zeros)), "chunk PROP zstd"),
+		// the chunk claims 65 bytes and the frame's one block holds 64
+		("zstd-underfull.rbx", claiming(&scripts, 65, WINDOWED, &[Block::Run(64)]), "decompressed to 64 of 65 bytes"),
+		// the chunk claims 1 GiB less 1 MiB for a frame of ten bytes: nothing is allocated for it
+		("zstd-overclaim.rbx", claiming(&scripts, (1 << 30) - (1 << 20), WINDOWED, &[Block::Run(BLOCK)]), "claims 1072693248 bytes from 10"),
+		// the chunk claims 65 bytes and the frame declares the 64 it holds
+		("zstd-declared.rbx", claiming(&scripts, 65, &[0x20, 64], &[Block::Run(64)]), "claims 65 bytes, and its zstd frame declares 64"),
+		// the chunk's data in two frames, one after the other: a chunk holds one
+		("zstd-two-frames.rbx", as_two_frames(&scripts), "after its zstd frame"),
+	]
+}
+
+#[test]
+fn a_zstd_chunk_reads_as_an_lz4_one_does() {
+	let place = sample_place();
+	let archived = Builder::place(place.clone()).externalize(64).build().unwrap();
+	for bytes in [as_studio_writes(&archived), as_raw_blocks(&archived)] {
+		let scene = unwrap(&bytes).unwrap();
+		assert_eq!(dump(&scene.bytes), dump(&place));
+		assert_eq!(scene.report.restored_values, 5);
+	}
+	// the blocks the next test overfills chunks with are sound: they decode to what they say
+	let zeros = zstd::bulk::decompress(&frame(WINDOWED, &[Block::Zeros, Block::Run(7), Block::Zeros]), 3 * BLOCK).unwrap();
+	assert_eq!(zeros, vec![0; 2 * BLOCK + 7]);
+}
+
+#[test]
+fn a_zstd_chunk_is_held_to_what_it_claims() {
+	for (name, bytes, what) in mismatched_frames() {
+		let error = unwrap(&bytes).unwrap_err();
+		assert!(matches!(error, Error::Scene(_)), "{name}: {error}");
+		assert!(error.to_string().contains(what), "{name}: {error}");
+	}
+}
+
+#[test]
+fn the_scene_limit_counts_every_chunk() {
+	let place = sample_place();
+	let bytes = Builder::place(place.clone()).externalize(64).build().unwrap();
+	let view = Archive::open(&bytes).unwrap();
+	let total: u64 = scene::chunks(view.root().unwrap().bytes).unwrap().0.iter().map(|chunk| chunk.size as u64).sum();
+	let scene = unwrap_with(&bytes, &Limits { max_scene_bytes: total, ..Limits::default() }).unwrap();
+	assert_eq!(dump(&scene.bytes), dump(&place));
+	let tight = Limits { max_scene_bytes: total - 1, ..Limits::default() };
+	assert!(matches!(unwrap_with(&bytes, &tight), Err(Error::Limit("scene bytes"))));
+}
+
+#[test]
+fn a_chunk_is_written_back_within_the_limit_it_was_read_under() {
+	// four copies of the source go back into one chunk, which makes it the scene's largest by far
+	let place = repeating_place(4, 0, 0);
+	let bytes = Builder::place(place.clone()).externalize(64).build().unwrap();
+	let largest = |scene: &[u8]| scene::chunks(scene).unwrap().0.iter().map(|chunk| chunk.size).max().unwrap();
+	let view = Archive::open(&bytes).unwrap();
+	let stored = largest(view.root().unwrap().bytes);
+	let restored = largest(&unwrap(&bytes).unwrap().bytes);
+	assert!(restored > stored + 4 * LONG_SOURCE.len() / 2, "{restored} bytes restored from {stored}");
+	let scene = unwrap_with(&bytes, &Limits { max_chunk_bytes: restored, ..Limits::default() }).unwrap();
+	assert_eq!(dump(&scene.bytes), dump(&place));
+	// every chunk of the stored scene is within this limit, and the one written back is not
+	let tight = Limits { max_chunk_bytes: restored - 1, ..Limits::default() };
+	assert!(matches!(unwrap_with(&bytes, &tight), Err(Error::Limit("scene chunk bytes"))));
+}
+
 #[test]
 fn bytes_after_the_shared_strings_do_not_move_the_restored_ones() {
 	let place = sample_place();
@@ -920,8 +1084,14 @@ fn archives_for_other_readers_to_test_against() {
 		("limit-order.rbx", with_missing_source(&scripts, 4)),
 		// refused: an opaque content reference over a value that is an asset id
 		("content-over-uri.rbx", content_over_an_asset_id()),
+		// reads as the place: every chunk is a zstd frame that declares its size, as Studio writes them
+		("zstd.rbx", as_studio_writes(&archived)),
+		// reads as the place: the script sources are a zstd frame of raw blocks that declares no size
+		("zstd-raw-blocks.rbx", as_raw_blocks(&archived)),
 	];
-	for (name, bytes) in files {
+	// refused, each for its own reason: a chunk and the zstd frame in it that do not match
+	let mismatched = mismatched_frames().map(|(name, bytes, _)| (name, bytes));
+	for (name, bytes) in files.into_iter().chain(mismatched) {
 		std::fs::write(folder.join(name), &bytes).unwrap();
 		println!("{name}: {} bytes", bytes.len());
 	}

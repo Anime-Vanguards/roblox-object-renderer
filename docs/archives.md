@@ -76,10 +76,13 @@ Some things a strict reader refuses are read past and reported: members other th
 | `manifest.jsonl` | 64 MiB |
 | One manifest record | 1 MiB |
 | Members, and content records | 1,000,000 |
-| One decompressed chunk of the scene | 1 GiB |
+| One chunk of the scene, decompressed | 1 GiB |
+| Every chunk of the scene, decompressed | 8 GiB |
 | Bytes written back into the scene | 2 GiB |
 
-Members are stored uncompressed, so an archive cannot unpack to more than its own size. The scene's chunks are compressed, which is what the last two limits bound. Bytes written back are counted before they are copied: a string once for each value that holds it, a shared string once however many values share it.
+Members are stored uncompressed, so an archive cannot unpack to more than its own size. The scene's chunks are compressed, which is what the last three limits bound. The limit on one chunk holds for a chunk as it is read and as it is written back with its values restored, so a flattened scene reads under the limits it was made under. Bytes written back are counted before they are copied: a string once for each value that holds it, a shared string once however many values share it.
+
+A compressed chunk is an LZ4 block or one zstd frame. `ror` sets no memory aside for a chunk that claims more than its compressed bytes can hold, or another size than its zstd frame declares: such a chunk is an error.
 
 ## Warnings and errors
 
