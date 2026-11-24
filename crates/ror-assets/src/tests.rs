@@ -524,6 +524,29 @@ fn concurrent_fetches_share_one_download() {
 }
 
 #[test]
+fn both_pinned_version_spellings_share_one_download() {
+	let cdn = MockServer::start(|_| Reply::bytes(MESH));
+	let cdn_url = cdn.url("/obj");
+	let ad = MockServer::start(move |_| Reply::json(&format!("{{\"location\":\"{cdn_url}\"}}")));
+	let state = temp_state("pinned");
+
+	// Roblox's spelling, with text around the numbers that must not reach the request
+	let first = assets(AssetConfig::new(&state), endpoints(&ad, &cdn), false);
+	let fetched = first.fetch("rbxassetid://88&Version=+03&next=https://example.com/../x&q=?y").unwrap();
+	assert_eq!((fetched.source, fetched.bytes.as_slice()), (Source::Network, MESH));
+	assert_eq!(ad.requests().iter().map(|r| r.path.as_str()).collect::<Vec<_>>(), ["/v1/assetId/88/version/3"]);
+	assert!(first.inner.disk.read_meta("rbxassetid://88?version=3").is_some());
+
+	// the `?` spelling is the same entry: in memory, and in the disk cache for another instance
+	assert_eq!(first.fetch("rbxassetid://88?version=3").unwrap().bytes, MESH);
+	let second = assets(AssetConfig::new(&state), endpoints(&ad, &cdn), false);
+	assert_eq!(second.fetch("rbxassetid://88?version=3").unwrap().source, Source::DiskCache);
+	assert_eq!(second.fetch("rbxassetid://88&version=3").unwrap().source, Source::DiskCache);
+	assert_eq!(ad.requests().len(), 1);
+	assert_eq!(cdn.requests().len(), 1);
+}
+
+#[test]
 fn disk_cache_is_shared_and_offline_works() {
 	let cdn = MockServer::start(|_| Reply::bytes(MESH));
 	let cdn_url = cdn.url("/obj");

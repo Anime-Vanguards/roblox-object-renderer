@@ -11,8 +11,9 @@ pub enum ContentId {
 	/// `rbxasset://<path>`: a file of the Studio install. The path uses `/` separators, has no
 	/// leading slash and no `..` components.
 	StudioAsset(String),
-	/// An asset on assetdelivery: `rbxassetid://N`, `rbxassetid://N?version=V`, the
-	/// `roblox.com/asset/?id=N` URL spellings, assetdelivery URLs, bare numeric ids.
+	/// An asset on assetdelivery: `rbxassetid://N`, `rbxassetid://N&version=V` (how Roblox pins a
+	/// version), `rbxassetid://N?version=V`, the `roblox.com/asset/?id=N` URL spellings, assetdelivery
+	/// URLs, bare numeric ids.
 	Asset { id: u64, version: Option<u64> },
 	/// `rbxthumb://type=…&id=…&w=…&h=…[&filters=circular]`
 	Thumbnail(Thumbnail),
@@ -188,6 +189,12 @@ fn query_pairs(query: &str) -> Vec<(String, String)> {
 }
 
 fn parse_assetid(rest: &str) -> Option<ContentId> {
+	// An `&` before any `?`: how Roblox spells a pinned version. The `?` spelling below never read these.
+	if let Some(amp) = rest.find('&')
+		&& rest.find('?').is_none_or(|question| amp < question)
+	{
+		return parse_pinned(&rest[..amp], &rest[amp + 1..]);
+	}
 	let (id_part, query) = rest.split_once('?').unwrap_or((rest, ""));
 	let id = parse_id(id_part.trim_end_matches('/'))?;
 	let mut version = None;
@@ -197,6 +204,60 @@ fn parse_assetid(rest: &str) -> Option<ContentId> {
 		}
 	}
 	Some(ContentId::Asset { id, version })
+}
+
+/// `rbxassetid://N&version=V[&…]`, the spelling Roblox saves a pinned version in, read the way a Roblox
+/// client reads it: the id with spaces around it at most; no `#` anywhere; keys and values
+/// percent-decoded (`+` a space) and trimmed. Each `version` key, in any case, whose value is an
+/// [`integer`] replaces the one before it, 0 or less meaning the latest version; the first that is
+/// not one (empty, `abc`, `4/`, past i64) ends the reading, keeping what was read. A lowercase `id`
+/// key holding an id names that asset instead. `assetversionid` names an asset version, which this
+/// resolver does not fetch: invalid.
+fn parse_pinned(id_part: &str, query: &str) -> Option<ContentId> {
+	if query.contains('#') {
+		return None;
+	}
+	let mut id = parse_id(id_part.trim())?;
+	let (mut version, mut reading) = (None, true);
+	for pair in query.split('&').filter(|p| !p.is_empty()) {
+		let (key, value) = pair.split_once('=').map_or((pair, None), |(k, v)| (k, Some(form_decode(v))));
+		let key = form_decode(key);
+		let (key, value) = (key.trim(), value.as_deref().map(str::trim));
+		if key.eq_ignore_ascii_case("assetversionid") {
+			return None;
+		}
+		if key == "id" {
+			id = value.and_then(parse_id).unwrap_or(id);
+		} else if reading && key.eq_ignore_ascii_case("version") {
+			match value.and_then(integer) {
+				Some(v) => version = u64::try_from(v).ok().filter(|&v| v > 0),
+				None => reading = false,
+			}
+		}
+	}
+	Some(ContentId::Asset { id, version })
+}
+
+/// A pinned version's integer: an optional sign, then decimal digits (a leading zero is not octal) or
+/// `0x` and hex digits, within i64.
+fn integer(text: &str) -> Option<i64> {
+	let (sign, digits) = match text.strip_prefix('-') {
+		Some(rest) => ("-", rest),
+		None => ("", text.strip_prefix('+').unwrap_or(text)),
+	};
+	let (radix, digits) = match digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")) {
+		Some(hex) => (16, hex),
+		None => (10, digits),
+	};
+	if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+		return None;
+	}
+	i64::from_str_radix(&format!("{sign}{digits}"), radix).ok()
+}
+
+/// A query key or value as a form decodes it: `+` is a space, then percent escapes.
+fn form_decode(text: &str) -> String {
+	percent_decode(&text.replace('+', " "))
 }
 
 fn parse_thumb(rest: &str) -> Option<Thumbnail> {
@@ -326,11 +387,92 @@ mod tests {
 			// how Studio saves a union's Content
 			("https://www.roblox.com//asset/?id=123456789", asset(123456789, None)),
 			("123", asset(123, None)),
+			// `?` before any `&` reads as it always did
+			("rbxassetid://123?version=4&foo=bar", asset(123, Some(4))),
+			("rbxassetid://123?foo=bar&version=4", asset(123, Some(4))),
+			("rbxassetid://123/?version=4&version=5", asset(123, Some(5))),
 		];
 		for (text, expected) in cases {
 			assert_eq!(ContentId::parse(text).unwrap(), expected, "{text}");
 		}
 		assert_eq!(asset(5, Some(2)).canonical(), "rbxassetid://5?version=2");
+	}
+
+	/// `rbxassetid://N&version=V`, how Roblox saves a pinned version, read as a Roblox client loads it
+	/// (Studio 0.747's client, 2026-11-24: a mesh and an image whose only version is 1, so a version
+	/// read loads at 1 and fails at 2, and a version not read loads the latest).
+	#[test]
+	fn pinned_version_spellings() {
+		let cases = [
+			("rbxassetid://123&version=4", asset(123, Some(4))),
+			("rbxassetid://123&Version=4", asset(123, Some(4))),
+			("rbxassetid://123&VERSION=4", asset(123, Some(4))),
+			// other keys before and after it
+			("rbxassetid://123&version=4&foo=bar", asset(123, Some(4))),
+			("rbxassetid://123&foo=bar&version=4", asset(123, Some(4))),
+			("rbxassetid://123&foo&version=4", asset(123, Some(4))),
+			("rbxassetid://123&&version=4&", asset(123, Some(4))),
+			("rbxassetid://123&amp;version=4", asset(123, None)),
+			("rbxassetid://123&=4", asset(123, None)),
+			("rbxassetid://123&", asset(123, None)),
+			("rbxassetid://123&ID=456", asset(123, None)),
+			("rbxassetid://123&id=456&version=4", asset(456, Some(4))),
+			("rbxassetid://123& id=456", asset(456, None)),
+			("rbxassetid://123&id=abc", asset(123, None)),
+			// spaces around the id
+			("rbxassetid://123 &version=4", asset(123, Some(4))),
+			("rbxassetid:// 123\t&version=4", asset(123, Some(4))),
+			("rbxassetid://00123&version=4", asset(123, Some(4))),
+			// what reads as the integer
+			("rbxassetid://123&version=04", asset(123, Some(4))),
+			("rbxassetid://123&version=08", asset(123, Some(8))),
+			("rbxassetid://123&version= 4 ", asset(123, Some(4))),
+			("rbxassetid://123&version=+4", asset(123, Some(4))),
+			("rbxassetid://123&version=4+", asset(123, Some(4))),
+			("rbxassetid://123&version=%2B4", asset(123, Some(4))),
+			("rbxassetid://123&version=%34", asset(123, Some(4))),
+			("rbxassetid://123&ver%73ion=4", asset(123, Some(4))),
+			("rbxassetid://123& version =4", asset(123, Some(4))),
+			("rbxassetid://123&version=0x4", asset(123, Some(4))),
+			("rbxassetid://123&version=+0X4", asset(123, Some(4))),
+			("rbxassetid://123&version=9223372036854775807", asset(123, Some(9223372036854775807))),
+			// the latest version: no integer, or one of 0 or less, or past i64
+			("rbxassetid://123&version=", asset(123, None)),
+			("rbxassetid://123&version", asset(123, None)),
+			("rbxassetid://123&version=abc", asset(123, None)),
+			("rbxassetid://123&version=4abc", asset(123, None)),
+			("rbxassetid://123&version=4/", asset(123, None)),
+			("rbxassetid://123&version=4.0", asset(123, None)),
+			("rbxassetid://123&version=4?x=1", asset(123, None)),
+			("rbxassetid://123&version=4=5", asset(123, None)),
+			("rbxassetid://123&version=4%23", asset(123, None)),
+			("rbxassetid://123&version=0x", asset(123, None)),
+			("rbxassetid://123&version=0xg", asset(123, None)),
+			("rbxassetid://123&version=0", asset(123, None)),
+			("rbxassetid://123&version=-4", asset(123, None)),
+			("rbxassetid://123&version=-0x4", asset(123, None)),
+			("rbxassetid://123&version=9223372036854775808", asset(123, None)),
+			("rbxassetid://123&version=18446744073709551620", asset(123, None)),
+			// repeated: each integer replaces the one before; the first that is none ends the reading
+			("rbxassetid://123&version=3&version=4", asset(123, Some(4))),
+			("rbxassetid://123&version=4&version=3", asset(123, Some(3))),
+			("rbxassetid://123&version=4&version=-1", asset(123, None)),
+			("rbxassetid://123&version=0&version=4", asset(123, Some(4))),
+			("rbxassetid://123&version=4&version=abc&version=3", asset(123, Some(4))),
+			("rbxassetid://123&version=4&version&version=3", asset(123, Some(4))),
+			("rbxassetid://123&version=4&version=", asset(123, Some(4))),
+			("rbxassetid://123&version=abc&version=4", asset(123, None)),
+			("rbxassetid://123&version=%20&version=4", asset(123, None)),
+			("rbxassetid://123&version=99999999999999999999&version=4", asset(123, None)),
+		];
+		for (text, expected) in cases {
+			assert_eq!(ContentId::parse(text).unwrap(), expected, "{text}");
+		}
+		// the same asset as the `?` spelling, under one cache key
+		for (pinned, question) in [("rbxassetid://5&version=2", "rbxassetid://5?version=2"), ("rbxassetid://5&Version=02&x=y", "rbxassetid://5?version=2")] {
+			assert_eq!(ContentId::parse(pinned).unwrap().canonical(), ContentId::parse(question).unwrap().canonical(), "{pinned}");
+		}
+		assert_eq!(ContentId::parse("rbxassetid://5&version=2").unwrap().canonical(), "rbxassetid://5?version=2");
 	}
 
 	#[test]
@@ -342,6 +484,20 @@ mod tests {
 			"rbxassetid://abc",
 			"rbxassetid://0",
 			"rbxassetid://99999999999999999999999",
+			"rbxassetid://123?version=abc",
+			// a pinned version where a Roblox client loads nothing
+			"rbxassetid://123/&version=4",
+			"rbxassetid:///123&version=4",
+			"rbxassetid://123%26version=4",
+			"rbxassetid://123&version=4#x",
+			"rbxassetid://123&#version=4",
+			"rbxassetid://123#&version=4",
+			"rbxassetid://&version=4",
+			"rbxassetid://0&version=4",
+			"rbxassetid://abc&version=4",
+			// an asset version id names another asset's version: not fetched
+			"rbxassetid://123&assetversionid=5",
+			"rbxassetid://123&version=4&AssetVersionId=5",
 			"http://www.roblox.com/asset/?id=",
 			"http://www.roblox.com/catalog/123",
 			"https://example.com/image.png",

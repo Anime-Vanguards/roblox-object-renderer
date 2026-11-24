@@ -2,10 +2,11 @@
 //!
 //! - `rbxasset://path` → the local Roblox Studio install, looked up in `PlatformContent/pc/`, then
 //!   `content/`, then `ExtraContent/` (see `studio.rs` for detection and the evidence for the order)
-//! - `rbxassetid://N`, `rbxassetid://N?version=V`, `http(s)://www.roblox.com/asset/?id=N` (and the
-//!   other asset URL spellings), bare numeric ids → assetdelivery.roblox.com (public route first,
-//!   then an Open Cloud API key's route, then the account cookie; a refusal carries assetdelivery's
-//!   reason, [`RefusalReason`]), then the CDN location it returns (never with a credential)
+//! - `rbxassetid://N`, `rbxassetid://N&version=V` (or `?version=V`),
+//!   `http(s)://www.roblox.com/asset/?id=N` (and the other asset URL spellings), bare numeric ids →
+//!   assetdelivery.roblox.com (public route first, then an Open Cloud API key's route, then the
+//!   account cookie; a refusal carries assetdelivery's reason, [`RefusalReason`]), then the CDN
+//!   location it returns (never with a credential)
 //! - `rbxthumb://type=Asset&id=N&w=W&h=H` → thumbnails.roblox.com
 //! - a local file path → the file
 //!
