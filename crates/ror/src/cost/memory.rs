@@ -1292,4 +1292,123 @@ mod tests {
 		assert!(line.contains("PARTIAL total est GPU upper bound"), "{line}");
 		let _ = std::fs::remove_dir_all(&dir);
 	}
+
+	#[test]
+	fn normal_map_upload_is_priced_as_bc3_not_bc1() {
+		let dir = std::env::temp_dir().join(format!("ror-memory-normal-test-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+
+		let color_png = dir.join("color64.png");
+		let normal_png = dir.join("normal64.png");
+		write_png(&color_png, 64, 64, false);
+		write_png(&normal_png, 64, 64, false);
+		let uri = |p: &std::path::Path| format!("file://{}", p.to_string_lossy().replace('\\', "/"));
+
+		let mut model = ModelBuilder::new("Norm");
+		let part = model.part(&PartSpec { name: "Block".into(), ..Default::default() });
+		model.child(
+			part,
+			InstanceBuilder::new("SurfaceAppearance")
+				.with_property("ColorMap", ContentId::from(uri(&color_png)))
+				.with_property("NormalMap", ContentId::from(uri(&normal_png))),
+		);
+		let document = model.into_document();
+		let scene = crate::scene::extract::extract(&document);
+		let assets = Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(dir.join("cache")) });
+		let meshes = Meshes::load(&scene.parts, &assets);
+		let report = measure(&scene, &meshes, &assets);
+
+		assert_eq!(report.textures.unique, 2);
+		assert_eq!(report.textures.missing, 0);
+		let color = report.textures.top.iter().find(|e| e.id.contains("color64.png")).expect("color entry");
+		let normal = report.textures.top.iter().find(|e| e.id.contains("normal64.png")).expect("normal entry");
+		assert_eq!(color.desktop_bc_format, "bc1");
+		assert_eq!(color.desktop_bc_mip_bytes, 2_744);
+		assert_eq!(normal.desktop_bc_format, "bc3");
+		assert_eq!(normal.desktop_bc_mip_bytes, 5_488);
+		assert_eq!(report.textures.desktop_bc_mip_bytes, 2_744 + 5_488);
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	#[test]
+	fn sky_excludes_default_roblox_textures_and_counts_custom_sky_textures() {
+		let dir = std::env::temp_dir().join(format!("ror-memory-sky-test-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+
+		let custom_face = dir.join("custom_sky.png");
+		let custom_bytes = write_png(&custom_face, 32, 32, false);
+		let custom_uri = format!("file://{}", custom_face.to_string_lossy().replace('\\', "/"));
+
+		let mut dom = rbx_dom_weak::WeakDom::new(InstanceBuilder::new("DataModel"));
+		let root = dom.root_ref();
+		let lighting = dom.insert(root, InstanceBuilder::new("Lighting"));
+		dom.insert(
+			lighting,
+			InstanceBuilder::new("Sky")
+				.with_property("SkyboxBk", ContentId::from(custom_uri.as_str()))
+				.with_property("SkyboxDn", ContentId::from("rbxasset://textures/sky/sky512_dn.tex"))
+				.with_property("SkyboxFt", ContentId::from("rbxasset://textures/sky/sky512_ft.tex"))
+				.with_property("SkyboxLf", ContentId::from("rbxasset://textures/sky/sky512_lf.tex"))
+				.with_property("SkyboxRt", ContentId::from("rbxasset://textures/sky/sky512_rt.tex"))
+				.with_property("SkyboxUp", ContentId::from("rbxasset://textures/sky/sky512_up.tex"))
+				.with_property("SunTextureId", ContentId::from("rbxasset://sky/sun.jpg"))
+				.with_property("MoonTextureId", ContentId::from("rbxasset://sky/moon.jpg")),
+		);
+		let document = crate::scene::load::Document::new(dom);
+		let scene = crate::scene::extract::extract(&document);
+		let assets = Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(dir.join("cache")) });
+		let meshes = Meshes::load(&scene.parts, &assets);
+		let report = measure(&scene, &meshes, &assets);
+
+		assert_eq!(report.textures.unique, 1, "only custom sky face should be counted: {:?}", report.textures.top);
+		assert_eq!(report.textures.loaded, 1);
+		assert_eq!(report.textures.missing, 0);
+		assert_eq!(report.textures.file_bytes, custom_bytes);
+		assert!(report.textures.top[0].id.contains("custom_sky.png"));
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	#[test]
+	fn texture_pack_counts_color_normal_and_mr_layers_with_recorded_etc2_formats() {
+		let dir = std::env::temp_dir().join(format!("ror-memory-pack-test-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		let cache_dir = dir.join("cache");
+		std::fs::create_dir_all(&cache_dir).unwrap();
+
+		let pack_xml = b"<texturepack_version>1</texturepack_version><usage>0</usage>";
+		cache_write_key(&cache_dir, "rbxassetid://2001", pack_xml);
+		let color_ktx = make_ktx2_bc(131, 64, 64, &[("transcodedWidth", "64"), ("transcodedHeight", "64")]);
+		let normal_ktx = make_ktx2_bc(137, 64, 64, &[("transcodedWidth", "64"), ("transcodedHeight", "64"), ("colorSpace", "Linear")]);
+		let mr_ktx = make_ktx2_bc(131, 64, 64, &[("transcodedWidth", "64"), ("transcodedHeight", "64")]);
+		cache_write_key(&cache_dir, &format!("rbxassetid://2001#ktx2/7rdo/{}", Transcode::PackColor.fidelity(0)), &color_ktx);
+		cache_write_key(&cache_dir, &format!("rbxassetid://2001#ktx2/7rdo/{}", Transcode::PackNormal.fidelity(0)), &normal_ktx);
+		cache_write_key(&cache_dir, &format!("rbxassetid://2001#ktx2/7rdo/{}", Transcode::PackMetalnessRoughness.fidelity(0)), &mr_ktx);
+
+		let mut model = ModelBuilder::new("Pack");
+		let part = model.part(&PartSpec { name: "Block".into(), ..Default::default() });
+		model.child(part, InstanceBuilder::new("SurfaceAppearance").with_property("TexturePack", ContentId::from("rbxassetid://2001")));
+		let document = model.into_document();
+		let scene = crate::scene::extract::extract(&document);
+		let assets = Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&cache_dir) });
+		let meshes = Meshes::load(&scene.parts, &assets);
+		let report = measure(&scene, &meshes, &assets);
+
+		assert_eq!(report.textures.unique, 3, "color, normal, and mr layers must all be counted");
+		assert_eq!(report.textures.loaded, 3);
+		assert_eq!(report.textures.missing, 0);
+		let color = report.textures.top.iter().find(|e| e.id == "rbxassetid://2001#color").expect("color layer");
+		let normal = report.textures.top.iter().find(|e| e.id == "rbxassetid://2001#normal").expect("normal layer");
+		let mr = report.textures.top.iter().find(|e| e.id == "rbxassetid://2001#mr").expect("mr layer");
+		assert_eq!((color.desktop_bc_format, color.mobile_etc2_format), ("bc1", "etc2_rgb8"));
+		assert_eq!((normal.desktop_bc_format, normal.mobile_etc2_format), ("bc3", "etc2_rgba8"));
+		assert_eq!((mr.desktop_bc_format, mr.mobile_etc2_format), ("bc1", "etc2_rgb8"));
+		assert_eq!(color.mobile_etc2_mip_bytes, 2_744);
+		assert_eq!(normal.mobile_etc2_mip_bytes, 5_488);
+		assert_eq!(mr.mobile_etc2_mip_bytes, 2_744);
+		assert_eq!(report.textures.desktop_bc_mip_bytes, 2_744 + 5_488 + 2_744);
+		assert_eq!(report.textures.mobile_etc2_mip_bytes, 2_744 + 5_488 + 2_744);
+		let _ = std::fs::remove_dir_all(&dir);
+	}
 }

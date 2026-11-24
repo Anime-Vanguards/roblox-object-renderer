@@ -359,4 +359,40 @@ mod tests {
 		assert_eq!(stats.index_bytes, 6);
 		assert_eq!(stats.gpu_bytes, 126);
 	}
+
+	#[test]
+	fn skinned_mesh_and_large_index_buffer_bytes_follow_recorded_layout() {
+		let mut skinned = mesh_from_tris(&[
+			[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+			[[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+		]);
+		let verts = skinned.positions.len();
+		skinned.normals = vec![[0.0, 0.0, 1.0]; verts];
+		skinned.uvs = vec![[0.0, 0.0]; verts];
+		skinned.skinning = Some(ror_mesh::Skinning {
+			bones: vec![ror_mesh::Bone::default(); 5],
+			joints: vec![[0, 0, 0, 0]; verts],
+			weights: vec![[1.0, 0.0, 0.0, 0.0]; verts],
+			subsets: Vec::new(),
+		});
+		let stats = stats_of(&skinned, 512);
+		assert!(stats.skinned);
+		// 6 verts * (12+12+8 = 32 B) = 192 B; 6 indices * 2 B = 12 B;
+		// skinning: 6*4 B joints + 6*4 B weights + 5*64 B bone matrices = 368 B.
+		assert_eq!(stats.vertex_bytes, 192);
+		assert_eq!(stats.index_bytes, 12);
+		assert_eq!(stats.skinning_bytes, 6 * 4 + 6 * 4 + 5 * 64);
+		assert_eq!(stats.gpu_bytes, 192 + 12 + 368);
+
+		// Meshes over 65,535 vertices use 4-byte u32 indices.
+		let mut large = ror_mesh::Mesh::default();
+		large.positions = vec![[0.0, 0.0, 0.0]; 65_536];
+		large.positions[1] = [1.0, 0.0, 0.0];
+		large.positions[2] = [0.0, 1.0, 0.0];
+		large.indices = vec![0, 1, 2];
+		let large_stats = stats_of(&large, 1024);
+		assert_eq!(large_stats.vertices, 65_536);
+		assert_eq!(large_stats.index_bytes, 3 * 4);
+		assert_eq!(large_stats.gpu_bytes, 65_536 * 12 + 12);
+	}
 }
