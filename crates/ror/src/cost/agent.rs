@@ -17,6 +17,7 @@ use super::attribute::{self, Node, Owners, ViewWork, Work};
 use super::edits::{self, EditsFile};
 use super::findings::{self, Finding};
 use super::ids::InstanceIds;
+use super::memory::{self, MemoryReport};
 use super::pixels::{self, ViewPixels};
 use super::prices::{self, Preset, Quality};
 use super::{Analysis, CostOptions, ViewCost};
@@ -116,6 +117,8 @@ pub struct Costed {
 	/// device, not only the preset's. The same as the counted pixels' parts where the preset culls
 	/// nothing; `None` without pixels.
 	pub shown: Option<std::collections::HashSet<usize>>,
+	/// Deduplicated mesh and texture memory in bytes for the scene.
+	pub memory: MemoryReport,
 }
 
 pub struct Setup<'a> {
@@ -230,7 +233,8 @@ pub fn cost(setup: &Setup, scene: &Scene, document: &Document, ids: &InstanceIds
 		.zip(pixels.par_iter())
 		.map(|((cost, (camera, _, _)), counted)| attribute::view(scene, &analysis, &owners, ids, cost, camera, counted.as_ref(), &setup.preset, &setup.quality))
 		.collect();
-	Ok(Costed { analysis, owners, costs, pixels, works, frames, shown })
+	let memory = memory::measure(scene, &analysis.meshes, &setup.renderer.assets);
+	Ok(Costed { analysis, owners, costs, pixels, works, frames, shown, memory })
 }
 
 fn mean_work(works: &[ViewWork]) -> Work {
@@ -318,6 +322,7 @@ pub fn run(setup: &Setup, scene: &Scene, document: &Document, reload: Option<&dy
 		"views": views,
 		"mean": mean,
 		"worst": worst_view.map(|work| json!({ "view": work.name, "work": work.total.rounded() })),
+		"memory": costed.memory,
 		"budget": budget.as_ref().map(|budget| json!({ "limits": budget, "viewsOver": over.len(), "views": views.len() })),
 		"topInstances": top_nodes,
 		"findings": found,
@@ -325,7 +330,7 @@ pub fn run(setup: &Setup, scene: &Scene, document: &Document, reload: Option<&dy
 	});
 	crate::output::write_json_atomic(&out.join("analysis.json"), &analysis_json, true)?;
 	crate::output::write_json_atomic(&out.join("tree.json"), &json!({ "schema": TREE_SCHEMA, "views": costed.works.iter().map(|work| work.name.clone()).collect::<Vec<_>>(), "nodes": tree }), false)?;
-	let mut lines = summary_lines(input, setup, &views, &mean, worst_view, &tree, &found, budget.as_ref());
+	let mut lines = summary_lines(input, setup, &views, &mean, worst_view, &costed.memory, &tree, &found, budget.as_ref());
 	if options.heat {
 		write_heat(&costed, out)?;
 		lines.push(format!("heat images: <view>.heat-cost.png, .heat-overdraw.png, .heat-lights.png, .heat-density.png in {}", out.display()));
@@ -355,7 +360,7 @@ fn ms(value: f64) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn summary_lines(input: &str, setup: &Setup, views: &[ViewLine], mean: &Work, worst: Option<&ViewWork>, tree: &[Node], found: &[Finding], budget: Option<&Budget>) -> Vec<String> {
+fn summary_lines(input: &str, setup: &Setup, views: &[ViewLine], mean: &Work, worst: Option<&ViewWork>, memory: &MemoryReport, tree: &[Node], found: &[Finding], budget: Option<&Budget>) -> Vec<String> {
 	let mut lines = Vec::new();
 	let quality_label = match setup.quality.client_level {
 		Some(bar) => format!("quality {} (client bar {bar}, {:.0} studs)", setup.quality.level, setup.quality.view_distance),
@@ -394,6 +399,7 @@ fn summary_lines(input: &str, setup: &Setup, views: &[ViewLine], mean: &Work, wo
 		}
 		lines.push("fidelity: desktop CPU ms is estimated from one reference PC ratio (1/2.224, not players' desktops); desktop GPU ms is uncalibrated (gpuMs = null); findings rank by combined CPU + gpuUnits share".into());
 	}
+	lines.push(memory::summary_line(memory, setup.preset.phone));
 	if let Some(budget) = budget {
 		let over: Vec<&ViewLine> = views.iter().filter(|view| !view.over_budget.is_empty()).collect();
 		lines.push(format!("budget {} ({} draws, {}k triangles, {} per view): {} of {} views over", budget.name, budget.draws, budget.triangles / 1000, ms(budget.ms), over.len(), views.len()));

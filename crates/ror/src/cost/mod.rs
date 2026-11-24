@@ -17,6 +17,7 @@ pub mod findings;
 pub mod grid;
 pub mod ids;
 pub mod images;
+pub mod memory;
 pub mod meshes;
 pub mod pixels;
 pub mod prices;
@@ -630,6 +631,11 @@ impl Analysis {
 	/// copies of one appearance among them one batch (cost::edits' merge).
 	pub fn new_with(scene: &Scene, document: &Document, assets: &ror_assets::Assets, options: &CostOptions, merges: &HashMap<usize, String>) -> Self {
 		let meshes = Meshes::load(&scene.parts, assets);
+		Self::new_with_meshes(scene, document, meshes, options, merges)
+	}
+
+	/// [`Analysis::new_with`] taking already-loaded [`Meshes`] (reused across timeline frames).
+	pub fn new_with_meshes(scene: &Scene, document: &Document, meshes: Meshes, options: &CostOptions, merges: &HashMap<usize, String>) -> Self {
 		let technology = options.technology.unwrap_or(scene.environment.technology);
 		let quality = options.quality();
 		let mut labels = Labels::default();
@@ -1870,6 +1876,8 @@ pub struct CostReport {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub mesh_streaming: Option<u32>,
 	pub scene: SceneCounts,
+	/// Deduplicated mesh and texture memory in bytes (encoded file bytes, GPU buffers, mip chains and compressed formats).
+	pub memory: memory::MemoryReport,
 	pub views: Vec<ViewCost>,
 	/// The views' opportunities, what they would save on average over the views first.
 	pub opportunities: Vec<report::Summary>,
@@ -1903,7 +1911,7 @@ pub fn run(
 	lent: (bool, bool),
 ) -> anyhow::Result<CostReport> {
 	// the cost loop: its own costing of every view (attributed, with pixels), the report's from it
-	let (analysis, costs, agent_lines, over_budget) = if options.attribute && options.grid.is_none() {
+	let (analysis, costs, memory, agent_lines, over_budget) = if options.attribute && options.grid.is_none() {
 		let preset = agent::preset_of(options, shots)?;
 		let quality = prices::Quality::of_scale(options.quality(), options.client_quality, preset.phone);
 		let setup = agent::Setup { renderer, options, names: views.iter().map(|view| view.name.clone()).collect(), shots, preset, quality, gpu, lent_lighting: lent.0, lent_materials: lent.1 };
@@ -1911,12 +1919,13 @@ pub fn run(
 		let over = options.budget.as_deref().map(agent::Budget::parse).transpose()?.map_or(0, |budget| {
 			costed.costs.iter().zip(&costed.works).filter(|(cost, work)| cost.total.draws > budget.draws || cost.total.triangles > budget.triangles || work.total.ms > budget.ms).count()
 		});
-		(costed.analysis, costed.costs, lines, over)
+		(costed.analysis, costed.costs, costed.memory, lines, over)
 	} else {
 		let analysis = Analysis::new(scene, document, &renderer.assets, options);
 		// each view on every core (a map's 20-stud grid, 440 views: 4.6 s one after another)
 		let costs: Vec<ViewCost> = views.par_iter().zip(shots.par_iter()).map(|(view, (camera, width, height))| analysis.view(&view.name, camera, *width as f32 / (*height).max(1) as f32, options)).collect();
-		(analysis, costs, Vec::new(), 0)
+		let memory = memory::measure(scene, &analysis.meshes, &renderer.assets);
+		(analysis, costs, memory, Vec::new(), 0)
 	};
 	let mut grid_lines = Vec::new();
 	if let Some(spacing) = options.grid {
@@ -1971,6 +1980,7 @@ pub fn run(
 		occlusion: !options.no_occlusion,
 		mesh_streaming: analysis.mesh_streaming,
 		scene: analysis.scene_counts(),
+		memory,
 		opportunities: report::summarize(&costs),
 		views: costs,
 		lines: Vec::new(),

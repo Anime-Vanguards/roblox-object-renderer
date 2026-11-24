@@ -1,0 +1,818 @@
+//! Deduplicated mesh and texture memory accounting in bytes for `ror cost`: every distinct mesh
+//! asset and authored texture asset referenced by a scene is counted once, with encoded file bytes,
+//! packed GPU mesh buffer bytes, uncompressed RGBA8 base and full mip-chain bytes, and desktop BCn
+//! / mobile ASTC compressed mip-chain GPU byte estimates.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+
+use rayon::prelude::*;
+use ror_assets::{Assets, ContentId, Download, Transcode};
+use ror_image::PixelFormat;
+use serde::Serialize;
+
+use super::meshes::{self, MeshStats, Meshes};
+use crate::scene::{Geometry, Scene};
+
+/// Heaviest entries kept in `top` for meshes and textures.
+const TOP_LIST: usize = 20;
+
+/// Built-in default Sky textures (left out when a place has a default Sky unchanged from Roblox's).
+const DEFAULT_SKY_PREFIX: &str = "rbxasset://textures/sky/sky512_";
+const DEFAULT_SUN: &str = "rbxasset://sky/sun.jpg";
+const DEFAULT_MOON: &str = "rbxasset://sky/moon.jpg";
+
+/// Complete deduplicated memory report for a scene (or union of timeline scenes).
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryReport {
+	pub meshes: MeshMemory,
+	pub textures: TextureMemory,
+	pub total_gpu_bytes: TotalGpuBytes,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TotalGpuBytes {
+	pub rgba8: u64,
+	pub desktop_bc: u64,
+	#[serde(rename = "mobileAstc4x4")]
+	pub mobile_astc4x4: u64,
+	#[serde(rename = "mobileAstc6x6")]
+	pub mobile_astc6x6: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeshMemory {
+	/// Distinct mesh assets referenced by the scene (counted once each).
+	pub unique: u64,
+	/// Total part instances referencing those meshes.
+	pub instances: u64,
+	/// Encoded file bytes across unique loaded meshes.
+	pub file_bytes: u64,
+	/// Vertex buffer GPU bytes across unique loaded meshes.
+	pub vertex_bytes: u64,
+	/// Index buffer GPU bytes across unique loaded meshes.
+	pub index_bytes: u64,
+	/// Skinning GPU bytes across unique loaded meshes.
+	pub skinning_bytes: u64,
+	/// Total packed GPU geometry bytes (`vertexBytes + indexBytes + skinningBytes`).
+	pub gpu_bytes: u64,
+	/// Distinct meshes that failed to load or decode.
+	pub missing: u64,
+	/// Heaviest unique meshes by GPU bytes (ties by id).
+	pub top: Vec<MeshEntry>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeshEntry {
+	pub id: String,
+	pub instances: u64,
+	pub vertices: u32,
+	pub indices: u32,
+	pub lods: usize,
+	pub skinned: bool,
+	pub file_bytes: u64,
+	pub vertex_bytes: u64,
+	pub index_bytes: u64,
+	pub skinning_bytes: u64,
+	pub gpu_bytes: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextureMemory {
+	/// Distinct authored texture assets referenced by the scene (counted once each).
+	pub unique: u64,
+	/// Total texture references across parts, decals, surface appearances, effects and custom skies.
+	pub references: u64,
+	/// Encoded bytes on disk / downloaded across unique loaded textures.
+	pub file_bytes: u64,
+	/// Uncompressed RGBA8 level-0 (base mip) GPU bytes across unique loaded textures.
+	pub rgba8_base_bytes: u64,
+	/// Uncompressed RGBA8 full mip-chain GPU bytes across unique loaded textures.
+	pub rgba8_mip_bytes: u64,
+	/// Desktop block-compressed (BCn) full mip-chain GPU bytes across unique loaded textures.
+	pub desktop_bc_mip_bytes: u64,
+	/// Mobile ASTC 4x4 full mip-chain GPU bytes across unique loaded textures.
+	#[serde(rename = "mobileAstc4x4MipBytes")]
+	pub mobile_astc4x4_mip_bytes: u64,
+	/// Mobile ASTC 6x6 full mip-chain GPU bytes across unique loaded textures.
+	#[serde(rename = "mobileAstc6x6MipBytes")]
+	pub mobile_astc6x6_mip_bytes: u64,
+	/// Distinct textures that failed to load or decode.
+	pub missing: u64,
+	/// Heaviest unique textures by RGBA8 mip-chain GPU bytes (ties by id).
+	pub top: Vec<TextureEntry>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextureEntry {
+	pub id: String,
+	pub references: u64,
+	pub width: u32,
+	pub height: u32,
+	pub layers: u32,
+	pub depth: u32,
+	pub format: &'static str,
+	pub desktop_bc_format: &'static str,
+	pub has_alpha: bool,
+	pub file_bytes: u64,
+	pub rgba8_base_bytes: u64,
+	pub rgba8_mip_bytes: u64,
+	pub desktop_bc_mip_bytes: u64,
+	#[serde(rename = "mobileAstc4x4MipBytes")]
+	pub mobile_astc4x4_mip_bytes: u64,
+	#[serde(rename = "mobileAstc6x6MipBytes")]
+	pub mobile_astc6x6_mip_bytes: u64,
+}
+
+/// Decoded metadata for one unique texture asset, cached across frames in timeline mode.
+#[derive(Clone, Debug)]
+pub struct TextureInfo {
+	pub width: u32,
+	pub height: u32,
+	pub layers: u32,
+	pub depth: u32,
+	pub format: PixelFormat,
+	pub has_alpha: bool,
+	pub file_bytes: u64,
+}
+
+/// Cache of decoded texture metadata keyed by canonical texture key.
+#[derive(Default)]
+pub struct TextureCache {
+	entries: HashMap<String, Option<TextureInfo>>,
+}
+
+#[derive(Clone, Debug)]
+struct TextureWanted {
+	/// Original URI or pack URI for fetching.
+	uri: String,
+	/// Transcode layer when inspecting a TexturePack layer directly.
+	pack_layer: Option<Transcode>,
+	/// Whether to prefer the Roblox KTX2 transcode before raw upload (true for regular image assets,
+	/// false for MaterialVariant maps and clothing templates).
+	prefer_transcode: bool,
+	/// Whether any reference uses this texture as a normal map.
+	is_normal: bool,
+	/// Reference count across the scene.
+	references: u64,
+}
+
+fn transcodes_enabled() -> bool {
+	std::env::var("ROR_TRANSCODES").map_or(true, |value| value.trim() != "0")
+}
+
+fn is_asset_id(uri: &str) -> bool {
+	matches!(ContentId::parse(uri), Ok(ContentId::Asset { .. }))
+}
+
+fn is_default_sky_texture(uri: &str) -> bool {
+	let trimmed = uri.trim();
+	trimmed.starts_with(DEFAULT_SKY_PREFIX) || trimmed == DEFAULT_SUN || trimmed == DEFAULT_MOON
+}
+
+/// Measures deduplicated mesh and texture memory for one scene.
+pub fn measure(scene: &Scene, meshes: &Meshes, assets: &Assets) -> MemoryReport {
+	let mut cache = TextureCache::default();
+	measure_cached(scene, meshes, assets, &mut cache)
+}
+
+/// Measures deduplicated mesh and texture memory for one scene, reusing `cache`.
+pub fn measure_cached(scene: &Scene, meshes: &Meshes, assets: &Assets, cache: &mut TextureCache) -> MemoryReport {
+	measure_many(&[scene], &meshes.stats, assets, cache)
+}
+
+/// Measures deduplicated mesh and texture memory across the union of `scenes` (e.g. a timeline's
+/// frames), using decoded mesh entries from `mesh_stats` and caching texture lookups in `cache`.
+pub fn measure_many(scenes: &[&Scene], mesh_stats: &HashMap<String, Arc<MeshStats>>, assets: &Assets, cache: &mut TextureCache) -> MemoryReport {
+	// 1. Deduplicate meshes across all scenes (count instances in the peak scene, or total across
+	// a single scene; for multi-frame timelines use the max simultaneous instances of each mesh).
+	let mut mesh_instances: BTreeMap<String, u64> = BTreeMap::new();
+	for scene in scenes {
+		let mut frame_counts: HashMap<String, u64> = HashMap::new();
+		for part in &scene.parts {
+			if let Some(key) = meshes::mesh_key(&part.geometry) {
+				*frame_counts.entry(key).or_default() += 1;
+			}
+		}
+		for (key, count) in frame_counts {
+			let entry = mesh_instances.entry(key).or_default();
+			*entry = (*entry).max(count);
+		}
+	}
+
+	let mut mesh_mem = MeshMemory { unique: mesh_instances.len() as u64, ..Default::default() };
+	let mut mesh_entries = Vec::with_capacity(mesh_instances.len());
+	for (id, instances) in mesh_instances {
+		mesh_mem.instances += instances;
+		if let Some(stats) = mesh_stats.get(&id) {
+			mesh_mem.file_bytes += stats.file_bytes;
+			mesh_mem.vertex_bytes += stats.vertex_bytes;
+			mesh_mem.index_bytes += stats.index_bytes;
+			mesh_mem.skinning_bytes += stats.skinning_bytes;
+			mesh_mem.gpu_bytes += stats.gpu_bytes;
+			mesh_entries.push(MeshEntry {
+				id,
+				instances,
+				vertices: stats.vertices,
+				indices: stats.indices,
+				lods: stats.lods.len(),
+				skinned: stats.skinned,
+				file_bytes: stats.file_bytes,
+				vertex_bytes: stats.vertex_bytes,
+				index_bytes: stats.index_bytes,
+				skinning_bytes: stats.skinning_bytes,
+				gpu_bytes: stats.gpu_bytes,
+			});
+		} else {
+			mesh_mem.missing += 1;
+		}
+	}
+	mesh_entries.sort_by(|a, b| b.gpu_bytes.cmp(&a.gpu_bytes).then_with(|| a.id.cmp(&b.id)));
+	mesh_entries.truncate(TOP_LIST);
+	mesh_mem.top = mesh_entries;
+
+	// 2. Collect authored texture references across all scenes (deduplicated by canonical URI).
+	let mut wanted: BTreeMap<String, TextureWanted> = BTreeMap::new();
+	let mut pack_cache: HashMap<String, Option<PackMaps>> = HashMap::new();
+	let use_transcodes = transcodes_enabled();
+	for scene in scenes {
+		let mut frame_refs: BTreeMap<String, TextureWanted> = BTreeMap::new();
+		collect_scene_textures(scene, assets, use_transcodes, &mut pack_cache, &mut frame_refs);
+		for (key, item) in frame_refs {
+			wanted
+				.entry(key)
+				.and_modify(|existing| {
+					existing.references = existing.references.max(item.references);
+					existing.is_normal |= item.is_normal;
+				})
+				.or_insert(item);
+		}
+	}
+
+	// Warm any uncached remote textures in batch when online.
+	let uncached: Vec<(&String, &TextureWanted)> = wanted.iter().filter(|(key, _)| !cache.entries.contains_key(*key)).collect();
+	if !uncached.is_empty() && !assets.offline() {
+		let mut downloads = Vec::new();
+		for (_, item) in &uncached {
+			if let Some(layer) = item.pack_layer {
+				if is_asset_id(&item.uri) {
+					downloads.push(Download::Transcode(item.uri.clone(), layer));
+				}
+			} else if is_asset_id(&item.uri) {
+				downloads.push(if item.prefer_transcode && use_transcodes {
+					Download::Transcode(item.uri.clone(), Transcode::Image)
+				} else {
+					Download::Asset(item.uri.clone())
+				});
+			}
+		}
+		if !downloads.is_empty() {
+			assets.warm(&downloads, &crate::render::transcode_packs);
+		}
+	}
+
+	// Decode uncached textures in parallel.
+	if !uncached.is_empty() {
+		let decoded: Vec<(String, Option<TextureInfo>)> = uncached
+			.into_par_iter()
+			.map(|(key, item)| (key.clone(), inspect_texture(item, assets, use_transcodes)))
+			.collect();
+		for (key, info) in decoded {
+			cache.entries.insert(key, info);
+		}
+	}
+
+	let mut tex_mem = TextureMemory { unique: wanted.len() as u64, ..Default::default() };
+	let mut tex_entries = Vec::with_capacity(wanted.len());
+	for (id, item) in wanted {
+		tex_mem.references += item.references;
+		let Some(Some(info)) = cache.entries.get(&id) else {
+			tex_mem.missing += 1;
+			continue;
+		};
+		let entry = build_texture_entry(id, item.references, item.is_normal, info);
+		tex_mem.file_bytes += entry.file_bytes;
+		tex_mem.rgba8_base_bytes += entry.rgba8_base_bytes;
+		tex_mem.rgba8_mip_bytes += entry.rgba8_mip_bytes;
+		tex_mem.desktop_bc_mip_bytes += entry.desktop_bc_mip_bytes;
+		tex_mem.mobile_astc4x4_mip_bytes += entry.mobile_astc4x4_mip_bytes;
+		tex_mem.mobile_astc6x6_mip_bytes += entry.mobile_astc6x6_mip_bytes;
+		tex_entries.push(entry);
+	}
+	tex_entries.sort_by(|a, b| b.rgba8_mip_bytes.cmp(&a.rgba8_mip_bytes).then_with(|| a.id.cmp(&b.id)));
+	tex_entries.truncate(TOP_LIST);
+	tex_mem.top = tex_entries;
+
+	let total_gpu_bytes = TotalGpuBytes {
+		rgba8: mesh_mem.gpu_bytes + tex_mem.rgba8_mip_bytes,
+		desktop_bc: mesh_mem.gpu_bytes + tex_mem.desktop_bc_mip_bytes,
+		mobile_astc4x4: mesh_mem.gpu_bytes + tex_mem.mobile_astc4x4_mip_bytes,
+		mobile_astc6x6: mesh_mem.gpu_bytes + tex_mem.mobile_astc6x6_mip_bytes,
+	};
+	MemoryReport { meshes: mesh_mem, textures: tex_mem, total_gpu_bytes }
+}
+
+/// Concise single-line memory summary for `analysis.txt` and `cost` reports.
+pub fn summary_line(memory: &MemoryReport, phone: bool) -> String {
+	let mb = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+	let m = &memory.meshes;
+	let t = &memory.textures;
+	let tot = &memory.total_gpu_bytes;
+	if phone {
+		format!(
+			"memory: {} unique meshes ({:.2} MB GPU, {:.2} MB files), {} unique textures ({:.2} MB ASTC4x4, {:.2} MB ASTC6x6, {:.2} MB RGBA8 mips, {:.2} MB files); total GPU {:.2} MB ASTC4x4 / {:.2} MB ASTC6x6",
+			m.unique,
+			mb(m.gpu_bytes),
+			mb(m.file_bytes),
+			t.unique,
+			mb(t.mobile_astc4x4_mip_bytes),
+			mb(t.mobile_astc6x6_mip_bytes),
+			mb(t.rgba8_mip_bytes),
+			mb(t.file_bytes),
+			mb(tot.mobile_astc4x4),
+			mb(tot.mobile_astc6x6)
+		)
+	} else {
+		format!(
+			"memory: {} unique meshes ({:.2} MB GPU, {:.2} MB files), {} unique textures ({:.2} MB BCn, {:.2} MB ASTC4x4, {:.2} MB RGBA8 mips, {:.2} MB files); total GPU {:.2} MB BCn / {:.2} MB RGBA8",
+			m.unique,
+			mb(m.gpu_bytes),
+			mb(m.file_bytes),
+			t.unique,
+			mb(t.desktop_bc_mip_bytes),
+			mb(t.mobile_astc4x4_mip_bytes),
+			mb(t.rgba8_mip_bytes),
+			mb(t.file_bytes),
+			mb(tot.desktop_bc),
+			mb(tot.rgba8)
+		)
+	}
+}
+
+struct PackMaps {
+	usage: u32,
+	color: Option<String>,
+	normal: Option<String>,
+	metalness: Option<String>,
+	roughness: Option<String>,
+	emissive: Option<String>,
+}
+
+fn parse_pack_xml(bytes: &[u8]) -> Option<PackMaps> {
+	let text = std::str::from_utf8(bytes).ok()?;
+	if !text.contains("<texturepack_version>") {
+		return None;
+	}
+	let tag = |name: &str| -> Option<String> {
+		let open = format!("<{name}");
+		let mut from = 0;
+		let start = loop {
+			let at = text[from..].find(&open)? + from + open.len();
+			match text[at..].chars().next() {
+				Some('>') => break at + 1,
+				Some(' ') => break text[at..].find('>')? + at + 1,
+				_ => from = at,
+			}
+		};
+		let end = text[start..].find('<')? + start;
+		let value = text[start..end].trim();
+		(!value.is_empty()).then(|| value.to_string())
+	};
+	let map = |name: &str| -> Option<String> {
+		let value = tag(name)?;
+		Some(if value.bytes().all(|byte| byte.is_ascii_digit()) { format!("rbxassetid://{value}") } else { value })
+	};
+	Some(PackMaps {
+		usage: tag("usage").and_then(|v| v.parse().ok()).unwrap_or(0),
+		color: map("color"),
+		normal: map("normal"),
+		metalness: map("metalness"),
+		roughness: map("roughness"),
+		emissive: map("emissive"),
+	})
+}
+
+fn add_uri(out: &mut BTreeMap<String, TextureWanted>, uri: &str, prefer_transcode: bool, is_normal: bool) {
+	let trimmed = uri.trim();
+	if trimmed.is_empty() {
+		return;
+	}
+	let key = meshes::canonical(trimmed);
+	out.entry(key)
+		.and_modify(|item| {
+			item.references += 1;
+			item.is_normal |= is_normal;
+		})
+		.or_insert_with(|| TextureWanted {
+			uri: trimmed.to_string(),
+			pack_layer: None,
+			prefer_transcode,
+			is_normal,
+			references: 1,
+		});
+}
+
+fn add_pack_layer(out: &mut BTreeMap<String, TextureWanted>, pack: &str, layer: Transcode, suffix: &str, is_normal: bool) {
+	let key = format!("{}#{suffix}", meshes::canonical(pack));
+	out.entry(key)
+		.and_modify(|item| {
+			item.references += 1;
+			item.is_normal |= is_normal;
+		})
+		.or_insert_with(|| TextureWanted {
+			uri: pack.trim().to_string(),
+			pack_layer: Some(layer),
+			prefer_transcode: true,
+			is_normal,
+			references: 1,
+		});
+}
+
+fn collect_scene_textures(
+	scene: &Scene,
+	assets: &Assets,
+	use_transcodes: bool,
+	pack_cache: &mut HashMap<String, Option<PackMaps>>,
+	out: &mut BTreeMap<String, TextureWanted>,
+) {
+	for part in &scene.parts {
+		if let Some(texture) = &part.texture {
+			add_uri(out, texture, true, false);
+		}
+		for decal in &part.decals {
+			add_uri(out, &decal.texture, true, false);
+		}
+		if let Some(appearance) = &part.surface_appearance {
+			let explicit = [
+				(&appearance.color_map, false),
+				(&appearance.normal_map, true),
+				(&appearance.metalness_map, false),
+				(&appearance.roughness_map, false),
+				(&appearance.emissive_mask, false),
+			];
+			if let Some(pack) = appearance.texture_pack.as_deref().filter(|pack| use_transcodes && is_asset_id(pack)) {
+				let xml = pack_cache.entry(meshes::canonical(pack)).or_insert_with(|| assets.fetch(pack).ok().and_then(|f| parse_pack_xml(&f.bytes)));
+				let is_sa_pack = xml.as_ref().is_none_or(|xml| xml.usage == 0);
+				if is_sa_pack {
+					add_pack_layer(out, pack, Transcode::PackColor, "color", false);
+					add_pack_layer(out, pack, Transcode::PackNormal, "normal", true);
+					add_pack_layer(out, pack, Transcode::PackMetalnessRoughness, "mr", false);
+					if let Some(emissive) = &appearance.emissive_mask {
+						add_uri(out, emissive, true, false);
+					}
+				} else if let Some(xml) = xml {
+					for (map, is_normal) in [(&xml.color, false), (&xml.normal, true), (&xml.metalness, false), (&xml.roughness, false), (&xml.emissive, false)] {
+						if let Some(uri) = map {
+							add_uri(out, uri, true, is_normal);
+						}
+					}
+				}
+			} else {
+				let mut any = false;
+				for (map, is_normal) in explicit {
+					if let Some(uri) = map {
+						any = true;
+						add_uri(out, uri, true, is_normal);
+					}
+				}
+				if !any
+					&& let Some(pack) = appearance.texture_pack.as_deref()
+					&& let Some(xml) = pack_cache.entry(meshes::canonical(pack)).or_insert_with(|| assets.fetch(pack).ok().and_then(|f| parse_pack_xml(&f.bytes)))
+				{
+					for (map, is_normal) in [(&xml.color, false), (&xml.normal, true), (&xml.metalness, false), (&xml.roughness, false), (&xml.emissive, false)] {
+						if let Some(uri) = map {
+							add_uri(out, uri, true, is_normal);
+						}
+					}
+				}
+			}
+		}
+		if let Some(composite) = &part.composite {
+			for layer in [&composite.pants, &composite.shirt, &composite.graphic].into_iter().flatten() {
+				add_uri(out, &layer.image, false, false);
+			}
+		}
+		if let Some(variant) = scene.materials.variant(part.material, &part.material_variant) {
+			let mut any = false;
+			for (map, is_normal) in [
+				(&variant.color_map, false),
+				(&variant.normal_map, true),
+				(&variant.metalness_map, false),
+				(&variant.roughness_map, false),
+				(&variant.emissive_mask, false),
+			] {
+				if let Some(uri) = map {
+					any = true;
+					add_uri(out, uri, false, is_normal);
+				}
+			}
+			if !any
+				&& let Some(pack) = variant.texture_pack.as_deref()
+				&& let Some(xml) = pack_cache.entry(meshes::canonical(pack)).or_insert_with(|| assets.fetch(pack).ok().and_then(|f| parse_pack_xml(&f.bytes)))
+			{
+				for (map, is_normal) in [(&xml.color, false), (&xml.normal, true), (&xml.metalness, false), (&xml.roughness, false), (&xml.emissive, false)] {
+					if let Some(uri) = map {
+						add_uri(out, uri, false, is_normal);
+					}
+				}
+			}
+		}
+	}
+	for emitter in &scene.particles {
+		if let Some(texture) = &emitter.texture {
+			add_uri(out, texture, true, false);
+		}
+	}
+	for beam in &scene.beams {
+		if let Some(texture) = &beam.texture {
+			add_uri(out, texture, true, false);
+		}
+	}
+	for trail in &scene.trails {
+		if let Some(texture) = &trail.texture {
+			add_uri(out, texture, true, false);
+		}
+	}
+	if let Some(sky) = &scene.environment.sky {
+		for face in &sky.skybox {
+			if !is_default_sky_texture(face) {
+				add_uri(out, face, true, false);
+			}
+		}
+		if !is_default_sky_texture(&sky.sun_texture) {
+			add_uri(out, &sky.sun_texture, true, false);
+		}
+		if !is_default_sky_texture(&sky.moon_texture) {
+			add_uri(out, &sky.moon_texture, true, false);
+		}
+	}
+	let _ = Geometry::Block;
+}
+
+fn inspect_transcode(uri: &str, layer: Transcode, assets: &Assets) -> Option<TextureInfo> {
+	let pack0 = assets.fetch_transcode(uri, layer, 0).ok()?;
+	let first = ror_image::decode(&pack0.bytes).ok()?;
+	let table = ror_image::ktx2_pack_table(&first);
+	let (width, height) = match (
+		first.meta("transcodedWidth").and_then(|value| value.trim().parse::<u32>().ok()),
+		first.meta("transcodedHeight").and_then(|value| value.trim().parse::<u32>().ok()),
+	) {
+		(Some(w), Some(h)) if w > 0 && h > 0 => (w, h),
+		_ => {
+			let shift = table.first().map_or(0, |&(first_level, _)| first_level.min(16));
+			(first.width.checked_shl(shift).unwrap_or(first.width).max(1), first.height.checked_shl(shift).unwrap_or(first.height).max(1))
+		}
+	};
+	let mut file_bytes = pack0.bytes.len() as u64;
+	if table.len() > 1 {
+		for pack in 1..table.len() as u32 {
+			if let Ok(fetched) = assets.fetch_transcode(uri, layer, pack) {
+				file_bytes += fetched.bytes.len() as u64;
+			}
+		}
+	}
+	let has_alpha = if layer == Transcode::Image && first.dxt5nm {
+		first.meta("avgAlpha").and_then(|alpha| alpha.trim().parse::<u32>().ok()).is_none_or(|alpha| alpha < 255)
+	} else {
+		first.has_alpha
+	};
+	Some(TextureInfo {
+		width,
+		height,
+		layers: first.layers.max(1),
+		depth: first.depth.max(1),
+		format: first.format,
+		has_alpha,
+		file_bytes,
+	})
+}
+
+fn inspect_raw(uri: &str, assets: &Assets) -> Option<TextureInfo> {
+	let fetched = assets.fetch(uri).ok()?;
+	let ext = uri.rsplit('.').next().filter(|ext| ext.len() <= 8).unwrap_or("");
+	let image = ror_image::decode_with_extension(&fetched.bytes, ext).ok()?;
+	Some(TextureInfo {
+		width: image.width,
+		height: image.height,
+		layers: image.layers.max(1),
+		depth: image.depth.max(1),
+		format: image.format,
+		has_alpha: image.has_alpha,
+		file_bytes: fetched.bytes.len() as u64,
+	})
+}
+
+fn inspect_texture(item: &TextureWanted, assets: &Assets, use_transcodes: bool) -> Option<TextureInfo> {
+	if let Some(layer) = item.pack_layer {
+		return inspect_transcode(&item.uri, layer, assets);
+	}
+	if is_asset_id(&item.uri) && use_transcodes && item.prefer_transcode {
+		if let Some(info) = inspect_transcode(&item.uri, Transcode::Image, assets) {
+			return Some(info);
+		}
+		return inspect_raw(&item.uri, assets);
+	}
+	if let Some(info) = inspect_raw(&item.uri, assets) {
+		return Some(info);
+	}
+	if is_asset_id(&item.uri) && use_transcodes {
+		return inspect_transcode(&item.uri, Transcode::Image, assets);
+	}
+	None
+}
+
+fn format_name(format: PixelFormat) -> &'static str {
+	match format {
+		PixelFormat::Rgba8 => "rgba8",
+		PixelFormat::Bc1 => "bc1",
+		PixelFormat::Bc2 => "bc2",
+		PixelFormat::Bc3 => "bc3",
+		PixelFormat::Bc4 => "bc4",
+		PixelFormat::Bc5 => "bc5",
+		PixelFormat::Bc7 => "bc7",
+	}
+}
+
+fn mip_chain_bytes(width: u32, height: u32, depth: u32, layers: u32, per_slice: impl Fn(u32, u32) -> u64) -> u64 {
+	let mut w = width.max(1);
+	let mut h = height.max(1);
+	let mut d = depth.max(1);
+	let layers = layers.max(1) as u64;
+	let mut total = 0u64;
+	loop {
+		total += per_slice(w, h) * d as u64 * layers;
+		if w == 1 && h == 1 && d == 1 {
+			break;
+		}
+		w = (w >> 1).max(1);
+		h = (h >> 1).max(1);
+		d = (d >> 1).max(1);
+	}
+	total
+}
+
+fn block_bytes_for(w: u32, h: u32, bw: u32, bh: u32, bytes_per_block: u64) -> u64 {
+	u64::from(w.div_ceil(bw)) * u64::from(h.div_ceil(bh)) * bytes_per_block
+}
+
+fn build_texture_entry(id: String, references: u64, is_normal: bool, info: &TextureInfo) -> TextureEntry {
+	let rgba8_base_bytes = u64::from(info.width.max(1)) * u64::from(info.height.max(1)) * 4 * u64::from(info.depth.max(1)) * u64::from(info.layers.max(1));
+	let rgba8_mip_bytes = mip_chain_bytes(info.width, info.height, info.depth, info.layers, |w, h| u64::from(w) * u64::from(h) * 4);
+	let (bc_block_bytes, desktop_bc_format) = match info.format.block_bytes() {
+		Some(bytes) => (bytes as u64, format_name(info.format)),
+		None if !info.has_alpha && !is_normal => (8, "bc1"),
+		None => (16, "bc7"),
+	};
+	let desktop_bc_mip_bytes = mip_chain_bytes(info.width, info.height, info.depth, info.layers, |w, h| block_bytes_for(w, h, 4, 4, bc_block_bytes));
+	let mobile_astc4x4_mip_bytes = mip_chain_bytes(info.width, info.height, info.depth, info.layers, |w, h| block_bytes_for(w, h, 4, 4, 16));
+	let mobile_astc6x6_mip_bytes = mip_chain_bytes(info.width, info.height, info.depth, info.layers, |w, h| block_bytes_for(w, h, 6, 6, 16));
+	TextureEntry {
+		id,
+		references,
+		width: info.width,
+		height: info.height,
+		layers: info.layers,
+		depth: info.depth,
+		format: format_name(info.format),
+		desktop_bc_format,
+		has_alpha: info.has_alpha,
+		file_bytes: info.file_bytes,
+		rgba8_base_bytes,
+		rgba8_mip_bytes,
+		desktop_bc_mip_bytes,
+		mobile_astc4x4_mip_bytes,
+		mobile_astc6x6_mip_bytes,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::scene::build::{ModelBuilder, PartSpec};
+	use glam::{Affine3A, Vec3};
+	use rbx_dom_weak::InstanceBuilder;
+	use rbx_dom_weak::types::{ContentId, Enum, Vector3};
+
+	fn write_png(path: &std::path::Path, width: u32, height: u32, rgba: bool) -> u64 {
+		let file = std::fs::File::create(path).unwrap();
+		let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+		encoder.set_color(if rgba { png::ColorType::Rgba } else { png::ColorType::Rgb });
+		encoder.set_depth(png::BitDepth::Eight);
+		let mut writer = encoder.write_header().unwrap();
+		let pixel: &[u8] = if rgba { &[180, 90, 220, 128] } else { &[180, 90, 220] };
+		let mut data = Vec::with_capacity(width as usize * height as usize * pixel.len());
+		for _ in 0..(width * height) {
+			data.extend_from_slice(pixel);
+		}
+		writer.write_image_data(&data).unwrap();
+		drop(writer);
+		std::fs::metadata(path).unwrap().len()
+	}
+
+	fn write_dds_dxt1(path: &std::path::Path, width: u32, height: u32) -> u64 {
+		let mut header = vec![0u8; 128];
+		header[0..4].copy_from_slice(b"DDS ");
+		let put = |buf: &mut [u8], off: usize, v: u32| buf[4 + off..8 + off].copy_from_slice(&v.to_le_bytes());
+		put(&mut header, 0, 124);
+		put(&mut header, 4, 0x000A_1007);
+		put(&mut header, 8, height);
+		put(&mut header, 12, width);
+		let blocks = width.div_ceil(4) * height.div_ceil(4);
+		put(&mut header, 16, blocks * 8);
+		put(&mut header, 24, 1);
+		put(&mut header, 72, 32);
+		put(&mut header, 76, 0x4);
+		header[4 + 80..4 + 84].copy_from_slice(b"DXT1");
+		put(&mut header, 104, 0x1000);
+		header.extend(std::iter::repeat_n(0u8, (blocks * 8) as usize));
+		std::fs::write(path, &header).unwrap();
+		header.len() as u64
+	}
+
+	#[test]
+	fn deduplicates_meshes_and_textures_and_matches_closed_form_bytes() {
+		let dir = std::env::temp_dir().join(format!("ror-memory-test-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+
+		let mesh_path = dir.join("quad4.mesh");
+		let mesh_text = concat!(
+			"version 1.01\n4\n",
+			"[-1,0,-1][0,1,0][0,0,0][1,0,-1][0,1,0][1,0,0][1,0,1][0,1,0][0,1,0]",
+			"[-1,0,-1][0,1,0][0,0,0][1,0,1][0,1,0][1,0,0][-1,0,1][0,1,0][0,1,0]",
+			"[-1,1,-1][0,1,0][0,0,0][1,1,-1][0,1,0][1,0,0][1,1,1][0,1,0][0,1,0]",
+			"[-1,1,-1][0,1,0][0,0,0][1,1,1][0,1,0][1,0,0][-1,1,1][0,1,0][0,1,0]\n"
+		);
+		std::fs::write(&mesh_path, mesh_text).unwrap();
+		let mesh_file_bytes = mesh_text.len() as u64;
+
+		let tex_rgb = dir.join("rgb64.png");
+		let tex_rgba = dir.join("rgba128x64.png");
+		let tex_dds = dir.join("dxt32.dds");
+		let rgb_bytes = write_png(&tex_rgb, 64, 64, false);
+		let rgba_bytes = write_png(&tex_rgba, 128, 64, true);
+		let dds_bytes = write_dds_dxt1(&tex_dds, 32, 32);
+
+		let uri = |p: &std::path::Path| format!("file://{}", p.to_string_lossy().replace('\\', "/"));
+		let mut model = ModelBuilder::new("Mem");
+		let mp1 = model.child(
+			model.model,
+			InstanceBuilder::new("MeshPart")
+				.with_name("A")
+				.with_property("Size", Vector3::new(2.0, 2.0, 2.0))
+				.with_property("InitialSize", Vector3::new(2.0, 1.0, 2.0))
+				.with_property("MeshId", ContentId::from(uri(&mesh_path)))
+				.with_property("TextureID", ContentId::from(uri(&tex_rgb)))
+				.with_property("CFrame", crate::scene::build::cframe(Affine3A::IDENTITY)),
+		);
+		let mp2 = model.child(
+			model.model,
+			InstanceBuilder::new("MeshPart")
+				.with_name("B")
+				.with_property("Size", Vector3::new(2.0, 2.0, 2.0))
+				.with_property("InitialSize", Vector3::new(2.0, 1.0, 2.0))
+				.with_property("MeshId", ContentId::from(uri(&mesh_path)))
+				.with_property("CFrame", crate::scene::build::cframe(Affine3A::from_translation(Vec3::X * 4.0))),
+		);
+		model.child(mp2, InstanceBuilder::new("Decal").with_property("Texture", ContentId::from(uri(&tex_rgb))).with_property("Face", Enum::from_u32(1)));
+		model.child(mp1, InstanceBuilder::new("Texture").with_property("Texture", ContentId::from(uri(&tex_dds))).with_property("Face", Enum::from_u32(5)));
+		let host = model.part(&PartSpec { name: "Host".into(), transparency: 1.0, ..Default::default() });
+		model.child(host, InstanceBuilder::new("ParticleEmitter").with_property("Texture", ContentId::from(uri(&tex_rgba))).with_property("Rate", 10.0f32));
+
+		let document = model.into_document();
+		let scene = crate::scene::extract::extract(&document);
+		let assets = Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(dir.join("cache")) });
+		let meshes = Meshes::load(&scene.parts, &assets);
+		let report = measure(&scene, &meshes, &assets);
+
+		assert_eq!(report.meshes.unique, 1);
+		assert_eq!(report.meshes.instances, 2);
+		assert_eq!(report.meshes.file_bytes, mesh_file_bytes);
+		assert_eq!(report.meshes.gpu_bytes, 408);
+
+		assert_eq!(report.textures.unique, 3);
+		assert_eq!(report.textures.references, 4);
+		assert_eq!(report.textures.file_bytes, rgb_bytes + rgba_bytes + dds_bytes);
+		assert_eq!(report.textures.rgba8_base_bytes, 64 * 64 * 4 + 128 * 64 * 4 + 32 * 32 * 4);
+		assert_eq!(report.textures.rgba8_mip_bytes, 21_844 + 43_692 + 5_460);
+		assert_eq!(report.textures.desktop_bc_mip_bytes, 2_744 + 10_960 + 696);
+		assert_eq!(report.textures.mobile_astc4x4_mip_bytes, 5_488 + 10_960 + 1_392);
+		assert_eq!(report.textures.mobile_astc6x6_mip_bytes, 2_768 + 5_392 + 832);
+		assert_eq!(report.total_gpu_bytes.rgba8, 408 + 21_844 + 43_692 + 5_460);
+		assert_eq!(report.total_gpu_bytes.desktop_bc, 408 + 2_744 + 10_960 + 696);
+		assert_eq!(report.total_gpu_bytes.mobile_astc4x4, 408 + 5_488 + 10_960 + 1_392);
+		assert_eq!(report.total_gpu_bytes.mobile_astc6x6, 408 + 2_768 + 5_392 + 832);
+
+		let json = serde_json::to_value(&report).unwrap();
+		assert_eq!(json["textures"]["mobileAstc4x4MipBytes"], 5_488 + 10_960 + 1_392);
+		assert_eq!(json["textures"]["mobileAstc6x6MipBytes"], 2_768 + 5_392 + 832);
+		assert_eq!(json["totalGpuBytes"]["mobileAstc4x4"], 408 + 5_488 + 10_960 + 1_392);
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+}

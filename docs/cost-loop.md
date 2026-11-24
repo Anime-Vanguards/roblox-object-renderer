@@ -105,9 +105,9 @@ Because GPU shader weights are estimates, treat small differences (under ~0.05 m
 
 ### `analysis.json` (`ror-cost-analysis/1`)
 
-Top-level fields: `preset`, `quality` (active features), `prices`, `pixelsCounted`, `views` (per view: `name`, Roblox `draws`/`triangles` excluding Shadows, `work`, `overBudget`), `mean`, `worst`, `topInstances`, and `findings`.
+Top-level fields: `preset`, `quality` (active features), `prices`, `fidelity`, `unmodeled`, `memory` (deduplicated mesh and texture bytes: `meshes`, `textures`, `totalGpuBytes`), `pixelsCounted`, `views` (per view: `name`, Roblox `draws`/`triangles` excluding Shadows, `work`, `overBudget`), `mean`, `worst`, `topInstances`, and `findings`.
 
-Every `work` object (in `analysis.json` and `tree.json`) contains: `draws`, `triangles`, `pixels`, `blended` (at preset resolution), `lightPixels`, `litPixels`, `shadowTriangles`, `parts`, `cpuMs`, `gpuMs`, and `ms` (`cpuMs + gpuMs share`).
+Every `work` object (in `analysis.json` and `tree.json`) contains: `draws`, `triangles`, `pixels`, `blended` (at preset resolution), `lightPixels`, `litPixels`, `shadowTriangles`, `parts`, `gpuUnits`, `cpuMs`, `gpuMs` (`null` on `--preset desktop`), and `ms` (`cpuMs + gpuMs share` on phone/custom; `cpuMs` on desktop).
 
 ### `tree.json` (`ror-cost-tree/1`)
 

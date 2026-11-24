@@ -49,7 +49,7 @@ Files written to `--out`:
 - `<view>.png`: rendered view.
 - `<view>.draws.png`: false-color image where every draw call gets a distinct color.
 - `<view>.heat.png`: instancing efficiency heatmap (red = 1 copy/draw, yellow = 10 copies/draw, blue = 100+ copies/draw, gray = culled).
-- `analysis.txt`, `analysis.json`, `tree.json`: per-instance attribution (`prices`, `fidelity`, `unmodeled`) and ranked findings ([cost-loop.md](cost-loop.md)).
+- `analysis.txt`, `analysis.json`, `tree.json`: per-instance attribution (`prices`, `fidelity`, `unmodeled`), deduplicated mesh and texture memory (`memory`: file bytes, GPU mesh buffers, RGBA8 / BCn / ASTC 4×4 / ASTC 6×6 mip chains), and ranked findings ([cost-loop.md](cost-loop.md)).
 
 ## How Roblox counts draws and triangles
 

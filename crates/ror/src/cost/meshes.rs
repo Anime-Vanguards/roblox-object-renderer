@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use glam::Vec3;
-use parking_lot::Mutex;
 use rayon::prelude::*;
 
 use crate::scene::{Geometry, Part};
@@ -40,6 +39,20 @@ pub struct MeshStats {
 	/// The file's count of high-quality levels: what RenderFidelity Automatic takes of the chain
 	/// (crate::lod)
 	pub high_quality: u8,
+	/// Encoded mesh bytes on disk / downloaded asset (inline MeshData length for inline unions).
+	pub file_bytes: u64,
+	/// Vertex count in the decoded mesh (`mesh.positions.len()`).
+	pub vertices: u32,
+	/// Index count across all LODs (`mesh.indices.len()`).
+	pub indices: u32,
+	/// Packed vertex buffer GPU bytes across present vertex streams.
+	pub vertex_bytes: u64,
+	/// Index buffer GPU bytes (u16 when `vertices <= 65535`, else u32).
+	pub index_bytes: u64,
+	/// Skinning GPU bytes (packed joints + weights + 64-byte bone matrices).
+	pub skinning_bytes: u64,
+	/// Total GPU geometry bytes (`vertex_bytes + index_bytes + skinning_bytes`).
+	pub gpu_bytes: u64,
 }
 
 /// Every mesh, union and file mesh the scene's parts draw, decoded once (in parallel); failures
@@ -80,34 +93,56 @@ pub fn fnv(bytes: &[u8]) -> u64 {
 
 impl Meshes {
 	pub fn load(parts: &[Arc<Part>], assets: &ror_assets::Assets) -> Self {
+		let mut cache = HashMap::new();
+		Self::load_cached(parts, assets, &mut cache)
+	}
+
+	/// Loads every distinct mesh referenced by `parts`, reusing any previously decoded entries in
+	/// `cache` (used by multi-frame timeline costing to decode each mesh asset once).
+	pub fn load_cached(parts: &[Arc<Part>], assets: &ror_assets::Assets, cache: &mut HashMap<String, Result<Arc<MeshStats>, String>>) -> Self {
 		let mut wanted: HashMap<String, &Geometry> = HashMap::new();
 		for part in parts {
 			if let Some(key) = mesh_key(&part.geometry) {
 				wanted.entry(key).or_insert(&part.geometry);
 			}
 		}
-		let missing = Mutex::new(Vec::new());
-		let stats: HashMap<String, Arc<MeshStats>> = wanted
-			.into_par_iter()
-			.filter_map(|(key, geometry)| {
-				let decoded = match geometry {
-					Geometry::Union { mesh_data: Some(data), .. } => ror_mesh::decode_union(data).map_err(|error| error.to_string()),
-					Geometry::Union { asset: Some(asset), .. } => assets.fetch(asset).map_err(|error| error.to_string()).and_then(|fetched| ror_mesh::decode_union(&fetched.bytes).map_err(|error| error.to_string())),
-					Geometry::MeshPart { mesh, .. } | Geometry::Special { mesh: Some(mesh), .. } => {
-						assets.fetch(mesh).map_err(|error| error.to_string()).and_then(|fetched| ror_mesh::decode_mesh(&fetched.bytes).map_err(|error| error.to_string()))
-					}
-					_ => return None,
-				};
-				match decoded {
-					Ok(mesh) => Some((key, Arc::new(stats_of(&mesh)))),
-					Err(error) => {
-						missing.lock().push(format!("{key}: {error}"));
-						None
-					}
+		let uncached: Vec<(String, &Geometry)> = wanted.iter().filter(|(key, _)| !cache.contains_key(*key)).map(|(key, geometry)| (key.clone(), *geometry)).collect();
+		if !uncached.is_empty() {
+			let decoded: Vec<(String, Result<Arc<MeshStats>, String>)> = uncached
+				.into_par_iter()
+				.filter_map(|(key, geometry)| {
+					let result = match geometry {
+						Geometry::Union { mesh_data: Some(data), .. } => ror_mesh::decode_union(data).map(|mesh| (mesh, data.len() as u64)).map_err(|error| error.to_string()),
+						Geometry::Union { asset: Some(asset), .. } => assets.fetch(asset).map_err(|error| error.to_string()).and_then(|fetched| {
+							let len = fetched.bytes.len() as u64;
+							ror_mesh::decode_union(&fetched.bytes).map(|mesh| (mesh, len)).map_err(|error| error.to_string())
+						}),
+						Geometry::MeshPart { mesh, .. } | Geometry::Special { mesh: Some(mesh), .. } => assets.fetch(mesh).map_err(|error| error.to_string()).and_then(|fetched| {
+							let len = fetched.bytes.len() as u64;
+							ror_mesh::decode_mesh(&fetched.bytes).map(|mesh| (mesh, len)).map_err(|error| error.to_string())
+						}),
+						_ => return None,
+					};
+					Some((key, result.map(|(mesh, file_bytes)| Arc::new(stats_of(&mesh, file_bytes)))))
+				})
+				.collect();
+			for (key, result) in decoded {
+				cache.insert(key, result);
+			}
+		}
+		let mut stats = HashMap::new();
+		let mut missing = Vec::new();
+		for key in wanted.into_keys() {
+			match cache.get(&key) {
+				Some(Ok(entry)) => {
+					stats.insert(key, entry.clone());
 				}
-			})
-			.collect();
-		let mut missing = missing.into_inner();
+				Some(Err(error)) => {
+					missing.push(format!("{key}: {error}"));
+				}
+				None => {}
+			}
+		}
 		missing.sort();
 		Self { stats, missing }
 	}
@@ -117,7 +152,7 @@ impl Meshes {
 	}
 }
 
-fn stats_of(mesh: &ror_mesh::Mesh) -> MeshStats {
+fn stats_of(mesh: &ror_mesh::Mesh, file_bytes: u64) -> MeshStats {
 	let lods: Vec<u32> = mesh.lods.iter().map(|range| (range.end - range.start) / 3).filter(|&count| count > 0).collect();
 	let lods = if lods.is_empty() { vec![(mesh.indices.len() / 3) as u32] } else { lods };
 	let indices = mesh.lod0();
@@ -182,7 +217,43 @@ fn stats_of(mesh: &ror_mesh::Mesh) -> MeshStats {
 			triangles.push([a, b, c]);
 		}
 	}
-	MeshStats { lods, shape: hash, bounds, facing, facing_positive, positions, occluder: full.then(|| Arc::new(triangles)), skinned: mesh.skinning.is_some(), high_quality: mesh.high_quality_lods }
+	let vertices = mesh.positions.len() as u32;
+	let indices_count = mesh.indices.len() as u32;
+	let mut stride = 12u64;
+	if !mesh.normals.is_empty() {
+		stride += 12;
+	}
+	if !mesh.uvs.is_empty() {
+		stride += 8;
+	}
+	if !mesh.tangents.is_empty() {
+		stride += 16;
+	}
+	if !mesh.colors.is_empty() {
+		stride += 4;
+	}
+	let vertex_bytes = u64::from(vertices) * stride;
+	let index_bytes = u64::from(indices_count) * if vertices > 65_535 { 4 } else { 2 };
+	let skinning_bytes = mesh.skinning.as_ref().map_or(0, |skin| skin.joints.len() as u64 * 4 + skin.weights.len() as u64 * 4 + skin.bones.len() as u64 * 64);
+	let gpu_bytes = vertex_bytes + index_bytes + skinning_bytes;
+	MeshStats {
+		lods,
+		shape: hash,
+		bounds,
+		facing,
+		facing_positive,
+		positions,
+		occluder: full.then(|| Arc::new(triangles)),
+		skinned: mesh.skinning.is_some(),
+		high_quality: mesh.high_quality_lods,
+		file_bytes,
+		vertices,
+		indices: indices_count,
+		vertex_bytes,
+		index_bytes,
+		skinning_bytes,
+		gpu_bytes,
+	}
 }
 
 /// The box face (`Enum.NormalId` order: Right +X, Top +Y, Back +Z, Left -X, Bottom -Y, Front -Z)
@@ -229,9 +300,10 @@ mod tests {
 			[[-1.0, 0.0, 1.0], [1.0, 0.0, 1.0], [1.0, 0.0, -1.0]],
 			[[-1.0, 0.0, 1.0], [1.0, 0.0, -1.0], [-1.0, 0.0, -1.0]],
 		]);
-		let stats = stats_of(&flat);
+		let stats = stats_of(&flat, 0);
 		assert_eq!(stats.facing, [0, 2, 0, 0, 0, 0]);
 		assert_eq!(stats.facing_positive, [0, 2, 0, 0, 0, 0]);
+		assert_eq!((stats.vertices, stats.indices, stats.vertex_bytes, stats.index_bytes, stats.gpu_bytes), (6, 6, 72, 12, 84));
 
 		// Asymmetric tilted mesh: distinct triangle count per NormalId face (Right=1, Top=2, Back=3,
 		// Left=4, Bottom=5, Front=6) so swapping any two faces fails, and tilted normals ensure
@@ -251,7 +323,7 @@ mod tests {
 			}
 		}
 		let asym = mesh_from_tris(&tris);
-		let asym_stats = stats_of(&asym);
+		let asym_stats = stats_of(&asym, 0);
 		assert_eq!(asym_stats.facing, [1, 2, 3, 4, 5, 6]);
 		assert_eq!(asym_stats.facing.iter().sum::<u32>(), 21);
 		assert!(asym_stats.facing_positive.iter().sum::<u32>() > 21, "tilted faces have positive dot on multiple axes: {:?}", asym_stats.facing_positive);
@@ -264,7 +336,7 @@ mod tests {
 			[py, pz, px], [py, px, nz], [py, nz, nx], [py, nx, pz],
 			[ny, px, pz], [ny, nz, px], [ny, nx, nz], [ny, pz, nx],
 		]);
-		let oct_stats = stats_of(&oct);
+		let oct_stats = stats_of(&oct, 0);
 		assert_eq!(oct_stats.facing.iter().sum::<u32>(), 8);
 	}
 }
