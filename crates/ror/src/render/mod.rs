@@ -803,6 +803,37 @@ mod surface_tests {
 		assert_eq!(content_key(&transcode::image_key("rbxassetid://123")), transcode::image_key("rbxassetid://123"));
 	}
 
+	/// A local image rewritten under its path is drawn anew while geometry prepared with its first
+	/// version still holds that version's material: the service drew a repainted sheet's old paint for as
+	/// long as renders followed one another.
+	#[test]
+	fn a_rewritten_local_image_gets_a_new_material() {
+		let state = std::env::temp_dir().join(format!("ror-material-stamp-test-{}", std::process::id()));
+		std::fs::create_dir_all(&state).unwrap();
+		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let file = state.join("paint.png");
+		let paint = |side: u32, rgba: [u8; 4]| crate::output::write_png(&file, side, side, &rgba.repeat((side * side) as usize), true).unwrap();
+		paint(4, [255, 0, 0, 255]);
+		let key = MaterialKey { color: Some(format!("file:///{}", file.display().to_string().replace('\\', "/").replace(' ', "%20"))), ..MaterialKey::default() };
+		let mut missing = Vec::new();
+		let first = renderer.material_bind_group(&key, &mut missing);
+		assert!(Arc::ptr_eq(&first, &renderer.material_bind_group(&key, &mut missing)), "an unchanged image keeps its material");
+		paint(8, [0, 255, 0, 255]);
+		// `first` is still held, as the geometry prepared with it holds it
+		let second = renderer.material_bind_group(&key, &mut missing);
+		assert!(missing.is_empty(), "{missing:?}");
+		assert!(!Arc::ptr_eq(&first, &second), "the rewritten image drew with its first version's material");
+		assert_eq!(second.maps[0].as_ref().map(|map| map.width), Some(8));
+		assert_eq!(first.maps[0].as_ref().map(|map| map.width), Some(4));
+		// an asset id's key is kept as it is
+		let asset = MaterialKey { color: Some("rbxassetid://123".into()), ..MaterialKey::default() };
+		assert!(matches!(asset.stamped(), std::borrow::Cow::Borrowed(_)));
+		drop((first, second, renderer));
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
 	#[test]
 	fn surface_groups_pack_per_face() {
 		let block = |material: u32, geometry: Geometry| crate::scene::Part {
@@ -915,6 +946,16 @@ impl MaterialKey {
 		[(&self.color, TextureUse::Color), (&self.normal, TextureUse::Normal), (&self.metalness, TextureUse::Scalar), (&self.roughness, TextureUse::Scalar), (&self.emissive, TextureUse::Color)]
 			.into_iter()
 			.filter_map(|(uri, usage)| uri.as_deref().map(|uri| (uri, usage)))
+	}
+
+	/// The key its binding is kept by: each local file's URI with its file's stamp ([`content_key`]),
+	/// so an image rewritten under its path is another material's.
+	fn stamped(&self) -> std::borrow::Cow<'_, MaterialKey> {
+		if !self.textures().any(|(uri, _)| names_local_file(uri)) {
+			return std::borrow::Cow::Borrowed(self);
+		}
+		let stamp = |uri: &Option<String>| uri.as_deref().map(content_key);
+		std::borrow::Cow::Owned(MaterialKey { color: stamp(&self.color), normal: stamp(&self.normal), metalness: stamp(&self.metalness), roughness: stamp(&self.roughness), emissive: stamp(&self.emissive), clamped: self.clamped })
 	}
 }
 
@@ -2375,7 +2416,10 @@ impl Renderer {
 	}
 
 	fn material_bind_group(&self, key: &MaterialKey, missing: &mut Vec<String>) -> Arc<MaterialBinding> {
-		if let Some(material) = self.materials.lock().get(key).and_then(std::sync::Weak::upgrade) {
+		// kept by its files' stamps: the binding of a rewritten image's first version lives on in the
+		// geometry prepared with it, and each later preparation that found it by its path kept it alive
+		let kept = key.stamped();
+		if let Some(material) = self.materials.lock().get(kept.as_ref()).and_then(std::sync::Weak::upgrade) {
 			return material;
 		}
 		let mut load = |uri: &Option<String>, usage: TextureUse| -> Option<Arc<GpuTexture>> {
@@ -2411,7 +2455,7 @@ impl Renderer {
 		let complete = uris.iter().zip(&maps).all(|(uri, texture)| uri.is_none() || texture.is_some());
 		let binding = Arc::new(MaterialBinding { maps, clamped: key.clamped, info, feedback, group: Mutex::new(None) });
 		if complete {
-			self.materials.lock().insert(key.clone(), Arc::downgrade(&binding));
+			self.materials.lock().insert(kept.into_owned(), Arc::downgrade(&binding));
 		}
 		binding
 	}
