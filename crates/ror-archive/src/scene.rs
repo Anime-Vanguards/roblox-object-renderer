@@ -16,6 +16,10 @@
 //! Flattening rewrites those chunks without the tag. Strings and shared strings get their bytes
 //! back. A content reference (version 2) names an opaque object that no standalone file can carry,
 //! so its value stays `None` and the [`Report`] lists it. Every other chunk is copied as it is.
+//!
+//! A reference is honoured only when everything about it checks out: the archive holds the object,
+//! the object has the size and the BLAKE3 digest the reference gives, and the value it stands for is
+//! the empty placeholder of its type. Anything else is an error, never a guess.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -287,7 +291,7 @@ impl Reference {
 }
 
 /// The reference column after a `0x82` tag: one slot per instance of the class.
-fn read_references(chunk: &mut Reader, count: usize) -> Result<Vec<Option<Reference>>> {
+pub(crate) fn read_references(chunk: &mut Reader, count: usize) -> Result<Vec<Option<Reference>>> {
 	let mut references = Vec::with_capacity(count);
 	while references.len() < count {
 		let length = chunk.u32("a property's object references")? as i32;
@@ -344,19 +348,25 @@ impl<'a> SharedStrings<'a> {
 		if count > chunk.remaining() / 20 {
 			return Err(invalid(format!("the shared string table claims {count} entries")));
 		}
-		let stored = chunk.rest();
+		let start = chunk.at;
 		let mut entries = Vec::with_capacity(count);
 		for _ in 0..count {
 			chunk.take(16, "a shared string's hash")?;
 			entries.push(chunk.sized("a shared string")?);
 		}
+		// Bytes after the last entry belong to no entry, and a parser stops before them. They are left
+		// out, so that the entries flattening adds follow the stored ones directly.
+		let stored = &payload[start..chunk.at];
 		Ok(Self { entries, stored, added: Vec::new(), added_count: 0, by_digest: BTreeMap::new() })
 	}
 
+	/// The index of the entry added for this object, when there is one.
+	fn index_of(&self, digest: &[u8; 16]) -> Option<u32> {
+		self.by_digest.get(digest).copied()
+	}
+
+	/// Adds an entry for an object that has none yet (see [`SharedStrings::index_of`]).
 	fn add(&mut self, digest: [u8; 16], bytes: &[u8]) -> u32 {
-		if let Some(index) = self.by_digest.get(&digest) {
-			return *index;
-		}
 		let index = (self.entries.len() + self.added_count) as u32;
 		// the table's hash field is the first 16 bytes of the string's BLAKE3, which is the object's digest
 		self.added.extend_from_slice(&digest);
@@ -381,6 +391,64 @@ enum Out {
 	Rewritten([u8; 4], Vec<u8>),
 }
 
+/// The objects a scene's properties refer to, each one found and checked once however many values
+/// name it.
+struct Objects<'a, 'b> {
+	archive: &'b Archive<'a>,
+	scene_digest: &'b str,
+	found: BTreeMap<[u8; 16], &'a [u8]>,
+}
+
+impl<'a> Objects<'a, '_> {
+	fn resolve(&mut self, reference: &Reference) -> Result<&'a [u8]> {
+		let bytes = match self.found.get(&reference.digest) {
+			Some(bytes) => *bytes,
+			None => {
+				let hex = reference.hex();
+				if self.scene_digest == hex {
+					return Err(invalid("a property refers to the scene itself"));
+				}
+				let Some(bytes) = self.archive.object(&hex) else {
+					let algorithm = &self.archive.manifest().digest_algorithm;
+					return Err(invalid(if self.archive.verified() {
+						format!("a property refers to object {hex}, which the archive does not hold")
+					} else {
+						format!(
+							"a property refers to object {hex}, which the archive does not hold under that name (its objects are named by digest algorithm '{algorithm}', which this reader does not know)"
+						)
+					}));
+				};
+				// A reference names its object by the first 16 bytes of the object's BLAKE3, whatever
+				// algorithm the manifest names the members by. Opening the archive checked exactly that
+				// when the two are the same algorithm.
+				if !self.archive.verified() && blake3::hash(bytes).as_bytes()[..16] != reference.digest {
+					return Err(Error::Digest { digest: hex });
+				}
+				self.found.insert(reference.digest, bytes);
+				bytes
+			}
+		};
+		if bytes.len() as u64 != reference.size {
+			return Err(invalid(format!(
+				"object {} is {} bytes where a property expects {}",
+				reference.hex(),
+				bytes.len(),
+				reference.size
+			)));
+		}
+		Ok(bytes)
+	}
+}
+
+/// Counts bytes against the limit on what is written back into a scene, before they are copied.
+fn charge(written: &mut u64, bytes: &[u8], limit: u64) -> Result<()> {
+	*written = written.saturating_add(bytes.len() as u64);
+	if *written > limit {
+		return Err(Error::Limit("restored bytes"));
+	}
+	Ok(())
+}
+
 /// Rewrites a binary scene so that no property refers to an object outside it. Returns the scene
 /// itself when it was standalone already.
 pub(crate) fn flatten<'a>(scene: &'a [u8], scene_digest: &str, archive: &Archive<'a>) -> Result<(Cow<'a, [u8]>, Report)> {
@@ -392,31 +460,12 @@ pub(crate) fn flatten<'a>(scene: &'a [u8], scene_digest: &str, archive: &Archive
 	let mut changed = false;
 	let mut scratch = Vec::new();
 	// the table comes before the properties that index it; it is read only if a shared string is restored
-	let sstr_index = list.iter().position(|chunk| &chunk.name == b"SSTR");
+	let tables: Vec<usize> = list.iter().enumerate().filter(|(_, chunk)| &chunk.name == b"SSTR").map(|(index, _)| index).collect();
 	let sstr_payload: std::cell::OnceCell<Vec<u8>> = std::cell::OnceCell::new();
-	let mut shared: Option<SharedStrings> = None;
-
-	let resolve = |reference: &Reference| -> Result<&'a [u8]> {
-		let hex = reference.hex();
-		let bytes = match archive.object(&hex) {
-			Some(bytes) => bytes,
-			None => {
-				// an algorithm with longer digests names objects by more than a reference's 16 bytes
-				let mut matches = archive.objects().filter(|(digest, _)| digest.starts_with(&hex));
-				match (matches.next(), matches.next()) {
-					(Some((_, bytes)), None) => bytes,
-					_ => return Err(invalid(format!("a property refers to object {hex}, which the archive does not hold"))),
-				}
-			}
-		};
-		if scene_digest.starts_with(&hex) {
-			return Err(invalid("a property refers to the scene itself"));
-		}
-		if bytes.len() as u64 != reference.size {
-			return Err(invalid(format!("object {hex} is {} bytes where a property expects {}", bytes.len(), reference.size)));
-		}
-		Ok(bytes)
-	};
+	let mut shared: Option<(usize, SharedStrings)> = None;
+	let mut objects = Objects { archive, scene_digest, found: BTreeMap::new() };
+	// what the rewritten chunks gain: a string once per value that holds it, a shared string once
+	let mut written = 0u64;
 
 	for chunk in &list {
 		let verbatim = Out::Verbatim(chunk.whole.clone());
@@ -480,7 +529,8 @@ pub(crate) fn flatten<'a>(scene: &'a [u8], scene_digest: &str, archive: &Archive
 								class.name
 							)));
 						}
-						let bytes = resolve(reference)?;
+						let bytes = objects.resolve(reference)?;
+						charge(&mut written, bytes, limits.max_restored_bytes)?;
 						restored += bytes.len() as u64;
 						push_sized(&mut rewritten, bytes);
 					}
@@ -489,15 +539,27 @@ pub(crate) fn flatten<'a>(scene: &'a [u8], scene_digest: &str, archive: &Archive
 					let raw = reader.take(class.count.checked_mul(4).ok_or_else(|| invalid("a shared string property is too long"))?, "a shared string property")?;
 					let mut indices = read_interleaved(raw, class.count);
 					if shared.is_none() {
-						let index = sstr_index.ok_or_else(|| invalid("a shared string property has no shared string table to index"))?;
+						// Indices count through one table. With more than one, where the entries flattening
+						// adds would land is each parser's own reading, so no value is put anywhere.
+						let index = match tables[..] {
+							[index] => index,
+							[] => return Err(invalid("a shared string property has no shared string table to index")),
+							_ => {
+								return Err(Error::Unsupported(format!(
+									"the scene has {} shared string tables, and {}.{property_name} keeps values outside it that go into one",
+									tables.len(),
+									class.name
+								)));
+							}
+						};
 						if sstr_payload.get().is_none() {
 							let mut scratch = Vec::new();
 							let payload = data(scene, &list[index], &mut scratch, limits.max_chunk_bytes)?.to_vec();
 							let _ = sstr_payload.set(payload);
 						}
-						shared = Some(SharedStrings::parse(sstr_payload.get().expect("just set"))?);
+						shared = Some((index, SharedStrings::parse(sstr_payload.get().expect("just set"))?));
 					}
-					let table = shared.as_mut().expect("just set");
+					let (_, table) = shared.as_mut().expect("just set");
 					for (index, reference) in indices.iter_mut().zip(&references) {
 						let Some(reference) = reference else {
 							continue;
@@ -509,20 +571,38 @@ pub(crate) fn flatten<'a>(scene: &'a [u8], scene_digest: &str, archive: &Archive
 								class.name
 							)));
 						}
-						let bytes = resolve(reference)?;
+						let bytes = objects.resolve(reference)?;
 						restored += bytes.len() as u64;
-						*index = table.add(reference.digest, bytes);
+						*index = match table.index_of(&reference.digest) {
+							Some(added) => added,
+							None => {
+								charge(&mut written, bytes, limits.max_restored_bytes)?;
+								table.add(reference.digest, bytes)
+							}
+						};
 					}
 					write_interleaved(&mut rewritten, &indices);
 				}
 				TYPE_CONTENT => {
 					// opaque objects have no form in a standalone file: the `None` placeholders stay
+					let raw = reader.take(class.count.checked_mul(4).ok_or_else(|| invalid("a content property is too long"))?, "a content property")?;
+					// each value's source type, stored transformed; `None` is 0 either way
+					let sources = read_interleaved(raw, class.count);
 					let mut bytes = 0u64;
-					for reference in references.iter().flatten() {
+					for (source, reference) in sources.iter().zip(&references) {
+						let Some(reference) = reference else {
+							continue;
+						};
 						if reference.identity.is_none() {
 							return Err(invalid(format!("{}.{property_name} refers to plain bytes from a content value", class.name)));
 						}
-						bytes += resolve(reference)?.len() as u64;
+						if *source != 0 {
+							return Err(invalid(format!(
+								"{}.{property_name} has a stored value that is not a `None` placeholder for a content object",
+								class.name
+							)));
+						}
+						bytes += objects.resolve(reference)?.len() as u64;
 					}
 					report.embedded_content.push(EmbeddedContent {
 						class: class.name.clone(),
@@ -530,6 +610,7 @@ pub(crate) fn flatten<'a>(scene: &'a [u8], scene_digest: &str, archive: &Archive
 						values: referenced,
 						bytes,
 					});
+					rewritten.extend_from_slice(raw);
 					rewritten.extend_from_slice(reader.rest());
 					reader.at = reader.bytes.len();
 				}
@@ -546,9 +627,6 @@ pub(crate) fn flatten<'a>(scene: &'a [u8], scene_digest: &str, archive: &Archive
 			if wire != TYPE_CONTENT {
 				report.restored_values += referenced;
 				report.restored_bytes += restored;
-				if report.restored_bytes > limits.max_restored_bytes {
-					return Err(Error::Limit("restored bytes"));
-				}
 			}
 		}
 		changed = true;
@@ -558,12 +636,12 @@ pub(crate) fn flatten<'a>(scene: &'a [u8], scene_digest: &str, archive: &Archive
 	if !changed {
 		return Ok((Cow::Borrowed(scene), report));
 	}
-	if let (Some(index), Some(table)) = (sstr_index, &shared)
+	if let Some((index, table)) = &shared
 		&& table.added_count > 0
 	{
-		outputs[index] = Out::Rewritten(*b"SSTR", table.payload());
+		outputs[*index] = Out::Rewritten(*b"SSTR", table.payload());
 	}
-	let mut out = Vec::with_capacity(scene.len() + report.restored_bytes as usize / 2);
+	let mut out = Vec::with_capacity(scene.len() + written as usize / 2);
 	out.extend_from_slice(&scene[..HEADER_LEN]);
 	for output in &outputs {
 		match output {

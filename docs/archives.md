@@ -44,21 +44,27 @@ The layout of the marker is not part of Roblox's page yet. `ror` follows the dra
 - Version 1 references stand for plain bytes in a string or shared string column. Flattening restores these.
 - Version 2 references stand for content kept as an opaque object. Its layout is not documented, and a standalone file has no place for it, so these values read as empty content. Each property they occur in is reported (see [Warnings and errors](#warnings-and-errors)).
 
-A marker or reference of any other kind is an error: `ror` does not guess at values it cannot restore.
+`ror` follows a reference only when all of this holds:
+
+- The archive holds the object, and the object has the size and the BLAKE3 digest the reference gives.
+- The value the reference stands for is the empty placeholder of its type: an empty string, an empty shared string, or a content value of `None`.
+- For a shared string, the scene has one shared string table for the bytes to go into.
+
+Anything else is an error, and so is a marker or a reference of any other kind: `ror` does not guess at values it cannot restore.
 
 ## Validation
 
 | Part | Rule |
 |---|---|
 | Container | A ZIP, ZIP64 included, with every member stored uncompressed and unencrypted, in one file. Member names are UTF-8 with `/` separators, at most 128 characters, without empty, `.` or `..` parts, and none twice. Each member's CRC-32 must match. |
-| Manifest | `header`, then `package`, then `content` records. `version` must be 1. A JSON key may not repeat within an object. Logical paths follow the member name rules and are unique. |
-| Objects | Every `objectDigest` must name a member under `objects/`, and the member's bytes must match the digest (`blake3-128`: the first 16 bytes of BLAKE3, in lowercase hex). |
+| Manifest | `header`, then `package`, then `content` records. `version` must be 1. A JSON key may not repeat within an object. Logical paths are relative, use `/` separators, have no empty, `.` or `..` parts, and are unique. The 128-character limit is for member names and does not apply to them. |
+| Objects | Every `objectDigest` must name a member under `objects/`, and the member's bytes must match the digest (`blake3-128`: the first 16 bytes of BLAKE3, in lowercase hex). Roblox's page names no algorithm. `blake3-128` is the one the draft uses and the only one `ror` computes. |
 | Package | `place`: the `place` field names the content record of the scene. `model`: see below. Any other type is refused. |
 | Scene | A binary (`<roblox!`) or XML (`<roblox`) Roblox file. Only a binary scene can hold references. |
 
 Roblox's page gives a model package no layout yet. `ror` finds a model's scene by the package's `model` field, else by the single content record whose path ends in `.rbxm` or `.rbxmx`, else by the single object that is a Roblox file.
 
-Some things a strict reader refuses are read past and reported: members other than the manifest and the objects, objects no record names, fields the format does not define in the header or in a content record, and a digest algorithm `ror` does not know (the objects are then used unchecked).
+Some things a strict reader refuses are read past and reported: members other than the manifest and the objects, objects no record names, fields the format does not define in the header or in a content record, and a digest algorithm `ror` does not know. Under such an algorithm the objects are not checked against their names. An object a property refers to is still checked against the BLAKE3 digest in its reference, and a reference that names no member is an error.
 
 `ror` lists the manifest's asset references and does not download them. A scene's own content ids are fetched as for any other file ([assets.md](assets.md)).
 
@@ -73,7 +79,7 @@ Some things a strict reader refuses are read past and reported: members other th
 | One decompressed chunk of the scene | 1 GiB |
 | Bytes written back into the scene | 2 GiB |
 
-Members are stored uncompressed, so an archive cannot unpack to more than its own size. The scene's chunks are compressed, which is what the last two limits bound.
+Members are stored uncompressed, so an archive cannot unpack to more than its own size. The scene's chunks are compressed, which is what the last two limits bound. Bytes written back are counted before they are copied: a string once for each value that holds it, a shared string once however many values share it.
 
 ## Warnings and errors
 

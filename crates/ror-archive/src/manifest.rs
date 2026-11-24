@@ -67,29 +67,23 @@ pub struct Asset {
 	pub tag: Option<String>,
 }
 
-/// A digest algorithm this crate computes.
+/// A digest algorithm this crate computes. Roblox's page names none; `blake3-128` is the one the
+/// draft readers and writers use, and the one a property's reference to an object is written in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Digest {
 	/// The first 16 bytes of BLAKE3.
 	Blake3_128,
-	/// All 32 bytes of BLAKE3.
-	Blake3_256,
 }
 
 impl Digest {
 	pub(crate) fn named(algorithm: &str) -> Option<Self> {
-		match algorithm.to_ascii_lowercase().as_str() {
-			BLAKE3_128 => Some(Self::Blake3_128),
-			"blake3" | "blake3-256" => Some(Self::Blake3_256),
-			_ => None,
-		}
+		algorithm.eq_ignore_ascii_case(BLAKE3_128).then_some(Self::Blake3_128)
 	}
 
 	pub(crate) fn hex(self, bytes: &[u8]) -> String {
 		let hash = blake3::hash(bytes).to_hex();
 		match self {
 			Self::Blake3_128 => hash[..32].to_owned(),
-			Self::Blake3_256 => hash.to_string(),
 		}
 	}
 }
@@ -101,7 +95,8 @@ pub(crate) fn valid_digest(digest: &str) -> bool {
 		&& digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-/// Logical paths are relative, use `/`, and have no empty, `.` or `..` component.
+/// Logical paths are relative, use `/`, and have no empty, `.` or `..` component. The format's
+/// 128-character limit is on ZIP member names, which these are not.
 pub(crate) fn valid_path(path: &str) -> bool {
 	!path.is_empty()
 		&& !path.contains(['\\', '\0'])
@@ -433,11 +428,24 @@ mod tests {
 	#[test]
 	fn digests_are_named_by_algorithm() {
 		assert_eq!(Digest::named("blake3-128"), Some(Digest::Blake3_128));
-		assert_eq!(Digest::named("BLAKE3"), Some(Digest::Blake3_256));
-		assert_eq!(Digest::named("sha256"), None);
+		assert_eq!(Digest::named("BLAKE3-128"), Some(Digest::Blake3_128));
+		// names nobody has defined are not guessed at: what a property's 16-byte reference would mean
+		// under them is unknown
+		for unknown in ["blake3", "blake3-256", "sha256", ""] {
+			assert_eq!(Digest::named(unknown), None, "{unknown}");
+		}
 		// BLAKE3's published test vector for the empty input
 		assert_eq!(Digest::Blake3_128.hex(b""), "af1349b9f5f9a1a6a0404dea36dcc949");
-		assert_eq!(Digest::Blake3_256.hex(b"").len(), 64);
-		assert!(Digest::Blake3_256.hex(b"").starts_with("af1349b9f5f9a1a6a0404dea36dcc949"));
+	}
+
+	#[test]
+	fn a_logical_path_may_be_longer_than_a_member_name() {
+		// the 128-character limit is on ZIP member names; objects are named by digest, not by path
+		let package = r#"{"kind":"package","type":"model"}"#;
+		let long = format!("Scripts/{}/Main.luau", "Deeply/Nested".repeat(20));
+		assert!(long.len() > 128);
+		let record = format!(r#"{{"kind":"content","path":"{long}","objectDigest":"{DIGEST}"}}"#);
+		let (manifest, _) = parse(&format!("{HEADER}\n{package}\n{record}\n")).unwrap();
+		assert_eq!(manifest.content[0].path.as_deref(), Some(long.as_str()));
 	}
 }

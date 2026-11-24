@@ -91,7 +91,8 @@ pub struct Limits {
 	pub max_entries: usize,
 	/// One decompressed chunk of the scene (default 1 GiB).
 	pub max_chunk_bytes: usize,
-	/// Bytes put back into the scene from `objects/`, counting repeats (default 2 GiB).
+	/// Bytes written back into the scene from `objects/` (default 2 GiB). A string counts once for
+	/// each value that holds it, a shared string once however many values share it.
 	pub max_restored_bytes: u64,
 }
 
@@ -196,6 +197,8 @@ pub struct Archive<'a> {
 	bytes: &'a [u8],
 	manifest: Manifest,
 	objects: BTreeMap<String, Range<usize>>,
+	/// Whether every object was checked against the digest it is named by.
+	verified: bool,
 	warnings: Vec<String>,
 	limits: Limits,
 }
@@ -207,7 +210,10 @@ impl<'a> Archive<'a> {
 	}
 
 	/// Reads and validates an archive: the ZIP container, every member's CRC-32, the manifest, and
-	/// every object's digest when the digest algorithm is one this crate computes.
+	/// every object's digest when the digest algorithm is the one this crate computes (`blake3-128`).
+	/// Under any other algorithm the objects are not checked against their names, which the warnings
+	/// say; [`Archive::flatten`] still checks each object a property refers to against the digest in
+	/// the reference.
 	pub fn open_with(bytes: &'a [u8], limits: &Limits) -> Result<Self> {
 		if !is_archive(bytes) {
 			return Err(Error::NotArchive);
@@ -243,7 +249,7 @@ impl<'a> Archive<'a> {
 		let verify = manifest::Digest::named(&manifest.digest_algorithm);
 		if verify.is_none() {
 			warnings.push(format!(
-				"object digests were not checked: digest algorithm '{}' is not one this reader computes",
+				"objects were not checked against their names: digest algorithm '{}' is not one this reader computes",
 				manifest.digest_algorithm
 			));
 		}
@@ -267,7 +273,7 @@ impl<'a> Archive<'a> {
 		if unlisted > 0 {
 			warnings.push(format!("{unlisted} object(s) have no content record"));
 		}
-		Ok(Self { bytes, manifest, objects, warnings, limits: limits.clone() })
+		Ok(Self { bytes, manifest, objects, verified: verify.is_some(), warnings, limits: limits.clone() })
 	}
 
 	/// The parsed manifest.
@@ -385,5 +391,10 @@ impl<'a> Archive<'a> {
 
 	pub(crate) fn limits(&self) -> &Limits {
 		&self.limits
+	}
+
+	/// Whether opening checked every object against the digest it is named by.
+	pub(crate) fn verified(&self) -> bool {
+		self.verified
 	}
 }

@@ -97,11 +97,31 @@ fn digest(bytes: &[u8]) -> String {
 
 /// A ZIP from a manifest's lines and objects named by their own digests.
 fn archive(lines: &[String], objects: &[&[u8]]) -> Vec<u8> {
+	let named: Vec<(String, &[u8])> = objects.iter().map(|bytes| (digest(bytes), *bytes)).collect();
+	archive_named(lines, &named)
+}
+
+/// A ZIP from a manifest's lines and objects under the names given, whatever their bytes are.
+fn archive_named(lines: &[String], objects: &[(String, &[u8])]) -> Vec<u8> {
 	let manifest = lines.join("\n") + "\n";
-	let named: Vec<(String, &[u8])> = objects.iter().map(|bytes| (format!("objects/{}", digest(bytes)), *bytes)).collect();
 	let mut members: Vec<(String, &[u8])> = vec![("manifest.jsonl".to_owned(), manifest.as_bytes())];
-	members.extend(named);
+	members.extend(objects.iter().map(|(name, bytes)| (format!("objects/{name}"), *bytes)));
 	zip::write(&members, false)
+}
+
+/// The archive `archived` with `stored` as its scene: the other objects stay, a record for each.
+fn with_scene(archived: &[u8], stored: &[u8]) -> Vec<u8> {
+	let view = Archive::open(archived).unwrap();
+	let root = view.root().unwrap();
+	let mut lines = place_lines(stored);
+	let mut all: Vec<&[u8]> = vec![stored];
+	for (name, object) in view.objects() {
+		if name != root.digest {
+			lines.push(format!(r#"{{"kind":"content","objectDigest":"{name}"}}"#));
+			all.push(object);
+		}
+	}
+	archive(&lines, &all)
 }
 
 const HEADER: &str = r#"{"kind":"header","version":1,"digestAlgorithm":"blake3-128"}"#;
@@ -139,6 +159,60 @@ fn edit_property(scene_bytes: &[u8], property: &str, edit: impl Fn(&[u8]) -> Vec
 	assert!(done, "no PROP chunk for {property}");
 	out.extend_from_slice(&scene_bytes[end..]);
 	out
+}
+
+/// Replaces the shared string table with the chunks `edit` makes of its data.
+fn edit_table(scene_bytes: &[u8], edit: impl Fn(&[u8]) -> Vec<Vec<u8>>) -> Vec<u8> {
+	let (list, end) = scene::chunks(scene_bytes).unwrap();
+	let mut out = scene_bytes[..scene::HEADER_LEN].to_vec();
+	let mut done = false;
+	for chunk in &list {
+		if &chunk.name == b"SSTR" {
+			let mut scratch = Vec::new();
+			for payload in edit(scene::data(scene_bytes, chunk, &mut scratch, usize::MAX).unwrap()) {
+				write_chunk(&mut out, b"SSTR", &payload).unwrap();
+			}
+			done = true;
+			continue;
+		}
+		out.extend_from_slice(&scene_bytes[chunk.whole.clone()]);
+	}
+	assert!(done, "no shared string table");
+	out.extend_from_slice(&scene_bytes[end..]);
+	out
+}
+
+/// A shared string table's entries, each with its hash, and a table of the entries given.
+fn table_entries(payload: &[u8]) -> Vec<&[u8]> {
+	let mut reader = Reader::new(payload);
+	assert_eq!(reader.u32("version").unwrap(), 0);
+	let count = reader.u32("count").unwrap();
+	(0..count)
+		.map(|_| {
+			let start = reader.at;
+			reader.take(16, "hash").unwrap();
+			reader.sized("data").unwrap();
+			&payload[start..reader.at]
+		})
+		.collect()
+}
+
+fn table_of(entries: &[&[u8]]) -> Vec<u8> {
+	let mut out = 0u32.to_le_bytes().to_vec();
+	out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+	out.extend(entries.iter().flat_map(|entry| entry.iter().copied()));
+	out
+}
+
+/// A place of scripts that all have the same long source, and mesh parts that share one blob.
+fn repeating_place(scripts: usize, parts: usize, blob_len: usize) -> Vec<u8> {
+	let shared = SharedString::new(blob(5, blob_len));
+	let scripts = (0..scripts).map(|index| InstanceBuilder::new("ModuleScript").with_name(format!("Module{index}")).with_property("Source", LONG_SOURCE));
+	let parts = (0..parts).map(|index| InstanceBuilder::new("MeshPart").with_name(format!("Part{index}")).with_property("PhysicalConfigData", shared.clone()));
+	let dom = WeakDom::new(InstanceBuilder::new("DataModel").with_children(scripts).with_children(parts));
+	let mut bytes = Vec::new();
+	rbx_binary::to_writer(&mut bytes, &dom, dom.root().children()).unwrap();
+	bytes
 }
 
 #[test]
@@ -423,17 +497,17 @@ fn records_and_members_that_disagree() {
 	assert!(matches!(Archive::open(&archive(&place_lines(text), &[text])).unwrap().root(), Err(Error::Scene(_))));
 }
 
-/// The sample place with its mesh parts' `MeshContent` column given one opaque reference, for the
-/// part whose content is `None`.
-fn place_with_opaque_content(envelope: &[u8], identity: Option<&str>) -> Vec<u8> {
+/// The sample place with its mesh parts' `MeshContent` column given one opaque reference: for a
+/// part whose content is `None`, or (`on_none` false) for the part whose content is an asset id.
+fn place_with_opaque_content(envelope: &[u8], identity: Option<&str>, on_none: bool) -> Vec<u8> {
 	edit_property(&sample_place(), "MeshContent", |rest| {
 		assert_eq!(rest[0], TYPE_CONTENT);
 		// three mesh parts; sources are interleaved and transformed, and 0 stays 0
 		let sources = scene::read_interleaved(&rest[1..13], 3);
 		let mut references = vec![None; 3];
-		let none = sources.iter().rposition(|source| *source == 0).unwrap();
+		let slot = sources.iter().rposition(|source| (*source == 0) == on_none).unwrap();
 		let digest: [u8; 16] = blake3::hash(envelope).as_bytes()[..16].try_into().unwrap();
-		references[none] = Some(Reference { digest, size: envelope.len() as u64, identity: identity.map(str::to_owned) });
+		references[slot] = Some(Reference { digest, size: envelope.len() as u64, identity: identity.map(str::to_owned) });
 		let mut out = vec![TAG_EMBEDDED];
 		write_references(&mut out, &references);
 		out.extend_from_slice(rest);
@@ -444,7 +518,7 @@ fn place_with_opaque_content(envelope: &[u8], identity: Option<&str>) -> Vec<u8>
 #[test]
 fn opaque_content_stays_none_and_is_reported() {
 	let envelope = blob(40, 120);
-	let stored = place_with_opaque_content(&envelope, Some("content-1"));
+	let stored = place_with_opaque_content(&envelope, Some("content-1"), true);
 	let mut lines = place_lines(&stored);
 	lines.push(format!(r#"{{"kind":"content","objectDigest":"{}"}}"#, digest(&envelope)));
 	let bytes = archive(&lines, &[&stored, &envelope]);
@@ -471,14 +545,20 @@ fn references_this_reader_cannot_honour_are_errors_not_guesses() {
 	};
 
 	// the object a property names is not in the archive
-	let stored = place_with_opaque_content(&envelope, Some("content-1"));
+	let stored = place_with_opaque_content(&envelope, Some("content-1"), true);
 	let error = open(&stored, &[&stored]).unwrap_err();
 	assert!(matches!(error, Error::Scene(_)), "{error}");
 	assert!(error.to_string().contains("does not hold"), "{error}");
 
 	// a content value pointing at plain bytes (no identity)
-	let stored = place_with_opaque_content(&envelope, None);
+	let stored = place_with_opaque_content(&envelope, None, true);
 	assert!(matches!(open(&stored, &[&stored, &envelope]), Err(Error::Scene(_))));
+
+	// a reference over a content value that is there: the asset id it holds would be read, and the
+	// report would call it an object
+	let error = unwrap(&content_over_an_asset_id()).unwrap_err();
+	assert!(matches!(error, Error::Scene(_)), "{error}");
+	assert!(error.to_string().contains("MeshPart.MeshContent") && error.to_string().contains("`None` placeholder"), "{error}");
 
 	// a metadata tag other than the reference column
 	let stored = edit_property(&sample_place(), "MeshContent", |rest| {
@@ -522,6 +602,177 @@ fn a_placeholder_that_is_not_empty_is_refused() {
 	let error = unwrap(&archive(&lines, &all)).unwrap_err();
 	assert!(matches!(error, Error::Scene(_)), "{error}");
 	assert!(error.to_string().contains("BinaryStringValue.Value"), "{error}");
+}
+
+/// The archive with bytes after the last entry of its scene's shared string table.
+fn with_padded_table(archived: &[u8]) -> Vec<u8> {
+	let stored = edit_table(Archive::open(archived).unwrap().root().unwrap().bytes, |payload| {
+		let mut padded = payload.to_vec();
+		padded.extend_from_slice(&[0xAB; 37]);
+		vec![padded]
+	});
+	with_scene(archived, &stored)
+}
+
+/// The scene with the last entry of its shared string table in a table of its own.
+fn split_table(scene_bytes: &[u8]) -> Vec<u8> {
+	edit_table(scene_bytes, |payload| {
+		let entries = table_entries(payload);
+		assert!(entries.len() >= 2);
+		let (first, last) = entries.split_at(entries.len() - 1);
+		vec![table_of(first), table_of(last)]
+	})
+}
+
+/// The archive's members under a header that names `algorithm`, each object named as `rename` says.
+/// With `swap`, the object holding its first bytes holds its second instead, under the same name.
+fn renamed(archived: &[u8], algorithm: &str, rename: &dyn Fn(&str, &[u8]) -> String, swap: Option<(&[u8], &[u8])>) -> Vec<u8> {
+	let view = Archive::open(archived).unwrap();
+	let root = view.root().unwrap();
+	let mut lines = vec![
+		format!(r#"{{"kind":"header","version":1,"digestAlgorithm":"{algorithm}"}}"#),
+		r#"{"kind":"package","type":"place","place":"Place.rbxl"}"#.to_owned(),
+	];
+	let mut objects: Vec<(String, &[u8])> = Vec::new();
+	for (name, bytes) in view.objects() {
+		let renamed = rename(name, bytes);
+		let path = if name == root.digest { r#""path":"Place.rbxl","# } else { "" };
+		lines.push(format!(r#"{{"kind":"content",{path}"objectDigest":"{renamed}"}}"#));
+		let bytes = match swap {
+			Some((from, to)) if bytes == from => to,
+			_ => bytes,
+		};
+		objects.push((renamed, bytes));
+	}
+	archive_named(&lines, &objects)
+}
+
+fn same_name(name: &str, _: &[u8]) -> String {
+	name.to_owned()
+}
+
+/// The long source with other text of the same length: what a swapped object holds.
+fn other_source() -> String {
+	let other = LONG_SOURCE.replace("hello", "HELLO");
+	assert_eq!(other.len(), LONG_SOURCE.len());
+	other
+}
+
+/// The archive with the last of its `count` script sources referring to an object it does not hold.
+fn with_missing_source(archived: &[u8], count: usize) -> Vec<u8> {
+	let stored = edit_property(Archive::open(archived).unwrap().root().unwrap().bytes, "Source", |rest| {
+		assert_eq!(rest[0], TAG_EMBEDDED);
+		let mut reader = Reader::new(&rest[1..]);
+		let mut references = scene::read_references(&mut reader, count).unwrap();
+		references[count - 1].as_mut().unwrap().digest = [0xEE; 16];
+		let mut out = vec![TAG_EMBEDDED];
+		write_references(&mut out, &references);
+		out.extend_from_slice(reader.rest());
+		out
+	});
+	with_scene(archived, &stored)
+}
+
+/// An archive of the sample place with an opaque reference over the mesh content that is an asset id.
+fn content_over_an_asset_id() -> Vec<u8> {
+	let envelope = blob(40, 120);
+	let stored = place_with_opaque_content(&envelope, Some("content-1"), false);
+	let mut lines = place_lines(&stored);
+	lines.push(format!(r#"{{"kind":"content","objectDigest":"{}"}}"#, digest(&envelope)));
+	archive(&lines, &[&stored, &envelope])
+}
+
+#[test]
+fn bytes_after_the_shared_strings_do_not_move_the_restored_ones() {
+	let place = sample_place();
+	let archived = Builder::place(place.clone()).externalize(64).build().unwrap();
+	let padded = with_padded_table(&archived);
+	// a parser stops at the table's last entry, so the stored scene reads as it did
+	let stored = Archive::open(&padded).unwrap();
+	assert_eq!(dump(stored.root().unwrap().bytes), dump(Archive::open(&archived).unwrap().root().unwrap().bytes));
+	// and the entries flattening adds go right after that entry, not after the bytes that follow it
+	let scene = unwrap(&padded).unwrap();
+	assert_eq!(dump(&scene.bytes), dump(&place));
+	assert_eq!(scene.report.restored_values, 5);
+}
+
+#[test]
+fn a_scene_with_two_shared_string_tables_gets_no_value_written_into_one() {
+	let place = sample_place();
+	// The stored table's last entry gets a table of its own. An entry added to the first table would
+	// then take the index that entry has in a parser that counts through both.
+	let archived = Builder::place(place.clone()).externalize(64).build().unwrap();
+	let stored = split_table(Archive::open(&archived).unwrap().root().unwrap().bytes);
+	let error = unwrap(&with_scene(&archived, &stored)).unwrap_err();
+	assert!(matches!(error, Error::Unsupported(_)), "{error}");
+	assert!(error.to_string().contains("2 shared string tables") && error.to_string().contains("MeshPart.PhysicalConfigData"), "{error}");
+
+	// with nothing to write into a table, such a scene is passed on as it is
+	let plain = split_table(&place);
+	let wrapped = Builder::place(plain.clone()).build().unwrap();
+	let scene = unwrap(&wrapped).unwrap();
+	assert!(matches!(scene.bytes, Cow::Borrowed(_)));
+	assert_eq!(&*scene.bytes, plain.as_slice());
+}
+
+#[test]
+fn an_object_is_checked_against_its_reference_under_any_algorithm() {
+	let place = sample_place();
+	let archived = Builder::place(place.clone()).externalize(64).build().unwrap();
+
+	// the same members under a header that names an algorithm this reader does not compute: nothing
+	// can be checked against its name, which is said, and every value still comes back
+	let unnamed = renamed(&archived, "sha3-256", &same_name, None);
+	let scene = unwrap(&unnamed).unwrap();
+	assert_eq!(dump(&scene.bytes), dump(&place));
+	assert_eq!(scene.report.warnings.len(), 1, "{:?}", scene.report.warnings);
+	assert!(scene.report.warnings[0].contains("sha3-256"), "{:?}", scene.report.warnings);
+
+	// an object swapped for other bytes of the same size is not what the property refers to
+	let other = other_source();
+	let swapped = renamed(&archived, "sha3-256", &same_name, Some((LONG_SOURCE.as_bytes(), other.as_bytes())));
+	let error = unwrap(&swapped).unwrap_err();
+	assert!(matches!(error, Error::Digest { .. }), "{error}");
+	// under the algorithm this reader computes, opening the archive already refuses it
+	let swapped = renamed(&archived, "blake3-128", &same_name, Some((LONG_SOURCE.as_bytes(), other.as_bytes())));
+	assert!(matches!(Archive::open(&swapped), Err(Error::Digest { .. })));
+
+	// objects named by longer digests cannot be told apart by a reference's 16 bytes: no guess is made
+	let full_name = |_: &str, bytes: &[u8]| blake3::hash(bytes).to_hex().to_string();
+	let error = unwrap(&renamed(&archived, "blake3-256", &full_name, None)).unwrap_err();
+	assert!(matches!(error, Error::Scene(_)), "{error}");
+	assert!(error.to_string().contains("blake3-256"), "{error}");
+}
+
+#[test]
+fn the_restored_bytes_limit_stops_a_column_before_it_is_rebuilt() {
+	// scripts only: theirs is the one column that restores anything
+	let place = repeating_place(4, 0, 0);
+	let archived = Builder::place(place.clone()).externalize(64).build().unwrap();
+	assert_eq!(dump(&unwrap(&archived).unwrap().bytes), dump(&place));
+	// point the last script's reference at an object the archive does not hold
+	let bytes = with_missing_source(&archived, 4);
+	// with room for every value, the missing object is what stops the read
+	assert!(matches!(unwrap(&bytes), Err(Error::Scene(_))));
+	// With room for two copies of the source, the read stops at the third. It does not go on copying
+	// to the end of the column, where the missing object would stop it instead.
+	let tight = Limits { max_restored_bytes: 2 * LONG_SOURCE.len() as u64 + 1, ..Limits::default() };
+	assert!(matches!(unwrap_with(&bytes, &tight), Err(Error::Limit("restored bytes"))));
+}
+
+#[test]
+fn a_shared_string_counts_once_against_the_limit() {
+	// four scripts hold a copy of the source each; four mesh parts share one entry of the table
+	let place = repeating_place(4, 4, 800);
+	let bytes = Builder::place(place.clone()).externalize(64).build().unwrap();
+	let written = 4 * LONG_SOURCE.len() as u64 + 800;
+	let scene = unwrap_with(&bytes, &Limits { max_restored_bytes: written, ..Limits::default() }).unwrap();
+	assert_eq!(dump(&scene.bytes), dump(&place));
+	assert_eq!(scene.report.restored_values, 8);
+	// the report counts what the values hold, the limit what the file gains
+	assert_eq!(scene.report.restored_bytes, 4 * LONG_SOURCE.len() as u64 + 4 * 800);
+	let tight = Limits { max_restored_bytes: written - 1, ..Limits::default() };
+	assert!(matches!(unwrap_with(&bytes, &tight), Err(Error::Limit("restored bytes"))));
 }
 
 #[test]
@@ -633,4 +884,45 @@ fn only_text_and_bytes_move_unless_everything_is_asked_for() {
 	assert_eq!(dump(&scene.bytes), original);
 	// the asset map and the mesh part that shares its bytes count once each
 	assert_eq!(scene.report.restored_values, 7);
+}
+
+/// Writes the archives above that a reader must refuse or read with care, and the place they are
+/// made from, into a folder. Other readers of the format run their tests on them (the Lune port keeps
+/// them beside the archives `tools/archive-xcheck` writes), so every reader is held to the same bytes:
+///
+/// ```sh
+/// ROR_ARCHIVE_FIXTURES=<folder> cargo test --release -p ror-archive -- --ignored for_other_readers
+/// ```
+#[test]
+#[ignore = "writes files: set ROR_ARCHIVE_FIXTURES to the folder they go in"]
+fn archives_for_other_readers_to_test_against() {
+	let folder = std::env::var_os("ROR_ARCHIVE_FIXTURES").expect("ROR_ARCHIVE_FIXTURES names the folder to write into");
+	let folder = std::path::Path::new(&folder);
+	std::fs::create_dir_all(folder).unwrap();
+	let place = sample_place();
+	let archived = Builder::place(place.clone()).externalize(64).build().unwrap();
+	let stored = split_table(Archive::open(&archived).unwrap().root().unwrap().bytes);
+	let other = other_source();
+	let scripts = Builder::place(repeating_place(4, 0, 0)).externalize(64).build().unwrap();
+	let files = [
+		// the place the archives below are made from
+		("sample.rbxl", place.clone()),
+		// reads as the place: bytes follow the shared string table's last entry
+		("table-padding.rbx", with_padded_table(&archived)),
+		// refused: two shared string tables, and a value to write into one
+		("two-tables.rbx", with_scene(&archived, &stored)),
+		// reads as the place, with a warning: the header names an algorithm no reader computes
+		("unnamed-digests.rbx", renamed(&archived, "sha3-256", &same_name, None)),
+		// refused: the same, with one object's bytes swapped for others of the same length
+		("swapped-object.rbx", renamed(&archived, "sha3-256", &same_name, Some((LONG_SOURCE.as_bytes(), other.as_bytes())))),
+		// four scripts share one source, and the last refers to an object the archive does not hold:
+		// refused for that, or, with room for fewer than three copies, for the limit first
+		("limit-order.rbx", with_missing_source(&scripts, 4)),
+		// refused: an opaque content reference over a value that is an asset id
+		("content-over-uri.rbx", content_over_an_asset_id()),
+	];
+	for (name, bytes) in files {
+		std::fs::write(folder.join(name), &bytes).unwrap();
+		println!("{name}: {} bytes", bytes.len());
+	}
 }
