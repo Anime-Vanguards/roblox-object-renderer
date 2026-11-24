@@ -264,6 +264,8 @@ pub fn fidelity(preset: &Preset, pixels: bool) -> serde_json::Value {
 	map.insert("cpuBasis".into(), serde_json::json!(if desktop { "estimated" } else { "fitted" }));
 	map.insert("gpuBasis".into(), serde_json::json!(if desktop { "uncalibrated" } else { "anchored" }));
 	map.insert("msIncludesGpu".into(), serde_json::json!(!desktop));
+	map.insert("memoryBasis".into(), serde_json::json!("upper-bound-estimate"));
+	map.insert("memoryCalibrated".into(), serde_json::json!(false));
 	if desktop {
 		map.insert(
 			"cpuEstimate".into(),
@@ -301,8 +303,20 @@ pub fn unmodeled(preset: &Preset, quality: &Quality) -> Vec<serde_json::Value> {
 		serde_json::json!({
 			"kind": "textureStreaming",
 			"scope": "gpu,memory",
-			"reason": "Runtime texture streaming bandwidth and VRAM pressure are not converted into frame ms.",
+			"reason": "Runtime texture streaming bandwidth and VRAM pressure are not converted into frame ms; memory totals count every mip level of every referenced texture whether drawn or streamed.",
 			"settleWith": "Device memory-pressure and streaming-budget benchmarks.",
+		}),
+		serde_json::json!({
+			"kind": "memoryUpperBound",
+			"scope": "memory",
+			"reason": "Memory totals are an upper-bound estimate over referenced authored mesh and texture assets (deduplicated by canonical asset id/URI), not measured client VRAM residency. Omitted: built-in material texture packs, plain primitive part geometry, Terrain voxels/Grass, UI/fonts, default Sky textures, per-instance posed skinning buffers and bone matrices, render targets, and driver padding.",
+			"settleWith": "Live Roblox client or Studio memory-profiler capture on the same place and view set.",
+		}),
+		serde_json::json!({
+			"kind": "mobileTextureTranscode",
+			"scope": "memory",
+			"reason": "Mobile ETC2 byte estimates derive from formats recorded in notes/image.md (vkFormat 147 ETC2 RGB8 8 B/4x4 block for opaque TexturePack layers, vkFormat 151 ETC2 RGBA8 16 B/4x4 block for mobile rollout images and alpha/normal pack layers) applied to desktop transcode or upload dimensions; ror never fetches mobile ETC2 packs, and no ASTC format is recorded so no ASTC figure is emitted.",
+			"settleWith": "Fetch mobile ETC2 transcode packs and capture an iOS/Android Roblox client HTTP cache to record actual mobile vkFormats, dimensions, and whether ASTC is served.",
 		}),
 	];
 	if preset.uses_desktop_pricing() {

@@ -45,13 +45,17 @@ pub struct MeshStats {
 	pub vertices: u32,
 	/// Index count across all LODs (`mesh.indices.len()`).
 	pub indices: u32,
-	/// Packed vertex buffer GPU bytes across present vertex streams.
+	/// Vertex buffer bytes estimated from Roblox's recorded FileMesh binary layout (`notes/mesh.md`:
+	/// 12 B position, 12 B normal, 8 B UV, 4 B packed tangent, 4 B RGBA color; 40 B full vertex).
 	pub vertex_bytes: u64,
-	/// Index buffer GPU bytes (u16 when `vertices <= 65535`, else u32).
+	/// Assumed index buffer GPU bytes (u16 when `vertices <= 65535`, else u32; FileMesh stores u32).
 	pub index_bytes: u64,
-	/// Skinning GPU bytes (packed joints + weights + 64-byte bone matrices).
+	/// Skinning bytes estimated from FileMesh packed envelopes (`4 B` joints + `4 B` weights per
+	/// vertex) plus an assumed `64 B` per bone matrix counted once per unique mesh (a client poses
+	/// each skinned instance separately).
 	pub skinning_bytes: u64,
-	/// Total GPU geometry bytes (`vertex_bytes + index_bytes + skinning_bytes`).
+	/// Upper-bound estimated GPU geometry bytes (`vertex_bytes + index_bytes + skinning_bytes`;
+	/// client GPU mesh layout is not recorded in `notes/mesh.md`).
 	pub gpu_bytes: u64,
 }
 
@@ -219,6 +223,8 @@ fn stats_of(mesh: &ror_mesh::Mesh, file_bytes: u64) -> MeshStats {
 	}
 	let vertices = mesh.positions.len() as u32;
 	let indices_count = mesh.indices.len() as u32;
+	// Roblox FileMesh binary vertex layout (notes/mesh.md): 12 B pos, 12 B normal, 8 B UV,
+	// 4 B packed tangent, 4 B RGBA color (40 B full vertex). Client GPU layout is unrecorded.
 	let mut stride = 12u64;
 	if !mesh.normals.is_empty() {
 		stride += 12;
@@ -227,7 +233,7 @@ fn stats_of(mesh: &ror_mesh::Mesh, file_bytes: u64) -> MeshStats {
 		stride += 8;
 	}
 	if !mesh.tangents.is_empty() {
-		stride += 16;
+		stride += 4;
 	}
 	if !mesh.colors.is_empty() {
 		stride += 4;
@@ -338,5 +344,19 @@ mod tests {
 		]);
 		let oct_stats = stats_of(&oct, 0);
 		assert_eq!(oct_stats.facing.iter().sum::<u32>(), 8);
+	}
+
+	#[test]
+	fn full_vertex_layout_matches_recorded_40_byte_filemesh_stride() {
+		let mut mesh = mesh_from_tris(&[[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]]);
+		mesh.normals = vec![[0.0, 0.0, 1.0]; 3];
+		mesh.uvs = vec![[0.0, 0.0]; 3];
+		mesh.tangents = vec![[1.0, 0.0, 0.0, 1.0]; 3];
+		mesh.colors = vec![[255, 255, 255, 255]; 3];
+		let stats = stats_of(&mesh, 200);
+		// 12 + 12 + 8 + 4 + 4 = 40 B/vertex (FileMesh packed tangent), 3*2 = 6 B u16 indices
+		assert_eq!(stats.vertex_bytes, 3 * 40);
+		assert_eq!(stats.index_bytes, 6);
+		assert_eq!(stats.gpu_bytes, 126);
 	}
 }

@@ -1,7 +1,15 @@
-//! Deduplicated mesh and texture memory accounting in bytes for `ror cost`: every distinct mesh
-//! asset and authored texture asset referenced by a scene is counted once, with encoded file bytes,
-//! packed GPU mesh buffer bytes, uncompressed RGBA8 base and full mip-chain bytes, and desktop BCn
-//! / mobile ASTC compressed mip-chain GPU byte estimates.
+//! Upper-bound memory estimates in bytes for referenced authored mesh and texture assets in
+//! `ror cost`: every distinct mesh asset and authored texture asset referenced by a scene is
+//! deduplicated by canonical asset ID / content URI and counted once, with measured encoded file
+//! bytes, assumed GPU mesh buffer bytes (FileMesh 40 B vertex + 8 B skinning envelope layout,
+//! assumed u16/u32 indices and once-per-mesh bone matrices), derived uncompressed RGBA8 base and
+//! full mip-chain bytes, derived desktop BC1/BC3 full mip-chain bytes, and derived mobile ETC2
+//! full mip-chain bytes per `notes/image.md` (vkFormat 147/151; no ASTC format is recorded).
+//!
+//! These totals are upper-bound asset estimates, not measured Roblox client VRAM residency: every
+//! mip level of every referenced texture is counted whether drawn or streamed, and built-in
+//! material texture packs, plain primitive part geometry, Terrain, UI, default Sky textures, and
+//! per-instance posed skinning buffers are excluded.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -12,7 +20,7 @@ use ror_image::PixelFormat;
 use serde::Serialize;
 
 use super::meshes::{self, MeshStats, Meshes};
-use crate::scene::{Geometry, Scene};
+use crate::scene::Scene;
 
 /// Heaviest entries kept in `top` for meshes and textures.
 const TOP_LIST: usize = 20;
@@ -22,24 +30,149 @@ const DEFAULT_SKY_PREFIX: &str = "rbxasset://textures/sky/sky512_";
 const DEFAULT_SUN: &str = "rbxasset://sky/sun.jpg";
 const DEFAULT_MOON: &str = "rbxasset://sky/moon.jpg";
 
-/// Complete deduplicated memory report for a scene (or union of timeline scenes).
-#[derive(Clone, Debug, Default, Serialize)]
+/// Explicit basis for one memory figure family (`measured`, `derived`, `assumed`, or `unrecorded`).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BasisNote {
+	pub basis: &'static str,
+	pub detail: &'static str,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub settle_with: Option<&'static str>,
+}
+
+/// Basis recorded for every memory metric in [`MemoryReport`].
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryBasis {
+	pub mesh_file_bytes: BasisNote,
+	pub mesh_gpu_bytes: BasisNote,
+	pub texture_file_bytes: BasisNote,
+	pub texture_rgba8_bytes: BasisNote,
+	pub texture_desktop_bc_bytes: BasisNote,
+	pub texture_mobile_etc2_bytes: BasisNote,
+	pub texture_mobile_astc_bytes: BasisNote,
+}
+
+impl Default for MemoryBasis {
+	fn default() -> Self {
+		Self {
+			mesh_file_bytes: BasisNote {
+				basis: "measured",
+				detail: "exact encoded byte length of each unique loaded mesh file or inline union MeshData",
+				settle_with: None,
+			},
+			mesh_gpu_bytes: BasisNote {
+				basis: "assumed",
+				detail: "upper bound from recorded FileMesh binary layout (notes/mesh.md: 12 B pos + 12 B normal + 8 B UV + 4 B tangent + 4 B color = 40 B full vertex, 8 B/vertex skinning envelopes) with assumed u16/u32 indices and 64 B/bone matrices counted once per unique mesh (not per posed instance); client GPU mesh layout is unrecorded",
+				settle_with: Some("Measure client GPU vertex/index/skinning buffer layouts via a graphics frame capture or live client memory profiler."),
+			},
+			texture_file_bytes: BasisNote {
+				basis: "measured",
+				detail: "exact encoded byte length of loaded KTX2 transcode pack files or uploaded/local image files",
+				settle_with: None,
+			},
+			texture_rgba8_bytes: BasisNote {
+				basis: "derived",
+				detail: "upper bound: full uncompressed RGBA8 base and mip chain down to 1x1 from decoded texture dimensions (ignores progressive mip streaming)",
+				settle_with: None,
+			},
+			texture_desktop_bc_bytes: BasisNote {
+				basis: "derived",
+				detail: "upper bound: full BC1/BC3 mip chain from decoded dimensions (uses decoded KTX2/DDS block format when loaded; derives BC1 for opaque non-normal uploads and BC3 for alpha or normal uploads; ignores progressive mip streaming)",
+				settle_with: Some("Live client memory profiler capture to measure streamed mip residency."),
+			},
+			texture_mobile_etc2_bytes: BasisNote {
+				basis: "derived",
+				detail: "upper bound: full ETC2 mip chain using formats recorded in notes/image.md (vkFormat 147 ETC2 RGB8 8 B/4x4 block for opaque TexturePack layers; vkFormat 151 ETC2 RGBA8 16 B/4x4 block for mobile rollout images /////Ck= and alpha/normal pack layers) applied to desktop transcode or upload dimensions because ror never requests mobile ETC2 files",
+				settle_with: Some("Fetch mobile ETC2 transcode packs (/////Ck= and TexturePack option bit 0x08) to measure mobile transcoded dimensions and encoded pack sizes directly."),
+			},
+			texture_mobile_astc_bytes: BasisNote {
+				basis: "unrecorded",
+				detail: "no ASTC transcode format is recorded in notes/image.md; no ASTC figure is emitted",
+				settle_with: Some("Capture an iOS/Android Roblox client HTTP cache (rbx-storage) and request mobile assetdelivery fidelities to record actual mobile vkFormats, dimensions, and whether ASTC is served."),
+			},
+		}
+	}
+}
+
+/// A memory category explicitly excluded from [`MemoryReport`] totals.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryUnmodeled {
+	pub kind: &'static str,
+	pub reason: &'static str,
+	pub settle_with: &'static str,
+}
+
+fn default_unmodeled() -> Vec<MemoryUnmodeled> {
+	vec![
+		MemoryUnmodeled {
+			kind: "builtInMaterialPacks",
+			reason: "Only MaterialVariant maps/packs and authored SurfaceAppearance/part/decal/effect/custom-sky textures are counted; built-in Roblox material texture packs are omitted.",
+			settle_with: "Add built-in material pack resolution from MaterialService if full-place material residency is needed.",
+		},
+		MemoryUnmodeled {
+			kind: "primitivePartGeometry",
+			reason: "Plain primitive parts (Block, Ball, Cylinder, Wedge, CornerWedge, Truss, non-FileMesh SpecialMesh) are omitted from mesh bytes.",
+			settle_with: "Live client geometry memory counter capture.",
+		},
+		MemoryUnmodeled {
+			kind: "terrainAndUi",
+			reason: "Roblox Terrain voxels, Terrain Grass, GUI textures/fonts, and default Sky textures are omitted.",
+			settle_with: "Live client / Studio memory profiler capture.",
+		},
+		MemoryUnmodeled {
+			kind: "streamingAndRuntimeResidency",
+			reason: "Every mip level of every referenced texture is counted whether drawn or streamed; per-instance posed skinning buffers, render targets, shadow maps, and GPU driver padding are omitted.",
+			settle_with: "Live client Developer Console / Stats memory capture on the same views.",
+		},
+		MemoryUnmodeled {
+			kind: "mobileAstcFormat",
+			reason: "No ASTC format is recorded in notes/image.md, so no mobile ASTC total is printed or emitted.",
+			settle_with: "Capture an iOS/Android Roblox client HTTP cache to record actual mobile texture vkFormats and dimensions.",
+		},
+	]
+}
+
+/// Complete deduplicated upper-bound memory estimate for a scene (or union of timeline scenes).
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryReport {
+	/// Always `"upper-bound-estimate"`: full asset chains, not measured client VRAM residency.
+	pub kind: &'static str,
+	/// Deduplication key: canonical asset ID / content URI (two distinct files with identical bytes count twice).
+	pub deduplicated_by: &'static str,
+	pub basis: MemoryBasis,
+	pub unmodeled: Vec<MemoryUnmodeled>,
 	pub meshes: MeshMemory,
 	pub textures: TextureMemory,
 	pub total_gpu_bytes: TotalGpuBytes,
 }
 
+impl Default for MemoryReport {
+	fn default() -> Self {
+		Self {
+			kind: "upper-bound-estimate",
+			deduplicated_by: "canonical-asset-id",
+			basis: MemoryBasis::default(),
+			unmodeled: default_unmodeled(),
+			meshes: MeshMemory::default(),
+			textures: TextureMemory::default(),
+			total_gpu_bytes: TotalGpuBytes::default(),
+		}
+	}
+}
+
+/// Upper-bound estimated GPU bytes across unique loaded meshes and full texture mip chains.
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TotalGpuBytes {
+	/// Assumed mesh GPU bytes + derived uncompressed RGBA8 full mip-chain bytes.
 	pub rgba8: u64,
+	/// Assumed mesh GPU bytes + derived desktop BC1/BC3 full mip-chain bytes.
 	pub desktop_bc: u64,
-	#[serde(rename = "mobileAstc4x4")]
-	pub mobile_astc4x4: u64,
-	#[serde(rename = "mobileAstc6x6")]
-	pub mobile_astc6x6: u64,
+	/// Assumed mesh GPU bytes + derived mobile ETC2 full mip-chain bytes (`notes/image.md` vkFormat 147/151 at desktop/upload dimensions).
+	pub mobile_etc2: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -94,14 +227,12 @@ pub struct TextureMemory {
 	pub rgba8_base_bytes: u64,
 	/// Uncompressed RGBA8 full mip-chain GPU bytes across unique loaded textures.
 	pub rgba8_mip_bytes: u64,
-	/// Desktop block-compressed (BCn) full mip-chain GPU bytes across unique loaded textures.
+	/// Desktop block-compressed (BC1/BC3) full mip-chain GPU bytes (derived upper bound).
 	pub desktop_bc_mip_bytes: u64,
-	/// Mobile ASTC 4x4 full mip-chain GPU bytes across unique loaded textures.
-	#[serde(rename = "mobileAstc4x4MipBytes")]
-	pub mobile_astc4x4_mip_bytes: u64,
-	/// Mobile ASTC 6x6 full mip-chain GPU bytes across unique loaded textures.
-	#[serde(rename = "mobileAstc6x6MipBytes")]
-	pub mobile_astc6x6_mip_bytes: u64,
+	/// Mobile ETC2 full mip-chain GPU bytes derived from `notes/image.md` (vkFormat 147 ETC2 RGB8
+	/// 8 B/4x4 block for opaque TexturePack layers, vkFormat 151 ETC2 RGBA8 16 B/4x4 block for
+	/// mobile rollout images and alpha/normal pack layers) at desktop transcode or upload sizes.
+	pub mobile_etc2_mip_bytes: u64,
 	/// Distinct textures that failed to load or decode.
 	pub missing: u64,
 	/// Heaviest unique textures by RGBA8 mip-chain GPU bytes (ties by id).
@@ -119,15 +250,13 @@ pub struct TextureEntry {
 	pub depth: u32,
 	pub format: &'static str,
 	pub desktop_bc_format: &'static str,
+	pub mobile_etc2_format: &'static str,
 	pub has_alpha: bool,
 	pub file_bytes: u64,
 	pub rgba8_base_bytes: u64,
 	pub rgba8_mip_bytes: u64,
 	pub desktop_bc_mip_bytes: u64,
-	#[serde(rename = "mobileAstc4x4MipBytes")]
-	pub mobile_astc4x4_mip_bytes: u64,
-	#[serde(rename = "mobileAstc6x6MipBytes")]
-	pub mobile_astc6x6_mip_bytes: u64,
+	pub mobile_etc2_mip_bytes: u64,
 }
 
 /// Decoded metadata for one unique texture asset, cached across frames in timeline mode.
@@ -296,13 +425,12 @@ pub fn measure_many(scenes: &[&Scene], mesh_stats: &HashMap<String, Arc<MeshStat
 			tex_mem.missing += 1;
 			continue;
 		};
-		let entry = build_texture_entry(id, item.references, item.is_normal, info);
+		let entry = build_texture_entry(id, item.references, item.is_normal, item.pack_layer.is_some(), info);
 		tex_mem.file_bytes += entry.file_bytes;
 		tex_mem.rgba8_base_bytes += entry.rgba8_base_bytes;
 		tex_mem.rgba8_mip_bytes += entry.rgba8_mip_bytes;
 		tex_mem.desktop_bc_mip_bytes += entry.desktop_bc_mip_bytes;
-		tex_mem.mobile_astc4x4_mip_bytes += entry.mobile_astc4x4_mip_bytes;
-		tex_mem.mobile_astc6x6_mip_bytes += entry.mobile_astc6x6_mip_bytes;
+		tex_mem.mobile_etc2_mip_bytes += entry.mobile_etc2_mip_bytes;
 		tex_entries.push(entry);
 	}
 	tex_entries.sort_by(|a, b| b.rgba8_mip_bytes.cmp(&a.rgba8_mip_bytes).then_with(|| a.id.cmp(&b.id)));
@@ -312,10 +440,14 @@ pub fn measure_many(scenes: &[&Scene], mesh_stats: &HashMap<String, Arc<MeshStat
 	let total_gpu_bytes = TotalGpuBytes {
 		rgba8: mesh_mem.gpu_bytes + tex_mem.rgba8_mip_bytes,
 		desktop_bc: mesh_mem.gpu_bytes + tex_mem.desktop_bc_mip_bytes,
-		mobile_astc4x4: mesh_mem.gpu_bytes + tex_mem.mobile_astc4x4_mip_bytes,
-		mobile_astc6x6: mesh_mem.gpu_bytes + tex_mem.mobile_astc6x6_mip_bytes,
+		mobile_etc2: mesh_mem.gpu_bytes + tex_mem.mobile_etc2_mip_bytes,
 	};
-	MemoryReport { meshes: mesh_mem, textures: tex_mem, total_gpu_bytes }
+	MemoryReport {
+		meshes: mesh_mem,
+		textures: tex_mem,
+		total_gpu_bytes,
+		..MemoryReport::default()
+	}
 }
 
 /// Concise single-line memory summary for `analysis.txt` and `cost` reports.
@@ -326,27 +458,25 @@ pub fn summary_line(memory: &MemoryReport, phone: bool) -> String {
 	let tot = &memory.total_gpu_bytes;
 	if phone {
 		format!(
-			"memory: {} unique meshes ({:.2} MB GPU, {:.2} MB files), {} unique textures ({:.2} MB ASTC4x4, {:.2} MB ASTC6x6, {:.2} MB RGBA8 mips, {:.2} MB files); total GPU {:.2} MB ASTC4x4 / {:.2} MB ASTC6x6",
+			"memory (upper-bound estimate; measured files, assumed mesh layout, derived full-chain ETC2 [vkFormat 147/151] & RGBA8, no ASTC recorded): {} unique meshes ({:.2} MB est GPU, {:.2} MB files), {} unique textures ({:.2} MB ETC2, {:.2} MB RGBA8, {:.2} MB files); total est GPU upper bound {:.2} MB ETC2 / {:.2} MB RGBA8 (excludes built-in materials, primitives, terrain, UI)",
 			m.unique,
 			mb(m.gpu_bytes),
 			mb(m.file_bytes),
 			t.unique,
-			mb(t.mobile_astc4x4_mip_bytes),
-			mb(t.mobile_astc6x6_mip_bytes),
+			mb(t.mobile_etc2_mip_bytes),
 			mb(t.rgba8_mip_bytes),
 			mb(t.file_bytes),
-			mb(tot.mobile_astc4x4),
-			mb(tot.mobile_astc6x6)
+			mb(tot.mobile_etc2),
+			mb(tot.rgba8)
 		)
 	} else {
 		format!(
-			"memory: {} unique meshes ({:.2} MB GPU, {:.2} MB files), {} unique textures ({:.2} MB BCn, {:.2} MB ASTC4x4, {:.2} MB RGBA8 mips, {:.2} MB files); total GPU {:.2} MB BCn / {:.2} MB RGBA8",
+			"memory (upper-bound estimate; measured files, assumed mesh layout, derived full-chain BC1/BC3 & RGBA8): {} unique meshes ({:.2} MB est GPU, {:.2} MB files), {} unique textures ({:.2} MB BCn, {:.2} MB RGBA8, {:.2} MB files); total est GPU upper bound {:.2} MB BCn / {:.2} MB RGBA8 (excludes built-in materials, primitives, terrain, UI)",
 			m.unique,
 			mb(m.gpu_bytes),
 			mb(m.file_bytes),
 			t.unique,
 			mb(t.desktop_bc_mip_bytes),
-			mb(t.mobile_astc4x4_mip_bytes),
 			mb(t.rgba8_mip_bytes),
 			mb(t.file_bytes),
 			mb(tot.desktop_bc),
@@ -552,7 +682,6 @@ fn collect_scene_textures(
 			add_uri(out, &sky.moon_texture, true, false);
 		}
 	}
-	let _ = Geometry::Block;
 }
 
 fn inspect_transcode(uri: &str, layer: Transcode, assets: &Assets) -> Option<TextureInfo> {
@@ -661,17 +790,22 @@ fn block_bytes_for(w: u32, h: u32, bw: u32, bh: u32, bytes_per_block: u64) -> u6
 	u64::from(w.div_ceil(bw)) * u64::from(h.div_ceil(bh)) * bytes_per_block
 }
 
-fn build_texture_entry(id: String, references: u64, is_normal: bool, info: &TextureInfo) -> TextureEntry {
+fn build_texture_entry(id: String, references: u64, is_normal: bool, is_pack_layer: bool, info: &TextureInfo) -> TextureEntry {
 	let rgba8_base_bytes = u64::from(info.width.max(1)) * u64::from(info.height.max(1)) * 4 * u64::from(info.depth.max(1)) * u64::from(info.layers.max(1));
 	let rgba8_mip_bytes = mip_chain_bytes(info.width, info.height, info.depth, info.layers, |w, h| u64::from(w) * u64::from(h) * 4);
+	// Roblox desktop KTX2 transcodes use BC1 (8 B/4x4 block) and BC3 (16 B/4x4 block) only (notes/image.md);
+	// never emit a fabricated "bc7" label for uploaded images.
 	let (bc_block_bytes, desktop_bc_format) = match info.format.block_bytes() {
 		Some(bytes) => (bytes as u64, format_name(info.format)),
 		None if !info.has_alpha && !is_normal => (8, "bc1"),
-		None => (16, "bc7"),
+		None => (16, "bc3"),
 	};
 	let desktop_bc_mip_bytes = mip_chain_bytes(info.width, info.height, info.depth, info.layers, |w, h| block_bytes_for(w, h, 4, 4, bc_block_bytes));
-	let mobile_astc4x4_mip_bytes = mip_chain_bytes(info.width, info.height, info.depth, info.layers, |w, h| block_bytes_for(w, h, 4, 4, 16));
-	let mobile_astc6x6_mip_bytes = mip_chain_bytes(info.width, info.height, info.depth, info.layers, |w, h| block_bytes_for(w, h, 6, 6, 16));
+	// Mobile ETC2 strictly follows notes/image.md: vkFormat 147 (ETC2 RGB8, 8 B/4x4 block) for opaque
+	// TexturePack layers (option bit 0x08), and vkFormat 151 (ETC2 RGBA8, 16 B/4x4 block) for mobile
+	// rollout images (/////Ck=) and alpha/normal pack layers. No ASTC format is recorded.
+	let (etc2_block_bytes, mobile_etc2_format) = if is_pack_layer && bc_block_bytes == 8 { (8u64, "etc2_rgb8") } else { (16u64, "etc2_rgba8") };
+	let mobile_etc2_mip_bytes = mip_chain_bytes(info.width, info.height, info.depth, info.layers, |w, h| block_bytes_for(w, h, 4, 4, etc2_block_bytes));
 	TextureEntry {
 		id,
 		references,
@@ -681,13 +815,13 @@ fn build_texture_entry(id: String, references: u64, is_normal: bool, info: &Text
 		depth: info.depth,
 		format: format_name(info.format),
 		desktop_bc_format,
+		mobile_etc2_format,
 		has_alpha: info.has_alpha,
 		file_bytes: info.file_bytes,
 		rgba8_base_bytes,
 		rgba8_mip_bytes,
 		desktop_bc_mip_bytes,
-		mobile_astc4x4_mip_bytes,
-		mobile_astc6x6_mip_bytes,
+		mobile_etc2_mip_bytes,
 	}
 }
 
@@ -791,6 +925,15 @@ mod tests {
 		let meshes = Meshes::load(&scene.parts, &assets);
 		let report = measure(&scene, &meshes, &assets);
 
+		assert_eq!(report.kind, "upper-bound-estimate");
+		assert_eq!(report.deduplicated_by, "canonical-asset-id");
+		assert_eq!(report.basis.mesh_file_bytes.basis, "measured");
+		assert_eq!(report.basis.mesh_gpu_bytes.basis, "assumed");
+		assert_eq!(report.basis.texture_mobile_etc2_bytes.basis, "derived");
+		assert_eq!(report.basis.texture_mobile_astc_bytes.basis, "unrecorded");
+		assert!(report.basis.texture_mobile_astc_bytes.settle_with.is_some());
+		assert!(report.unmodeled.iter().any(|u| u.kind == "builtInMaterialPacks"));
+
 		assert_eq!(report.meshes.unique, 1);
 		assert_eq!(report.meshes.instances, 2);
 		assert_eq!(report.meshes.file_bytes, mesh_file_bytes);
@@ -802,17 +945,27 @@ mod tests {
 		assert_eq!(report.textures.rgba8_base_bytes, 64 * 64 * 4 + 128 * 64 * 4 + 32 * 32 * 4);
 		assert_eq!(report.textures.rgba8_mip_bytes, 21_844 + 43_692 + 5_460);
 		assert_eq!(report.textures.desktop_bc_mip_bytes, 2_744 + 10_960 + 696);
-		assert_eq!(report.textures.mobile_astc4x4_mip_bytes, 5_488 + 10_960 + 1_392);
-		assert_eq!(report.textures.mobile_astc6x6_mip_bytes, 2_768 + 5_392 + 832);
+		// Non-pack images use vkFormat 151 (ETC2 RGBA8, 16 B/4x4 block) per notes/image.md
+		assert_eq!(report.textures.mobile_etc2_mip_bytes, 5_488 + 10_960 + 1_392);
 		assert_eq!(report.total_gpu_bytes.rgba8, 408 + 21_844 + 43_692 + 5_460);
 		assert_eq!(report.total_gpu_bytes.desktop_bc, 408 + 2_744 + 10_960 + 696);
-		assert_eq!(report.total_gpu_bytes.mobile_astc4x4, 408 + 5_488 + 10_960 + 1_392);
-		assert_eq!(report.total_gpu_bytes.mobile_astc6x6, 408 + 2_768 + 5_392 + 832);
+		assert_eq!(report.total_gpu_bytes.mobile_etc2, 408 + 5_488 + 10_960 + 1_392);
+		assert!(report.textures.top.iter().all(|e| e.desktop_bc_format != "bc7"));
+		assert!(report.textures.top.iter().any(|e| e.has_alpha && e.desktop_bc_format == "bc3"));
 
 		let json = serde_json::to_value(&report).unwrap();
-		assert_eq!(json["textures"]["mobileAstc4x4MipBytes"], 5_488 + 10_960 + 1_392);
-		assert_eq!(json["textures"]["mobileAstc6x6MipBytes"], 2_768 + 5_392 + 832);
-		assert_eq!(json["totalGpuBytes"]["mobileAstc4x4"], 408 + 5_488 + 10_960 + 1_392);
+		assert_eq!(json["kind"], "upper-bound-estimate");
+		assert_eq!(json["textures"]["mobileEtc2MipBytes"], 5_488 + 10_960 + 1_392);
+		assert_eq!(json["totalGpuBytes"]["mobileEtc2"], 408 + 5_488 + 10_960 + 1_392);
+		assert!(json["textures"].get("mobileAstc4x4MipBytes").is_none());
+		assert!(json["textures"].get("mobileAstc6x6MipBytes").is_none());
+		assert!(json["totalGpuBytes"].get("mobileAstc4x4").is_none());
+		assert!(json["totalGpuBytes"].get("mobileAstc6x6").is_none());
+
+		let phone_line = summary_line(&report, true);
+		let desktop_line = summary_line(&report, false);
+		assert!(phone_line.contains("upper-bound estimate") && phone_line.contains("ETC2") && phone_line.contains("no ASTC recorded") && !phone_line.contains("ASTC4x4"));
+		assert!(desktop_line.contains("upper-bound estimate") && desktop_line.contains("BC1/BC3") && !desktop_line.contains("ASTC") && !desktop_line.to_ascii_lowercase().contains("phone"));
 		let _ = std::fs::remove_dir_all(&dir);
 	}
 }

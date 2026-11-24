@@ -51,7 +51,7 @@ Note: `--grid STUDS` only generates top-down maps ([cost.md](cost.md)) and does 
 
 - `--preset phone`: 2532 x 1170 px (844 x 390 pt at 3x) at Studio edit graphics quality **2** (300-stud culling horizon; pass `--client-quality 2` for the Roblox client 10-bar slider bar 2, which maps to engine quality 4 / 450 studs with shadows and bloom still off).
 - `--preset desktop`: 1920 x 1080 px at graphics quality **21**.
-- Without `--preset`, `ror` uses `--size` and `--quality` (or `--client-quality <1-10>`) and prices the frame with the calibrated phone model (the same default as before `871a83e`, so baselines and GPU-led finding rankings stay unchanged unless `--preset desktop` is asked for). `analysis.json` records `quality.scale` (`"edit"` or `"client"`), `quality.clientLevel` (when client-scale), and `quality.viewDistance`.
+- Without `--preset`, `ror` uses `--size` and `--quality` (or `--client-quality <1-10>`) and prices the frame with the calibrated phone model so baselines and GPU-led finding rankings stay unchanged unless `--preset desktop` is requested. `analysis.json` records `quality.scale` (`"edit"` or `"client"`), `quality.clientLevel` (when client-scale), and `quality.viewDistance`.
 
 What Roblox renders at each graphics quality level under `Future` lighting (measured in Studio):
 
@@ -105,7 +105,7 @@ Because GPU shader weights are estimates, treat small differences (under ~0.05 m
 
 ### `analysis.json` (`ror-cost-analysis/1`)
 
-Top-level fields: `preset`, `quality` (active features), `prices`, `fidelity`, `unmodeled`, `memory` (deduplicated mesh and texture bytes: `meshes`, `textures`, `totalGpuBytes`), `pixelsCounted`, `views` (per view: `name`, Roblox `draws`/`triangles` excluding Shadows, `work`, `overBudget`), `mean`, `worst`, `topInstances`, and `findings`.
+Top-level fields: `preset`, `quality` (active features), `prices`, `fidelity`, `unmodeled`, `memory` (upper-bound asset memory estimate, deduplicated by canonical asset id/URI — two spellings of one id count once, two distinct files with identical bytes count twice: `kind`, `deduplicatedBy`, `basis`, `unmodeled`, `meshes`, `textures`, `totalGpuBytes` for `rgba8`, `desktopBc`, and `mobileEtc2`; no ASTC figure is emitted because no ASTC transcode is recorded), `pixelsCounted`, `views` (per view: `name`, Roblox `draws`/`triangles` excluding Shadows, `work`, `overBudget`), `mean`, `worst`, `topInstances`, and `findings`.
 
 Every `work` object (in `analysis.json` and `tree.json`) contains: `draws`, `triangles`, `pixels`, `blended` (at preset resolution), `lightPixels`, `litPixels`, `shadowTriangles`, `parts`, `gpuUnits`, `cpuMs`, `gpuMs` (`null` on `--preset desktop`), and `ms` (`cpuMs + gpuMs share` on phone/custom; `cpuMs` on desktop).
 
