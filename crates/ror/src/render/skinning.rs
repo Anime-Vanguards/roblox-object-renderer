@@ -206,7 +206,7 @@ impl Renderer {
 	}
 
 	fn posed_mesh(&self, uri: &str, skeleton: &Skeleton, part: &Part, bind: &Arc<GpuMesh>, local: &Affine3A, live: Option<usize>) -> Result<Option<Arc<GpuMesh>>> {
-		let source = self.skins.sources.get_or_load(&uri.to_string(), || self.skin_source(uri))?;
+		let source = self.skins.sources.get_or_load_for(&uri.to_string(), self.assets.is_offline_view(), || self.skin_source(uri))?;
 		let Some(mesh_scale) = MeshScale::of(local).filter(|_| !source.bones.is_empty()) else {
 			return Ok(None);
 		};

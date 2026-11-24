@@ -1019,7 +1019,7 @@ impl Renderer {
 		}
 		let rur_start = Instant::now();
 		let batches = frame_batches(left);
-		let offline = self.assets.config().offline;
+		let offline = self.assets.offline();
 		let calls = batches.len();
 		let next = std::sync::atomic::AtomicUsize::new(0);
 		let finished: Mutex<Vec<(GuiKey, GuiImage)>> = Mutex::new(Vec::new());
@@ -1071,9 +1071,12 @@ impl Renderer {
 								let reason = format!("{error:#}");
 								let mut failures = self.gui_failures.keys.lock();
 								let mut problems = problems.lock();
+								let transient = self.assets.is_offline_view();
 								for (key, gui, _) in members {
 									problems.push(format!("{}: not drawn ({reason})", gui.path));
-									failures.insert(*key, (Instant::now(), reason.clone()));
+									if !transient {
+										failures.insert(*key, (Instant::now(), reason.clone()));
+									}
 								}
 							}
 						}

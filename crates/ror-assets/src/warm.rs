@@ -136,7 +136,7 @@ fn now() -> u64 {
 impl Assets {
 	/// Whether nothing is fetched: [`Assets::warm`] then does nothing, so a caller can skip what it would hand it.
 	pub fn offline(&self) -> bool {
-		self.inner.config.offline
+		self.offline
 	}
 
 	/// Downloads into the disk cache whatever of `downloads` is not there yet, many files at a time:
@@ -147,7 +147,7 @@ impl Assets {
 	/// which tries again and reports it. Offline, it does nothing.
 	pub fn warm(&self, downloads: &[Download], packs: &(dyn Fn(&[u8]) -> u32 + Sync)) -> WarmReport {
 		let mut report = WarmReport::default();
-		if self.inner.config.offline {
+		if self.offline {
 			return report;
 		}
 		let mut seen = HashSet::new();

@@ -391,6 +391,7 @@ struct Inner {
 #[derive(Clone)]
 pub struct Assets {
 	inner: Arc<Inner>,
+	offline: bool,
 }
 
 impl Assets {
@@ -399,6 +400,7 @@ impl Assets {
 	}
 
 	fn with_endpoints(config: AssetConfig, endpoints: Endpoints, account: Option<Account>, key: Option<Key>) -> Self {
+		let offline = config.offline;
 		let client = Client::new(endpoints, config.max_concurrent_downloads, &config.assetdelivery_headers);
 		let account_cell = OnceLock::new();
 		if let Some(preset) = account {
@@ -420,7 +422,20 @@ impl Assets {
 				refreshed: Mutex::new(HashSet::new()),
 				config,
 			}),
+			offline,
 		}
+	}
+
+	/// A view of these assets sharing the same memory cache, disk cache, credentials and HTTP client,
+	/// with network access allowed (`false`) or forbidden (`true`).
+	pub fn with_offline(&self, offline: bool) -> Self {
+		Self { inner: self.inner.clone(), offline }
+	}
+
+	/// Whether this handle is a per-request offline view of an online [`Assets`] instance (so
+	/// offline misses should not poison failure caches shared with online callers).
+	pub fn is_offline_view(&self) -> bool {
+		self.offline && !self.inner.config.offline
 	}
 
 	pub fn config(&self) -> &AssetConfig {
@@ -597,6 +612,15 @@ impl Assets {
 		if let Some(hit) = self.inner.memory.lock().get(&key, stamp) {
 			return Ok(respell(hit, uri));
 		}
+		if self.offline {
+			// Offline lookups only touch local files and disk cache; bypass `inflight` so an offline
+			// miss never fails a concurrent online caller (or waits on one) sharing the same `Assets`.
+			let result = load().map(Arc::new);
+			if let Ok(fetched) = &result {
+				self.inner.memory.lock().insert(&key, fetched.clone(), stamp);
+			}
+			return result;
+		}
 
 		// Join or start the in-flight fetch for this key
 		let (slot, leader) = {
@@ -714,12 +738,12 @@ impl Assets {
 	fn load_disk_or_network(&self, key: &str, uri: &str, download: impl FnOnce() -> Result<(Vec<u8>, String), AssetError>) -> Result<Fetched, AssetError> {
 		let config = &self.inner.config;
 		let use_disk = !config.refresh || self.inner.refreshed.lock().contains(key);
-		if (use_disk || config.offline)
+		if (use_disk || self.offline)
 			&& let Some(bytes) = self.inner.disk.read(key)
 		{
 			return Ok(Fetched { uri: uri.to_string(), bytes, source: Source::DiskCache });
 		}
-		if config.offline {
+		if self.offline {
 			return Err(AssetError::Offline { uri: uri.to_string() });
 		}
 		let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());

@@ -76,11 +76,9 @@ pub fn build_id() -> String {
 	format!("{}-{}-{}", env!("CARGO_PKG_VERSION"), meta.map(|meta| meta.len()).unwrap_or(0), modified)
 }
 
-/// What a service is: its binary, whether it may reach the network, and the settings its pictures and
-/// counts depend on. A client only ever talks to a service of its own kind. These used to be whatever the
-/// service that came up first had, so a command's `--offline` or `ROR_NO_AO=1` was dropped without a word
-/// when another was running (the online service's asset checks billed every job: a solo particle frame
-/// 524 ms against 73 offline, 2026-11-02), and the way round it was a line in the README.
+/// What a service is: its binary and the environment settings its pictures and counts depend on.
+/// Online and `--offline` clients of the same build share one service; offline requests pass
+/// `X-ROR-Offline: 1` and run on an offline handle sharing the GPU device, pipelines and caches.
 pub fn service_id(build: &str, offline: bool) -> String {
 	id_of(build, offline, std::env::vars())
 }
@@ -90,11 +88,8 @@ pub fn build_of(id: &str) -> &str {
 	id.split('+').next().unwrap_or(id)
 }
 
-fn id_of(build: &str, offline: bool, environment: impl Iterator<Item = (String, String)>) -> String {
+fn id_of(build: &str, _offline: bool, environment: impl Iterator<Item = (String, String)>) -> String {
 	let mut id = build.to_string();
-	if offline {
-		id.push_str("+offline");
-	}
 	let mut settings: Vec<(String, String)> = environment.filter(|(name, _)| changes_output(name)).collect();
 	if !settings.is_empty() {
 		settings.sort();
@@ -168,6 +163,9 @@ struct State {
 /// What lives on one device: dropped whole when the service goes dormant.
 struct Awake {
 	renderer: Renderer,
+	/// Shares the GPU device, pipelines and every GPU/disk/memory cache with `renderer`, with network
+	/// access forbidden for `X-ROR-Offline: 1` requests.
+	offline: Renderer,
 	warmer: std::sync::OnceLock<warm::Warmer>,
 }
 
@@ -187,6 +185,7 @@ impl State {
 		let gpu = Arc::new(Gpu::on_adapter(&self.adapter)?);
 		let device_ms = start.elapsed().as_secs_f64() * 1000.0;
 		let renderer = Renderer::new(gpu, self.assets.clone())?;
+		let offline = renderer.with_assets(self.assets.with_offline(true));
 		let total_ms = start.elapsed().as_secs_f64() * 1000.0;
 		eprintln!("ror: GPU device and renderer made in {total_ms:.0} ms (device {device_ms:.0}, renderer {:.0} ms)", total_ms - device_ms);
 		// a lost device (a GPU driver reset) fails every later render: finish the running jobs and exit,
@@ -198,7 +197,7 @@ impl State {
 				state.shutting_down.store(true, Ordering::SeqCst);
 			}
 		});
-		let made = Arc::new(Awake { renderer, warmer: std::sync::OnceLock::new() });
+		let made = Arc::new(Awake { renderer, offline, warmer: std::sync::OnceLock::new() });
 		*self.awake.write() = Some(made.clone());
 		self.wakes.fetch_add(1, Ordering::SeqCst);
 		self.wake_ms.store(start.elapsed().as_millis() as u64, Ordering::SeqCst);
@@ -567,8 +566,8 @@ fn successor(state: Arc<State>, source: String, state_dir: PathBuf) {
 				seen = Some(now);
 				continue;
 			}
-			let build = service_id(&format!("{}-{}-{}", env!("CARGO_PKG_VERSION"), now.0, now.1), state.offline);
-			match client::start_successor(&state_dir, Path::new(&source), &build, state.offline) {
+			let build = service_id(&format!("{}-{}-{}", env!("CARGO_PKG_VERSION"), now.0, now.1), false);
+			match client::start_successor(&state_dir, Path::new(&source), &build, false) {
 				Ok(port) => eprintln!("ror: {source} was rebuilt: its service is on port {port}"),
 				Err(error) => eprintln!("ror: {source} was rebuilt; starting its service: {error:#}"),
 			}
@@ -630,12 +629,14 @@ fn handle(state: &State, stream: &TcpStream) -> Result<()> {
 		}
 		("POST", "/render") => {
 			let job: Job = serde_json::from_slice(&request.body).context("job JSON")?;
+			let offline = request_offline(state, &request);
 			let reply = Reply::new(stream, &request)?;
-			let (status, body) = crate::for_caller(reply.clone(), || run_job(state, &job));
+			let (status, body) = crate::for_caller(reply.clone(), || run_job(state, &job, offline));
 			reply.answer(status, body.to_string().as_bytes())
 		}
 		("POST", "/video") => {
 			let job: crate::video::VideoJob = serde_json::from_slice(&request.body).context("video job JSON")?;
+			let offline = request_offline(state, &request);
 			let reply = Reply::new(stream, &request)?;
 			// a sheet-first clip answers once its sheet is written, and finishes on this thread
 			let mut answered: Option<std::path::PathBuf> = None;
@@ -648,7 +649,7 @@ fn handle(state: &State, stream: &TcpStream) -> Result<()> {
 				answered = result.pending.clone();
 			};
 			let (status, body) = crate::for_caller(reply.clone(), || {
-				counted(state, |renderer| crate::video::run_with(renderer, &state.scenes, &job, Some(&state.gpu), Some(&mut early)).and_then(|result| Ok(serde_json::to_value(result)?)))
+				counted(state, offline, |renderer| crate::video::run_with(renderer, &state.scenes, &job, Some(&state.gpu), Some(&mut early)).and_then(|result| Ok(serde_json::to_value(result)?)))
 			});
 			match answered {
 				Some(pending) => {
@@ -668,8 +669,9 @@ fn handle(state: &State, stream: &TcpStream) -> Result<()> {
 				jobs: Vec<Job>,
 			}
 			let batch: Batch = serde_json::from_slice(&request.body).context("batch JSON")?;
+			let offline = request_offline(state, &request);
 			let results: Vec<serde_json::Value> = std::thread::scope(|scope| {
-				let handles: Vec<_> = batch.jobs.iter().map(|job| scope.spawn(move || run_job(state, job).1)).collect();
+				let handles: Vec<_> = batch.jobs.iter().map(|job| scope.spawn(move || run_job(state, job, offline).1)).collect();
 				handles.into_iter().map(|handle| handle.join().unwrap_or_else(|_| serde_json::json!({"error": "job panicked"}))).collect()
 			});
 			http::write_response(stream, 200, "application/json", serde_json::json!({ "results": results }).to_string().as_bytes())
@@ -754,20 +756,27 @@ impl crate::Caller for Reply {
 	}
 }
 
-fn run_job(state: &State, job: &Job) -> (u16, serde_json::Value) {
-	counted(state, |renderer| Ok(serde_json::to_value(job::run_gated(renderer, &state.scenes, job, Some(&state.gpu))?)?))
+/// Whether a request forbids network access: either the service itself was started `--offline`
+/// (backwards compatibility with older clients) or the request carries `X-ROR-Offline: 1`.
+fn request_offline(state: &State, request: &http::Request) -> bool {
+	state.offline || request.header("x-ror-offline") == Some("1")
+}
+
+fn run_job(state: &State, job: &Job, offline: bool) -> (u16, serde_json::Value) {
+	counted(state, offline, |renderer| Ok(serde_json::to_value(job::run_gated(renderer, &state.scenes, job, Some(&state.gpu))?)?))
 }
 
 /// Runs one job on the renderer (made again if the service is dormant), counting it running, done or
 /// failed; a panic fails it alone.
-fn counted(state: &State, run: impl FnOnce(&Renderer) -> Result<serde_json::Value>) -> (u16, serde_json::Value) {
+fn counted(state: &State, offline: bool, run: impl FnOnce(&Renderer) -> Result<serde_json::Value>) -> (u16, serde_json::Value) {
 	// counted running before it takes the renderer: the service does not go dormant under it
 	state.running.fetch_add(1, Ordering::SeqCst);
 	let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
 		let awake = state.awake()?;
+		let renderer = if offline { &awake.offline } else { &awake.renderer };
 		// within the GPU memory the system gives the service before the job adds to it
-		awake.renderer.fit_vram();
-		run(&awake.renderer)
+		renderer.fit_vram();
+		run(renderer)
 	}));
 	*state.last_job.lock() = Instant::now();
 	state.running.fetch_sub(1, Ordering::SeqCst);
@@ -828,7 +837,7 @@ mod tests {
 		let none = || std::iter::empty();
 		let (online, offline) = (id_of("0.1.0-1-2", false, none()), id_of("0.1.0-1-2", true, none()));
 		assert_eq!(online, "0.1.0-1-2", "a plain service keeps the id older clients know");
-		assert_ne!(online, offline);
+		assert_eq!(online, offline, "online and offline clients share one service per build");
 		assert_eq!(build_of(&offline), "0.1.0-1-2");
 		let set = |name: &str, value: &str| vec![(name.to_string(), value.to_string())].into_iter();
 		let tuned = id_of("0.1.0-1-2", true, set("ROR_NO_AO", "1"));
@@ -838,6 +847,95 @@ mod tests {
 		// the command's own business leaves a service shareable
 		assert_eq!(id_of("0.1.0-1-2", false, set("ROR_STATE_DIR", "x")), online);
 		assert_eq!(id_of("0.1.0-1-2", false, set("ROR_NO_SERVICE", "1")), online);
+	}
+
+	/// One online service answers `X-ROR-Offline: 1` requests without touching the network, serves
+	/// older clients omitting `X-ROR-Offline` as before, and shares one `SceneCache` and `Renderer`
+	/// across online and offline jobs.
+	#[test]
+	fn one_service_handles_online_and_offline_requests_and_old_clients() {
+		let dir = std::env::temp_dir().join(format!("ror-unified-service-test-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		let mut model = crate::scene::build::ModelBuilder::new("Block");
+		model.part(&crate::scene::build::PartSpec { name: "Block".into(), size: glam::Vec3::splat(2.0), ..Default::default() });
+		let doc = model.into_document();
+		let rbxm = dir.join("block.rbxm");
+		let mut file = std::fs::File::create(&rbxm).unwrap();
+		rbx_binary::to_writer(&mut file, &doc.dom, doc.dom.root().children()).unwrap();
+		drop(file);
+
+		let adapter = GpuAdapter::find().expect("a GPU (or software adapter)");
+		let adapter_info = adapter.adapter.get_info();
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig::new(&dir));
+		let state = Arc::new_cyclic(|me| State {
+			me: me.clone(),
+			adapter,
+			adapter_info,
+			assets,
+			awake: RwLock::new(None),
+			waking: Mutex::new(()),
+			wakes: AtomicU64::new(0),
+			wake_ms: AtomicU64::new(0),
+			last_wake: Mutex::new(Instant::now()),
+			scenes: SceneCache::default(),
+			gpu: crate::budget::GpuGate::default(),
+			started: Instant::now(),
+			last_activity: Mutex::new(Instant::now()),
+			last_job: Mutex::new(Instant::now()),
+			running: AtomicU64::new(0),
+			done: AtomicU64::new(0),
+			failed: AtomicU64::new(0),
+			shutting_down: AtomicBool::new(false),
+			build: "test-build".into(),
+			warming: AtomicBool::new(false),
+			state_dir: dir.clone(),
+			offline: false,
+			source: None,
+			idle: Duration::from_secs(60),
+			handed_over: AtomicBool::new(false),
+		});
+
+		let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+		let port = listener.local_addr().unwrap().port();
+		let server_state = state.clone();
+		let server = std::thread::spawn(move || {
+			for _ in 0..3 {
+				let (stream, _) = listener.accept().unwrap();
+				handle(&server_state, &stream).unwrap();
+			}
+		});
+
+		// 1. Offline request on an uncached asset id is refused locally with an offline error.
+		let missing_job = serde_json::json!({
+			"input": "rbxassetid://999999999999",
+			"views": [{ "name": "front", "width": 32, "height": 32, "msaa": 1, "bloom": false, "background": { "color": [0.0, 0.0, 0.0] } }],
+			"noPng": true,
+		});
+		let (status, body) = http::request_as(port, "POST", "/render", "X-ROR: 1\r\nX-ROR-Offline: 1", missing_job.to_string().as_bytes(), Duration::from_secs(30)).unwrap();
+		assert_eq!(status, 400, "uncached asset under X-ROR-Offline must fail: {}", String::from_utf8_lossy(&body));
+		assert!(String::from_utf8_lossy(&body).to_ascii_lowercase().contains("offline"), "error should mention offline: {}", String::from_utf8_lossy(&body));
+
+		// 2. Old-client request (X-ROR: 1 only, no X-ROR-Offline) renders a local scene and caches it.
+		let local_job = serde_json::json!({
+			"input": rbxm,
+			"views": [{ "name": "front", "width": 32, "height": 32, "msaa": 1, "bloom": false, "background": { "color": [0.0, 0.0, 0.0] } }],
+			"noPng": true,
+		});
+		let (status, body) = http::request_as(port, "POST", "/render", "X-ROR: 1", local_job.to_string().as_bytes(), Duration::from_secs(30)).unwrap();
+		assert_eq!(status, 200, "old-client online render failed: {}", String::from_utf8_lossy(&body));
+		let first: serde_json::Value = serde_json::from_slice(&body).unwrap();
+		assert_eq!(first["timings"]["sceneCached"], false);
+
+		// 3. Offline request on the same local scene hits the exact same SceneCache and Renderer.
+		let (status, body) = http::request_as(port, "POST", "/render", "X-ROR: 1\r\nX-ROR-Offline: 1", local_job.to_string().as_bytes(), Duration::from_secs(30)).unwrap();
+		assert_eq!(status, 200, "offline render failed: {}", String::from_utf8_lossy(&body));
+		let second: serde_json::Value = serde_json::from_slice(&body).unwrap();
+		assert_eq!(second["timings"]["sceneCached"], true, "online and offline must share SceneCache: {second}");
+
+		server.join().unwrap();
+		drop(state);
+		let _ = std::fs::remove_dir_all(&dir);
 	}
 
 	#[test]

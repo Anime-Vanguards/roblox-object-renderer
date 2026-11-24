@@ -1189,6 +1189,13 @@ struct Defaults {
 pub struct Renderer {
 	pub gpu: Arc<Gpu>,
 	pub assets: ror_assets::Assets,
+	inner: Arc<RendererInner>,
+}
+
+/// Shared GPU pipelines and caches behind [`Renderer`], so online and offline handles on one service
+/// share every compiled pipeline and cached GPU resource while differing only in [`Renderer::assets`].
+#[doc(hidden)]
+pub struct RendererInner {
 	pipelines: Pipelines,
 	defaults: Defaults,
 	primitives: HashMap<Primitive, Arc<GpuMesh>>,
@@ -1232,6 +1239,13 @@ pub struct Renderer {
 	effect_bindings: Mutex<Vec<Arc<EffectBindings>>>,
 	/// Scene keys frames made ahead still hold ([`Renderer::prepare_environment`]), shared by equal ones
 	recent_keys: Mutex<Vec<std::sync::Weak<prepared::SceneKey>>>,
+}
+
+impl std::ops::Deref for Renderer {
+	type Target = RendererInner;
+	fn deref(&self) -> &Self::Target {
+		&self.inner
+	}
 }
 
 /// The share of the GPU's memory budget a process's renders may fill (`ROR_GPU_ROOM_PERCENT`, default 90).
@@ -1892,44 +1906,52 @@ impl Renderer {
 		Ok(Self {
 			gpu,
 			assets,
-			pipelines,
-			defaults,
-			primitives,
-			// what stays between renders on a machine shared with Studios and games (a render's own may
-			// go past it while it draws): a large place seen whole takes 1.6 GB of textures and 44 MB of
-			// meshes, a map 200-300 MB and 4 MB, a character 40-80 MB and 1 MB, an attack's effects
-			// 234 MB; the disk cache gives the rest back in a few seconds
-			meshes: Cache::new(cache_budget("MESH", 256)),
-			textures: Cache::new(cache_budget("TEXTURE", 384)),
-			packs: Cache::new(64 << 20),
-			// a sky's maps take ~4 MB over its images (in `skies`, once per sky); a clip whose Lighting
-			// changes makes them every frame, so few are kept
-			environments: Cache::new(cache_budget("ENVIRONMENT", 64)),
-			skies: Cache::new(cache_budget("SKY", 64)),
-			materials: Mutex::new(HashMap::new()),
-			skins: skinning::Skins::default(),
-			beams,
-			ids,
-			particles,
-			post,
-			guis,
-			gui_textures: Cache::new(128 << 20),
-			gui_failures: guis::GuiFailures::default(),
-			gui_uploads: Default::default(),
-			effect_bindings: Default::default(),
-			reuse: reuse::Reuse::default(),
-			preparations: prepared::Preparations::new(cache_budget("PREPARED", 256)),
-			// a view's sun atlas is 84 MB (4096 x 1280 moments of four floats): under 128 MB a still
-			// camera's frames draw the sun's shadows once (at 64 MB none was ever kept)
-			shadows: shadow_reuse::Shadows::new(cache_budget("SHADOW", 128)),
-			nv12: std::sync::OnceLock::new(),
-			layers: std::sync::OnceLock::new(),
-			voxel_field: std::sync::OnceLock::new(),
-			clouds: std::sync::OnceLock::new(),
-			staging: texture_files::Staging::new(),
-			recent_keys: Mutex::default(),
-			residency_from: std::sync::atomic::AtomicU64::new(residency::FEEDBACK_FROM),
+			inner: Arc::new(RendererInner {
+				pipelines,
+				defaults,
+				primitives,
+				// what stays between renders on a machine shared with Studios and games (a render's own may
+				// go past it while it draws): a large place seen whole takes 1.6 GB of textures and 44 MB of
+				// meshes, a map 200-300 MB and 4 MB, a character 40-80 MB and 1 MB, an attack's effects
+				// 234 MB; the disk cache gives the rest back in a few seconds
+				meshes: Cache::new(cache_budget("MESH", 256)),
+				textures: Cache::new(cache_budget("TEXTURE", 384)),
+				packs: Cache::new(64 << 20),
+				// a sky's maps take ~4 MB over its images (in `skies`, once per sky); a clip whose Lighting
+				// changes makes them every frame, so few are kept
+				environments: Cache::new(cache_budget("ENVIRONMENT", 64)),
+				skies: Cache::new(cache_budget("SKY", 64)),
+				materials: Mutex::new(HashMap::new()),
+				skins: skinning::Skins::default(),
+				beams,
+				ids,
+				particles,
+				post,
+				guis,
+				gui_textures: Cache::new(128 << 20),
+				gui_failures: guis::GuiFailures::default(),
+				gui_uploads: Default::default(),
+				effect_bindings: Default::default(),
+				reuse: reuse::Reuse::default(),
+				preparations: prepared::Preparations::new(cache_budget("PREPARED", 256)),
+				// a view's sun atlas is 84 MB (4096 x 1280 moments of four floats): under 128 MB a still
+				// camera's frames draw the sun's shadows once (at 64 MB none was ever kept)
+				shadows: shadow_reuse::Shadows::new(cache_budget("SHADOW", 128)),
+				nv12: std::sync::OnceLock::new(),
+				layers: std::sync::OnceLock::new(),
+				voxel_field: std::sync::OnceLock::new(),
+				clouds: std::sync::OnceLock::new(),
+				staging: texture_files::Staging::new(),
+				recent_keys: Mutex::default(),
+				residency_from: std::sync::atomic::AtomicU64::new(residency::FEEDBACK_FROM),
+			}),
 		})
+	}
+
+	/// A view of this renderer sharing the GPU device, pipelines and every GPU cache, using `assets`
+	/// for asset lookups (e.g. an offline handle on one shared render service).
+	pub fn with_assets(&self, assets: ror_assets::Assets) -> Self {
+		Self { gpu: self.gpu.clone(), assets, inner: self.inner.clone() }
 	}
 
 	/// A texture a view handed out ([`ViewRequest::texture`]) that its holder is done with: a later
@@ -2362,7 +2384,7 @@ impl Renderer {
 	/// fewer), placed as the full mesh is (MeshPart scale comes from InitialSize): what a
 	/// Performance-fidelity copy shows at a distance (notes/cost.md "Levels of detail").
 	fn load_mesh(&self, uri: &str) -> Result<Arc<GpuMesh>> {
-		self.meshes.get_or_load(&format!("mesh:{}", content_key(uri)), || {
+		self.meshes.get_or_load_for(&format!("mesh:{}", content_key(uri)), self.assets.is_offline_view(), || {
 			let (source, level) = match uri.rsplit_once("#lod=") {
 				Some((source, level)) => (source, level.parse::<usize>().with_context(|| format!("{uri}: #lod= takes a level number"))?),
 				None => (uri, 0),
@@ -2384,7 +2406,7 @@ impl Renderer {
 			(None, Some(asset)) => format!("union:{asset}"),
 			(None, None) => return Err(anyhow!("union without mesh data or AssetId")),
 		};
-		self.meshes.get_or_load(&key, || {
+		self.meshes.get_or_load_for(&key, self.assets.is_offline_view(), || {
 			let bytes = match (data, asset) {
 				(Some(data), _) => data.as_ref().clone(),
 				(None, Some(asset)) => self.assets.fetch(asset).map_err(|error| anyhow!("{error}"))?.bytes.clone(),
@@ -2401,7 +2423,7 @@ impl Renderer {
 	/// its levels' source; one kept on disk goes to the GPU only once asked for (a material map's levels
 	/// from the finest a view samples, render::residency; [`Renderer::load_whole`]).
 	fn load_texture(&self, uri: &str, usage: TextureUse) -> Result<Arc<GpuTexture>> {
-		self.textures.get_or_load(&(content_key(uri), usage), || self.make_texture(uri, usage))
+		self.textures.get_or_load_for(&(content_key(uri), usage), self.assets.is_offline_view(), || self.make_texture(uri, usage))
 	}
 
 	/// [`Renderer::load_texture`] with every level on the GPU (what effects, the sky's bodies and the
@@ -2414,7 +2436,7 @@ impl Renderer {
 
 	/// A texture pack (SurfaceAppearance / MaterialVariant TexturePack, a built-in material's pack).
 	fn texture_pack(&self, uri: &str) -> Result<Arc<TexturePack>> {
-		self.packs.get_or_load(&uri.to_string(), || {
+		self.packs.get_or_load_for(&uri.to_string(), self.assets.is_offline_view(), || {
 			let fetched = self.assets.fetch(uri).map_err(|error| anyhow!("{error}"))?;
 			texture_pack::parse(&fetched.bytes).with_context(|| format!("{uri}: texture pack"))
 		})
@@ -2524,11 +2546,12 @@ impl Renderer {
 		// new service hung so, at 0 % CPU). And a sky's work on the main pool could find every worker
 		// waiting for these maps. Here neither the initialiser's thread nor the inner pool's work
 		// waits on a cache.
+		let transient_failure = self.assets.is_offline_view();
 		let result = std::thread::scope(|scope| {
 			scope
 				.spawn(|| {
-					let base = self.skies.get_or_load(&sky_key, || inner_pool().install(|| self.sky_base(&sky)));
-					self.environments.get_or_load(&key, || {
+					let base = self.skies.get_or_load_for(&sky_key, transient_failure, || inner_pool().install(|| self.sky_base(&sky)));
+					self.environments.get_or_load_for(&key, transient_failure, || {
 						let base = base?;
 						Ok(inner_pool().install(|| self.environment_maps(&sky, &base, tint, atmosphere, glare_light, glare_tint, lighting.brightness)))
 					})
@@ -3033,7 +3056,8 @@ impl Renderer {
 		// a clip's frame after one that moved starts from that frame (prepared::ClipGeometry): it is not
 		// a scene kept whole (moving scenes are not), and looking for one compared its whole key
 		let last = clip.and_then(|clip| clip.last.lock().take());
-		let found = if last.as_ref().is_some_and(|last| last.moving) { None } else { key.as_ref().and_then(|key| self.preparations.get(key, self.dropped_failures())) };
+		let offline_view = self.assets.is_offline_view();
+		let found = if last.as_ref().is_some_and(|last| last.moving) { None } else { key.as_ref().and_then(|key| self.preparations.get(key, self.dropped_failures(offline_view), offline_view)) };
 		let geometry = match found {
 			Some(geometry) => {
 				stats.geometry_reused = true;
@@ -3046,14 +3070,15 @@ impl Renderer {
 				geometry
 			}
 			None => {
-				let failures = self.failures();
+				let failures = self.failures(offline_view);
 				let (mut geometry, moving, frame, remembered) = self.prepare_geometry(scene, stats, neon_share, key.as_deref(), lease, views, defer_maps, last)?;
 				// A missing asset can succeed on a later request: a scene some of whose loads failed is kept
 				// only while the caches remember every failure it met, until the first of them is retried
 				// (prepared::Retry), keeping their ordinary retry policy. A scene some of whose parts
 				// changed since the last is moving: its next frame differs again (its parts are kept
 				// instead, `prepare_geometry`), unless it is drawn again unchanged (Preparations::repeated).
-				let retry = (!geometry.missing.is_empty() && remembered).then(|| prepared::Retry::of(failures, self.failures())).flatten();
+				let retry = (!geometry.missing.is_empty() && remembered).then(|| prepared::Retry::of(failures, self.failures(offline_view))).flatten();
+				let offline_only = offline_view && !geometry.missing.is_empty();
 				let keep = (geometry.missing.is_empty() || retry.is_some()) && key.as_ref().is_some_and(|key| !moving || self.preparations.repeated(key));
 				if keep && moving {
 					// (prepare_geometry counts what a moving scene holds as nothing: it is not kept)
@@ -3063,7 +3088,7 @@ impl Renderer {
 				if let (Some(clip), Some(frame), Some(key)) = (clip, frame, key.clone()) {
 					*clip.last.lock() = Some(frame.finish(key, geometry.clone(), moving));
 				}
-				if keep && let Some(key) = key && self.preparations.insert(key, geometry.clone(), retry) {
+				if keep && let Some(key) = key && self.preparations.insert(key, geometry.clone(), retry, offline_only) {
 					lease.forget_buffer(&geometry.instances);
 					lease.forget_buffer(&geometry.no_lights);
 					if let Some(texture) = &geometry.light_grid_texture {
@@ -3419,13 +3444,13 @@ impl Renderer {
 
 	/// What the resource caches a scene's preparation loads through remember of failed loads now
 	/// (prepared::Failures).
-	fn failures(&self) -> prepared::Failures {
-		prepared::Failures::default().and(self.meshes.failures()).and(self.textures.failures()).and(self.packs.failures())
+	fn failures(&self, offline_view: bool) -> prepared::Failures {
+		prepared::Failures::default().and(self.meshes.failures_for(offline_view)).and(self.textures.failures_for(offline_view)).and(self.packs.failures_for(offline_view))
 	}
 
 	/// The failures those caches let go of before their time, so far ([`Renderer::failures`]).
-	fn dropped_failures(&self) -> u64 {
-		self.meshes.dropped_failures() + self.textures.dropped_failures() + self.packs.dropped_failures()
+	fn dropped_failures(&self, offline_view: bool) -> u64 {
+		self.meshes.dropped_failures_for(offline_view) + self.textures.dropped_failures_for(offline_view) + self.packs.dropped_failures_for(offline_view)
 	}
 
 	/// The light grid (`lightgrid::build`), kept by the parts that fill it: a clip whose moving parts

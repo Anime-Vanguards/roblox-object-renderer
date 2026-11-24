@@ -17,7 +17,7 @@ ror render Model.rbxm --no-service   # Bypass the service for one invocation
 
 ## Process lifecycle
 
-- **Safe rebuilds:** Each service runs from a copy of the binary under `<state dir>/bin`, so recompiling `ror` never fails on a locked executable. When the source binary changes, the service spawns a successor from the new build and exits cleanly once the successor is ready (`ROR_SERVICE_SUCCESSOR=0` disables auto-handoff). Distinct builds sharing a state directory run side-by-side services.
+- **Safe rebuilds:** Each service runs from a copy of the binary under `<state dir>/bin`, so recompiling `ror` never fails on a locked executable. When the source binary changes, the service spawns a successor from the new build and exits cleanly once the successor is ready (`ROR_SERVICE_SUCCESSOR=0` disables auto-handoff). Distinct builds sharing a state directory run side-by-side services; online and `--offline` callers of the same build share one service (`X-ROR-Offline: 1` forbids network access per request), and records of exited service processes are pruned automatically.
 - **Dormant mode & idle exit:** After `ROR_QUIET_RELEASE` seconds without jobs (default `10`, capped at `2` while a game is running), the service releases its GPU device and caches by handing off to a lightweight dormant process (~30 MB RSS holding only the GPU adapter; `ROR_SERVICE_HANDOVER=0` keeps it in-process). Waking on the next job takes 0.12–0.25 s. After `ROR_SERVICE_IDLE` seconds of inactivity (default `600`), it exits completely.
 - **Startup & Vulkan tuning:** Starts in under a second and prefers a discrete Vulkan GPU. On Windows it caches the selected driver in `<state dir>/gpu.json` (`ROR_VULKAN_FILTER=0` disables) and disables implicit Vulkan layers (overlays/capture hooks) unless `VK_LOADER_LAYERS_DISABLE` is set or `ROR_VULKAN_LAYERS=1`. Pipelines cache under `<state dir>/pipelines` (`ROR_PIPELINE_CACHE=0` disables).
 - **GPU clock warmup (`ror service warm` / `POST /warm`):** Runs a short GPU burst (at most 0.5 s, canceled immediately when a real job arrives) to wake an idle GPU out of low-power clocks before a clip starts.
@@ -63,9 +63,9 @@ The service listens on `127.0.0.1` only. Find the active port in `<state dir>/se
 | Endpoint | Behavior |
 |---|---|
 | `GET /health` | Service status, cache stats, running/queued jobs, in-flight loads, and `commitBytes`. |
-| `POST /render` | Run a `RenderJob` JSON payload. Send `X-ROR-Notes: 1` for streaming `application/x-ror-notes` lines (`{"note": "..."}` progress followed by `{"status": ..., "answer": ...}`). Override per-job limits with `X-ROR-Setting: ROR_MEMORY_FLOOR_GB=<GB>` or `ROR_MEMORY_WAIT=<s>`. |
-| `POST /batch` | Run `{"jobs": [job, ...]}` concurrently; returns `{"results": [...]}`. |
-| `POST /video` | Run a `VideoJob` (`crates/ror/src/video.rs`). |
+| `POST /render` | Run a `RenderJob` JSON payload. Send `X-ROR-Offline: 1` to forbid network downloads for this job, `X-ROR-Notes: 1` for streaming `application/x-ror-notes` lines (`{"note": "..."}` progress followed by `{"status": ..., "answer": ...}`), and `X-ROR-Setting: ROR_MEMORY_FLOOR_GB=<GB>` or `ROR_MEMORY_WAIT=<s>` for per-job limits. |
+| `POST /batch` | Run `{"jobs": [job, ...]}` concurrently (supports `X-ROR-Offline: 1`); returns `{"results": [...]}`. |
+| `POST /video` | Run a `VideoJob` (`crates/ror/src/video.rs`; supports `X-ROR-Offline: 1`). |
 | `POST /warm` | Trigger GPU warmup burst; returns `{"ok": true, "warming": bool}`. |
 | `POST /shutdown` | Stop the service cleanly. |
 

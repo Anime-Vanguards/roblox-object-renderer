@@ -1596,3 +1596,50 @@ fn child_processes_never_get_the_key() {
 	// and the switch to Studio's account, which holds none: a child that downloads reads the account itself
 	assert!(envs.contains(&("ROR_STUDIO_COOKIE".into(), Some("1".into()))));
 }
+
+#[test]
+fn with_offline_shares_caches_and_isolates_inflight_misses() {
+	let cdn = MockServer::start(|r| {
+		if r.path == "/cdn/slow" {
+			std::thread::sleep(std::time::Duration::from_millis(120));
+		}
+		Reply::bytes(PNG)
+	});
+	let fast_url = cdn.url("/cdn/fast");
+	let slow_url = cdn.url("/cdn/slow");
+	let ad = MockServer::start(move |r| {
+		let target = if r.path.contains("/500") { &fast_url } else { &slow_url };
+		Reply::json(&format!(r#"{{"location":"{target}"}}"#))
+	});
+	let state = temp_state("with-offline");
+	let online = assets(AssetConfig::new(&state), endpoints(&ad, &cdn), false);
+	let offline = online.with_offline(true);
+	assert!(!online.offline() && offline.offline());
+
+	// Online fetch populates memory + disk cache; offline reads both without touching the network.
+	assert_eq!(online.fetch("rbxassetid://500").unwrap().bytes, PNG);
+	let before = (ad.requests().len(), cdn.requests().len());
+	assert_eq!(offline.fetch("rbxassetid://500").unwrap().bytes, PNG);
+	online.release_memory();
+	let from_disk = offline.fetch("rbxassetid://500").unwrap();
+	assert_eq!((from_disk.bytes.as_slice(), from_disk.source), (PNG, Source::DiskCache));
+	assert_eq!((ad.requests().len(), cdn.requests().len()), before, "offline hits must not touch the network");
+
+	// Offline warm does nothing and uncached offline fetch fails cleanly.
+	let report = offline.warm(&[crate::Download::Asset("rbxassetid://777".into())], &|_| 0);
+	assert_eq!((report.downloaded, report.batches), (0, 0));
+	assert!(matches!(offline.fetch("rbxassetid://777"), Err(AssetError::Offline { .. })));
+	assert_eq!((ad.requests().len(), cdn.requests().len()), before);
+
+	// Concurrent online + offline fetch on the same uncached URI: neither breaks the other.
+	let (on_res, off_res) = std::thread::scope(|scope| {
+		let on = scope.spawn(|| online.fetch("rbxassetid://777"));
+		std::thread::sleep(std::time::Duration::from_millis(20));
+		let off = offline.fetch("rbxassetid://777");
+		(on.join().unwrap(), off)
+	});
+	assert_eq!(on_res.unwrap().bytes, PNG);
+	assert!(matches!(off_res, Err(AssetError::Offline { .. })));
+	// Once cached by the online fetch, offline now finds it.
+	assert_eq!(offline.fetch("rbxassetid://777").unwrap().bytes, PNG);
+}

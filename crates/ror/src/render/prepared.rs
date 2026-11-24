@@ -191,6 +191,10 @@ struct Kept {
 	used: Instant,
 	/// Until when it stands for a fresh preparation, when some of its loads failed
 	retry: Option<Retry>,
+	/// True when prepared by an offline view on an online service with missing assets: reusable by
+	/// offline views (e.g. multi-frame clips), skipped by online views so offline misses never
+	/// shadow online fetches.
+	offline_only: bool,
 }
 
 impl Kept {
@@ -367,12 +371,13 @@ impl Preparations {
 	}
 
 	/// The preparation kept for `key`, the resource caches having let go of `dropped` failures by now
-	/// ([`Failures`]).
-	pub fn get(&self, key: &SceneKey, dropped: u64) -> Option<Arc<PreparedGeometry>> {
+	/// ([`Failures`]). Offline-only entries (prepared with missing assets by an offline view on an
+	/// online service) are returned only when `offline_view` is `true`.
+	pub fn get(&self, key: &SceneKey, dropped: u64, offline_view: bool) -> Option<Arc<PreparedGeometry>> {
 		let mut kept = self.kept.lock();
 		let now = Instant::now();
-		kept.retain(|entry| entry.live(now, Some(dropped)));
-		let entry = kept.iter_mut().find(|entry| entry.key.same(key))?;
+		kept.retain(|entry| entry.live(now, (entry.offline_only == offline_view).then_some(dropped)));
+		let entry = kept.iter_mut().find(|entry| entry.key.same(key) && (!entry.offline_only || offline_view))?;
 		entry.used = now;
 		Some(entry.geometry.clone())
 	}
@@ -382,15 +387,19 @@ impl Preparations {
 	/// used first, while what they all own and hold (meshes and textures included) is past it: a map
 	/// whose textures alone are past the budget (a large place's 1.6 GB) is kept for its clip's next
 	/// frame, and nothing else with it.
-	pub fn insert(&self, key: Arc<SceneKey>, geometry: Arc<PreparedGeometry>, retry: Option<Retry>) -> bool {
+	pub fn insert(&self, key: Arc<SceneKey>, geometry: Arc<PreparedGeometry>, retry: Option<Retry>, offline_only: bool) -> bool {
 		if geometry.bytes + key.bytes() > self.budget {
 			return false;
 		}
 		let cost = |entry: &Kept| entry.geometry.kept_bytes() + entry.key.bytes();
 		let mut kept = self.kept.lock();
 		let now = Instant::now();
-		kept.retain(|entry| entry.live(now, None) && !entry.key.same(&key));
-		kept.push(Kept { key, geometry, used: now, retry });
+		kept.retain(|entry| entry.live(now, None));
+		if offline_only && kept.iter().any(|entry| entry.key.same(&key) && !entry.offline_only) {
+			return false;
+		}
+		kept.retain(|entry| !(entry.key.same(&key) && (!offline_only || entry.offline_only)));
+		kept.push(Kept { key, geometry, used: now, retry, offline_only });
 		let mut total: u64 = kept.iter().map(cost).sum();
 		while (total > self.budget && kept.len() > 1) || kept.len() > KEPT_SCENES {
 			// never the one just kept (the last)
@@ -1275,10 +1284,37 @@ mod retry_tests {
 		assert!(renderer.render(&scene, std::slice::from_ref(&request)).unwrap().1.geometry_reused, "kept again");
 		// a failure the caches let go of meanwhile (Cache::shrink_to): the next request retries it
 		let key = super::super::scene_key(&scene).unwrap();
-		assert!(renderer.preparations.get(&key, renderer.dropped_failures()).is_some());
-		assert!(renderer.preparations.get(&key, renderer.dropped_failures() + 1).is_none(), "not kept past a failure let go of");
+		assert!(renderer.preparations.get(&key, renderer.dropped_failures(false), false).is_some());
+		assert!(renderer.preparations.get(&key, renderer.dropped_failures(false) + 1, false).is_none(), "not kept past a failure let go of");
 		assert!(!renderer.render(&scene, std::slice::from_ref(&request)).unwrap().1.geometry_reused);
 		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	#[test]
+	fn offline_view_reuses_preparation_with_missing_assets_without_poisoning_online() {
+		let state = std::env::temp_dir().join(format!("ror-prepared-offline-isolation-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&state);
+		std::fs::create_dir_all(&state).unwrap();
+		let gpu = Arc::new(super::super::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let online_assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: false, ..ror_assets::AssetConfig::new(&state) });
+		let online = Renderer::new(gpu, online_assets.clone()).expect("a renderer");
+		let offline = online.with_assets(online_assets.with_offline(true));
+		let mut model = crate::scene::build::ModelBuilder::new("Yard");
+		model.part(&crate::scene::build::PartSpec { name: "Floor".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, -0.5, 0.0)), size: Vec3::new(20.0, 1.0, 20.0), ..Default::default() });
+		let broken = model.part(&crate::scene::build::PartSpec { class: "MeshPart", name: "Broken".into(), size: Vec3::splat(2.0), ..Default::default() });
+		model.set(broken, "MeshContent", Content::from_uri("rbxassetid://6060607"));
+		model.set(broken, "InitialSize", Vector3::new(2.0, 2.0, 2.0));
+		let scene = crate::scene::extract::extract(&model.into_document());
+		let request = ViewRequest { width: 96, height: 64, camera: CameraSpec::LookAt { eye: [8.0, 6.0, -10.0], target: [0.0; 3], fov: 70.0 }, ..Default::default() };
+		let (_, first) = offline.render(&scene, std::slice::from_ref(&request)).unwrap();
+		assert!(!first.geometry_reused && !first.missing.is_empty());
+		let (_, second) = offline.render(&scene, std::slice::from_ref(&request)).unwrap();
+		assert!(second.geometry_reused, "offline view must reuse kept preparation across repeated frames");
+		let key = super::super::scene_key(&scene).unwrap();
+		assert!(online.preparations.get(&key, online.dropped_failures(false), false).is_none(), "online view must not receive offline-only preparation");
+		assert!(online.preparations.get(&key, online.dropped_failures(true), true).is_some(), "offline view still hits its kept preparation");
+		drop((offline, online));
 		let _ = std::fs::remove_dir_all(&state);
 	}
 }

@@ -18,12 +18,69 @@ fn read_info(path: &Path) -> Option<ServiceInfo> {
 	serde_json::from_str(&text).ok()
 }
 
-/// Every service recorded for the state dir, running or not.
+/// Whether the recorded service process is definitely gone (or its PID was reused by a much newer
+/// process). Returns `false` when unsure (e.g. access denied), so live records are never pruned.
+#[cfg(windows)]
+fn process_dead(info: &ServiceInfo) -> bool {
+	use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, FILETIME, GetLastError};
+	use windows_sys::Win32::System::Threading::{GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+	const STILL_ACTIVE: u32 = 259;
+	if info.pid == 0 {
+		return true;
+	}
+	unsafe {
+		let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, info.pid);
+		if handle.is_null() {
+			return GetLastError() == ERROR_INVALID_PARAMETER;
+		}
+		let mut code = 0u32;
+		let dead = if GetExitCodeProcess(handle, &mut code) != 0 && code != STILL_ACTIVE {
+			true
+		} else if info.started > 0 {
+			let mut created = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+			let mut exit = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+			let mut kernel = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+			let mut user = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+			if GetProcessTimes(handle, &mut created, &mut exit, &mut kernel, &mut user) != 0 {
+				let ticks = ((created.dwHighDateTime as u64) << 32) | (created.dwLowDateTime as u64);
+				// Windows FILETIME epoch is 1601-01-01; Unix epoch offset is 11,644,473,600 s.
+				let created_unix = (ticks / 10_000_000).saturating_sub(11_644_473_600);
+				created_unix > info.started.saturating_add(60)
+			} else {
+				false
+			}
+		} else {
+			false
+		};
+		CloseHandle(handle);
+		dead
+	}
+}
+
+#[cfg(not(windows))]
+fn process_dead(_info: &ServiceInfo) -> bool {
+	false
+}
+
+/// Every recorded service of the state dir whose process is still alive (or cannot be proved dead);
+/// records of exited processes are removed so `status` and `stop` never stall probing dead ports.
 fn recorded(state_dir: &Path) -> Vec<ServiceInfo> {
 	let Ok(entries) = std::fs::read_dir(services_dir(state_dir)) else {
 		return Vec::new();
 	};
-	entries.flatten().filter(|entry| entry.path().extension().is_some_and(|extension| extension == "json")).filter_map(|entry| read_info(&entry.path())).collect()
+	entries
+		.flatten()
+		.filter(|entry| entry.path().extension().is_some_and(|extension| extension == "json"))
+		.filter_map(|entry| {
+			let path = entry.path();
+			let info = read_info(&path)?;
+			if process_dead(&info) {
+				let _ = std::fs::remove_file(&path);
+				return None;
+			}
+			Some(info)
+		})
+		.collect()
 }
 
 fn health(port: u16) -> Option<serde_json::Value> {
@@ -59,13 +116,16 @@ pub fn stop(state_dir: &Path) -> Result<usize> {
 }
 
 /// The port of a service running this build, starting one if needed.
-pub fn ensure(state_dir: &Path, offline: bool) -> Result<u16> {
-	let build = service_id(&build_id(), offline);
+/// Online and `--offline` callers share one service; offline jobs pass `X-ROR-Offline: 1`.
+pub fn ensure(state_dir: &Path, _offline: bool) -> Result<u16> {
+	let build = service_id(&build_id(), false);
 	let record = build_info_path(state_dir, &build);
-	if let Some(info) = read_info(&record)
-		&& ready(&info, &build)
-	{
-		return Ok(info.port);
+	if let Some(info) = read_info(&record) {
+		if process_dead(&info) {
+			let _ = std::fs::remove_file(&record);
+		} else if ready(&info, &build) {
+			return Ok(info.port);
+		}
 	}
 	std::fs::create_dir_all(services_dir(state_dir))?;
 	let lock = services_dir(state_dir).join(format!("{build}.lock"));
@@ -76,6 +136,7 @@ pub fn ensure(state_dir: &Path, offline: bool) -> Result<u16> {
 			Err(_) => {
 				// someone else is starting it: wait for theirs, or take over a stale lock
 				if let Some(info) = read_info(&record)
+					&& !process_dead(&info)
 					&& ready(&info, &build)
 				{
 					return Ok(info.port);
@@ -94,12 +155,13 @@ pub fn ensure(state_dir: &Path, offline: bool) -> Result<u16> {
 	}
 	// the previous holder may have started one just before releasing the lock
 	if let Some(info) = read_info(&record)
+		&& !process_dead(&info)
 		&& ready(&info, &build)
 	{
 		let _ = std::fs::remove_file(&lock);
 		return Ok(info.port);
 	}
-	let result = start(state_dir, offline, &build);
+	let result = start(state_dir, false, &build);
 	let _ = std::fs::remove_file(&lock);
 	result
 }
@@ -229,9 +291,10 @@ fn start_from(state_dir: &Path, offline: bool, build: &str, exe: PathBuf, source
 			&& info.pid == pid
 			&& health(info.port).is_some()
 		{
-			// earlier builds of the same executable are superseded: let them finish and exit
+			// earlier builds (and legacy `+offline` splits) of the same executable are superseded: let them finish and exit
 			for old in recorded(state_dir) {
-				if build_of(&old.build) != build_of(build) && old.source.is_some() && old.source == source {
+				let legacy_offline = old.build != build && old.build.split('+').any(|part| part == "offline");
+				if (build_of(&old.build) != build_of(build) || legacy_offline) && old.source.is_some() && old.source == source {
 					let _ = http::request(old.port, "POST", "/shutdown", b"{}", Duration::from_secs(3));
 				}
 			}
@@ -339,9 +402,13 @@ pub fn video(state_dir: &Path, job: &crate::video::VideoJob, offline: bool) -> R
 }
 
 /// The request's header lines: ror's, notes wanted (what the job says while it waits is printed on
-/// stderr as it comes, service::Reply), and this command's settings for its job ([`crate::CALLER_SETTINGS`]).
-fn job_header() -> String {
+/// stderr as it comes, service::Reply), per-request offline mode (`X-ROR-Offline: 1`), and this
+/// command's settings for its job ([`crate::CALLER_SETTINGS`]).
+fn job_header(offline: bool) -> String {
 	let mut header = "X-ROR: 1\r\nX-ROR-Notes: 1".to_string();
+	if offline {
+		header.push_str("\r\nX-ROR-Offline: 1");
+	}
 	for name in crate::CALLER_SETTINGS {
 		if let Ok(value) = std::env::var(name) {
 			header.push_str(&format!("\r\nX-ROR-Setting: {name}={}", value.trim()));
@@ -356,7 +423,7 @@ fn job_header() -> String {
 /// twice was drawn twice, once for nobody).
 fn post(state_dir: &Path, route: &str, body: &[u8], offline: bool, timeout: Duration) -> Result<serde_json::Value> {
 	let log = state_dir.join("serve.log");
-	let header = job_header();
+	let header = job_header(offline);
 	let mut attempt = 0;
 	loop {
 		attempt += 1;
@@ -402,5 +469,40 @@ mod tests {
 		assert_eq!(relative_here(Some(PathBuf::from("project"))), Some(here.join("project")));
 		let named = std::env::temp_dir().join("named");
 		assert_eq!(relative_here(Some(named.clone())), Some(named));
+	}
+
+	#[test]
+	fn job_header_carries_offline_only_when_requested() {
+		assert!(!job_header(false).contains("X-ROR-Offline"));
+		assert!(job_header(true).contains("X-ROR-Offline: 1"));
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn stale_dead_pid_records_are_pruned_and_live_records_stay() {
+		let state = std::env::temp_dir().join(format!("ror-prune-records-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&state);
+		let dir = services_dir(&state);
+		std::fs::create_dir_all(&dir).unwrap();
+		let now = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+		let write = |name: &str, value: serde_json::Value| {
+			std::fs::write(dir.join(format!("{name}.json")), value.to_string()).unwrap();
+		};
+		// Dead PID (including an old-format record without `source` and a legacy `+offline` record).
+		write("old-no-source", serde_json::json!({ "port": 1, "pid": 999996, "build": "0.1.0-1-1", "started": now }));
+		write("dead-offline", serde_json::json!({ "port": 2, "pid": 999992, "build": "0.1.0-1-2+offline", "started": now, "source": "C:/old/ror.exe" }));
+		// PID reuse: current live PID, but the record claims it started long before this process was created.
+		write("reused-pid", serde_json::json!({ "port": 3, "pid": std::process::id(), "build": "0.1.0-1-3", "started": 1 }));
+		// Live record: current process PID with current timestamp must stay.
+		write("live", serde_json::json!({ "port": 4, "pid": std::process::id(), "build": "0.1.0-1-4", "started": now }));
+
+		let kept = recorded(&state);
+		assert_eq!(kept.len(), 1, "only the live record should remain: {kept:?}");
+		assert_eq!(kept[0].build, "0.1.0-1-4");
+		assert!(!dir.join("old-no-source.json").exists());
+		assert!(!dir.join("dead-offline.json").exists());
+		assert!(!dir.join("reused-pid.json").exists());
+		assert!(dir.join("live.json").exists());
+		let _ = std::fs::remove_dir_all(&state);
 	}
 }

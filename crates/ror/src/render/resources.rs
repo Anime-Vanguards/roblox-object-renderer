@@ -396,27 +396,58 @@ const FAILURE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 /// A keyed cache with load de-duplication and an LRU byte budget.
 pub struct Cache<K, V> {
 	entries: Mutex<HashMap<K, Entry<V>>>,
+	/// In-flight loads and cached failures from offline views on an online service (`offline_view`).
+	/// Kept separate from `entries` so offline misses deduplicate across concurrent threads and
+	/// repeat frames (with [`FAILURE_TTL`]) without blocking or poisoning online loads; offline
+	/// successes are promoted into `entries` and removed here so this map holds zero GPU bytes at rest.
+	offline: Mutex<HashMap<K, Entry<V>>>,
 	tick: AtomicU64,
 	budget: u64,
 	pub hits: AtomicU64,
 	pub misses: AtomicU64,
 	/// Failures let go of before [`FAILURE_TTL`] ([`Cache::shrink_to`]): their next request retries them
 	dropped_failures: AtomicU64,
+	/// Offline-view failures let go of or superseded by a later online success
+	dropped_offline_failures: AtomicU64,
 }
 
 impl<K: Eq + Hash + Clone, V: Weighed> Cache<K, V> {
 	pub fn new(budget: u64) -> Self {
-		Self { entries: Mutex::new(HashMap::new()), tick: AtomicU64::new(0), budget, hits: AtomicU64::new(0), misses: AtomicU64::new(0), dropped_failures: AtomicU64::new(0) }
+		Self {
+			entries: Mutex::new(HashMap::new()),
+			offline: Mutex::new(HashMap::new()),
+			tick: AtomicU64::new(0),
+			budget,
+			hits: AtomicU64::new(0),
+			misses: AtomicU64::new(0),
+			dropped_failures: AtomicU64::new(0),
+			dropped_offline_failures: AtomicU64::new(0),
+		}
 	}
 
 	/// When the first failure it remembers now is retried (`None`: it remembers none), and
 	/// [`Cache::dropped_failures`]: what a preparation shaped by its failures may stand for a fresh one
 	/// until (render::prepared::Failures).
 	pub fn failures(&self) -> (Option<std::time::Instant>, u64) {
+		self.failures_for(false)
+	}
+
+	/// Like [`Cache::failures`], including isolated offline-view failures when `offline_view` is `true`.
+	pub fn failures_for(&self, offline_view: bool) -> (Option<std::time::Instant>, u64) {
 		let now = std::time::Instant::now();
-		let entries = self.entries.lock();
-		let first = entries.values().filter(|entry| matches!(entry.cell.get(), Some(Err(_)))).map(|entry| entry.created + FAILURE_TTL).filter(|retried| *retried > now).min();
-		(first, self.dropped_failures())
+		let mut first = {
+			let entries = self.entries.lock();
+			entries.values().filter(|entry| matches!(entry.cell.get(), Some(Err(_)))).map(|entry| entry.created + FAILURE_TTL).filter(|retried| *retried > now).min()
+		};
+		if offline_view {
+			let offline = self.offline.lock();
+			let offline_first = offline.values().filter(|entry| matches!(entry.cell.get(), Some(Err(_)))).map(|entry| entry.created + FAILURE_TTL).filter(|retried| *retried > now).min();
+			first = match (first, offline_first) {
+				(Some(a), Some(b)) => Some(a.min(b)),
+				(a, b) => a.or(b),
+			};
+		}
+		(first, self.dropped_failures_for(offline_view))
 	}
 
 	/// How many failures it has let go of before their time ([`Cache::shrink_to`]).
@@ -424,10 +455,96 @@ impl<K: Eq + Hash + Clone, V: Weighed> Cache<K, V> {
 		self.dropped_failures.load(Ordering::Relaxed)
 	}
 
+	/// Like [`Cache::dropped_failures`], including isolated offline-view failures when `offline_view` is `true`.
+	pub fn dropped_failures_for(&self, offline_view: bool) -> u64 {
+		self.dropped_failures() + if offline_view { self.dropped_offline_failures.load(Ordering::Relaxed) } else { 0 }
+	}
+
 	/// The cached value for `key`, loading it with `load` if absent. Concurrent callers with the
 	/// same key share one load; a failure is remembered for [`FAILURE_TTL`], then retried.
 	pub fn get_or_load(&self, key: &K, load: impl FnOnce() -> Result<V>) -> Result<Arc<V>> {
+		self.get_or_load_for(key, false, load)
+	}
+
+	/// Like [`Cache::get_or_load`], isolating misses when `offline_view` is `true` (an offline view
+	/// on an online service): successes share the main cache in both directions, while offline
+	/// in-flight loads and [`FAILURE_TTL`] failures stay in `offline` so they deduplicate across
+	/// concurrent offline threads and repeat frames without poisoning online loads.
+	pub fn get_or_load_for(&self, key: &K, offline_view: bool, load: impl FnOnce() -> Result<V>) -> Result<Arc<V>> {
 		let tick = self.tick.fetch_add(1, Ordering::Relaxed);
+		if offline_view {
+			{
+				let mut entries = self.entries.lock();
+				if let Some(entry) = entries.get_mut(key) {
+					match entry.cell.get() {
+						Some(Ok(value)) => {
+							entry.last_used = tick;
+							self.hits.fetch_add(1, Ordering::Relaxed);
+							return Ok(value.clone());
+						}
+						Some(Err(error)) if entry.created.elapsed() <= FAILURE_TTL => {
+							entry.last_used = tick;
+							self.hits.fetch_add(1, Ordering::Relaxed);
+							return Err(anyhow!(error.clone()));
+						}
+						_ => {}
+					}
+				}
+			}
+			let cell = {
+				let mut offline = self.offline.lock();
+				match offline.get_mut(key) {
+					Some(entry) if !(matches!(entry.cell.get(), Some(Err(_))) && entry.created.elapsed() > FAILURE_TTL) => {
+						entry.last_used = tick;
+						entry.cell.clone()
+					}
+					_ => {
+						let cell = Arc::new(OnceLock::new());
+						offline.insert(key.clone(), Entry { cell: cell.clone(), last_used: tick, created: std::time::Instant::now() });
+						cell
+					}
+				}
+			};
+			let mut loaded = false;
+			let result = cell
+				.get_or_init(|| {
+					loaded = true;
+					load().map(Arc::new).map_err(|error| format!("{error:#}"))
+				})
+				.clone();
+			if loaded {
+				self.misses.fetch_add(1, Ordering::Relaxed);
+			} else {
+				self.hits.fetch_add(1, Ordering::Relaxed);
+			}
+			return match result {
+				Ok(value) => {
+					if loaded {
+						let shared = Arc::new(OnceLock::new());
+						let _ = shared.set(Ok(value.clone()));
+						{
+							let mut entries = self.entries.lock();
+							let replace = match entries.get(key) {
+								None => true,
+								Some(entry) => matches!(entry.cell.get(), Some(Err(_))),
+							};
+							if replace {
+								entries.insert(key.clone(), Entry { cell: shared, last_used: tick, created: std::time::Instant::now() });
+							}
+						}
+						{
+							let mut offline = self.offline.lock();
+							if offline.get(key).is_some_and(|entry| Arc::ptr_eq(&entry.cell, &cell)) {
+								offline.remove(key);
+							}
+						}
+						self.evict();
+					}
+					Ok(value)
+				}
+				Err(error) => Err(anyhow!(error)),
+			};
+		}
 		let cell = {
 			let mut entries = self.entries.lock();
 			// a hit neither clones the key nor allocates while the lock is held
@@ -458,6 +575,9 @@ impl<K: Eq + Hash + Clone, V: Weighed> Cache<K, V> {
 		match result {
 			Ok(value) => {
 				if loaded {
+					if self.offline.lock().remove(key).is_some() {
+						self.dropped_offline_failures.fetch_add(1, Ordering::Relaxed);
+					}
 					self.evict();
 				}
 				Ok(value)
@@ -513,6 +633,22 @@ impl<K: Eq + Hash + Clone, V: Weighed> Cache<K, V> {
 	/// scene with more textures than the budget loaded some again for each part that drew them);
 	/// counted, a scene held past the budget would leave no room for what its frames load and let go.
 	pub fn shrink_to(&self, budget: u64) -> u64 {
+		{
+			let mut offline = self.offline.lock();
+			let mut dropped = 0u64;
+			offline.retain(|_, entry| match entry.cell.get() {
+				Some(Err(_)) if budget == 0 || entry.created.elapsed() > FAILURE_TTL => {
+					if entry.created.elapsed() <= FAILURE_TTL {
+						dropped += 1;
+					}
+					false
+				}
+				_ => true,
+			});
+			if dropped > 0 {
+				self.dropped_offline_failures.fetch_add(dropped, Ordering::Relaxed);
+			}
+		}
 		let mut entries = self.entries.lock();
 		let mut total: u64 = entries.values().filter_map(Self::idle).sum();
 		let before = total;
@@ -590,6 +726,27 @@ mod tests {
 		cache.fit();
 		assert_eq!(cache.failures(), (None, 1), "let go of, and counted");
 		assert!(cache.get(&2).is_none() && cache.get(&3).is_some());
+	}
+
+	#[test]
+	fn offline_failures_deduplicate_without_poisoning_online_cache() {
+		let cache: Cache<u32, Blob> = Cache::new(100);
+		assert!(cache.get_or_load_for(&1, true, || Err(anyhow!("offline and not cached"))).is_err());
+		// Online sees no cached failure, while repeated offline lookups hit the offline failure cache.
+		assert_eq!(cache.failures(), (None, 0), "offline-view failure must not appear in online failures");
+		assert!(cache.failures_for(true).0.is_some(), "offline-view failure is remembered for offline callers");
+		assert!(cache.get_or_load_for(&1, true, || panic!("offline failure should be cached")).is_err());
+		// Online fetch succeeds, shares the value with offline, and clears the stale offline failure.
+		let loaded = cache.get_or_load(&1, || Ok(Blob(40))).unwrap();
+		assert_eq!(loaded.0, 40);
+		assert_eq!(cache.dropped_failures_for(true), 1, "superseded offline failure counted");
+		let hit = cache.get_or_load_for(&1, true, || panic!("should hit cached success")).unwrap();
+		assert!(Arc::ptr_eq(&loaded, &hit));
+		// An offline-view success is promoted into the shared cache and removed from `offline`.
+		let from_disk = cache.get_or_load_for(&2, true, || Ok(Blob(20))).unwrap();
+		let shared = cache.get_or_load(&2, || panic!("should hit cached offline success")).unwrap();
+		assert!(Arc::ptr_eq(&from_disk, &shared));
+		assert!(cache.offline.lock().is_empty(), "offline map holds zero GPU values at rest");
 	}
 }
 
