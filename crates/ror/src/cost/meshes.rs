@@ -135,10 +135,11 @@ fn stats_of(mesh: &ror_mesh::Mesh) -> MeshStats {
 	let bounds = mesh.lod0_bounds().map(|(min, max)| (Vec3::from(min), Vec3::from(max))).unwrap_or((Vec3::ZERO, Vec3::ZERO));
 	const AXES: [Vec3; 6] = [Vec3::X, Vec3::Y, Vec3::Z, Vec3::NEG_X, Vec3::NEG_Y, Vec3::NEG_Z];
 	let mut facing = [0u32; 6];
-	// ROR_COST_FACING_MIN: the cosine a triangle's normal must exceed toward a face to count as facing it (default 0: any
-	// positive component, about three faces per triangle). Studio drew a quarter of that for 108 Textures on 18 meshes
-	// (notes/cost.md "Decals and Textures on meshes"); no value fits both its triangles and its draws, so it stays 0.
-	let facing_min: f32 = std::env::var("ROR_COST_FACING_MIN").ok().and_then(|value| value.parse().ok()).unwrap_or(0.0);
+	// Default: assign each triangle to its single dominant box face (matching mesh.wgsl's `box_face`
+	// for MeshPart decals), so the six faces partition the mesh (~1x total, ~1/6 per face on an
+	// isotropic mesh) and faces with no matching triangles stay at 0. Setting `ROR_COST_FACING_MIN`
+	// overrides this with the legacy cosine threshold (`normal.dot(axis) > min`).
+	let facing_min: Option<f32> = std::env::var("ROR_COST_FACING_MIN").ok().and_then(|value| value.parse().ok());
 	let positions = indices
 		.iter()
 		.map(|&index| {
@@ -156,10 +157,14 @@ fn stats_of(mesh: &ror_mesh::Mesh) -> MeshStats {
 		if normal.length_squared() > 0.0 {
 			// NormalId order: Right +X, Top +Y, Back +Z, Left -X, Bottom -Y, Front -Z
 			let normal = normal.normalize();
-			for (face, axis) in AXES.iter().enumerate() {
-				if normal.dot(*axis) > facing_min {
-					facing[face] += 1;
+			if let Some(min) = facing_min {
+				for (face, axis) in AXES.iter().enumerate() {
+					if normal.dot(*axis) > min {
+						facing[face] += 1;
+					}
 				}
+			} else {
+				facing[box_face(normal)] += 1;
 			}
 		}
 		if full {
@@ -167,4 +172,56 @@ fn stats_of(mesh: &ror_mesh::Mesh) -> MeshStats {
 		}
 	}
 	MeshStats { lods, shape: hash, bounds, facing, positions, occluder: full.then(|| Arc::new(triangles)), skinned: mesh.skinning.is_some(), high_quality: mesh.high_quality_lods }
+}
+
+/// The box face (`Enum.NormalId` order: Right +X, Top +Y, Back +Z, Left -X, Bottom -Y, Front -Z)
+/// that `direction` points most nearly toward, matching `mesh.wgsl`'s `box_face`.
+fn box_face(direction: Vec3) -> usize {
+	let a = direction.abs();
+	if a.x >= a.y && a.x >= a.z {
+		if direction.x > 0.0 { 0 } else { 3 }
+	} else if a.y >= a.z {
+		if direction.y > 0.0 { 1 } else { 4 }
+	} else if direction.z > 0.0 {
+		2
+	} else {
+		5
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn mesh_from_tris(tris: &[[[f32; 3]; 3]]) -> ror_mesh::Mesh {
+		let mut mesh = ror_mesh::Mesh::default();
+		for tri in tris {
+			let base = mesh.positions.len() as u32;
+			mesh.positions.extend_from_slice(tri);
+			mesh.indices.extend_from_slice(&[base, base + 1, base + 2]);
+		}
+		mesh
+	}
+
+	#[test]
+	fn dominant_axis_assigns_each_triangle_to_one_face() {
+		// Flat +Y quad (2 triangles strictly facing Top / +Y)
+		let flat = mesh_from_tris(&[
+			[[-1.0, 0.0, 1.0], [1.0, 0.0, 1.0], [1.0, 0.0, -1.0]],
+			[[-1.0, 0.0, 1.0], [1.0, 0.0, -1.0], [-1.0, 0.0, -1.0]],
+		]);
+		let stats = stats_of(&flat);
+		assert_eq!(stats.facing, [0, 2, 0, 0, 0, 0]);
+
+		// Octahedron (8 tilted faces, none axis-aligned): dominant axis partitions all 8 triangles
+		let (px, nx) = ([1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]);
+		let (py, ny) = ([0.0, 1.0, 0.0], [0.0, -1.0, 0.0]);
+		let (pz, nz) = ([0.0, 0.0, 1.0], [0.0, 0.0, -1.0]);
+		let oct = mesh_from_tris(&[
+			[py, pz, px], [py, px, nz], [py, nz, nx], [py, nx, pz],
+			[ny, px, pz], [ny, nz, px], [ny, nx, nz], [ny, pz, nx],
+		]);
+		let oct_stats = stats_of(&oct);
+		assert_eq!(oct_stats.facing.iter().sum::<u32>(), 8);
+	}
 }

@@ -124,4 +124,4 @@ Across 472 views of 10 game maps, `ror cost` matched Studio's total draw calls w
 
 Known caveats:
 - Individual views can diverge due to Roblox's adaptive CPU occlusion budget; use `--no-occlusion` for the frustum-only ceiling.
-- Decals on meshes are counted using the mesh triangles facing the decal's normal, which is an approximation of Studio's exact count.
+- Decals and Textures on meshes are counted by assigning each full-detail triangle to its single dominant box face (matching the renderer's `box_face` projection rule) and skipping faces with zero assigned triangles on loaded meshes. Set `ROR_COST_FACING_MIN` to override with a cosine threshold.

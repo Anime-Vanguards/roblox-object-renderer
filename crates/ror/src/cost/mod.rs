@@ -776,6 +776,10 @@ impl Analysis {
 				continue;
 			}
 			for decal in part.decals.iter().filter(|decal| decal.transparency < 1.0) {
+				let triangles = decal_triangles(part, decal.face, &meshes);
+				if triangles == 0 {
+					continue;
+				}
 				let (kind, class) = if decal.tiling.is_some() { (Kind::Texture, "Texture") } else { (Kind::Decal, "Decal") };
 				// and per what they lie on: its geometry, material and whether it draws opaque, transparent
 				// or not at all (m1, m2: one image on blocks and two meshes three draws, on blocks of two
@@ -794,7 +798,7 @@ impl Analysis {
 					// on a transparent or invisible part they join the transparent queue (t1, m10)
 					sorted: false,
 					draws: 1,
-					triangles: vec![decal_triangles(part, decal.face, &meshes)],
+					triangles: vec![triangles],
 					lod: None,
 					cull: (cluster == Cluster::Static).then(|| part.size.length()),
 					bounds,
@@ -959,8 +963,9 @@ impl Analysis {
 		if !matches!(technology, 4 | 5) {
 			warnings.push(format!("Lighting.Technology {technology}: the rules were measured under Future and Unified"));
 		}
-		// Decals and Textures on meshes: counted as the mesh's triangles with a positive component toward the
-		// face, which Studio does not match (notes/cost.md "Decals and Textures on meshes", case e146)
+		// Decals and Textures on meshes: each triangle is assigned to its single dominant box face
+		// (matching mesh.wgsl's `box_face`) and faces with zero triangles submit no draw (notes/cost.md
+		// "Decals and Textures on meshes", case e146).
 		let (mesh_decals, mesh_decal_triangles) = items
 			.iter()
 			.filter(|item| matches!(item.kind, Kind::Decal | Kind::Texture))
@@ -968,7 +973,7 @@ impl Analysis {
 			.fold((0u32, 0u32), |(count, sum), item| (count + 1, sum + item.triangles.first().copied().unwrap_or(0)));
 		if mesh_decals >= 20 && mesh_decal_triangles >= 20_000 {
 			warnings.push(format!(
-				"{mesh_decals} Decals or Textures on meshes count {mesh_decal_triangles} triangles: a face's share of a mesh is not calibrated, Studio drew about a quarter of it (108 Textures on 18 meshes: 145k here, 35.7k and 72 of 108 draws in Studio); read those triangles and draws as an upper bound"
+				"{mesh_decals} Decals or Textures on meshes count {mesh_decal_triangles} triangles: counted by dominant-axis face assignment (approximating Studio's per-face clipping)"
 			));
 		}
 		let mesh_streaming = document
@@ -2230,5 +2235,49 @@ mod tests {
 		assert_eq!(tested_group("MainLobby.Assets.Model.Model.challengedoor1.default"), "challengedoor1 (MainLobby.Assets.Model.Model)");
 		assert_eq!(tested_group("MainLobby.Assets.Model.Part"), "loose parts in MainLobby.Assets.Model");
 		assert_eq!(tested_group(r#"Map.Assets.Bush["Plane.049"]"#), "Bush (Map.Assets)");
+	}
+
+	#[test]
+	fn mesh_decals_skip_zero_triangle_faces_while_block_decals_keep_all_six() {
+		let temp = std::env::temp_dir().join(format!("ror-cost-decal-test-{}", std::process::id()));
+		let _ = std::fs::create_dir_all(&temp);
+		let mesh_path = temp.join("flat_top.mesh");
+		let mesh_text = concat!(
+			"version 1.01\n2\n",
+			"[-1,0,1][0,1,0][0,0,0][1,0,1][0,1,0][1,0,0][1,0,-1][0,1,0][0,1,0]",
+			"[-1,0,1][0,1,0][0,0,0][1,0,-1][0,1,0][1,0,0][-1,0,-1][0,1,0][0,1,0]\n"
+		);
+		std::fs::write(&mesh_path, mesh_text).unwrap();
+		let mesh_uri = format!("file://{}", mesh_path.to_string_lossy().replace('\\', "/"));
+
+		let mut model = ModelBuilder::new("MeshDecal");
+		let mp = model.child(
+			model.model,
+			InstanceBuilder::new("MeshPart")
+				.with_name("Flat")
+				.with_property("Size", rbx_dom_weak::types::Vector3::new(4.0, 0.2, 4.0))
+				.with_property("InitialSize", rbx_dom_weak::types::Vector3::new(2.0, 0.1, 2.0))
+				.with_property("MeshId", rbx_dom_weak::types::ContentId::from(mesh_uri))
+				.with_property("CFrame", crate::scene::build::cframe(Affine3A::IDENTITY)),
+		);
+		for face in 0..6u32 {
+			model.child(mp, InstanceBuilder::new("Texture").with_name(format!("T{face}")).with_property("Texture", "rbxasset://textures/face.png").with_property("Face", Enum::from_u32(face)));
+		}
+		let v = view(&analyze(model).0);
+		let tex_batches: Vec<&Batch> = v.batches.iter().filter(|b| b.kind == Kind::Texture).collect();
+		assert_eq!(tex_batches.iter().map(|b| b.draws).sum::<u64>(), 1);
+		assert_eq!(tex_batches.iter().map(|b| b.triangles).sum::<u64>(), 2);
+
+		// Plain block still submits all 6 faces x 2 tris = 12 tris
+		let mut block_model = ModelBuilder::new("BlockDecal");
+		let block = block_model.part(&PartSpec { size: Vec3::splat(4.0), ..Default::default() });
+		for face in 0..6u32 {
+			block_model.child(block, InstanceBuilder::new("Texture").with_name(format!("T{face}")).with_property("Texture", "rbxasset://textures/face.png").with_property("Face", Enum::from_u32(face)));
+		}
+		let bv = view(&analyze(block_model).0);
+		let btex: Vec<&Batch> = bv.batches.iter().filter(|b| b.kind == Kind::Texture).collect();
+		assert_eq!(btex.iter().map(|b| b.draws).sum::<u64>(), 6);
+		assert_eq!(btex.iter().map(|b| b.triangles).sum::<u64>(), 12);
+		let _ = std::fs::remove_dir_all(&temp);
 	}
 }
