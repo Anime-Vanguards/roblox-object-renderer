@@ -6,12 +6,15 @@
 //! fight recording's 145 particle and beam textures took 290 ms of CPU that way, a map's 67 materials
 //! 80 ms of their first frame.
 //!
-//! Only textures whose source never changes are kept: an asset id's download is cached for good
-//! (ror-assets), a transcode's too; Studio's own content, local files and composites are made every
-//! time. `<code>` is a hash of the code that makes a texture's texels (build.rs: render::texels, the
-//! transcodes' code, ror-image and its locked dependencies), so another build's textures never stand
-//! in for this one's, and a rebuild that changed none of it finds them all. The least recently used
-//! go past [`budget`]; another code's folder a day after it was last used.
+//! Downloaded assets are keyed by URI (an asset id's download is cached for good in ror-assets, a
+//! transcode's too). Local files (`file://` or plain paths) are keyed by the BLAKE3 hash of their
+//! raw bytes (`local:v1`), so an unchanged local texture skips PNG/JPEG decode, mip generation and
+//! BC encoding across renders and wakes (and streams mips through `render::residency`), while a file
+//! rewritten in place produces a new key automatically. Studio's own content and composites are made
+//! every time. `<code>` is a hash of the code that makes a texture's texels (build.rs:
+//! render::texels, the transcodes' code, ror-image and its locked dependencies), so another build's
+//! textures never stand in for this one's, and a rebuild that changed none of it finds them all. The
+//! least recently used go past [`budget`]; another code's folder a day after it was last used.
 //!
 //! The content store (ror_assets::store) keeps them for every state dir: a texture this state dir
 //! has not kept is taken from the store's `textures/<code>/` (hard-linked in, its header checked
@@ -52,13 +55,24 @@ pub(super) fn cacheable(key: &str) -> bool {
 	!key.contains('#') && matches!(ror_assets::ContentId::parse(source), Ok(ror_assets::ContentId::Asset { .. }))
 }
 
-fn directory() -> PathBuf {
-	crate::output::state_dir().join("textures").join(CODE)
+/// The local file path a texture key names (no `#` fragment, composite or transcode layer).
+fn local_file_path(key: &str) -> Option<PathBuf> {
+	if key.contains('#') || key.starts_with(super::composite::KEY_PREFIX) || super::transcode::parse_layer_key(key).is_some() {
+		return None;
+	}
+	match ror_assets::ContentId::parse(key) {
+		Ok(ror_assets::ContentId::File(path)) => Some(path),
+		_ => None,
+	}
+}
+
+fn directory_for(state_dir: &Path) -> PathBuf {
+	state_dir.join("textures").join(CODE)
 }
 
 /// The content store's folder of this code's textures.
-fn store_directory() -> Option<PathBuf> {
-	crate::output::store_dir().map(|store| store.join("textures").join(CODE))
+fn store_directory_for(store: Option<&Path>) -> Option<PathBuf> {
+	store.map(|store| store.join("textures").join(CODE))
 }
 
 /// The file name the texture of `key` drawn as `usage` is kept under (`bc`: the device takes
@@ -68,40 +82,54 @@ fn name(key: &str, usage: TextureUse, bc: bool) -> String {
 	format!("{}.tex", &hash.to_hex()[..32])
 }
 
+/// The file name a local file with `bytes` drawn as `usage` is kept under, keyed by its content.
+fn local_name(bytes: &[u8], usage: TextureUse, bc: bool) -> String {
+	let content = blake3::hash(bytes).to_hex();
+	name(&format!("local:v1\n{content}"), usage, bc)
+}
+
 /// Keeps the texture made from `image` (as uploaded, `GpuTexture::uploadable`) for `usage` at
 /// `path`; false when its levels are not whole (it is then made every time) or it could not be
-/// written.
+/// written. Uses a unique temp file per write (`ror_assets::store::write`), so concurrent writers
+/// racing on the same `.tex` key never collide.
 pub(super) fn write(path: &Path, image: &ror_image::Image, usage: TextureUse) -> bool {
 	let Some(bytes) = super::texels::file_bytes(image, usage) else {
 		return false;
 	};
-	let written = crate::output::write_atomic(path, &bytes).is_ok();
-	prune();
+	let written = ror_assets::store::write(path, &bytes).is_ok();
+	if let Some(dir) = path.parent() {
+		prune_dir(dir);
+	}
 	written
 }
 
 /// Gives the content store the texture kept at `path` (a name of the same file).
-fn publish(path: &Path) {
-	if let Some(store) = store_directory()
+fn publish_to(path: &Path, store_root: Option<&Path>) {
+	if let Some(store) = store_directory_for(store_root)
 		&& let Some(name) = path.file_name()
 		&& ror_assets::store::link(path, &store.join(name)).is_ok()
-		&& let Some(root) = crate::output::store_dir()
+		&& let Some(root) = store_root
 	{
-		ror_assets::store::maybe_prune(&root);
+		ror_assets::store::maybe_prune(root);
 	}
 }
 
 /// The texture kept as `name` elsewhere, the content store first, then another state dir that used
 /// it: a whole file (its header checked against its length) is made this state dir's too, at `own`
 /// (hard-linked), and the store's.
-fn take_kept(name: &str, own: &Path, label: &str) -> Option<GpuTexture> {
-	let store = store_directory().map(|store| (store.join(name), true));
-	let others = crate::output::other_state_dirs().iter().map(|dir| (dir.join("textures").join(CODE).join(name), false));
-	take_from(store.into_iter().chain(others), own, label)
+fn take_kept_for(state_dir: &Path, store_root: Option<&Path>, name: &str, own: &Path, label: &str) -> Option<GpuTexture> {
+	let store = store_directory_for(store_root).map(|store| (store.join(name), true));
+	let others: Vec<(PathBuf, bool)> = store_root
+		.map(|root| ror_assets::store::state_dirs(root, state_dir))
+		.unwrap_or_default()
+		.into_iter()
+		.map(|dir| (dir.join("textures").join(CODE).join(name), false))
+		.collect();
+	take_from(store.into_iter().chain(others), own, label, store_root)
 }
 
-/// [`take_kept`] from `candidates` (a file, and whether it is the store's).
-fn take_from(candidates: impl Iterator<Item = (PathBuf, bool)>, own: &Path, label: &str) -> Option<GpuTexture> {
+/// [`take_kept_for`] from `candidates` (a file, and whether it is the store's).
+fn take_from(candidates: impl Iterator<Item = (PathBuf, bool)>, own: &Path, label: &str, store_root: Option<&Path>) -> Option<GpuTexture> {
 	for (candidate, in_store) in candidates {
 		if !candidate.is_file() {
 			continue;
@@ -117,7 +145,7 @@ fn take_from(candidates: impl Iterator<Item = (PathBuf, bool)>, own: &Path, labe
 			return Some(found);
 		}
 		if !in_store {
-			publish(own);
+			publish_to(own, store_root);
 		}
 		return open(own, label).or(Some(found));
 	}
@@ -328,7 +356,7 @@ impl Staging {
 /// The texture kept at `path`, its levels read once asked for ([`GpuTexture::levels_from`]); `None`
 /// when there is none (or it cannot be read).
 pub(super) fn open(path: &Path, label: &str) -> Option<GpuTexture> {
-	let mut file = std::fs::File::options().read(true).write(true).open(path).ok()?;
+	let mut file = std::fs::File::options().read(true).write(true).open(path).or_else(|_| std::fs::File::open(path)).ok()?;
 	let mut head = [0u8; HEADER];
 	file.read_exact(&mut head).ok()?;
 	let header = header(&head)?;
@@ -350,30 +378,79 @@ pub(super) fn open(path: &Path, label: &str) -> Option<GpuTexture> {
 	Some(GpuTexture::on_disk(source, header.width, header.height, [flag(FLAG_ALPHA), flag(FLAG_DXT5NM), flag(FLAG_NORMAL_RG)], header.bytes))
 }
 
+/// Decodes a local image's bytes and builds its mips and block compression identically to
+/// `texels::source_image`, without touching `texels.rs` (whose hash is `ROR_TEXTURE_CODE`).
+fn decode_local(uri: &str, bytes: &[u8], usage: TextureUse, supports_bc: bool) -> Result<ror_image::Image> {
+	let mut image = ror_image::decode(bytes).map_err(|error| anyhow::anyhow!("{uri}: {error}"))?;
+	if image.format == ror_image::PixelFormat::Rgba8 && image.levels.len() <= 1 {
+		match usage {
+			TextureUse::Color => ror_image::generate_mips_with(&mut image, ror_image::MipFilter::Triangle, true),
+			TextureUse::Normal => super::texels::normal_mips(&mut image),
+			TextureUse::Data | TextureUse::Scalar => ror_image::generate_mips(&mut image),
+		}
+		let compressed = match usage {
+			TextureUse::Normal if !image.dxt5nm => ror_image::encode_bc5(&image),
+			TextureUse::Scalar => ror_image::encode_bc4(&image),
+			_ => None,
+		};
+		if let Some(compressed) = compressed.filter(|_| supports_bc) {
+			image = compressed;
+		}
+	}
+	Ok(image)
+}
+
 impl super::Renderer {
 	/// The texture of a texture cache key: a composite's, a transcode layer's (an image asset's, else
-	/// its upload) or an image's with ror's own mips; one made from a downloaded asset is kept on disk
-	/// as uploaded, found there the next time, and goes to the GPU from there once asked for
-	/// ([`GpuTexture::levels_from`]).
+	/// its upload), a local image file's (kept on disk by content hash so unchanged files skip decode
+	/// and stream mips through `residency`), or an image's with ror's own mips.
 	pub(super) fn make_texture(&self, uri: &str, usage: TextureUse) -> Result<GpuTexture> {
 		if uri.starts_with(super::composite::KEY_PREFIX) {
 			return self.composite_texture(uri);
 		}
+		let config = self.assets.config();
+		let state_dir = &config.state_dir;
+		let store_root = config.store.as_deref();
+		let dir = directory_for(state_dir);
+		if let Some(path) = local_file_path(uri) {
+			let bytes = std::fs::read(&path).map_err(|error| match error.kind() {
+				std::io::ErrorKind::NotFound => anyhow::anyhow!("{uri} not found"),
+				_ => anyhow::anyhow!("{uri}: {error}"),
+			})?;
+			let file_name = local_name(&bytes, usage, self.gpu.supports_bc());
+			let own = dir.join(&file_name);
+			if !config.refresh
+				&& let Some(texture) = open(&own, uri).or_else(|| take_kept_for(state_dir, store_root, &file_name, &own, uri))
+			{
+				mark_used_in(&dir);
+				return Ok(texture);
+			}
+			let image = decode_local(uri, &bytes, usage, self.gpu.supports_bc())?;
+			if write(&own, &GpuTexture::uploadable(&self.gpu, &image), usage)
+				&& let Some(texture) = open(&own, uri)
+			{
+				publish_to(&own, store_root);
+				mark_used_in(&dir);
+				return Ok(texture);
+			}
+			self.gpu_room(image.levels.iter().map(|level| level.len() as u64).sum())?;
+			return GpuTexture::upload(&self.gpu, uri, &image, usage);
+		}
 		let kept = cacheable(uri).then(|| name(uri, usage, self.gpu.supports_bc()));
-		if let Some(name) = kept.as_deref().filter(|_| !self.assets.config().refresh) {
-			let own = directory().join(name);
-			if let Some(texture) = open(&own, uri).or_else(|| take_kept(name, &own, uri)) {
-				mark_used();
+		if let Some(name) = kept.as_deref().filter(|_| !config.refresh) {
+			let own = dir.join(name);
+			if let Some(texture) = open(&own, uri).or_else(|| take_kept_for(state_dir, store_root, name, &own, uri)) {
+				mark_used_in(&dir);
 				return Ok(texture);
 			}
 		}
 		let image = self.texture_image(uri, usage)?;
 		if let Some(name) = &kept {
-			let own = directory().join(name);
+			let own = dir.join(name);
 			if write(&own, &GpuTexture::uploadable(&self.gpu, &image), usage)
 				&& let Some(texture) = open(&own, uri)
 			{
-				publish(&own);
+				publish_to(&own, store_root);
 				return Ok(texture);
 			}
 		}
@@ -384,21 +461,20 @@ impl super::Renderer {
 
 /// Marks this code's folder used (its `.used` file's time, which another code's prune goes by: a
 /// folder read from, not written to, keeps its own time), at most every [`MARK_USED_EVERY`].
-fn mark_used() {
+fn mark_used_in(folder: &Path) {
 	static LAST: Mutex<Option<Instant>> = Mutex::new(None);
 	let mut last = LAST.lock();
 	if last.is_some_and(|when| when.elapsed() < MARK_USED_EVERY) {
 		return;
 	}
 	*last = Some(Instant::now());
-	let folder = directory();
-	let _ = std::fs::create_dir_all(&folder);
+	let _ = std::fs::create_dir_all(folder);
 	let _ = std::fs::write(folder.join(".used"), b"");
 }
 
 /// Keeps the folder within [`budget`] (the least recently used go) and removes other codes' folders
 /// unused for [`OLD_CODES`], at most every [`PRUNE_EVERY`].
-fn prune() {
+fn prune_dir(directory: &Path) {
 	{
 		let mut last = LAST_PRUNE.lock();
 		if last.is_some_and(|when| when.elapsed() < PRUNE_EVERY) {
@@ -406,7 +482,6 @@ fn prune() {
 		}
 		*last = Some(Instant::now());
 	}
-	let directory = directory();
 	let modified = |path: &Path| std::fs::metadata(path).and_then(|metadata| metadata.modified()).ok();
 	if let Some(parent) = directory.parent()
 		&& let Ok(entries) = std::fs::read_dir(parent)
@@ -420,7 +495,7 @@ fn prune() {
 			}
 		}
 	}
-	let Ok(entries) = std::fs::read_dir(&directory) else {
+	let Ok(entries) = std::fs::read_dir(directory) else {
 		return;
 	};
 	let mut files: Vec<(SystemTime, u64, PathBuf)> = entries
@@ -546,11 +621,92 @@ mod tests {
 		let bytes = file_bytes(&other.join("a.tex"));
 		std::fs::write(store.join("a.tex"), &bytes[..bytes.len() - 1]).unwrap();
 		let candidates = || vec![(store.join("a.tex"), true), (other.join("a.tex"), false)].into_iter();
-		let taken = take_from(candidates(), &own.join("a.tex"), "test").expect("the other state dir's");
+		let taken = take_from(candidates(), &own.join("a.tex"), "test", None).expect("the other state dir's");
 		assert_eq!((taken.width, taken.height), (16, 8));
 		assert!(!store.join("a.tex").exists());
 		assert_eq!(file_bytes(&own.join("a.tex")), bytes, "a name of the same file");
-		assert!(take_from(vec![(store.join("b.tex"), true)].into_iter(), &own.join("b.tex"), "test").is_none());
+		assert!(take_from(vec![(store.join("b.tex"), true)].into_iter(), &own.join("b.tex"), "test", None).is_none());
+		let _ = std::fs::remove_dir_all(&directory);
+	}
+
+	#[test]
+	fn local_files_are_cached_by_content_and_streamed_from_disk() {
+		let state = std::env::temp_dir().join(format!("ror-local-tex-cache-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&state);
+		std::fs::create_dir_all(&state).unwrap();
+		let gpu = std::sync::Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = super::super::Renderer::new(gpu, assets).expect("a renderer");
+		let png_a = state.join("a.png");
+		let png_b = state.join("b.png");
+		let red = [240u8, 30, 20, 255].repeat(32 * 32);
+		crate::output::write_png(&png_a, 32, 32, &red, true).unwrap();
+		std::fs::copy(&png_a, &png_b).unwrap();
+		let uri = |p: &Path| format!("file:///{}", p.display().to_string().replace('\\', "/"));
+		// First load writes a content-addressed .tex file and returns an on-disk GpuTexture for residency
+		let tex_a = renderer.make_texture(&uri(&png_a), TextureUse::Color).unwrap();
+		assert!(tex_a.held().is_none(), "kept on disk until residency or load_whole asks for levels");
+		assert!(tex_a.max_base() > 0, "32x32 halves evenly for mip streaming");
+		let tex_dir = directory_for(&state);
+		let tex_count = || std::fs::read_dir(&tex_dir).unwrap().flatten().filter(|e| e.path().extension().is_some_and(|ext| ext == "tex")).count();
+		assert_eq!(tex_count(), 1, "one .tex written for png_a");
+		// Identical bytes at another path reuse the exact same .tex file
+		let tex_b = renderer.make_texture(&uri(&png_b), TextureUse::Color).unwrap();
+		assert!(tex_b.held().is_none());
+		assert_eq!(tex_count(), 1, "identical bytes at png_b share the same .tex");
+		// Rewriting png_a in place with different pixels (same 32x32 size) writes a new .tex
+		let green = [20u8, 220, 40, 255].repeat(32 * 32);
+		crate::output::write_png(&png_a, 32, 32, &green, true).unwrap();
+		let tex_a2 = renderer.make_texture(&uri(&png_a), TextureUse::Color).unwrap();
+		assert!(tex_a2.held().is_none());
+		assert_eq!(tex_count(), 2, "rewritten local file gets a new content-addressed .tex");
+		// A truncated/corrupted .tex (simulated dying writer) is rejected by open() and recreated cleanly
+		let raw_green = std::fs::read(&png_a).unwrap();
+		let green_tex = tex_dir.join(local_name(&raw_green, TextureUse::Color, renderer.gpu.supports_bc()));
+		let whole = file_bytes(&green_tex);
+		std::fs::write(&green_tex, &whole[..HEADER - 4]).unwrap();
+		assert!(open(&green_tex, "corrupt").is_none(), "truncated header rejected");
+		std::fs::write(&green_tex, &whole[..whole.len() - 1]).unwrap();
+		assert!(open(&green_tex, "truncated").is_none(), "truncated payload rejected");
+		let mut wrong_magic = whole.clone();
+		wrong_magic[..8].copy_from_slice(b"RORTEX0\0");
+		std::fs::write(&green_tex, &wrong_magic).unwrap();
+		assert!(open(&green_tex, "old-version").is_none(), "older layout magic rejected");
+		let healed = renderer.make_texture(&uri(&png_a), TextureUse::Color).unwrap();
+		assert!(healed.held().is_none());
+		assert_eq!(file_bytes(&green_tex), whole, "corrupt .tex replaced cleanly on next load");
+		drop((tex_a, tex_b, tex_a2, healed, renderer));
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	#[test]
+	fn concurrent_writers_of_one_texture_file_succeed_cleanly() {
+		let directory = std::env::temp_dir().join(format!("ror-texture-race-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&directory);
+		std::fs::create_dir_all(&directory).unwrap();
+		let path = directory.join("shared.tex");
+		let rgba: Vec<u8> = (0..32 * 32 * 4).map(|index| (index * 11 % 251) as u8).collect();
+		let mut image = ror_image::Image::from_rgba8(32, 32, rgba);
+		ror_image::generate_mips(&mut image);
+		let expected = super::super::texels::file_bytes(&image, TextureUse::Color).unwrap();
+		std::thread::scope(|scope| {
+			let handles: Vec<_> = (0..6)
+				.map(|_| {
+					let path = &path;
+					let image = &image;
+					scope.spawn(move || {
+						for _ in 0..8 {
+							assert!(write(path, image, TextureUse::Color));
+						}
+					})
+				})
+				.collect();
+			for handle in handles {
+				handle.join().unwrap();
+			}
+		});
+		assert_eq!(file_bytes(&path), expected);
+		assert!(open(&path, "shared").is_some());
 		let _ = std::fs::remove_dir_all(&directory);
 	}
 }

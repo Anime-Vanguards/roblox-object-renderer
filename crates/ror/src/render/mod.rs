@@ -827,10 +827,15 @@ mod surface_tests {
 		assert!(!Arc::ptr_eq(&first, &second), "the rewritten image drew with its first version's material");
 		assert_eq!(second.maps[0].as_ref().map(|map| map.width), Some(8));
 		assert_eq!(first.maps[0].as_ref().map(|map| map.width), Some(4));
+		// rewriting again immediately at the same dimensions and byte length still gets a new material
+		paint(8, [0, 0, 255, 255]);
+		let third = renderer.material_bind_group(&key, &mut missing);
+		assert!(missing.is_empty(), "{missing:?}");
+		assert!(!Arc::ptr_eq(&second, &third), "same-size immediate rewrite kept its previous material");
 		// an asset id's key is kept as it is
 		let asset = MaterialKey { color: Some("rbxassetid://123".into()), ..MaterialKey::default() };
 		assert!(matches!(asset.stamped(), std::borrow::Cow::Borrowed(_)));
-		drop((first, second, renderer));
+		drop((first, second, third, renderer));
 		let _ = std::fs::remove_dir_all(&state);
 	}
 
@@ -5763,8 +5768,21 @@ pub(crate) fn content_key(uri: &str) -> String {
 	match ror_assets::ContentId::parse(path) {
 		Ok(ror_assets::ContentId::File(file)) => match std::fs::metadata(&file) {
 			Ok(meta) => {
-				let modified = meta.modified().ok().and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |time| time.as_nanos());
-				format!("{uri}@{}:{modified}", meta.len())
+				let modified_time = meta.modified().ok();
+				let modified = modified_time.and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |time| time.as_nanos());
+				// Windows file mtimes can quantise to ~15.6 ms ticks: an in-place rewrite at the same
+				// byte length right after a render can keep `(len, mtime)`. Hash recently-modified files
+				// so `Renderer.textures` and `MaterialKey::stamped` never keep stale paint.
+				let recent = modified_time.is_none_or(|time| time.elapsed().map_or(true, |age| age < std::time::Duration::from_secs(2)));
+				if recent
+					&& meta.len() <= 64 << 20
+					&& let Ok(bytes) = std::fs::read(&file)
+				{
+					let hash = blake3::hash(&bytes);
+					format!("{uri}@{}:{modified}:{}", meta.len(), &hash.to_hex()[..16])
+				} else {
+					format!("{uri}@{}:{modified}", meta.len())
+				}
 			}
 			Err(_) => uri.to_string(),
 		},
