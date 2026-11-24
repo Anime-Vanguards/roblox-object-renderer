@@ -72,11 +72,14 @@ pub(super) struct Raster<'a> {
 }
 
 /// How a view draws the parts that read material maps: its camera and size, and its rasters (more
-/// than it may draw: what more covers only reads more levels).
+/// than it may draw: what more covers only reads more levels); and the parts whose colour map's alpha
+/// cuts their shadow, in view or not, each with the finest texel (studs) a shadow map of the view may
+/// draw it at (`Renderer::shadow_texels`).
 pub(super) struct ViewPlan<'a> {
 	camera: Camera,
 	render: (u32, u32),
 	rasters: Vec<Raster<'a>>,
+	shadows: Vec<(&'a DrawItem, f32)>,
 }
 
 /// What a clip's residency feedback has seen while its camera holds still: the view it drew (camera,
@@ -164,6 +167,11 @@ impl ViewGroups {
 	/// The bind group of a material the views draw.
 	pub fn of(&self, material: &MaterialBinding) -> &wgpu::BindGroup {
 		&self.groups[&(std::ptr::from_ref(material) as usize)]
+	}
+
+	/// The bind group of a material, when the views or their shadow maps draw it.
+	pub fn get(&self, material: &MaterialBinding) -> Option<&wgpu::BindGroup> {
+		self.groups.get(&(std::ptr::from_ref(material) as usize))
 	}
 }
 
@@ -254,7 +262,49 @@ impl Renderer {
 			rasters.push(Raster { width: render.0, height: render.1, samples: 1, draws: by_texels });
 		}
 		rasters.push(Raster { width: render.0, height: render.1, samples, draws });
-		ViewPlan { camera, render, rasters }
+		let shadows = self.shadow_texels(scene, prepared, &camera, width as f32 / height as f32);
+		ViewPlan { camera, render, rasters, shadows }
+	}
+
+	/// The parts whose colour map's alpha cuts their shadow (`DrawItem::shadow_cutout`) that a shadow map
+	/// of a view from `camera` may draw, each with the finest texel (studs) one draws it at: the finest
+	/// of the sun's cascades reaching it, a shadowed light's face at its near side. Their colour maps are
+	/// read for those maps whether the view shows them or not, from the level those texels pick (a
+	/// part out of view still shadows what it does).
+	fn shadow_texels<'a>(&self, scene: &Scene, prepared: &'a Prepared, camera: &Camera, aspect: f32) -> Vec<(&'a DrawItem, f32)> {
+		let cutouts: Vec<&DrawItem> = prepared.casters().draws.iter().filter(|draw| draw.shadow_cutout && !draw.decal).collect();
+		if cutouts.is_empty() {
+			return Vec::new();
+		}
+		let sun = prepared.sun_direction;
+		let cascades = match (prepared.sun_shadows, prepared.bounds) {
+			(true, Some(bounds)) => super::sun_cascades(camera, aspect, sun, bounds, scene.environment.shadow_softness),
+			_ => Vec::new(),
+		};
+		let lights: Vec<super::ShadowLight> = prepared.lights.iter().filter(|light| light.shadow[1] > 0.0).map(super::shadow_light).collect();
+		let size = super::light_shadow_size(lights.len().min(super::MAX_SHADOW_LIGHTS)) as f32;
+		let mut texels = Vec::new();
+		for draw in cutouts {
+			let mut texel = f32::INFINITY;
+			if draw.casts_shadow {
+				for cascade in cascades.iter().filter(|cascade| cascade.reaches(draw, sun)) {
+					texel = texel.min(cascade.texel());
+				}
+			}
+			if draw.casts_light_shadow {
+				for light in &lights {
+					let distance = draw.bound.0.distance(light.origin);
+					if distance <= light.reach + draw.bound.1 * 2.0 {
+						let half = if light.aim.w > 0.0 { light.aim.w } else { (super::LIGHT_SHADOW_FOV * 0.5).to_radians().tan() };
+						texel = texel.min(2.0 * (distance - draw.bound.1).max(draw.bound.1).max(light.near) * half / size);
+					}
+				}
+			}
+			if texel.is_finite() {
+				texels.push((draw, texel));
+			}
+		}
+		texels
 	}
 
 	/// The bind groups of the materials `plans` draw, their maps' levels read first: from [`MARGIN`]
@@ -269,18 +319,44 @@ impl Renderer {
 				materials.push(&draw.material);
 			}
 		}
-		// each map that may still read levels once: held from past its finest, or not yet
+		let viewed = materials.len();
+		// the colour maps the shadow maps cut casters by: from the level their texels pick, [`MARGIN`]
+		// levels finer (a map spread once across the part's sphere, as `worth_feedback` takes it); a
+		// caster the views do not draw binds its other maps' fallbacks
+		let mut shadow_bases: HashMap<u32, u32> = HashMap::new();
+		let mut shadow_maps: Vec<&Arc<GpuTexture>> = Vec::new();
+		for &(draw, texel) in plans.iter().flat_map(|plan| &plan.shadows) {
+			let Some(map) = draw.material.maps[0].as_ref().filter(|map| map.id != 0) else { continue };
+			let texels = map.width.max(map.height) as f32 * texel / (2.0 * draw.bound.1).max(1e-3);
+			let level = if texels > 1.0 { texels.log2().floor() as u32 } else { 0 };
+			let base = level.saturating_sub(MARGIN).min(map.max_base());
+			let entry = shadow_bases.entry(map.id).or_insert_with(|| {
+				shadow_maps.push(map);
+				u32::MAX
+			});
+			*entry = (*entry).min(base);
+			if seen.insert(Arc::as_ptr(&draw.material) as usize) {
+				materials.push(&draw.material);
+			}
+		}
+		// each map that may still read levels once: held from past its finest, or not yet; the views'
+		// maps, then the colour maps the shadows read
 		let mut maps: Vec<&Arc<GpuTexture>> = Vec::new();
 		let mut ids = std::collections::HashSet::new();
 		let mut slots = 0;
-		for material in &materials {
-			for map in material.maps.iter().flatten().filter(|map| map.id != 0) {
-				slots = slots.max(map.id + 1);
-				if map.held().is_none_or(|held| held.base > 0) && ids.insert(map.id) {
-					maps.push(map);
-				}
+		for map in materials[..viewed].iter().flat_map(|material| material.maps.iter().flatten()).filter(|map| map.id != 0 && !shadow_bases.contains_key(&map.id)).chain(shadow_maps) {
+			slots = slots.max(map.id + 1);
+			if map.held().is_none_or(|held| held.base > 0) && ids.insert(map.id) {
+				maps.push(map);
 			}
 		}
+		// the maps a view's own passes sample
+		let sampled: std::collections::HashSet<u32> = plans.iter().flat_map(|plan| plan.rasters.iter().flat_map(|raster| &raster.draws)).flat_map(|draw| draw.material.maps.iter().flatten()).map(|map| map.id).collect();
+		// at most the shadows' level of a map they cut casters by
+		let with_shadow = |map: &Arc<GpuTexture>, base: u32| shadow_bases.get(&map.id).map_or(base, |&shadow| base.min(shadow));
+		// where the views' maps go up whole: a map only the shadows read still from their level (unless
+		// residency is off)
+		let whole_but_shadows = |maps: &[&Arc<GpuTexture>]| -> Vec<u32> { maps.iter().map(|map| if enabled() && !sampled.contains(&map.id) { with_shadow(map, map.max_base()) } else { 0 }).collect() };
 		if !maps.is_empty() {
 			let from = self.residency_from.load(std::sync::atomic::Ordering::Relaxed);
 			let open: u64 = maps.iter().map(|map| map.full_bytes.saturating_sub(map.bytes())).sum();
@@ -288,7 +364,8 @@ impl Renderer {
 			// (ClipResidency), the others' maps go up whole
 			let unseen = clip.filter(|_| enabled() && !whole && open >= from).and_then(|(clip, _)| clip.unseen_maps(prepared, plans));
 			let bases: Vec<u32> = if let Some(unseen) = unseen {
-				maps.iter().map(|map| if unseen.contains(&map.id) { 0 } else { map.held().map_or(0, |held| held.base) }).collect()
+				// a map only the shadows read: from their level
+				maps.iter().map(|map| if unseen.contains(&map.id) { 0 } else { with_shadow(map, map.held().map_or(if sampled.contains(&map.id) { 0 } else { map.max_base() }, |held| held.base)) }).collect()
 			} else if enabled() && !whole && open >= from {
 				let start = Instant::now();
 				let codes = self.residency_feedback(prepared, plans, slots)?;
@@ -300,17 +377,17 @@ impl Renderer {
 					.iter()
 					.map(|map| match codes.get(map.id as usize).copied().unwrap_or(0) {
 						// sampled by no fragment: from its coarsest
-						0 => map.max_base(),
-						code => (32 - code).saturating_sub(MARGIN).min(map.max_base()),
+						0 => with_shadow(map, map.max_base()),
+						code => with_shadow(map, (32 - code).saturating_sub(MARGIN).min(map.max_base())),
 					})
 					.collect();
 				// what the levels from those leave out, about (a level a quarter of the one before)
 				let saved: u64 = maps.iter().zip(&bases).map(|(map, &base)| map.full_bytes - (map.full_bytes >> (2 * base.min(16)))).sum();
 				// little to save: whole, at once (read a second time later, a map's finer levels took GPU
 				// memory blocks of their own, which stay: a map's frames, 64 MB more)
-				if saved < from { vec![0; maps.len()] } else { bases }
+				if saved < from { whole_but_shadows(&maps) } else { bases }
 			} else {
-				vec![0; maps.len()]
+				whole_but_shadows(&maps)
 			};
 			let room = |bytes: u64| self.gpu_room(bytes);
 			let wanted: Vec<(&Arc<GpuTexture>, u32)> = maps.into_iter().zip(bases).filter(|(map, base)| map.held().is_none_or(|held| held.base > *base)).collect();

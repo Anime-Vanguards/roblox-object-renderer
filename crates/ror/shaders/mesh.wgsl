@@ -1425,3 +1425,35 @@ fn vs_shadow(input: VertexInput, @builtin(instance_index) instance_index: u32) -
 	let world = instance.model * vec4<f32>(input.position, 1.0);
 	return frame.shadow_view_proj * world;
 }
+
+// The same for a part whose colour map's alpha cuts its shadow (render::DrawItem::shadow_cutout): its
+// texture coordinate too
+struct ShadowCutoutOutput {
+	@builtin(position) clip: vec4<f32>,
+	@location(0) uv: vec2<f32>,
+	@location(1) @interpolate(flat) instance: u32,
+}
+
+@vertex
+fn vs_shadow_cutout(input: VertexInput, @builtin(instance_index) instance_index: u32) -> ShadowCutoutOutput {
+	var output: ShadowCutoutOutput;
+	output.clip = frame.shadow_view_proj * (instances[instance_index].model * vec4<f32>(input.position, 1.0));
+	output.uv = input.uv;
+	output.instance = instance_index;
+	return output;
+}
+
+// A part shadows where its opacity is over 1 - scene::SHADOW_CUT_TRANSPARENCY: under a SurfaceAppearance
+// in AlphaMode Transparency, its colour map's alpha times 1 - Transparency (instance.texture.z), texel by
+// texel, from the sun and from local lights (fixtures/leaf-shadows.luau in a Roblox 0.747 client: alpha
+// 65 of 255 casts the full shadow and 64 none, 81 and 80 at Transparency 0.2, 92 and 91 at 0.3, 129 and
+// 128 at 0.5, 215 and 214 at 0.7: one cut at 0.252 of opacity, where Transparency alone cuts at 0.748)
+const SHADOW_CUT_OPACITY: f32 = 0.252;
+
+@fragment
+fn fs_shadow_cutout(input: ShadowCutoutOutput) {
+	let alpha = studio_mips(color_map, material_info.sizes[0].xy, input.uv, dpdx(input.uv), dpdy(input.uv)).a;
+	if (alpha * instances[input.instance].texture.z <= SHADOW_CUT_OPACITY) {
+		discard;
+	}
+}

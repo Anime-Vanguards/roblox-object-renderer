@@ -107,7 +107,8 @@ struct Instance {
 	// pattern's noise frequency (noise uv per tile)
 	material: vec4<f32>,
 	// material textures: x the colour map's far tiling (far tiles per tile, 0: none), y 1 / the view
-	// depth where it has taken over (pre-2022), zw unused
+	// depth where it has taken over (pre-2022), z the opacity its shadow is cut by (parts: 1 -
+	// Transparency, a shadow-only part's 1; mesh.wgsl fs_shadow_cutout), w unused
 	texture: vec4<f32>,
 	// rgb the colour map's tint where it overlays the part colour (SurfaceAppearance.Color in
 	// AlphaMode Overlay, linear), else 1; a unused

@@ -86,6 +86,11 @@ pub struct Pipelines {
 	pub sun_blur: wgpu::RenderPipeline,
 	/// The shadow pass culling back faces (local lights)
 	pub light_shadow: wgpu::RenderPipeline,
+	/// The same four for parts whose colour map's alpha cuts their shadow (`fs_shadow_cutout`), made the
+	/// first time one casts: the sun's single- and double-sided, local lights' single- and double-sided
+	shadow_cutout: std::sync::OnceLock<[wgpu::RenderPipeline; 4]>,
+	/// The frame's and a material's bind groups (the shadow cutout's layout)
+	mesh_pipeline_layout: wgpu::PipelineLayout,
 	/// The opaque parts' depth from the camera, single-sampled, for ForceField's contact glow and soft
 	/// particles: (single-sided, double-sided)
 	pub scene_depth: (wgpu::RenderPipeline, wgpu::RenderPipeline),
@@ -821,6 +826,8 @@ impl Pipelines {
 			residency_material_layout,
 			residency_layout,
 			residency_pipeline_layout,
+			shadow_cutout: Default::default(),
+			mesh_pipeline_layout: mesh_layout,
 			mesh_module,
 			cache: cache.cloned(),
 			residency: Default::default(),
@@ -873,6 +880,40 @@ impl Pipelines {
 				pipeline("vs_main", &bind_buffers[..1], "fs_residency"),
 				pipeline("vs_main", &bind_buffers[..1], "fs_residency_decal"),
 				pipeline("vs_decal_bind", &bind_buffers, "fs_residency_decal"),
+			]
+		})
+	}
+
+	/// The shadow passes for parts whose colour map's alpha cuts their shadow (`vs_shadow_cutout`,
+	/// `fs_shadow_cutout`), as `sun_depth_front`, `sun_depth`, `light_shadow` and `shadow` draw the rest:
+	/// [sun single-sided, sun double-sided, local lights single-sided, local lights double-sided].
+	pub fn shadow_cutout(&self, device: &wgpu::Device) -> &[wgpu::RenderPipeline; 4] {
+		self.shadow_cutout.get_or_init(|| {
+			let pipeline = |cull: Option<wgpu::Face>, bias: wgpu::DepthBiasState| {
+				device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+					label: Some("shadow cutout"),
+					layout: Some(&self.mesh_pipeline_layout),
+					vertex: wgpu::VertexState { module: &self.mesh_module, entry_point: Some("vs_shadow_cutout"), buffers: &[Vertex::layout()], compilation_options: Default::default() },
+					primitive: wgpu::PrimitiveState { cull_mode: cull, ..Default::default() },
+					depth_stencil: Some(wgpu::DepthStencilState {
+						format: SHADOW_FORMAT,
+						depth_write_enabled: true,
+						depth_compare: wgpu::CompareFunction::LessEqual,
+						stencil: Default::default(),
+						bias,
+					}),
+					multisample: Default::default(),
+					fragment: Some(wgpu::FragmentState { module: &self.mesh_module, entry_point: Some("fs_shadow_cutout"), targets: &[], compilation_options: Default::default() }),
+					multiview: None,
+					cache: self.cache.as_ref(),
+				})
+			};
+			let light_bias = wgpu::DepthBiasState { constant: 2, slope_scale: 2.0, clamp: 0.0 };
+			[
+				pipeline(Some(wgpu::Face::Back), Default::default()),
+				pipeline(None, Default::default()),
+				pipeline(Some(wgpu::Face::Back), light_bias),
+				pipeline(None, light_bias),
 			]
 		})
 	}

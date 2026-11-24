@@ -598,6 +598,22 @@ struct SunCascade {
 	sigma: f32,
 }
 
+impl SunCascade {
+	/// Its texel's side in studs.
+	fn texel(&self) -> f32 {
+		2.0 * self.radius / self.texels as f32
+	}
+
+	/// Whether a caster's sphere reaches its square, from beyond the sun side of its sphere (twice the
+	/// sphere: a posed skinned mesh keeps its bind pose's bounds): what its depth pass draws.
+	fn reaches(&self, draw: &DrawItem, sun: Vec3) -> bool {
+		let (center, radius) = (draw.bound.0, draw.bound.1 * 2.0);
+		let offset = center - self.center;
+		let along = offset.dot(sun);
+		along >= -(self.radius + radius) && (offset - sun * along).length() <= self.radius * std::f32::consts::SQRT_2 + radius
+	}
+}
+
 /// The sun's cascades for a camera whose spheres reach the scene's bounds.
 fn sun_cascades(camera: &Camera, aspect: f32, sun: Vec3, bounds: (Vec3, Vec3), softness: f32) -> Vec<SunCascade> {
 	let forward = -Vec3::from(camera.world.matrix3.z_axis).normalize();
@@ -1235,6 +1251,9 @@ struct DrawItem {
 	casts_shadow: bool,
 	/// Shadows local lights with Shadows (as the sun: `scene::casts_shadow`)
 	casts_light_shadow: bool,
+	/// Its shadows (the sun's and local lights') only where its colour map's alpha times its opacity is
+	/// over the cut (a SurfaceAppearance in AlphaMode Transparency: `fs_shadow_cutout`)
+	shadow_cutout: bool,
 	center: Vec3,
 	/// A sphere round what it draws, in world space (which sun cascades it can shadow)
 	bound: (Vec3, f32),
@@ -1269,8 +1288,8 @@ impl DrawItem {
 			&& runs
 			&& self.indices == other.indices
 			&& self.instance == other.instance
-			&& (self.transparent, self.double_sided, self.casts_shadow, self.casts_light_shadow, self.decal, self.forcefield, self.write_depth, self.glass, self.highlight_only)
-				== (other.transparent, other.double_sided, other.casts_shadow, other.casts_light_shadow, other.decal, other.forcefield, other.write_depth, other.glass, other.highlight_only)
+			&& (self.transparent, self.double_sided, self.casts_shadow, self.casts_light_shadow, self.shadow_cutout, self.decal, self.forcefield, self.write_depth, self.glass, self.highlight_only)
+				== (other.transparent, other.double_sided, other.casts_shadow, other.casts_light_shadow, other.shadow_cutout, other.decal, other.forcefield, other.write_depth, other.glass, other.highlight_only)
 			&& self.center.to_array().map(f32::to_bits) == other.center.to_array().map(f32::to_bits)
 			&& self.bound.0.to_array().map(f32::to_bits) == other.bound.0.to_array().map(f32::to_bits)
 			&& self.bound.1.to_bits() == other.bound.1.to_bits()
@@ -3558,6 +3577,7 @@ impl Renderer {
 					double_sided: false,
 					casts_shadow: false,
 					casts_light_shadow: false,
+					shadow_cutout: false,
 					// with a posed skinned part, where its Bones put it (as the part sorts, below)
 					center: if mesh.bind.is_some() { world.transform_point3((mesh.drawn.0 + mesh.drawn.1) * 0.5) } else { Vec3::from(part.cframe.translation) },
 					bound: (Vec3::from(part.cframe.translation), 0.0),
@@ -3657,7 +3677,8 @@ impl Renderer {
 				part_inverse: part_inverse.to_cols_array_2d(),
 				specular: [specular[0], specular[1], specular[2], normal_strength],
 				material: [emission.x, emission.y, emission.z, noise_frequency],
-				texture: [far[0], far[1], 0.0, 0.0],
+				// what of it shadows (`fs_shadow_cutout`): 1 - Transparency, a shadow-only part's whole
+				texture: [far[0], far[1], if part.shadow_only { 1.0 } else { 1.0 - part.transparency }, 0.0],
 				tint: [tint.x, tint.y, tint.z, 1.0],
 			});
 			let lod = draw_lod(&mesh);
@@ -3682,6 +3703,12 @@ impl Renderer {
 			// the sun's and local lights' shadows alike (scene::casts_shadow); a shadow-only part's at any
 			// Transparency
 			let casts = part.cast_shadow && (part.shadow_only || (crate::scene::casts_shadow(part.transparency) && !highlight_only));
+			// a SurfaceAppearance in AlphaMode Transparency casts them where its colour map's alpha times
+			// 1 - Transparency is over the cut in Transparency alone (fixtures/leaf-shadows.luau in a
+			// Roblox 0.747 client: alpha 65 of 255 casts the full shadow and 64 none, 129 and 128 at
+			// Transparency 0.5, 215 and 214 at 0.7; the sun's and shadowed PointLights' alike, texel by
+			// texel; Overlay and TintMask by Transparency alone)
+			let shadow_cutout = casts && flags & TEX_ALPHA_TRANSPARENCY != 0 && flags & TEX_MATERIAL == 0;
 			out.main = Some((index, draws.len()));
 			draws.push(DrawItem {
 				drawn_bounds: culling::Bounds::new(mesh.drawn, world),
@@ -3698,11 +3725,14 @@ impl Renderer {
 				// 206 on a floor lit at 221 / 231 / 238; at 0.75, 0.8 and up nothing; ForceField the same,
 				// where ror cast its full shadow up to Transparency 1)
 				double_sided: part.double_sided || forcefield,
-				casts_shadow: casts && (part.shadow_only || !texture_alpha),
+				// a SpecialMesh's texture alpha leaves its sun shadow out (not measured: the engine drew the
+				// install's triangle image opaque on a SpecialMesh, alpha and all)
+				casts_shadow: casts && (part.shadow_only || !special_alpha),
 				// local lights' shadows follow the sun's cut (light-transparency: SmoothPlastic at
 				// Transparency 0.25 and 0.5, Glass at 0 and 0.5 and ForceField at 0 shadow the floor fully,
 				// 0.75, 0.9, 0.98 and Glass at 0.9 not at all; ror cast them all, 9 of 255 too dark there)
 				casts_light_shadow: casts,
+				shadow_cutout,
 				center,
 				bound: {
 					let (low, high) = mesh_bounds;
@@ -3743,7 +3773,8 @@ impl Renderer {
 	/// texels, one layer per face: the faces of parts with CastShadow turned towards the light, those
 	/// below the shadow cut in Transparency (light-shadows, light-transparency), and of them only what reaches the
 	/// light's sphere and the face's view.
-	fn render_light_shadow_maps(&self, prepared: &Prepared, lights: &[ShadowLight], size: u32, lease: &reuse::Lease, profile: &profile::Profile, encoder: &mut wgpu::CommandEncoder, publish: &mut Vec<PendingShadows>) -> wgpu::TextureView {
+	#[allow(clippy::too_many_arguments)]
+	fn render_light_shadow_maps(&self, prepared: &Prepared, lights: &[ShadowLight], size: u32, groups: &residency::ViewGroups, lease: &reuse::Lease, profile: &profile::Profile, encoder: &mut wgpu::CommandEncoder, publish: &mut Vec<PendingShadows>) -> wgpu::TextureView {
 		let key = shadow_reuse::local_key(lights, size);
 		if prepared.immutable && let Some(maps) = self.shadows.get(prepared.casters(), &key, &self.reuse) {
 			let view = maps.view.clone();
@@ -3799,6 +3830,7 @@ impl Renderer {
 				.iter()
 				.filter(|draw| draw.casts_light_shadow && !draw.decal && draw.bound.0.distance(origin) <= reach + draw.bound.1 * 2.0)
 				.collect();
+			let cutouts = self.shadow_cutouts(groups, casters.iter().copied());
 			for (face, ((view, bind_group), axis)) in light.iter().zip(face_axes).enumerate() {
 				// an aimed light's one face (the shader reads no other)
 				if aimed && face > 0 {
@@ -3832,10 +3864,21 @@ impl Renderer {
 				for (double_sided, pipeline) in [(false, &self.pipelines.light_shadow), (true, &self.pipelines.shadow)] {
 					pass.set_pipeline(pipeline);
 					let mut runs = runs::Runs::new(1);
-					for draw in casters.iter().filter(|draw| draw.double_sided == double_sided).filter(|draw| draw.in_frustum(&frustum)).filter(in_face) {
+					for draw in casters.iter().filter(|draw| !draw.shadow_cutout && draw.double_sided == double_sided).filter(|draw| draw.in_frustum(&frustum)).filter(in_face) {
 						runs.draw(&mut pass, &draw.mesh.vertex_buffer, &draw.mesh.index_buffer, draw.indices.clone(), draw.instance, None);
 					}
 					runs.finish(&mut pass);
+				}
+				if !cutouts.is_empty() {
+					let pipelines = self.pipelines.shadow_cutout(&self.gpu.device);
+					for (double_sided, pipeline) in [(false, &pipelines[2]), (true, &pipelines[3])] {
+						pass.set_pipeline(pipeline);
+						let mut runs = runs::Runs::new(1);
+						for (draw, group) in cutouts.iter().filter(|(draw, _)| draw.double_sided == double_sided && draw.in_frustum(&frustum) && in_face(&draw)) {
+							runs.draw(&mut pass, &draw.mesh.vertex_buffer, &draw.mesh.index_buffer, draw.indices.clone(), draw.instance, Some(group));
+						}
+						runs.finish(&mut pass);
+					}
 				}
 			}
 		}
@@ -3846,6 +3889,13 @@ impl Renderer {
 		view
 	}
 
+	/// The draws among `casters` whose colour map's alpha cuts their shadow, each with its material's
+	/// bind group: the views' (render::residency holds their colour maps for the shadow maps too), else
+	/// one made from what its maps hold.
+	fn shadow_cutouts<'a>(&self, groups: &residency::ViewGroups, casters: impl Iterator<Item = &'a DrawItem>) -> Vec<(&'a DrawItem, wgpu::BindGroup)> {
+		casters.filter(|draw| draw.shadow_cutout).map(|draw| (draw, groups.get(&draw.material).cloned().unwrap_or_else(|| self.material_group(&draw.material)))).collect()
+	}
+
 	/// A view's sun cascades: per cascade, depth from the sun, then its warped moments blurred along
 	/// rows and along columns into the cascade's column of one atlas, all into the frame's encoder
 	/// (render_view): a submission each took 0.5 ms of CPU, 2 of a map clip's 6 ms frames.
@@ -3853,7 +3903,8 @@ impl Renderer {
 	/// largest (a viewport of its side; both passes read them by texel, clamped to that side), so they
 	/// take no more memory than when each submission gave them back to the next. Returns the atlas and
 	/// each cascade's column.
-	fn render_sun_shadows(&self, prepared: &Prepared, cascades: &[SunCascade], lease: &reuse::Lease, profile: &profile::Profile, encoder: &mut wgpu::CommandEncoder, publish: &mut Vec<PendingShadows>) -> (wgpu::TextureView, Vec<u32>) {
+	#[allow(clippy::too_many_arguments)]
+	fn render_sun_shadows(&self, prepared: &Prepared, cascades: &[SunCascade], groups: &residency::ViewGroups, lease: &reuse::Lease, profile: &profile::Profile, encoder: &mut wgpu::CommandEncoder, publish: &mut Vec<PendingShadows>) -> (wgpu::TextureView, Vec<u32>) {
 		let key = shadow_reuse::sun_key(cascades, prepared.sun_direction);
 		if prepared.immutable && let Some(maps) = self.shadows.get(prepared.casters(), &key, &self.reuse) {
 			let found = (maps.view.clone(), maps.columns.clone());
@@ -3937,21 +3988,28 @@ impl Renderer {
 				});
 				pass.set_viewport(0.0, 0.0, side, side, 0.0, 1.0);
 				pass.set_bind_group(0, &frame_group, &[]);
-				// casters whose sphere reaches the cascade's square, from beyond the sun side of its sphere
-				// (twice the sphere: a posed skinned mesh keeps its bind pose's bounds)
-				let reaches = |draw: &&DrawItem| {
-					let (center, radius) = (draw.bound.0, draw.bound.1 * 2.0);
-					let offset = center - cascade.center;
-					let along = offset.dot(prepared.sun_direction);
-					along >= -(cascade.radius + radius) && (offset - prepared.sun_direction * along).length() <= cascade.radius * std::f32::consts::SQRT_2 + radius
-				};
+				// casters whose sphere reaches the cascade's square (SunCascade::reaches)
+				let reaches = |draw: &&DrawItem| cascade.reaches(draw, prepared.sun_direction);
 				for (double_sided, pipeline) in [(false, &self.pipelines.sun_depth_front), (true, &self.pipelines.sun_depth)] {
 					pass.set_pipeline(pipeline);
 					let mut runs = runs::Runs::new(1);
-					for draw in prepared.casters().draws.iter().filter(|draw| draw.casts_shadow && !draw.decal && draw.double_sided == double_sided).filter(reaches).filter(|draw| draw.in_frustum(&frustum)) {
+					for draw in prepared.casters().draws.iter().filter(|draw| draw.casts_shadow && !draw.shadow_cutout && !draw.decal && draw.double_sided == double_sided).filter(reaches).filter(|draw| draw.in_frustum(&frustum)) {
 						runs.draw(&mut pass, &draw.mesh.vertex_buffer, &draw.mesh.index_buffer, draw.indices.clone(), draw.instance, None);
 					}
 					runs.finish(&mut pass);
+				}
+				// those whose colour map's alpha cuts their shadow, through it (`fs_shadow_cutout`)
+				let cutouts = self.shadow_cutouts(groups, prepared.casters().draws.iter().filter(|draw| draw.casts_shadow && !draw.decal).filter(reaches).filter(|draw| draw.in_frustum(&frustum)));
+				if !cutouts.is_empty() {
+					let pipelines = self.pipelines.shadow_cutout(&self.gpu.device);
+					for (double_sided, pipeline) in [(false, &pipelines[0]), (true, &pipelines[1])] {
+						pass.set_pipeline(pipeline);
+						let mut runs = runs::Runs::new(1);
+						for (draw, group) in cutouts.iter().filter(|(draw, _)| draw.double_sided == double_sided) {
+							runs.draw(&mut pass, &draw.mesh.vertex_buffer, &draw.mesh.index_buffer, draw.indices.clone(), draw.instance, Some(group));
+						}
+						runs.finish(&mut pass);
+					}
 				}
 			}
 			let color_pass = |encoder: &mut wgpu::CommandEncoder, label: &str, view: &wgpu::TextureView, load: wgpu::LoadOp<wgpu::Color>| {
@@ -4143,7 +4201,7 @@ impl Renderer {
 		let shadow_matrices: Vec<Mat4> = shadow_lights.iter().flat_map(light_shadow_matrices_at).collect();
 		let lights_buffer = (!lights.is_empty()).then(|| lease.buffer("lights", wgpu::BufferUsages::STORAGE, bytemuck::cast_slice(&lights)));
 		let shadow_start = Instant::now();
-		let shadow_maps = (!shadow_lights.is_empty()).then(|| self.render_light_shadow_maps(prepared, &shadow_lights, shadow_size, lease, &profile, &mut encoder, &mut publish));
+		let shadow_maps = (!shadow_lights.is_empty()).then(|| self.render_light_shadow_maps(prepared, &shadow_lights, shadow_size, groups, lease, &profile, &mut encoder, &mut publish));
 		stats.light_shadow_ms += shadow_start.elapsed().as_secs_f64() * 1000.0;
 		let shadow_matrices_buffer = (!shadow_matrices.is_empty()).then(|| {
 			let columns: Vec<[[f32; 4]; 4]> = shadow_matrices.iter().map(Mat4::to_cols_array_2d).collect();
@@ -4174,7 +4232,7 @@ impl Renderer {
 			_ => Vec::new(),
 		};
 		let shadow_start = Instant::now();
-		let sun_atlas = (!sun_cascades.is_empty()).then(|| self.render_sun_shadows(prepared, &sun_cascades, lease, &profile, &mut encoder, &mut publish));
+		let sun_atlas = (!sun_cascades.is_empty()).then(|| self.render_sun_shadows(prepared, &sun_cascades, groups, lease, &profile, &mut encoder, &mut publish));
 		stats.sun_shadow_ms += shadow_start.elapsed().as_secs_f64() * 1000.0;
 		let shadows_on = sun_atlas.is_some();
 		frame.sun_direction = [sun.x, sun.y, sun.z, if shadows_on { 1.0 } else { 0.0 }];
@@ -6497,6 +6555,158 @@ mod shadow_caster_tests {
 				assert!(seen.is_none_or(|seen| seen == (below != sky)), "{by}, roof {roof:?}: in the picture from below, {}", below != sky);
 			}
 		}
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+}
+
+#[cfg(test)]
+mod shadow_cutout_tests {
+	use super::*;
+	use crate::render::resources::TextureUse;
+	use crate::render::{content_key, texture_files, transcode};
+	use crate::scene::build::{ModelBuilder, PartSpec};
+	use rbx_dom_weak::types::{Content, Vector3};
+
+	/// A card's colour map: its left half (u < 0.5) at alpha `left`, its right half at `right`.
+	fn halves(side: u32, left: u8, right: u8) -> Vec<u8> {
+		(0..side * side).flat_map(|index| [60, 140, 60, if index % side < side / 2 { left } else { right }]).collect()
+	}
+
+	/// A 4 x 4 stud card (the quad of vertex_colour_tests, both faces) lying flat `height` studs over a
+	/// white floor, under a SurfaceAppearance (its ColorMap, AlphaMode) or none, at `transparency`; the
+	/// sun overhead, or (`lamp`) a shadowed PointLight 4 studs over the card and no sun. No other light.
+	fn scene(mesh: &str, card: Option<(Option<(String, u32)>, f32)>, height: f32, at: Vec3, lamp: bool) -> Scene {
+		let mut model = ModelBuilder::new("Leaves");
+		model.part(&PartSpec { name: "Floor".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, -0.5, 0.0)), size: Vec3::new(200.0, 1.0, 200.0), color: [255; 3], material: 272, ..Default::default() });
+		if let Some((_, transparency)) = &card {
+			let cframe = Affine3A::from_translation(at + Vec3::new(0.0, height, 0.0)) * Affine3A::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+			let part = model.part(&PartSpec { class: "MeshPart", name: "Card".into(), cframe, size: Vec3::new(4.0, 4.0, 0.05), material: 272, transparency: *transparency, ..Default::default() });
+			model.set(part, "MeshContent", Content::from_uri(mesh));
+			model.set(part, "InitialSize", Vector3::new(4.0, 4.0, 0.05));
+		}
+		if lamp {
+			let carrier = model.part(&PartSpec { name: "Lamp".into(), cframe: Affine3A::from_translation(at + Vec3::new(0.0, height + 4.0, 0.0)), size: Vec3::splat(0.2), transparency: 1.0, cast_shadow: false, ..Default::default() });
+			model.child(carrier, rbx_dom_weak::InstanceBuilder::new("PointLight").with_property("Shadows", true).with_property("Range", 30.0f32).with_property("Brightness", 3.0f32));
+		}
+		let mut scene = crate::scene::extract::extract(&model.into_document());
+		if let Some((Some((map, alpha_mode)), _)) = card {
+			let part = scene.parts.iter_mut().find(|part| matches!(part.geometry, crate::scene::Geometry::MeshPart { .. })).unwrap();
+			Arc::make_mut(part).surface_appearance = Some(crate::scene::SurfaceAppearance {
+				color_map: Some(map),
+				normal_map: None,
+				metalness_map: None,
+				roughness_map: None,
+				texture_pack: None,
+				alpha_mode,
+				color: Vec3::ONE,
+				emissive_mask: None,
+				emissive_strength: 1.0,
+				emissive_tint: Vec3::ONE,
+			});
+		}
+		let environment = &mut scene.environment;
+		(environment.ambient, environment.outdoor_ambient, environment.environment_diffuse_scale, environment.environment_specular_scale) = (Vec3::ZERO, Vec3::ZERO, 0.0, 0.0);
+		// the sun 6.5 degrees from overhead (`view`)
+		(environment.clock_time, environment.geographic_latitude) = (12.0, 30.0);
+		if lamp {
+			environment.brightness = 0.0;
+		}
+		scene
+	}
+
+	/// The floor where the sun puts the shadow of a card `height` studs over `at`, from between them (the
+	/// card out of view, above the camera).
+	fn view(at: Vec3, height: f32) -> ViewRequest {
+		let sun = environment::sun_direction(12.0, 30.0);
+		let target = at - Vec3::new(sun.x, 0.0, sun.z) * (height / sun.y);
+		ViewRequest { width: 96, height: 96, camera: CameraSpec::LookAt { eye: (target + Vec3::new(0.0, 2.5, -0.5)).into(), target: target.into(), fov: 110.0 }, background: Background::Color([0.0, 0.0, 1.0]), bloom: false, ..Default::default() }
+	}
+
+	fn levels(images: &[ViewImage]) -> Vec<f32> {
+		images[0].rgba.chunks(4).map(|pixel| pixel[..3].iter().map(|&channel| channel as f32).sum::<f32>() / 3.0).collect()
+	}
+
+	/// Of the floor an opaque card shades (`none` lit, `opaque` under it), the shares a case leaves dark
+	/// (over 0.8 of the opaque card's shadow) and lit (under 0.2).
+	fn split(none: &[f32], opaque: &[f32], case: &[f32]) -> (f32, f32) {
+		let footprint: Vec<usize> = (0..none.len()).filter(|&index| none[index] - opaque[index] > 30.0).collect();
+		assert!(footprint.len() > 400, "the opaque card's shadow covers {} pixels", footprint.len());
+		let share = |index: usize| (none[index] - case[index]) / (none[index] - opaque[index]);
+		let dark = footprint.iter().filter(|&&index| share(index) > 0.8).count() as f32 / footprint.len() as f32;
+		let lit = footprint.iter().filter(|&&index| share(index) < 0.2).count() as f32 / footprint.len() as f32;
+		(dark, lit)
+	}
+
+	/// A SurfaceAppearance in AlphaMode Transparency casts the sun's and a shadowed light's shadow where its
+	/// colour map's alpha times 1 - Transparency is over 0.252, its full shadow there and none elsewhere
+	/// (fixtures/leaf-shadows.luau in a Roblox 0.747 client): a card opaque on one half shades the floor
+	/// under that half alone, at alpha 40 of 255 on the other half and at Transparency 0.7 with alpha 200
+	/// there (0.235: alpha alone would cast); in AlphaMode Overlay alpha cuts nothing. ror cast no sun
+	/// shadow from such a card and a light's over the whole card. A card out of view whose shadow the view
+	/// shows: its colour map, read for nothing else, is held for the shadow map from the level the shadow
+	/// map's texels pick (render::residency), not whole, and cuts the shadow as the whole map does.
+	#[test]
+	fn a_surface_appearances_alpha_cuts_its_shadow_in_view_and_out() {
+		let state = std::env::temp_dir().join(format!("ror-shadow-cutout-test-{}", std::process::id()));
+		std::fs::create_dir_all(&state).unwrap();
+		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let uri = |path: &std::path::Path| format!("file:///{}", path.display().to_string().replace('\\', "/"));
+		let mesh_path = state.join("card.mesh");
+		std::fs::write(&mesh_path, super::vertex_colour_tests::quad_mesh([255; 4])).unwrap();
+		let mesh = uri(&mesh_path);
+		let map = |left: u8, right: u8| {
+			let path = state.join(format!("halves-{left}-{right}.png"));
+			crate::output::write_png(&path, 64, 64, &halves(64, left, right), false).unwrap();
+			uri(&path)
+		};
+		const TRANSPARENCY: u32 = 1;
+		const OVERLAY: u32 = 0;
+		let draw = |card: Option<(Option<(String, u32)>, f32)>, height: f32, at: Vec3, lamp: bool| {
+			let (images, stats) = renderer.render(&scene(&mesh, card, height, at, lamp), &[view(at, if lamp { 0.0 } else { height })]).unwrap();
+			assert!(stats.missing.iter().all(|reason| reason.contains("rbxasset://")), "missing {:?}", stats.missing);
+			levels(&images)
+		};
+		for lamp in [false, true] {
+			let by = if lamp { "a PointLight" } else { "the sun" };
+			let none = draw(None, 6.0, Vec3::ZERO, lamp);
+			let opaque = draw(Some((None, 0.0)), 6.0, Vec3::ZERO, lamp);
+			let cases = [
+				("alpha 255 | 40", Some((map(255, 40), TRANSPARENCY)), 0.0, true),
+				("alpha 255 | 200 at Transparency 0.7", Some((map(255, 200), TRANSPARENCY)), 0.7, true),
+				("Overlay, alpha 255 | 0", Some((map(255, 0), OVERLAY)), 0.0, false),
+			];
+			for (label, appearance, transparency, cut) in cases {
+				let (dark, lit) = split(&none, &opaque, &draw(Some((appearance, transparency)), 6.0, Vec3::ZERO, lamp));
+				if cut {
+					assert!((0.35..0.65).contains(&dark) && (0.35..0.65).contains(&lit), "{by}, {label}: {dark} of the card's shadow dark, {lit} lit; half of it each expected");
+				} else {
+					assert!(dark > 0.95, "{by}, {label}: {dark} of the card's shadow dark; all of it expected");
+				}
+			}
+		}
+
+		// out of view, its map's levels through the feedback (every render's, however few maps)
+		renderer.residency_from.store(0, std::sync::atomic::Ordering::Relaxed);
+		// a 1024 x 1024 map with its mips, as a kept texture file the cache finds for the card's ColorMap
+		let mut image = ror_image::Image::from_rgba8(1024, 1024, halves(1024, 255, 0));
+		ror_image::generate_mips_with(&mut image, ror_image::MipFilter::Triangle, true);
+		let path = state.join("halves.tex");
+		assert!(texture_files::write(&path, &image, TextureUse::Color));
+		let map_uri = "rbxassetid://454545";
+		let key = transcode::image_key(map_uri);
+		let texture = renderer.textures.get_or_load(&(content_key(&key), TextureUse::Color), || texture_files::open(&path, &key).ok_or_else(|| anyhow::anyhow!("the texture file"))).unwrap();
+		assert!(texture.held().is_none());
+		let at = Vec3::new(0.0, 0.0, 30.0);
+		let none = draw(None, 20.0, at, false);
+		let opaque = draw(Some((None, 0.0)), 20.0, at, false);
+		let (dark, lit) = split(&none, &opaque, &draw(Some((Some((map_uri.to_string(), TRANSPARENCY)), 0.0)), 20.0, at, false));
+		let held = texture.held().expect("its levels read for the shadow");
+		assert!(held.base > 0 && held.base <= texture.max_base(), "held from level {} of {}", held.base, texture.max_base());
+		assert!((0.35..0.65).contains(&dark) && (0.35..0.65).contains(&lit), "out of view: {dark} of the card's shadow dark, {lit} lit; half of it each expected");
+		drop(texture);
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
 	}
