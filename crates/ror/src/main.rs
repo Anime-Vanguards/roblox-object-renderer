@@ -71,8 +71,8 @@ struct ViewportWorkerArgs {
 
 #[derive(clap::Args)]
 struct CostArgs {
-	/// Model or place file (.rbxm, .rbxmx, .rbxl, .rbxlx), an asset id / rbxassetid:// URI, or with
-	/// --studio an instance path in that Studio
+	/// Model or place file (.rbxm, .rbxmx, .rbxl, .rbxlx, or a .rbx archive of one), an asset id /
+	/// rbxassetid:// URI, or with --studio an instance path in that Studio
 	input: String,
 	/// Export `input` (a dotted instance path) from the open Studio whose name contains this
 	/// (read-only) and count it
@@ -440,9 +440,9 @@ enum ServiceCommand {
 
 #[derive(clap::Args)]
 struct RenderArgs {
-	/// Model or place file (.rbxm, .rbxmx, .rbxl, .rbxlx), an asset id / rbxassetid:// URI, a .luau
-	/// script that builds into the Workspace (docs/scripts.md), or with --studio an instance path in
-	/// that Studio
+	/// Model or place file (.rbxm, .rbxmx, .rbxl, .rbxlx, or a .rbx archive of one), an asset id /
+	/// rbxassetid:// URI, a .luau script that builds into the Workspace (docs/scripts.md), or with
+	/// --studio an instance path in that Studio
 	input: String,
 	/// Export `input` (a dotted instance path) from the open Studio whose name contains this
 	/// (read-only) and render it
@@ -633,8 +633,8 @@ struct ChangeArgs {
 
 #[derive(clap::Args)]
 struct VideoArgs {
-	/// Model or place file (.rbxm, .rbxmx, .rbxl, .rbxlx), an asset id / rbxassetid:// URI, or a
-	/// .luau script that builds into the Workspace (docs/scripts.md)
+	/// Model or place file (.rbxm, .rbxmx, .rbxl, .rbxlx, or a .rbx archive of one), an asset id /
+	/// rbxassetid:// URI, or a .luau script that builds into the Workspace (docs/scripts.md)
 	input: String,
 	/// Draw only this instance (dotted path from the file's root, e.g. Workspace.Map.House)
 	#[arg(long)]

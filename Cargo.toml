@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/ror", "crates/ror-mesh", "crates/ror-image", "crates/ror-assets"]
+members = ["crates/ror", "crates/ror-mesh", "crates/ror-image", "crates/ror-assets", "crates/ror-archive"]
 default-members = ["crates/ror"]
 
 [workspace.package]
@@ -15,6 +15,7 @@ publish = false
 ror-mesh = { path = "crates/ror-mesh" }
 ror-image = { path = "crates/ror-image" }
 ror-assets = { path = "crates/ror-assets" }
+ror-archive = { path = "crates/ror-archive" }
 
 anyhow = "1.0.100"
 thiserror = "2"

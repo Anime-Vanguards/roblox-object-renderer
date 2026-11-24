@@ -1,0 +1,17 @@
+# Cross-checks crates/ror-archive against the draft archive support for rbx-dom (README.md). A
+# workspace of its own: it builds that draft's crates, which nothing else here depends on.
+[package]
+name = "archive-xcheck"
+version = "0.0.0"
+edition = "2021"
+publish = false
+default-run = "archive-xcheck"
+
+[workspace]
+
+[dependencies]
+rbx_archive = { path = "rbx-dom/rbx_archive" }
+rbx_binary = { path = "rbx-dom/rbx_binary" }
+rbx_dom_weak = { path = "rbx-dom/rbx_dom_weak" }
+ror-archive = { path = "../../crates/ror-archive" }
+blake3 = "1.8"

@@ -1,6 +1,6 @@
 # ror — Offline Renderer for Roblox 3D Objects
 
-`ror` renders Roblox 3D assets offline without opening Roblox Studio or launching a client. It accepts `.rbxm` / `.rbxmx` models, `.rbxl` / `.rbxlx` places, Roblox asset IDs, live exports from an open Studio window, and `.luau` scripts.
+`ror` renders Roblox 3D assets offline without opening Roblox Studio or launching a client. It accepts `.rbxm` / `.rbxmx` models, `.rbxl` / `.rbxlx` places, `.rbx` archives of either, Roblox asset IDs, live exports from an open Studio window, and `.luau` scripts.
 
 Output targets Roblox Studio at maximum graphics quality (quality level 21, `Future` lighting), calibrated against captures from a dedicated Studio instance. A background render service keeps the GPU device, pipelines, meshes, textures, and parsed models warm in memory so many processes can render in parallel.
 

@@ -6,7 +6,7 @@ Core modules: `crates/ror/src/scene/` (loading and extraction), `crates/ror/src/
 
 ## Scene pipeline
 
-1. **Load (`scene::load`):** Parses `.rbxm`, `.rbxmx`, `.rbxl`, and `.rbxlx` files via `rbx-dom` (places render `Workspace`), downloads asset IDs through `ror-assets`, or loads `ree` script recordings.
+1. **Load (`scene::load`):** Parses `.rbxm`, `.rbxmx`, `.rbxl`, and `.rbxlx` files via `rbx-dom` (places render `Workspace`), the place or model inside a `.rbx` archive the same way ([archives.md](archives.md)), downloads asset IDs through `ror-assets`, or loads `ree` script recordings.
 2. **Playback (`scene::playback`):** Applies timeline events, tweens, motion, and emissions at the target timestamp ([playback.md](playback.md)).
 3. **Extract (`scene::extract`):** Converts instances into renderable `Scene` data—parts, transforms (`CFrame` / `GetPivot`), materials, composited character clothing, emitters, beams, trails, lights, Highlights, GUIs, and environment (`Lighting`, `Sky`, `Atmosphere`, `Clouds`, post effects).
 4. **Resolve (`ror-assets`):** Resolves `rbxasset://` from the local Roblox Studio or Player installation and fetches/caches `rbxassetid://` and external assets.

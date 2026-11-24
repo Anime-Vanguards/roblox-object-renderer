@@ -1,6 +1,6 @@
 //! A Roblox model → the scene description the renderer draws.
 //!
-//! [`load`] reads `.rbxm` / `.rbxmx` / `.rbxl` / `.rbxlx` into a DOM, [`extract`] walks it into a
+//! [`load`] reads `.rbxm` / `.rbxmx` / `.rbxl` / `.rbxlx`, alone or in a `.rbx` archive, into a DOM, [`extract`] walks it into a
 //! [`Scene`]: every visible part with its geometry, material and surface decorations, the lights,
 //! and the environment (Lighting, Sky, Atmosphere, post effects). Asset URIs stay unresolved here;
 //! the renderer fetches and decodes them through its caches.

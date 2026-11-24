@@ -16,7 +16,7 @@ ror render Build.luau --views iso                                     # Execute 
 
 ## Supported inputs
 
-- **Local files:** `.rbxm`, `.rbxmx`, `.rbxl`, `.rbxlx` (places render `Workspace`). Use `--select <path>` to render only one instance inside a file.
+- **Local files:** `.rbxm`, `.rbxmx`, `.rbxl`, `.rbxlx` (places render `Workspace`), and `.rbx` archives of a place or a model ([archives.md](archives.md)). Use `--select <path>` to render only one instance inside a file.
 - **Asset IDs:** Bare numeric IDs or `rbxassetid://` URIs.
 - **Live Studio (`--studio <name>`):** A dotted instance path exported read-only via `SerializationService` along with the place's `MaterialVariant`s. Requires a local Studio MCP bridge ([parity.md](parity.md)).
 - **Luau scripts (`.luau`):** Executed in `ree`; `ror` renders what the script parents into `Workspace` ([scripts.md](scripts.md)).

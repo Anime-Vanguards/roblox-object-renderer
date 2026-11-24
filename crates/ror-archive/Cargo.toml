@@ -1,0 +1,26 @@
+[package]
+name = "ror-archive"
+description = "Roblox Archive (.rbx) containers: reading, validation, and flattening to a standalone .rbxl/.rbxm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Object digests (`blake3-128`) and the ZIP members' CRC-32. Both are in the workspace already.
+blake3 = "1.8"
+crc32fast = "1.5"
+# Binary-scene chunk compression. Same versions as rbx_binary and ror-mesh use, so the workspace
+# builds them once.
+lz4_flex = { version = "0.13.1", default-features = false, features = ["std", "safe-decode", "safe-encode", "checked-decode"] }
+zstd = { version = "0.13.3", default-features = false }
+
+[dev-dependencies]
+# Tests build their own places and compare what a DOM parser reads before and after an archive
+rbx_binary = "3.0.1"
+rbx_dom_weak = "4.2.0"

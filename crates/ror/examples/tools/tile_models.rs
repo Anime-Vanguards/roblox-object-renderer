@@ -16,7 +16,9 @@ pub fn main() -> anyhow::Result<()> {
 	let mut tops = Vec::new();
 	for (index, path) in files.iter().enumerate() {
 		let bytes = std::fs::read(path)?;
-		let mut dom = rbx_binary::Deserializer::new().deserialize(bytes.as_slice()).map_err(|error| anyhow::anyhow!("{path}: {error}"))?;
+		// a model alone or in a Roblox archive
+		let model = ror_archive::unwrap(&bytes).map_err(|error| anyhow::anyhow!("{path}: {error}"))?;
+		let mut dom = rbx_binary::Deserializer::new().deserialize(&*model.bytes).map_err(|error| anyhow::anyhow!("{path}: {error}"))?;
 		let offset = Vector3::new((index % columns) as f32 * spacing, 0.0, (index / columns) as f32 * spacing);
 		let shift = |position: Vector3| Vector3::new(position.x + offset.x, position.y + offset.y, position.z + offset.z);
 		let referents: Vec<Ref> = dom.descendants().map(|instance| instance.referent()).collect();

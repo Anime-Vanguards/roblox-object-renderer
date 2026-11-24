@@ -1,4 +1,4 @@
-//! Reading Roblox model and place files (binary and XML) into a DOM.
+//! Reading Roblox model and place files (binary and XML, alone or inside a Roblox archive) into a DOM.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -38,6 +38,9 @@ pub struct Document {
 	/// Drawn as the collisions-only view ([`super::collision`]): its scene keeps the parts that draw
 	/// nothing (Transparency 1 or more, no decals) among its parts, since they often are the collision.
 	pub keep_invisible: bool,
+	/// What reading the file left out: the values a Roblox archive keeps in a form this reader has no
+	/// decoder for (docs/archives.md). A scene of the whole document lists them among its warnings.
+	pub notes: Vec<String>,
 }
 
 /// A place's Lighting and what is in it, and its Terrain's Clouds, copied out of the place to give to
@@ -78,16 +81,50 @@ pub fn read_file(path: &Path) -> Result<Document> {
 pub fn read_bytes(bytes: &[u8]) -> Result<Document> {
 	// within the machine's free memory (crate::budget); a caller holding a reservation for the whole load adds none
 	let _budget = crate::budget::reserve(bytes.len() as u64);
+	// a Roblox archive (`.rbx`) is read as the place or model it holds, with the values it keeps in
+	// objects of their own put back: the parsers below would read such a scene without them and
+	// without an error (docs/archives.md)
+	let scene = match ror_archive::unwrap(bytes) {
+		Ok(scene) => scene,
+		Err(ror_archive::Error::NotArchive) => bail!("not a Roblox model, place or archive (expected a <roblox! or <roblox ...> header, or a .rbx archive)"),
+		Err(error) => bail!("Roblox archive: {error}"),
+	};
+	let notes = archive_notes(&scene.report);
+	let bytes: &[u8] = &scene.bytes;
 	let reading = reading();
-	let mut dom = if bytes.starts_with(b"<roblox!") {
-		rbx_binary::Deserializer::new().reflection_database(&reading.database).deserialize(bytes).map_err(|error| anyhow::anyhow!("binary model: {error}"))?
-	} else if is_xml(bytes) {
-		rbx_xml::from_reader(bytes, rbx_xml::DecodeOptions::new().reflection_database(&reading.database)).map_err(|error| anyhow::anyhow!("XML model: {error}"))?
-	} else {
-		bail!("not a Roblox model or place (expected <roblox! or <roblox ...> header)");
+	let mut dom = match scene.format {
+		ror_archive::SceneFormat::Binary => {
+			rbx_binary::Deserializer::new().reflection_database(&reading.database).deserialize(bytes).map_err(|error| anyhow::anyhow!("binary model: {error}"))?
+		}
+		ror_archive::SceneFormat::Xml => {
+			rbx_xml::from_reader(bytes, rbx_xml::DecodeOptions::new().reflection_database(&reading.database)).map_err(|error| anyhow::anyhow!("XML model: {error}"))?
+		}
 	};
 	fold_content_ids(&mut dom, reading);
-	Ok(Document::new(dom))
+	let mut document = Document::new(dom);
+	document.notes = notes;
+	Ok(document)
+}
+
+/// What an archive's reader reports, as a document's notes: content kept as opaque objects reads as
+/// empty (nothing documents the objects' layout), and whatever else it could not check.
+fn archive_notes(report: &ror_archive::Report) -> Vec<String> {
+	let mut notes: Vec<String> = report
+		.embedded_content
+		.iter()
+		.map(|content| {
+			format!(
+				"{}.{}: {} value{} kept in the archive as content objects ({} bytes) that have no documented layout; read as empty",
+				content.class,
+				content.property,
+				content.values,
+				if content.values == 1 { "" } else { "s" },
+				content.bytes
+			)
+		})
+		.collect();
+	notes.extend(report.warnings.iter().map(|warning| format!("Roblox archive: {warning}")));
+	notes
 }
 
 /// How files are read: the reflection database, with the content IDs Roblox replaced by Content
@@ -248,12 +285,6 @@ fn holds_content(value: &Variant) -> bool {
 	}
 }
 
-fn is_xml(bytes: &[u8]) -> bool {
-	let text = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-	let start = text.iter().position(|byte| !byte.is_ascii_whitespace()).unwrap_or(text.len());
-	text[start..].starts_with(b"<roblox")
-}
-
 impl Document {
 	pub fn new(dom: WeakDom) -> Self {
 		let root = dom.root();
@@ -286,7 +317,7 @@ impl Document {
 				.unwrap_or_default(),
 			None => root.children().to_vec(),
 		};
-		Self { dom, salt: String::new(), is_place, roots, lighting, material_service, setting: None, seeds: HashMap::new(), play: false, relative_to: None, keep_invisible: false }
+		Self { dom, salt: String::new(), is_place, roots, lighting, material_service, setting: None, seeds: HashMap::new(), play: false, relative_to: None, keep_invisible: false, notes: Vec::new() }
 	}
 
 	/// Reads its content's relative local paths from `folder` (a job's caller's working directory: a
@@ -393,7 +424,7 @@ impl Document {
 				queue.extend(instance.children().iter().copied());
 			}
 		}
-		Document { dom, salt: self.salt.clone(), is_place: self.is_place, roots: self.roots.clone(), lighting: self.lighting, material_service: self.material_service, setting: self.setting.clone(), seeds: self.seeds.clone(), play: self.play, relative_to: self.relative_to.clone(), keep_invisible: self.keep_invisible }
+		Document { dom, salt: self.salt.clone(), is_place: self.is_place, roots: self.roots.clone(), lighting: self.lighting, material_service: self.material_service, setting: self.setting.clone(), seeds: self.seeds.clone(), play: self.play, relative_to: self.relative_to.clone(), keep_invisible: self.keep_invisible, notes: self.notes.clone() }
 	}
 
 	/// Gives the document a Lighting for a playback to change, in place of its own: a copy of
@@ -734,5 +765,89 @@ mod tests {
 			let other = copy.dom.get_by_ref(instance.referent()).unwrap();
 			assert_eq!((&other.name, other.parent(), other.children(), other.properties.len()), (&instance.name, instance.parent(), instance.children(), instance.properties.len()));
 		}
+	}
+	/// A place and a model as Roblox archives: read as what they hold, the values the archive keeps in
+	/// objects of their own back in their properties.
+	#[test]
+	fn an_archive_reads_as_the_place_or_model_it_holds() {
+		use rbx_dom_weak::{InstanceBuilder, WeakDom};
+
+		let source = "-- long enough to be kept apart\n".repeat(8);
+		let dom = WeakDom::new(InstanceBuilder::new("DataModel").with_children([
+			InstanceBuilder::new("Workspace").with_children([InstanceBuilder::new("Part").with_name("Rock")]),
+			InstanceBuilder::new("ServerScriptService").with_children([InstanceBuilder::new("Script").with_name("Main").with_property("Source", source.as_str())]),
+		]));
+		let mut place = Vec::new();
+		rbx_binary::to_writer(&mut place, &dom, dom.root().children()).unwrap();
+		let source_of = |document: &super::Document| {
+			let script = document.dom.descendants().find(|instance| instance.name == "Main").unwrap();
+			match script.properties.get(&rbx_dom_weak::ustr("Source")) {
+				Some(rbx_dom_weak::types::Variant::String(text)) => Some(text.clone()),
+				_ => None,
+			}
+		};
+
+		// the place alone, wrapped, and wrapped with its source moved out
+		for bytes in [place.clone(), ror_archive::Builder::place(place.clone()).build().unwrap(), ror_archive::Builder::place(place.clone()).externalize(16).build().unwrap()] {
+			let document = super::read_bytes(&bytes).unwrap();
+			assert!(document.is_place);
+			assert_eq!(document.roots.len(), 1, "the Workspace's part");
+			assert_eq!(source_of(&document).as_deref(), Some(source.as_str()));
+			assert!(document.notes.is_empty(), "{:?}", document.notes);
+		}
+		// the scene as the archive stores it has no source for a reader that does not know archives:
+		// what reading the archive first prevents
+		let archived = ror_archive::Builder::place(place.clone()).externalize(16).build().unwrap();
+		let stored = ror_archive::Archive::open(&archived).unwrap().root().unwrap().bytes.to_vec();
+		let misread = rbx_binary::from_reader(stored.as_slice()).unwrap();
+		assert!(!misread.descendants().find(|instance| instance.name == "Main").unwrap().properties.contains_key(&rbx_dom_weak::ustr("Source")));
+
+		let model = WeakDom::new(InstanceBuilder::new("DataModel").with_children([InstanceBuilder::new("Model").with_name("Rig").with_children([InstanceBuilder::new("Part").with_name("Torso")])]));
+		let mut bytes = Vec::new();
+		rbx_binary::to_writer(&mut bytes, &model, model.root().children()).unwrap();
+		let document = super::read_bytes(&ror_archive::Builder::model(bytes).build().unwrap()).unwrap();
+		assert!(!document.is_place);
+		assert_eq!(document.roots.len(), 1);
+
+		// a ZIP that is no archive, and an archive cut short, say what they are
+		let zip = b"PK\x05\x06\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+		let error = super::read_bytes(zip).err().unwrap().to_string();
+		assert!(error.starts_with("Roblox archive: "), "{error}");
+		let error = super::read_bytes(&archived[..archived.len() / 2]).err().unwrap().to_string();
+		assert!(error.starts_with("Roblox archive: "), "{error}");
+		let error = super::read_bytes(b"version 4.00\n").err().unwrap().to_string();
+		assert!(error.starts_with("not a Roblox model, place or archive"), "{error}");
+	}
+
+	/// What an archive's reader could not give back is a note on the document and the first of its
+	/// scene's warnings.
+	#[test]
+	fn what_an_archive_keeps_apart_is_noted() {
+		use crate::scene::build::{ModelBuilder, PartSpec};
+
+		let report = ror_archive::Report {
+			embedded_content: vec![
+				ror_archive::EmbeddedContent { class: "MeshPart".into(), property: "MeshContent".into(), values: 2, bytes: 4096 },
+				ror_archive::EmbeddedContent { class: "Decal".into(), property: "TextureContent".into(), values: 1, bytes: 12 },
+			],
+			warnings: vec!["objects/00ff is in no content record".into()],
+			..Default::default()
+		};
+		let notes = super::archive_notes(&report);
+		assert_eq!(
+			notes,
+			[
+				"MeshPart.MeshContent: 2 values kept in the archive as content objects (4096 bytes) that have no documented layout; read as empty",
+				"Decal.TextureContent: 1 value kept in the archive as content objects (12 bytes) that have no documented layout; read as empty",
+				"Roblox archive: objects/00ff is in no content record",
+			]
+		);
+		let mut model = ModelBuilder::new("M");
+		model.part(&PartSpec::default());
+		let mut document = model.into_document();
+		document.notes = notes.clone();
+		assert_eq!(document.copy().notes, notes);
+		let scene = crate::scene::extract::extract(&document);
+		assert_eq!(scene.warnings[..3], notes[..]);
 	}
 }

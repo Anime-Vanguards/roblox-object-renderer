@@ -1,5 +1,6 @@
 //! Lists the content URIs referenced by Roblox model / place files (`.rbxm`, `.rbxmx`, `.rbxl`,
-//! `.rbxlx`), grouped by `Class.Property`: a source of real asset ids for tests.
+//! `.rbxlx`, and `.rbx` archives of them), grouped by `Class.Property`: a source of real asset ids
+//! for tests.
 //!
 //! ```text
 //! cargo run -p ror-assets --example asset_ids -- <file or dir>...
@@ -16,7 +17,7 @@ fn walk(path: &Path, out: &mut Vec<PathBuf>) {
 			walk(&entry.path(), out);
 		}
 	} else if let Some(ext) = path.extension().and_then(|e| e.to_str())
-		&& matches!(ext.to_ascii_lowercase().as_str(), "rbxm" | "rbxmx" | "rbxl" | "rbxlx")
+		&& matches!(ext.to_ascii_lowercase().as_str(), "rbxm" | "rbxmx" | "rbxl" | "rbxlx" | "rbx")
 	{
 		out.push(path.to_path_buf());
 	}
@@ -31,7 +32,12 @@ fn main() {
 	let mut uris: BTreeMap<String, (BTreeMap<String, usize>, usize)> = BTreeMap::new();
 	for file in &files {
 		let Ok(bytes) = std::fs::read(file) else { continue };
-		let dom = if bytes.starts_with(b"<roblox!") { rbx_binary::from_reader(&bytes[..]).ok() } else { rbx_xml::from_reader_default(&bytes[..]).ok() };
+		let Ok(scene) = ror_archive::unwrap(&bytes) else {
+			eprintln!("could not read {}", file.display());
+			continue;
+		};
+		let bytes = &*scene.bytes;
+		let dom = if bytes.starts_with(b"<roblox!") { rbx_binary::from_reader(bytes).ok() } else { rbx_xml::from_reader_default(bytes).ok() };
 		let Some(dom) = dom else {
 			eprintln!("could not parse {}", file.display());
 			continue;

@@ -21,6 +21,7 @@ foldhash = "0.2"
 ror-mesh.workspace = true
 ror-image.workspace = true
 ror-assets.workspace = true
+ror-archive.workspace = true
 
 anyhow.workspace = true
 bytemuck.workspace = true

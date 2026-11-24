@@ -21,3 +21,7 @@
 *.tmp
 __pycache__/
 /target-*
+
+# The draft rbx-dom branch tools/archive-xcheck builds against (its README.md), and its lock file
+/tools/archive-xcheck/rbx-dom/
+/tools/archive-xcheck/Cargo.lock

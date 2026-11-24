@@ -11,6 +11,7 @@ Reference guides for running `ror`, understanding its rendering rules, and exten
 | [playback.md](playback.md) | Effect timelines: CLI playback flags, JSON format, emit modes, and dynamic Lighting |
 | [video.md](video.md) | `ror video`: cameras, output formats, encoders, contact sheets, parallel copies, and VFX lints |
 | [scripts.md](scripts.md) | Running `.luau` scripts via `ree` as inputs to `render` and `video` |
+| [archives.md](archives.md) | Roblox archives (`.rbx`): what `ror` reads from one, what it checks and reports, and the `ror-archive` crate |
 | [cost.md](cost.md) | `ror cost`: draw call batching, triangle counts, LODs, and software occlusion culling |
 | [cost-loop.md](cost-loop.md) | Optimization loop: phone ms cost attribution, findings, in-memory what-if edits, visual checks, Lune export, and budgets |
 | [service.md](service.md) | Background render service, concurrent callers, HTTP API, job JSON, caching, memory admission, and profiling |

@@ -21,8 +21,8 @@ use crate::scene::{self, Scene};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Job {
-	/// A model or place file (`.rbxm`, `.rbxmx`, `.rbxl`, `.rbxlx`), or an asset URI / id
-	/// (`rbxassetid://123`, `123`).
+	/// A model or place file (`.rbxm`, `.rbxmx`, `.rbxl`, `.rbxlx`, or a `.rbx` archive of one), or an
+	/// asset URI / id (`rbxassetid://123`, `123`).
 	pub input: String,
 	/// Draw only this instance (dotted path from the file's root).
 	#[serde(default)]

@@ -22,7 +22,8 @@ flate2 = "1.1"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_System_Registry"] }
 
 [dev-dependencies]
-# asset_ids example: content references inside .rbxm / .rbxmx models
+# asset_ids example: content references inside .rbxm / .rbxmx models, alone or in .rbx archives
+ror-archive.workspace = true
 rbx_binary = "3.0.1"
 rbx_dom_weak = "4.2.0"
 rbx_xml = "3.0.1"

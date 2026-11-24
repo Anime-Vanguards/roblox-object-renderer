@@ -24,6 +24,7 @@ Tests that need a Studio install, the Roblox client's cache or the network skip 
 - `crates/ror`: the `ror` binary and library. `scene/` reads files into a scene (extraction, playback, GUIs, collision), `render/` draws it with wgpu (shaders in `crates/ror/shaders`), `cost/` estimates Roblox's draw calls and occlusion, `service/` is the render service and its client, `studio/` the Studio parity harness and the calibration experiments (`studio/calibrate.rs`, `experiment()` lists them), `video.rs` and `mp4.rs` the video output.
 - `crates/ror/examples/tools`: one example binary holding the scan, dump and probe tools.
 - `crates/ror-mesh`, `crates/ror-image`, `crates/ror-assets`: mesh decoding, texture decoding, and content resolution with downloads, caches and the cookie.
+- `crates/ror-archive`: Roblox archives (`.rbx`) read into the standalone place or model they hold, and written ([docs/archives.md](docs/archives.md)).
 - `tools/`: Python measurement and analysis scripts, Luau probes for the capture Studio, a Windows sampling profiler.
 - `vendor/x264`: the optional in-process H.264 encoder's entry points and build script (GPL-2.0-or-later when linked).
 - `docs/`: the rules and formats behind the code; `fixtures/`: small hand-made test inputs.

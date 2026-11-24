@@ -13,6 +13,7 @@ This page maps out the crates, tools, and directories in `roblox-object-renderer
 - **`crates/ror-mesh`** — Roblox mesh decoder covering FileMesh versions 1.00–7.00 (including Draco-compressed meshes) and union mesh data.
 - **`crates/ror-image`** — Texture decoder supporting PNG, JPEG, WebP, GIF, BMP, TGA, DDS, and KTX2 (with zstd and BCn block compression).
 - **`crates/ror-assets`** — Content URI resolution (`rbxasset://`, `rbxassetid://`, asset URLs, local files), HTTP downloads, the disk cache and shared content store, Roblox install detection, and authentication ([assets.md](assets.md)).
+- **`crates/ror-archive`** — Roblox archive (`.rbx`) reader and writer: the ZIP container, the manifest, digests, and turning the scene inside into a standalone `.rbxl` or `.rbxm` ([archives.md](archives.md)). No DOM and no Roblox library, so other tools can use it in front of the parser they have.
 - **`tools/`** — Python measurement and analysis scripts (requires `numpy`, `scipy`, `Pillow`, and `opencv-python`; `tools/perf_suite.py` also uses `psutil` and `pywin32`), cost and occlusion probes for the capture Studio, and `tools/perf-sampler` (a standalone Windows sampling profiler workspace).
 - **`vendor/x264`** — Entry points and build script for the optional in-process x264 H.264 encoder ([building.md](building.md)).
 - **`fixtures/`** — Small hand-built test models and scripts.

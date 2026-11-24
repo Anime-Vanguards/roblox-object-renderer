@@ -34,7 +34,14 @@ pub(crate) const GLASS: u32 = 1568;
 const FORCEFIELD: u32 = 1584;
 
 pub fn extract(document: &Document) -> Scene {
-	extract_roots(document, &document.roots)
+	noted(document, extract_roots(document, &document.roots))
+}
+
+/// A scene of the whole document with what reading its file left out ([`Document::notes`]) ahead of
+/// its own warnings: the scene is drawn without those values.
+fn noted(document: &Document, mut scene: Scene) -> Scene {
+	scene.warnings.splice(0..0, document.notes.iter().cloned());
+	scene
 }
 
 /// What a walk through one of the document's roots adds to a scene ([`extract_reusing`]): its
@@ -238,7 +245,7 @@ fn walk_all(document: &Document, root: Ref) -> Vec<Ref> {
 /// by its own model, the parts' indices, the Highlights) is carried as the whole walk carries it.
 pub fn extract_reusing(document: &Document, reuse: &mut RootReuse, undo: &super::playback::Undo) -> Scene {
 	let signatures = reuse.signatures(document, undo);
-	extract_with(document, &document.roots, Some((reuse, signatures)))
+	noted(document, extract_with(document, &document.roots, Some((reuse, signatures))))
 }
 
 /// The scene of what is at or under `roots` (a ViewportFrame's world: scene::guis), lit by the

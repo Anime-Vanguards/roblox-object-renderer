@@ -12,7 +12,7 @@ pub fn main() -> anyhow::Result<()> {
 		match assets.fetch(&uri) {
 			Ok(fetched) => {
 				let name: String = label.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }).collect();
-				let target = out.join(format!("{name}.rbxm"));
+				let target = out.join(format!("{name}.{}", if ror_archive::is_archive(&fetched.bytes) { "rbx" } else { "rbxm" }));
 				std::fs::write(&target, &fetched.bytes)?;
 				println!("{uri}: {} bytes -> {}", fetched.bytes.len(), target.display());
 			}

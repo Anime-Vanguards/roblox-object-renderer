@@ -1463,6 +1463,7 @@ dependencies = [
  "rbx_reflection",
  "rbx_reflection_database",
  "rbx_xml",
+ "ror-archive",
  "ror-assets",
  "ror-image",
  "ror-mesh",
@@ -1470,6 +1471,21 @@ dependencies = [
  "serde_json",
  "wgpu",
  "windows-sys 0.61.2",
+ "zstd",
+]
+
+[[package]]
+name = "ror-archive"
+version = "0.10.0"
+dependencies = [
+ "blake3",
+ "crc32fast",
+ "lz4_flex",
+ "rbx_binary",
+ "rbx_dom_weak",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
  "zstd",
 ]
 
@@ -1482,6 +1498,7 @@ dependencies = [
  "rbx_binary",
  "rbx_dom_weak",
  "rbx_xml",
+ "ror-archive",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
