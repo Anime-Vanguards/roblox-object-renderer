@@ -242,7 +242,13 @@ fn mean_work(works: &[ViewWork]) -> Work {
 }
 
 fn worst(works: &[ViewWork]) -> Option<&ViewWork> {
-	works.iter().fold(None, |best: Option<&ViewWork>, work| if best.is_none_or(|best| work.total.ms > best.total.ms) { Some(work) } else { best })
+	works.iter().fold(None, |best: Option<&ViewWork>, work| {
+		if best.is_none_or(|best| work.total.ms > best.total.ms || (work.total.ms == best.total.ms && work.total.gpu_units > best.total.gpu_units)) {
+			Some(work)
+		} else {
+			best
+		}
+	})
 }
 
 /// The scene parts each merge names, by scene index.
@@ -279,6 +285,7 @@ pub fn run(setup: &Setup, scene: &Scene, document: &Document, reload: Option<&dy
 		})
 		.collect();
 	let tree = attribute::tree(&ids, &costed.works);
+	let profile = prices::Profile::for_preset(&setup.preset);
 	let found = findings::find(&findings::Inputs {
 		scene,
 		document,
@@ -287,6 +294,7 @@ pub fn run(setup: &Setup, scene: &Scene, document: &Document, reload: Option<&dy
 		ids: &ids,
 		costs: &costed.costs,
 		works: &costed.works,
+		profile: &profile,
 		quality: &setup.quality,
 		pixels: options.pixels && costed.pixels.iter().all(Option::is_some),
 		shown: costed.shown.as_ref(),
@@ -302,7 +310,9 @@ pub fn run(setup: &Setup, scene: &Scene, document: &Document, reload: Option<&dy
 		"preset": setup.preset,
 		"quality": setup.quality,
 		"technology": costed.analysis.technology,
-		"prices": prices::table(),
+		"prices": prices::table_for(&setup.preset),
+		"fidelity": prices::fidelity(&setup.preset, options.pixels),
+		"unmodeled": prices::unmodeled(&setup.preset, &setup.quality),
 		"shadowRedrawShare": attribute::SHADOW_REDRAW_SHARE,
 		"pixelsCounted": options.pixels,
 		"views": views,
@@ -348,19 +358,35 @@ fn ms(value: f64) -> String {
 fn summary_lines(input: &str, setup: &Setup, views: &[ViewLine], mean: &Work, worst: Option<&ViewWork>, tree: &[Node], found: &[Finding], budget: Option<&Budget>) -> Vec<String> {
 	let mut lines = Vec::new();
 	lines.push(format!("cost loop ({SCHEMA}): {input}, {} views, preset {} ({}x{}, quality {}{})", views.len(), setup.preset.name, setup.preset.width, setup.preset.height, setup.quality.level, if setup.quality.sun_shadows { ", sun shadows" } else { ", no sun shadows" }));
-	lines.push(format!(
-		"per view, mean: {} phone frame (CPU {}, GPU {} of which the frame waits {}); {:.0} draws, {:.0}k triangles, {:.2} viewports blended, {:.0} parts",
-		ms(mean.ms),
-		ms(mean.cpu_ms),
-		ms(mean.gpu_ms),
-		ms(mean.gpu_ms * prices::GPU_TO_FRAME),
-		mean.draws,
-		mean.triangles / 1000.0,
-		mean.blended / (setup.preset.width as f64 * setup.preset.height as f64),
-		mean.parts
-	));
-	if let Some(worst) = worst {
-		lines.push(format!("worst view: {} {} ({:.0} draws, {:.0}k triangles)", worst.name, ms(worst.total.ms), worst.total.draws, worst.total.triangles / 1000.0));
+	if setup.preset.phone {
+		lines.push(format!(
+			"per view, mean: {} phone frame (CPU {}, GPU {} of which the frame waits {}); {:.0} draws, {:.0}k triangles, {:.2} viewports blended, {:.0} parts",
+			ms(mean.ms),
+			ms(mean.cpu_ms),
+			ms(mean.gpu_ms),
+			ms(mean.gpu_ms * prices::GPU_TO_FRAME),
+			mean.draws,
+			mean.triangles / 1000.0,
+			mean.blended / (setup.preset.width as f64 * setup.preset.height as f64),
+			mean.parts
+		));
+		if let Some(worst) = worst {
+			lines.push(format!("worst view: {} {} ({:.0} draws, {:.0}k triangles)", worst.name, ms(worst.total.ms), worst.total.draws, worst.total.triangles / 1000.0));
+		}
+	} else {
+		lines.push(format!(
+			"per view, mean: {} desktop CPU frame (GPU uncalibrated: {:.2} gpuUnits, 0.00 ms); {:.0} draws, {:.0}k triangles, {:.2} viewports blended, {:.0} parts",
+			ms(mean.ms),
+			mean.gpu_units,
+			mean.draws,
+			mean.triangles / 1000.0,
+			mean.blended / (setup.preset.width as f64 * setup.preset.height as f64),
+			mean.parts
+		));
+		if let Some(worst) = worst {
+			lines.push(format!("worst view: {} {} ({:.2} gpuUnits, {:.0} draws, {:.0}k triangles)", worst.name, ms(worst.total.ms), worst.total.gpu_units, worst.total.draws, worst.total.triangles / 1000.0));
+		}
+		lines.push("fidelity: desktop GPU ms is uncalibrated (gpuMs = 0); compare gpuUnits for shading/overdraw and check unmodeled in analysis.json".into());
 	}
 	if let Some(budget) = budget {
 		let over: Vec<&ViewLine> = views.iter().filter(|view| !view.over_budget.is_empty()).collect();
@@ -384,7 +410,11 @@ fn summary_lines(input: &str, setup: &Setup, views: &[ViewLine], mean: &Work, wo
 	}
 	lines.push(format!("top findings ({} in analysis.json, each with its edit):", found.len()));
 	for finding in found.iter().take(10) {
-		lines.push(format!("  #{:<2} -{:>8}/view (worst -{} {})  [{}] {}", finding.rank, ms(finding.saving.mean_ms), ms(finding.saving.worst_ms), finding.saving.worst_view, finding.kind, finding.title));
+		if !setup.preset.phone && finding.saving.mean_ms <= 0.0 && finding.saving.mean_gpu_units > 0.0 {
+			lines.push(format!("  #{:<2} -{:.2} gpuUnits/view (worst {})  [{}] {}", finding.rank, finding.saving.mean_gpu_units, finding.saving.worst_view, finding.kind, finding.title));
+		} else {
+			lines.push(format!("  #{:<2} -{:>8}/view (worst -{} {})  [{}] {}", finding.rank, ms(finding.saving.mean_ms), ms(finding.saving.worst_ms), finding.saving.worst_view, finding.kind, finding.title));
+		}
 	}
 	lines.push("try one: put its edit in an edits file and run again with --edits FILE --look (docs/cost-loop.md)".into());
 	lines
@@ -403,7 +433,12 @@ fn breakdown<'a>(tree: &'a [Node]) -> Vec<(&'a Node, usize)> {
 	// tree is sorted by mean ms: children keep that order
 	fn through<'a>(children: &HashMap<&'a str, Vec<&'a Node>>, mut node: &'a Node) -> &'a Node {
 		while let Some(first) = children.get(node.id.as_str()).and_then(|kids| kids.first()) {
-			if first.mean.ms < node.mean.ms * 0.8 {
+			let keep = if node.mean.ms > 0.0 {
+				first.mean.ms >= node.mean.ms * 0.8
+			} else {
+				node.mean.gpu_units > 0.0 && first.mean.gpu_units >= node.mean.gpu_units * 0.8
+			};
+			if !keep {
 				break;
 			}
 			node = first;
@@ -411,7 +446,7 @@ fn breakdown<'a>(tree: &'a [Node]) -> Vec<(&'a Node, usize)> {
 		node
 	}
 	let mut out = Vec::new();
-	let tops: Vec<&Node> = tree.iter().filter(|node| node.parent.is_none() && node.id != attribute::SHARED && node.mean.ms > 0.0).collect();
+	let tops: Vec<&Node> = tree.iter().filter(|node| node.parent.is_none() && node.id != attribute::SHARED && (node.mean.ms > 0.0 || node.mean.gpu_units > 0.0)).collect();
 	for top in tops.into_iter().take(3) {
 		let start = through(&children, top);
 		out.push((start, 0));
@@ -479,7 +514,7 @@ fn explain(ids: &InstanceIds, costed: &Costed, scene: &Scene, id: &str) -> Resul
 		per_view.push(json!({ "view": cost.name, "work": total.rounded(), "partsDrawn": shown, "partsOccluded": occluded, "partsCulled": items.len().saturating_sub(shown + occluded), "batches": batches }));
 	}
 	let mut ranked: Vec<(String, Work)> = leaves.into_iter().collect();
-	ranked.sort_by(|a, b| b.1.ms.total_cmp(&a.1.ms).then_with(|| a.0.cmp(&b.0)));
+	ranked.sort_by(|a, b| b.1.ms.total_cmp(&a.1.ms).then_with(|| b.1.gpu_units.total_cmp(&a.1.gpu_units)).then_with(|| a.0.cmp(&b.0)));
 	lines.push(format!("  costliest under it (mean per view), of {}:", ranked.len()));
 	for (leaf, work) in ranked.iter().take(10) {
 		lines.push(format!("    {}  {:.2} draws {:.0} tris {:.0} px {:.0} blended  {leaf}", ms(work.ms), work.draws, work.triangles, work.pixels, work.blended));
@@ -856,6 +891,63 @@ mod tests {
 		for file in ["analysis.json", "tree.json", "whatif.json"] {
 			assert_eq!(std::fs::read(out.join(file)).unwrap(), std::fs::read(again.join(file)).unwrap(), "{file} differs between two runs");
 		}
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	#[test]
+	fn desktop_preset_prices_cpu_as_desktop_and_refuses_gpu_ms() {
+		let state = std::env::temp_dir().join(format!("ror-desktop-pricing-test-{}", std::process::id()));
+		let gpu = std::sync::Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = crate::render::Renderer::new(gpu, assets).expect("a renderer");
+		let mut model = ModelBuilder::new("Map");
+		let at = |x: f32, y: f32, z: f32| Affine3A::from_translation(Vec3::new(x, y, z));
+		let wall = model.part(&PartSpec { name: "Wall".into(), size: Vec3::new(40.0, 20.0, 1.0), ..Default::default() });
+		model.part(&PartSpec { name: "Fog".into(), cframe: at(0.0, 0.0, 10.0), size: Vec3::new(30.0, 16.0, 0.2), transparency: 0.8, ..Default::default() });
+		model.child(
+			wall,
+			rbx_dom_weak::InstanceBuilder::new("PointLight")
+				.with_name("Lamp")
+				.with_property("Brightness", 4.0f32)
+				.with_property("Range", 40.0f32),
+		);
+		let document = model.into_document();
+		let scene = crate::scene::extract::extract(&document);
+		let spec = CameraSpec::LookAt { eye: [0.0, 2.0, 40.0], target: [0.0, 0.0, 0.0], fov: 60.0 };
+		let shots = vec![(spec.place(None, 320, 180), 320, 180)];
+		let options = CostOptions { attribute: true, pixels: true, ..Default::default() };
+
+		let phone_out = state.join("phone");
+		let desk_out = state.join("desktop");
+		std::fs::create_dir_all(&phone_out).unwrap();
+		std::fs::create_dir_all(&desk_out).unwrap();
+		let phone_preset = Preset::named("phone").unwrap();
+		let desk_preset = Preset::named("desktop").unwrap();
+		let phone_setup = Setup { renderer: &renderer, options: &options, names: vec!["front".into()], shots: &shots, preset: phone_preset, quality: Quality::of(2, true), gpu: None, lent_lighting: false, lent_materials: false };
+		let desk_setup = Setup { renderer: &renderer, options: &options, names: vec!["front".into()], shots: &shots, preset: desk_preset, quality: Quality::of(21, false), gpu: None, lent_lighting: false, lent_materials: false };
+		run(&phone_setup, &scene, &document, None, &phone_out, "map").unwrap();
+		let (_, desk_lines) = run(&desk_setup, &scene, &document, None, &desk_out, "map").unwrap();
+
+		let phone_json: Value = serde_json::from_slice(&std::fs::read(phone_out.join("analysis.json")).unwrap()).unwrap();
+		let desk_json: Value = serde_json::from_slice(&std::fs::read(desk_out.join("analysis.json")).unwrap()).unwrap();
+		let desk_txt = std::fs::read_to_string(desk_out.join("analysis.txt")).unwrap();
+
+		assert_eq!(phone_json["fidelity"]["gpuCalibrated"], true);
+		assert!(phone_json["mean"]["gpuMs"].as_f64().unwrap() > 0.0);
+		assert!(phone_json["mean"]["gpuUnits"].as_f64().unwrap() > 0.0);
+
+		assert_eq!(desk_json["fidelity"]["gpuCalibrated"], false);
+		assert_eq!(desk_json["fidelity"]["status"], "partial");
+		assert!(desk_json["fidelity"]["gpuRefusal"]["settleWith"].is_string());
+		assert!(desk_json["unmodeled"].as_array().unwrap().iter().any(|u| u["kind"] == "desktopGpuMs"));
+		assert_eq!(desk_json["mean"]["gpuMs"].as_f64().unwrap(), 0.0);
+		assert!(desk_json["mean"]["gpuUnits"].as_f64().unwrap() > 0.0);
+		assert!((desk_json["mean"]["ms"].as_f64().unwrap() - desk_json["mean"]["cpuMs"].as_f64().unwrap()).abs() <= 1e-4);
+		assert!(!desk_txt.to_ascii_lowercase().contains("phone"), "desktop analysis.txt mentioned phone:\n{desk_txt}");
+		let light_finding = desk_json["findings"].as_array().unwrap().iter().find(|f| f["kind"] == "lightRange").expect("desktop Q21 lightRange finding");
+		assert!(light_finding["saving"]["meanGpuUnits"].as_f64().unwrap() > 0.0, "{light_finding}");
+		assert_eq!(light_finding["saving"]["worstView"], "front", "{light_finding}");
+		assert!(desk_lines.iter().any(|l| l.contains("gpuUnits/view") && l.contains("[lightRange]")), "{desk_lines:?}");
 		let _ = std::fs::remove_dir_all(&state);
 	}
 

@@ -1,5 +1,5 @@
 //! Who pays for what in each view: every draw call, triangle, pixel, blended layer, light evaluation
-//! and shadow triangle charged to the instance that causes it, priced in phone frame ms
+//! and shadow triangle charged to the instance that causes it, priced by preset
 //! ([`super::prices`]), and rolled up the instance tree (place, folder, model, part) so an agent can
 //! go from a whole map down to the part that costs.
 //!
@@ -65,9 +65,12 @@ pub struct Work {
 	pub shadow_triangles: f64,
 	/// Parts in the place.
 	pub parts: f64,
+	/// Relative GPU shading/overdraw work in viewport-units (1.0 = one viewport of opaque Plastic).
+	pub gpu_units: f64,
 	pub cpu_ms: f64,
+	/// Calibrated GPU ms (0 when the preset has no GPU calibration; see `gpu_units`).
 	pub gpu_ms: f64,
-	/// Phone frame ms: CPU plus the GPU's share of the waits.
+	/// Frame ms: CPU plus the GPU's share of the waits when calibrated, else CPU ms only.
 	pub ms: f64,
 }
 
@@ -81,6 +84,7 @@ impl Work {
 		self.lit_pixels += other.lit_pixels;
 		self.shadow_triangles += other.shadow_triangles;
 		self.parts += other.parts;
+		self.gpu_units += other.gpu_units;
 		self.cpu_ms += other.cpu_ms;
 		self.gpu_ms += other.gpu_ms;
 		self.ms += other.ms;
@@ -96,6 +100,7 @@ impl Work {
 			lit_pixels: self.lit_pixels * by,
 			shadow_triangles: self.shadow_triangles * by,
 			parts: self.parts * by,
+			gpu_units: self.gpu_units * by,
 			cpu_ms: self.cpu_ms * by,
 			gpu_ms: self.gpu_ms * by,
 			ms: self.ms * by,
@@ -108,7 +113,7 @@ impl Work {
 		out
 	}
 
-	/// Rounded for output: counts to 0.01, ms to 0.1 us (the same run gives the same digits).
+	/// Rounded for output: counts to 0.01, ms and gpuUnits to 1e-4 (the same run gives the same digits).
 	pub fn rounded(&self) -> Work {
 		let r = |value: f64, step: f64| (value / step).round() * step;
 		Work {
@@ -120,17 +125,28 @@ impl Work {
 			lit_pixels: r(self.lit_pixels, 0.01),
 			shadow_triangles: r(self.shadow_triangles, 0.01),
 			parts: r(self.parts, 0.01),
+			gpu_units: r(self.gpu_units, 1e-4),
 			cpu_ms: r(self.cpu_ms, 1e-4),
 			gpu_ms: r(self.gpu_ms, 1e-4),
 			ms: r(self.ms, 1e-4),
 		}
 	}
 
-	/// The prices applied: CPU from the counts, GPU from viewport-units, the frame from both.
-	fn priced(mut self, units: f64) -> Work {
-		self.cpu_ms += self.draws * prices::DRAW_MS + self.triangles / 1000.0 * prices::KILO_TRIANGLE_MS + self.parts * prices::PART_MS + self.shadow_triangles * SHADOW_REDRAW_SHARE / 1000.0 * prices::KILO_TRIANGLE_MS;
-		self.gpu_ms += units * prices::GPU_MS_PER_UNIT;
-		self.ms = self.cpu_ms + self.gpu_ms * prices::GPU_TO_FRAME;
+	/// The prices applied for `profile`: CPU from the counts, GPU units recorded always, GPU ms and
+	/// GPU wait share added only when the profile has GPU calibration.
+	fn priced(mut self, units: f64, profile: &prices::Profile) -> Work {
+		self.gpu_units += units;
+		self.cpu_ms += self.draws * profile.draw_ms
+			+ self.triangles / 1000.0 * profile.kilo_triangle_ms
+			+ self.parts * profile.part_ms
+			+ self.shadow_triangles * SHADOW_REDRAW_SHARE / 1000.0 * profile.kilo_triangle_ms;
+		if let (Some(gpu_ms_per_unit), Some(gpu_to_frame)) = (profile.gpu_ms_per_unit, profile.gpu_to_frame) {
+			self.gpu_ms += self.gpu_units * gpu_ms_per_unit;
+			self.ms = self.cpu_ms + self.gpu_ms * gpu_to_frame;
+		} else {
+			self.gpu_ms = 0.0;
+			self.ms = self.cpu_ms;
+		}
 		self
 	}
 }
@@ -396,6 +412,7 @@ pub fn view(scene: &Scene, analysis: &Analysis, owners: &Owners, ids: &InstanceI
 		}
 		*units.entry(*owner).or_default() += feature_units(class).unwrap_or(0.0);
 	}
+	let profile = prices::Profile::for_preset(preset);
 	let mut by_instance = HashMap::new();
 	let mut total = Work::default();
 	let key_of = |referent: &Ref| ids.id(*referent).unwrap_or(SHARED).to_string();
@@ -403,7 +420,7 @@ pub fn view(scene: &Scene, analysis: &Analysis, owners: &Owners, ids: &InstanceI
 	keys.sort_by_key(key_of);
 	keys.dedup();
 	for key in keys {
-		let priced = work.get(&key).copied().unwrap_or_default().priced(units.get(&key).copied().unwrap_or(0.0));
+		let priced = work.get(&key).copied().unwrap_or_default().priced(units.get(&key).copied().unwrap_or(0.0), &profile);
 		by_instance.insert(key, priced);
 	}
 	// summed in a fixed order (by id), so the same run gives the same digits
@@ -468,7 +485,7 @@ pub fn tree(ids: &InstanceIds, views: &[ViewWork]) -> Vec<Node> {
 	let mut own: BTreeMap<String, Ref> = BTreeMap::new();
 	for view in views {
 		for (&referent, work) in &view.by_instance {
-			if work.ms > 0.0 || work.draws > 0.0 || work.pixels > 0.0 {
+			if work.ms > 0.0 || work.gpu_units > 0.0 || work.draws > 0.0 || work.pixels > 0.0 {
 				own.insert(if referent.is_none() { SHARED.to_string() } else { ids.id(referent).unwrap_or(SHARED).to_string() }, referent);
 			}
 		}
@@ -495,7 +512,13 @@ pub fn tree(ids: &InstanceIds, views: &[ViewWork]) -> Vec<Node> {
 				mean.add(work);
 			}
 			let mean = mean.scaled(1.0 / count.max(1) as f64);
-			let (worst_index, worst) = per_view.iter().enumerate().fold((0, Work::default()), |best, (index, work)| if work.ms > best.1.ms { (index, *work) } else { best });
+			let (worst_index, worst) = per_view.iter().enumerate().fold((0, Work::default()), |best, (index, work)| {
+				if work.ms > best.1.ms || (work.ms == best.1.ms && work.gpu_units > best.1.gpu_units) {
+					(index, *work)
+				} else {
+					best
+				}
+			});
 			let in_view = per_view.iter().filter(|work| work.draws > 0.0 || work.pixels > 0.0 || work.blended > 0.0).count() as u32;
 			let info = ids.info(referent);
 			Node {
@@ -512,7 +535,7 @@ pub fn tree(ids: &InstanceIds, views: &[ViewWork]) -> Vec<Node> {
 			}
 		})
 		.collect();
-	nodes.sort_by(|a, b| b.mean.ms.total_cmp(&a.mean.ms).then_with(|| a.id.cmp(&b.id)));
+	nodes.sort_by(|a, b| b.mean.ms.total_cmp(&a.mean.ms).then_with(|| b.mean.gpu_units.total_cmp(&a.mean.gpu_units)).then_with(|| a.id.cmp(&b.id)));
 	nodes
 }
 

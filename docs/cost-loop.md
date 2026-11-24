@@ -65,7 +65,7 @@ What Roblox renders at each graphics quality level under `Future` lighting (meas
 
 The cost model enables sun shadows at quality 12+, per-pixel local lights at 16+, and bloom at 6+. It also applies quality-based view distance culling (300 studs at quality 1–3) and small-part culling ([cost.md](cost.md)), and caps phone particle emission at an estimated 100 particles/s per emitter.
 
-Note that `--preset desktop` still uses phone millisecond pricing—it shows what desktop quality renders ranked on the same cost scale, rather than predicting desktop frame times.
+`--preset desktop` (and custom presets without `--preset phone`) scales CPU prices by `1 / 2.224` (paired desktop main-thread ratio) and refuses to fabricate desktop GPU milliseconds (`gpuMs: 0`, `fidelity.gpuCalibrated: false`), reporting shader and overdraw work in `gpuUnits` instead. `analysis.json` includes `fidelity` and `unmodeled` sections on every preset so callers know which costs are calibrated versus unmodeled and what measurement settles each gap.
 
 ## Cost attribution
 

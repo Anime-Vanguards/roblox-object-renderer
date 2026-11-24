@@ -13,7 +13,7 @@ use serde_json::json;
 use super::attribute::{Owners, ViewWork, Work};
 use super::edits::Edit;
 use super::ids::InstanceIds;
-use super::prices::{self, Quality};
+use super::prices::{Profile, Quality};
 use super::{Analysis, Cluster, Kind, ViewCost};
 use crate::scene::load::Document;
 use crate::scene::{Scene, props};
@@ -26,14 +26,16 @@ pub const KEPT: usize = 60;
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Saving {
-	/// Phone frame ms saved per view, averaged over every view (0 where it does not apply).
+	/// Frame ms saved per view, averaged over every view (0 where it does not apply).
 	pub mean_ms: f64,
 	pub worst_ms: f64,
 	pub worst_view: String,
+	/// Relative GPU viewport-units saved per view (populated even when GPU ms is uncalibrated).
+	pub mean_gpu_units: f64,
 	pub mean_draws: f64,
 	pub mean_triangles: f64,
 	pub mean_blended: f64,
-	/// Phone frame ms per view, the views it applies to.
+	/// Frame ms per view, the views it applies to.
 	pub views: BTreeMap<String, f64>,
 }
 
@@ -70,6 +72,7 @@ pub struct Inputs<'a> {
 	pub ids: &'a InstanceIds,
 	pub costs: &'a [ViewCost],
 	pub works: &'a [ViewWork],
+	pub profile: &'a Profile,
 	pub quality: &'a Quality,
 	/// Pixels were counted in every view (a layers render each).
 	pub pixels: bool,
@@ -89,6 +92,7 @@ impl Inputs<'_> {
 		instances.sort_by_key(|referent| self.id(*referent));
 		let mut saving = Saving::default();
 		let mut why = Work::default();
+		let mut worst_gpu = (0.0, String::new());
 		for work in self.works {
 			let mut view = Work::default();
 			for referent in &instances {
@@ -99,7 +103,7 @@ impl Inputs<'_> {
 			why.add(&view);
 			let mut ms = view.ms;
 			if keep_parts {
-				ms -= view.parts * prices::PART_MS;
+				ms -= view.parts * self.profile.part_ms;
 			}
 			if ms > 1e-6 {
 				saving.views.insert(work.name.clone(), round_ms(ms));
@@ -108,13 +112,21 @@ impl Inputs<'_> {
 					saving.worst_view = work.name.clone();
 				}
 			}
+			if view.gpu_units > worst_gpu.0 {
+				worst_gpu = (view.gpu_units, work.name.clone());
+			}
 			saving.mean_ms += ms;
+			saving.mean_gpu_units += view.gpu_units;
 			saving.mean_draws += view.draws;
 			saving.mean_triangles += view.triangles;
 			saving.mean_blended += view.blended;
 		}
 		let count = self.works.len().max(1) as f64;
 		saving.mean_ms = round_ms(saving.mean_ms / count);
+		saving.mean_gpu_units = round_ms(saving.mean_gpu_units / count);
+		if saving.worst_view.is_empty() && worst_gpu.0 > 0.0 {
+			saving.worst_view = worst_gpu.1;
+		}
 		saving.mean_draws = (saving.mean_draws / count * 100.0).round() / 100.0;
 		saving.mean_triangles = (saving.mean_triangles / count).round();
 		saving.mean_blended = (saving.mean_blended / count).round();
@@ -125,7 +137,7 @@ impl Inputs<'_> {
 	fn draws_saved(&self, per_view: &[f64]) -> Saving {
 		let mut saving = Saving::default();
 		for (work, &draws) in self.works.iter().zip(per_view) {
-			let ms = draws * prices::DRAW_MS;
+			let ms = draws * self.profile.draw_ms;
 			if draws > 0.0 {
 				saving.views.insert(work.name.clone(), round_ms(ms));
 				if ms > saving.worst_ms {
@@ -166,8 +178,8 @@ pub fn find(inputs: &Inputs) -> Vec<Finding> {
 	found.extend(invisible_effects(inputs));
 	found.extend(merges(inputs));
 	found.extend(shadows(inputs));
-	found.retain(|finding| finding.saving.mean_ms > 0.0 || finding.kind == "lightReachesNothing");
-	found.sort_by(|a, b| b.saving.mean_ms.total_cmp(&a.saving.mean_ms).then_with(|| a.id.cmp(&b.id)));
+	found.retain(|finding| finding.saving.mean_ms > 0.0 || finding.saving.mean_gpu_units > 0.0 || finding.kind == "lightReachesNothing");
+	found.sort_by(|a, b| b.saving.mean_ms.total_cmp(&a.saving.mean_ms).then_with(|| b.saving.mean_gpu_units.total_cmp(&a.saving.mean_gpu_units)).then_with(|| a.id.cmp(&b.id)));
 	found.truncate(KEPT);
 	for (rank, finding) in found.iter_mut().enumerate() {
 		finding.rank = rank + 1;
@@ -334,7 +346,14 @@ fn see_through(inputs: &Inputs) -> Vec<Finding> {
 			edit,
 			look: "changes",
 			basis: "attribution",
-			note: Some("blended layers are GPU work: on phones the frame pays it through the GPU waits (estimated weights)".into()),
+			note: Some(
+				if inputs.profile.phone {
+					"blended layers are GPU work: on phones the frame pays it through the GPU waits (estimated weights)"
+				} else {
+					"blended layers are GPU work: desktop GPU ms is uncalibrated, so compare gpuUnits (estimated weights)"
+				}
+				.into(),
+			),
 		});
 	}
 	found
@@ -366,11 +385,13 @@ fn emitters(inputs: &Inputs) -> Vec<Finding> {
 		// the quality's rate cap (a phone's 100 a second): half of what it makes, not of its Rate
 		let made = rate.min(inputs.quality.max_rate);
 		let rate = ((made as f64) * 0.5 * 100.0).round() / 100.0;
-		// half the fill's GPU work, through the waits; the draw stays
-		let half = |ms: f64, work: &Work| ((ms - work.draws * prices::DRAW_MS - work.triangles / 1000.0 * prices::KILO_TRIANGLE_MS) * 0.5).max(0.0);
+		// half the fill's GPU work, through the waits when calibrated; the draw stays
+		let half = |ms: f64, work: &Work| ((ms - work.draws * inputs.profile.draw_ms - work.triangles / 1000.0 * inputs.profile.kilo_triangle_ms) * 0.5).max(0.0);
 		let mut per_view = BTreeMap::new();
 		let mut total = 0.0;
+		let mut total_gpu = 0.0;
 		let mut worst = (0.0, String::new());
+		let mut worst_gpu = (0.0, String::new());
 		for work in inputs.works {
 			if let Some(entry) = work.by_instance.get(&referent) {
 				let ms = round_ms(half(entry.ms, entry));
@@ -380,14 +401,20 @@ fn emitters(inputs: &Inputs) -> Vec<Finding> {
 						worst = (ms, work.name.clone());
 					}
 				}
+				let gpu_u = (entry.gpu_units * 0.5).max(0.0);
+				if gpu_u > worst_gpu.0 {
+					worst_gpu = (gpu_u, work.name.clone());
+				}
 				total += ms;
+				total_gpu += gpu_u;
 			}
 		}
 		let count = inputs.works.len().max(1) as f64;
 		saving.views = per_view;
 		saving.mean_ms = round_ms(total / count);
+		saving.mean_gpu_units = round_ms(total_gpu / count);
 		saving.worst_ms = worst.0;
-		saving.worst_view = worst.1;
+		saving.worst_view = if !worst.1.is_empty() { worst.1 } else { worst_gpu.1 };
 		saving.mean_draws = 0.0;
 		saving.mean_triangles = (saving.mean_triangles * 0.5).round();
 		saving.mean_blended = (saving.mean_blended * 0.5).round();
@@ -403,7 +430,14 @@ fn emitters(inputs: &Inputs) -> Vec<Finding> {
 			edit: Edit::Set { targets: vec![id], classes: Vec::new(), properties: [("Rate".to_string(), json!(rate))].into_iter().collect() },
 			look: "changes",
 			basis: "attribution",
-			note: Some("particle fill is GPU work, priced through the waits (estimated weights)".into()),
+			note: Some(
+				if inputs.profile.phone {
+					"particle fill is GPU work, priced through the waits (estimated weights)"
+				} else {
+					"particle fill is GPU work: desktop GPU ms is uncalibrated, so compare gpuUnits (estimated weights)"
+				}
+				.into(),
+			),
 		});
 	}
 	found
@@ -437,7 +471,7 @@ fn lights(inputs: &Inputs) -> Vec<Finding> {
 				edit: Edit::Set { targets: vec![id], classes: Vec::new(), properties: [("Enabled".to_string(), json!(false))].into_iter().collect() },
 				look: "changes",
 				basis: "attribution",
-				note: None,
+				note: (!inputs.profile.phone).then(|| "per-pixel local light shading is GPU work: desktop GPU ms is uncalibrated, so compare gpuUnits (estimated weights)".into()),
 			});
 		}
 	}
@@ -599,7 +633,7 @@ fn levels_of_detail(inputs: &Inputs) -> Vec<Finding> {
 	for (mesh, gains) in by_mesh {
 		let mut saving = Saving::default();
 		for (view, triangles, batches) in &gains {
-			let ms = triangles / 1000.0 * prices::KILO_TRIANGLE_MS - batches * prices::DRAW_MS;
+			let ms = triangles / 1000.0 * inputs.profile.kilo_triangle_ms - batches * inputs.profile.draw_ms;
 			let name = &inputs.works[*view].name;
 			saving.views.insert(name.clone(), round_ms(ms));
 			if ms > saving.worst_ms {
@@ -751,7 +785,7 @@ fn shadows(inputs: &Inputs) -> Vec<Finding> {
 	let mut views = 0.0;
 	for work in inputs.works {
 		let triangles: f64 = small.iter().filter_map(|referent| work.by_instance.get(referent)).map(|entry| entry.shadow_triangles).sum();
-		let ms = triangles * super::attribute::SHADOW_REDRAW_SHARE / 1000.0 * prices::KILO_TRIANGLE_MS;
+		let ms = triangles * super::attribute::SHADOW_REDRAW_SHARE / 1000.0 * inputs.profile.kilo_triangle_ms;
 		if ms > 0.0 {
 			saving.views.insert(work.name.clone(), round_ms(ms));
 			if ms > saving.worst_ms {
@@ -777,6 +811,13 @@ fn shadows(inputs: &Inputs) -> Vec<Finding> {
 		edit: Edit::Set { targets, classes: Vec::new(), properties: [("CastShadow".to_string(), json!(false))].into_iter().collect() },
 		look: "changes",
 		basis: "attribution",
-		note: Some("only where the quality draws sun shadows (none on phones below quality 4)".into()),
+		note: Some(
+			if inputs.profile.phone {
+				"only where the quality draws sun shadows (none on phones below quality 4)"
+			} else {
+				"only where the quality draws sun shadows (quality 12 and up)"
+			}
+			.into(),
+		),
 	}]
 }

@@ -37,7 +37,7 @@ ror cost Map.rbxm --paths 4 --check --profile    # Compare against Studio counte
 | `--full-detail` | Keep all meshes at LOD 0 (matching Studio's default `MeshPartDetailLevel`), while keeping distance/size culling active. |
 | `--check` | Load the scene into capture Studio (`ror studio open`, pass `--technology` to match) and print Studio's real counters beside `ror`'s estimates (`cost-check.json`). Requires a Studio MCP bridge ([parity.md](parity.md)). |
 | `--profile` | With `--check`, pull render-job CPU timings (`queryOcclusion`, render-thread wait, render-thread work) from Studio's MicroProfiler via LibMP. |
-| `--preset phone\|desktop`, `--edits`, `--look`, `--export`, `--explain`, `--budget`, `--heat` | Cost-loop flags for phone ms attribution, what-if edits, and Lune export; see [cost-loop.md](cost-loop.md). |
+| `--preset phone\|desktop`, `--edits`, `--look`, `--export`, `--explain`, `--budget`, `--heat` | Cost-loop flags for preset frame attribution (phone calibrated ms; desktop scaled CPU ms + uncalibrated `gpuUnits`), what-if edits, and Lune export; see [cost-loop.md](cost-loop.md). |
 
 ## Output files
 
@@ -49,7 +49,7 @@ Files written to `--out`:
 - `<view>.png`: rendered view.
 - `<view>.draws.png`: false-color image where every draw call gets a distinct color.
 - `<view>.heat.png`: instancing efficiency heatmap (red = 1 copy/draw, yellow = 10 copies/draw, blue = 100+ copies/draw, gray = culled).
-- `analysis.txt`, `analysis.json`, `tree.json`: per-instance phone-ms attribution and ranked findings ([cost-loop.md](cost-loop.md)).
+- `analysis.txt`, `analysis.json`, `tree.json`: per-instance attribution (`prices`, `fidelity`, `unmodeled`) and ranked findings ([cost-loop.md](cost-loop.md)).
 
 ## How Roblox counts draws and triangles
 
