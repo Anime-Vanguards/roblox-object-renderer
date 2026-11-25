@@ -68,11 +68,110 @@ pub struct FileStamp {
 	kind: StampKind,
 }
 
+/// A [`FileStamp`] paired with the raw [`OsStamp`] and recent-window state observed when it was
+/// taken, so a reader can prove after reading the file's bytes that the bytes match the stamp it
+/// plans to cache them under.
+#[derive(Clone, Copy, Debug)]
+pub struct FileSnapshot {
+	pub stamp: FileStamp,
+	pub os: OsStamp,
+	recent: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+	static BEFORE_HASH_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&Path)>>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn run_before_hash_hook(path: &Path) {
+	BEFORE_HASH_HOOK.with_borrow_mut(|hook| {
+		if let Some(f) = hook.as_mut() {
+			f(path);
+		}
+	});
+}
+
+#[cfg(not(test))]
+#[inline]
+fn run_before_hash_hook(_path: &Path) {}
+
+impl FileSnapshot {
+	/// Proves that `bytes` read from `path` match the stamp this snapshot carries.
+	///
+	/// - For a content-hashed stamp, verifies the exact bytes read against `(len, hash)`.
+	/// - For a trusted OS stamp outside the recent window, re-reads the OS stamp after the read and
+	///   requires it to match `self.os` (including its monotonic USN on Windows or kernel `ctime`
+	///   and inode on Unix) and `bytes.len()`.
+	/// - Untrusted or still-recent OS stamps cannot prove that a file did not move from A to B and
+	///   back to A during the read, so they return `false`.
+	pub fn verify_read(&self, path: &Path, bytes: &[u8]) -> bool {
+		match self.stamp.kind {
+			StampKind::Content { len, hash } => bytes.len() as u64 == len && hash_bytes(bytes) == hash,
+			StampKind::Os(os_before) => {
+				if !os_before.trusted || self.recent {
+					return false;
+				}
+				let Ok((os_after, _, _, _)) = read_os_stamp(path) else {
+					return false;
+				};
+				os_after == os_before && os_after.len == bytes.len() as u64
+			}
+		}
+	}
+
+	/// Proves that `path` has not been modified or replaced since this snapshot was taken, for
+	/// external readers whose raw bytes are not returned to us (e.g. a subprocess rendering a GUI).
+	///
+	/// - On Windows NTFS/ReFS (`trusted && usn > 0`), the kernel USN advances on every write and
+	///   `file_id` / USN changes on replacement, so `os_after == self.os` proves no write happened.
+	/// - On Unix (`trusted && usn == 0`), kernel `ctime` and `ino` prove no write once outside the
+	///   recent window; within the recent window, same-tick A -> B -> A cannot be ruled out.
+	/// - On untrusted filesystems (`!trusted`), no monotonic OS change token exists, so this
+	///   conservatively returns `false`.
+	pub fn still_unchanged(&self, path: &Path) -> bool {
+		if !self.os.trusted {
+			return false;
+		}
+		if self.os.usn == 0 && self.recent {
+			return false;
+		}
+		let Ok((os_after, _, _, _)) = read_os_stamp(path) else {
+			return false;
+		};
+		os_after == self.os
+	}
+}
+
 impl FileStamp {
+	/// Reads `path`'s metadata (and content hash when recent or untrusted) and builds its snapshot.
+	pub fn snapshot(path: &Path) -> std::io::Result<FileSnapshot> {
+		let (os, _is_file, modified_time, change_time) = read_os_stamp(path)?;
+		let recent = is_os_recent(&os, modified_time, change_time);
+		let stamp = Self::from_os_stamp(path, os, modified_time, change_time);
+		Ok(FileSnapshot { stamp, os, recent })
+	}
+
+	/// Like [`FileStamp::snapshot`], returning `None` unless `path` is a regular file.
+	pub fn snapshot_file(path: &Path) -> Option<FileSnapshot> {
+		let (os, is_file, modified_time, change_time) = read_os_stamp(path).ok()?;
+		if !is_file {
+			return None;
+		}
+		let recent = is_os_recent(&os, modified_time, change_time);
+		let stamp = Self::from_os_stamp(path, os, modified_time, change_time);
+		Some(FileSnapshot { stamp, os, recent })
+	}
+
+	/// Content-hashed stamp of an in-memory byte slice, matching what [`FileStamp`] produces when
+	/// hashing a file on disk.
+	pub fn of_bytes(bytes: &[u8]) -> FileStamp {
+		FileStamp { kind: StampKind::Content { len: bytes.len() as u64, hash: hash_bytes(bytes) } }
+	}
+
 	/// Reads `path`'s metadata (and content hash when recent or untrusted) and builds its stamp.
 	pub fn try_of(path: &Path) -> std::io::Result<FileStamp> {
-		let (os, _is_file, modified_time, change_time) = read_os_stamp(path)?;
-		Ok(Self::from_os_stamp(path, os, modified_time, change_time))
+		Self::snapshot(path).map(|snapshot| snapshot.stamp)
 	}
 
 	/// Reads `path`'s metadata and builds its stamp, or `None` if it cannot be read.
@@ -82,11 +181,7 @@ impl FileStamp {
 
 	/// Like [`FileStamp::of`], returning `None` unless `path` is a regular file.
 	pub fn of_file(path: &Path) -> Option<FileStamp> {
-		let (os, is_file, modified_time, change_time) = read_os_stamp(path).ok()?;
-		if !is_file {
-			return None;
-		}
-		Some(Self::from_os_stamp(path, os, modified_time, change_time))
+		Self::snapshot_file(path).map(|snapshot| snapshot.stamp)
 	}
 
 	/// Reads only the OS-level metadata stamp for `path` (exposed for diagnostics and tests).
@@ -113,13 +208,13 @@ impl FileStamp {
 	/// untrusted-filesystem and aging tests).
 	pub fn from_os_stamp(path: &Path, os: OsStamp, modified_time: Option<SystemTime>, change_time: Option<SystemTime>) -> FileStamp {
 		if !os.trusted {
+			run_before_hash_hook(path);
 			return match hash_file(path) {
-				Some(hash) => FileStamp { kind: StampKind::Content { len: os.len, hash } },
+				Some((len, hash)) => FileStamp { kind: StampKind::Content { len, hash } },
 				None => FileStamp { kind: StampKind::Os(os) },
 			};
 		}
-		let is_recent = |time: Option<SystemTime>| time.is_some_and(|time| time.elapsed().map_or(true, |age| age < RECENT_WINDOW));
-		let recent = modified_time.is_none() || is_recent(modified_time) || is_recent(change_time);
+		let recent = is_os_recent(&os, modified_time, change_time);
 		let id_key = (os.volume, os.file_id);
 		let hashes = FILE_HASHES.get_or_init(Default::default);
 		if !recent {
@@ -131,12 +226,15 @@ impl FileStamp {
 				}
 				Some((kept_os, _, false)) if kept_os == os => {
 					// First look after aging past the recent window: hash once more to close any
-					// rewrite in the last timer tick or open handle, then settle so later looks
-					// read nothing while keeping the exact same content key.
-					if let Some(hash) = hash_file(path) {
-						let mut table = hashes.lock();
-						table.insert(id_key, (os, hash, true));
-						return FileStamp { kind: StampKind::Content { len: os.len, hash } };
+					// rewrite in the last timer tick or open handle, then settle only if the OS
+					// stamp still matches after hashing (what is kept under `os` is what was read).
+					run_before_hash_hook(path);
+					if let Some((len, hash)) = hash_file(path) {
+						if len == os.len && read_os_stamp(path).is_ok_and(|(after, _, _, _)| after == os) {
+							let mut table = hashes.lock();
+							table.insert(id_key, (os, hash, true));
+						}
+						return FileStamp { kind: StampKind::Content { len, hash } };
 					}
 					return FileStamp { kind: StampKind::Os(os) };
 				}
@@ -151,14 +249,17 @@ impl FileStamp {
 		if os.len > RECENT_HASH_MAX_BYTES {
 			return FileStamp { kind: StampKind::Os(os) };
 		}
+		run_before_hash_hook(path);
 		match hash_file(path) {
-			Some(hash) => {
-				let mut table = hashes.lock();
-				if table.len() >= FILE_HASHES_KEPT {
-					table.clear();
+			Some((len, hash)) => {
+				if len == os.len && read_os_stamp(path).is_ok_and(|(after, _, _, _)| after == os) {
+					let mut table = hashes.lock();
+					if table.len() >= FILE_HASHES_KEPT {
+						table.clear();
+					}
+					table.insert(id_key, (os, hash, false));
 				}
-				table.insert(id_key, (os, hash, false));
-				FileStamp { kind: StampKind::Content { len: os.len, hash } }
+				FileStamp { kind: StampKind::Content { len, hash } }
 			}
 			None => FileStamp { kind: StampKind::Os(os) },
 		}
@@ -215,27 +316,45 @@ impl FileStamp {
 	}
 }
 
+fn is_os_recent(os: &OsStamp, modified_time: Option<SystemTime>, change_time: Option<SystemTime>) -> bool {
+	if !os.trusted {
+		return true;
+	}
+	let is_recent = |time: Option<SystemTime>| time.is_some_and(|time| time.elapsed().map_or(true, |age| age < RECENT_WINDOW));
+	modified_time.is_none() || is_recent(modified_time) || is_recent(change_time)
+}
+
 fn unix_nanos(time: Option<SystemTime>) -> u128 {
 	time.and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map_or(0, |time| time.as_nanos())
 }
 
+/// First 128 bits of the BLAKE3 digest of `bytes`.
+fn hash_bytes(bytes: &[u8]) -> [u8; 16] {
+	let digest = blake3::hash(bytes);
+	let mut out = [0u8; 16];
+	out.copy_from_slice(&digest.as_bytes()[..16]);
+	out
+}
+
 /// Streams `path` through BLAKE3 using a fixed 64 KiB buffer (no whole-file allocation) and returns
-/// the first 128 bits of the digest.
-fn hash_file(path: &Path) -> Option<[u8; 16]> {
+/// `(bytes_read, first 128 bits of the digest)`.
+fn hash_file(path: &Path) -> Option<(u64, [u8; 16])> {
 	let mut file = std::fs::File::open(path).ok()?;
 	let mut hasher = blake3::Hasher::new();
 	let mut buf = [0u8; 64 * 1024];
+	let mut total = 0u64;
 	loop {
 		let read = file.read(&mut buf).ok()?;
 		if read == 0 {
 			break;
 		}
+		total += read as u64;
 		hasher.update(&buf[..read]);
 	}
 	let digest = hasher.finalize();
 	let mut out = [0u8; 16];
 	out.copy_from_slice(&digest.as_bytes()[..16]);
-	Some(out)
+	Some((total, out))
 }
 
 #[cfg(windows)]
@@ -520,6 +639,74 @@ mod tests {
 		std::fs::write(&path, b"different-payload-02").unwrap();
 		let changed = FileStamp::of(&path).unwrap();
 		assert_ne!(changed, fresh, "real content change must invalidate");
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	/// Deterministic test (no sleeps): if a file changes between `read_os_stamp` and `hash_file`,
+	/// `FILE_HASHES` must NOT record `(os_A, hash_B)`, so a subsequent look after the file returns
+	/// to `A` (or stays at `os_A`) never inherits `hash_B`.
+	#[test]
+	fn file_hashes_not_poisoned_when_file_moves_between_os_stamp_and_hash() {
+		let dir = std::env::temp_dir().join(format!("ror-stamp-race-hash-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("moving.bin");
+		let bytes_a = b"payload-alpha-01";
+		let bytes_b = b"payload-bravo-02";
+		std::fs::write(&path, bytes_a).unwrap();
+		let (os_a, _, mod_a, chg_a) = read_os_stamp(&path).unwrap();
+		assert!(os_a.trusted, "temp dir should be on a trusted filesystem for this test");
+
+		let moved_path = path.clone();
+		BEFORE_HASH_HOOK.set(Some(Box::new(move |p| {
+			if p == moved_path {
+				std::fs::write(p, bytes_b).unwrap();
+			}
+		})));
+		let stamp_during = FileStamp::from_os_stamp(&path, os_a, mod_a, chg_a);
+		BEFORE_HASH_HOOK.set(None);
+		// The stamp returned matches the bytes actually hashed (B), and `FILE_HASHES` was NOT
+		// poisoned with `(os_a, hash_b)` because `read_os_stamp` after hashing saw `os_b != os_a`.
+		assert_eq!(stamp_during, FileStamp::of_bytes(bytes_b));
+		let cached = FILE_HASHES.get_or_init(Default::default).lock().get(&(os_a.volume, os_a.file_id)).copied();
+		assert_ne!(cached.map(|(os, _, _)| os), Some(os_a), "FILE_HASHES must not cache a hash read after OS stamp moved");
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	/// Deterministic test (no sleeps): `FileSnapshot::verify_read` rejects B read under snapshot A,
+	/// even if the file was rewritten back to A before `verify_read` runs.
+	#[test]
+	fn verify_read_rejects_a_to_b_to_a_content_and_os() {
+		let dir = std::env::temp_dir().join(format!("ror-stamp-verify-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("flip.bin");
+		let bytes_a = b"alpha-contents-1";
+		let bytes_b = b"bravo-contents-2";
+
+		// 1. Content-stamped (fresh) file: A -> B -> A while reading B.
+		std::fs::write(&path, bytes_a).unwrap();
+		let snap_content = FileStamp::snapshot(&path).unwrap();
+		assert!(snap_content.stamp.is_content_hashed());
+		assert!(snap_content.verify_read(&path, bytes_a), "matching bytes verify");
+		std::fs::write(&path, bytes_b).unwrap();
+		let read_b = std::fs::read(&path).unwrap();
+		std::fs::write(&path, bytes_a).unwrap();
+		assert!(!snap_content.verify_read(&path, &read_b), "content snapshot must reject B even after file returns to A");
+
+		// 2. OS-stamped (aged, trusted) file: construct an aged OS snapshot directly (zero sleeps).
+		let (os_a, _, _, _) = read_os_stamp(&path).unwrap();
+		if os_a.trusted {
+			let snap_os = FileSnapshot { stamp: FileStamp { kind: StampKind::Os(os_a) }, os: os_a, recent: false };
+			assert!(snap_os.verify_read(&path, bytes_a), "unchanged trusted OS stamp verifies");
+			assert!(snap_os.still_unchanged(&path), "unchanged trusted OS stamp reports still_unchanged");
+			// File moves A -> B -> A: monotonic USN (Windows) / ctime (Unix) cannot return to os_a.
+			std::fs::write(&path, bytes_b).unwrap();
+			let read_b = std::fs::read(&path).unwrap();
+			std::fs::write(&path, bytes_a).unwrap();
+			assert!(!snap_os.verify_read(&path, &read_b), "OS snapshot must reject B even after file returns to A");
+			assert!(!snap_os.still_unchanged(&path), "still_unchanged must reject A -> B -> A");
+		}
 		let _ = std::fs::remove_dir_all(&dir);
 	}
 }

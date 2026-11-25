@@ -866,8 +866,8 @@ impl<'a> Builder<'a> {
 			roots: Default::default(),
 		};
 		let fixed = builder.playback.changes_nothing() && !builder.playback.touches_lighting() && !builder.playback.play;
-		let key = fixed.then(|| scenes.video_key(&job.input, builder.select, builder.map, builder.lend, builder.relative_to)).flatten();
-		if let Some(input) = key.as_deref().and_then(|key| scenes.video_input(key)) {
+		let key = fixed.then(|| scenes.video_key_checked(&job.input, builder.select, builder.map, builder.lend, builder.relative_to)).flatten();
+		if let Some(input) = key.as_ref().and_then(|key| scenes.video_input(&key.key)) {
 			builder.fades = crate::lint::tween_fades(&input.document, &builder.playback);
 			builder.roots = input.roots.clone();
 			builder.guis = input.guis;
@@ -875,16 +875,22 @@ impl<'a> Builder<'a> {
 			return Ok(builder);
 		}
 		builder.bytes = read()?;
-		let (document, lent) = builder.document()?;
+		let (document, lent, map_proven) = builder.document_proven()?;
 		builder.lent = lent;
 		builder.fades = crate::lint::tween_fades(&document, &builder.playback);
 		builder.roots = crate::lint::EffectRoots::of(&document);
 		builder.guis = document.dom.descendants().any(|instance| matches!(instance.class.as_str(), "SurfaceGui" | "BillboardGui"));
 		if builder.playback.changes_nothing() {
-			let scene = builder.extracted(&document)?;
+			let (scene, mat_proven, light_proven) = builder.extracted_proven(&document)?;
 			let input = Arc::new(FixedInput { document, scene, roots: builder.roots.clone(), guis: builder.guis });
-			if let Some(key) = key {
-				scenes.keep_video_input(key, input.clone());
+			if let Some(vk) = key {
+				let input_ok = vk.input.1.verify_read(&vk.input.0, &builder.bytes);
+				let map_ok = vk.map.is_none_or(|stamp| map_proven == Some(stamp));
+				let mat_ok = vk.materials.is_none_or(|stamp| mat_proven == Some(stamp));
+				let light_ok = vk.lighting.is_none_or(|stamp| light_proven == Some(stamp));
+				if input_ok && map_ok && mat_ok && light_ok {
+					scenes.keep_video_input(vk.key, input.clone());
+				}
 			}
 			builder.fixed = Some(input);
 		} else if builder.playback.resolve(&document)?.changes_only_lighting(&document) {
@@ -898,6 +904,10 @@ impl<'a> Builder<'a> {
 
 	/// The input as a document, with the map drawn around it and the Lighting the playback changes.
 	fn document(&self) -> Result<(Document, bool)> {
+		self.document_proven().map(|(document, lent, _)| (document, lent))
+	}
+
+	fn document_proven(&self) -> Result<(Document, bool, Option<ror_assets::FileStamp>)> {
 		let mut document = scene::load::read_bytes(&self.bytes)?;
 		document.play = self.playback.play;
 		document.salt = self.playback.salt.clone();
@@ -907,11 +917,9 @@ impl<'a> Builder<'a> {
 		if let Some(folder) = self.relative_to {
 			document.read_relative_to(folder);
 		}
-		if let Some(map) = self.map {
-			self.scenes.add_map(&mut document, map)?;
-		}
+		let map_proven = if let Some(map) = self.map { self.scenes.add_map(&mut document, map)? } else { None };
 		let lent = self.scenes.give_lighting(&mut document, &self.playback, self.lend.1)?;
-		Ok((document, lent))
+		Ok((document, lent, map_proven))
 	}
 
 	/// Fetches the files the clip draws that are not on disk yet, many at a time
@@ -940,14 +948,19 @@ impl<'a> Builder<'a> {
 
 	/// What a document draws as it stands, in the other places' MaterialService and Lighting.
 	fn extracted(&self, document: &Document) -> Result<Scene> {
+		self.extracted_proven(document).map(|(scene, _, _)| scene)
+	}
+
+	fn extracted_proven(&self, document: &Document) -> Result<(Scene, Option<ror_assets::FileStamp>, Option<ror_assets::FileStamp>)> {
 		let mut scene = scene::extract::extract(document);
-		self.finish(&mut scene)?;
-		Ok(scene)
+		let (mat_proven, light_proven) = self.scenes.lend(&mut scene, self.lend.0, self.lend.1.filter(|_| !self.lent))?;
+		Ok((scene, mat_proven, light_proven))
 	}
 
 	/// The other places' MaterialService and Lighting (unless the documents carry that Lighting).
 	fn finish(&self, scene: &mut Scene) -> Result<()> {
-		self.scenes.lend(scene, self.lend.0, self.lend.1.filter(|_| !self.lent))
+		self.scenes.lend(scene, self.lend.0, self.lend.1.filter(|_| !self.lent))?;
+		Ok(())
 	}
 
 	/// The scene `time` seconds after the playback's start, on a document of its own.

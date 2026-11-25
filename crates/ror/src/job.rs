@@ -289,6 +289,17 @@ impl Loading {
 /// Video inputs kept ([`SceneCache::keep_video_input`])
 const KEPT_VIDEO_INPUTS: usize = 2;
 
+/// Snapshot-backed key for [`SceneCache::keep_video_input`], carrying the snapshots/stamps of the
+/// input file and every supporting map/place file so the video input is only cached if every read
+/// matched the exact stamped files.
+pub(crate) struct VideoKey {
+	pub key: String,
+	pub input: (PathBuf, ror_assets::FileSnapshot),
+	pub map: Option<FileStamp>,
+	pub materials: Option<FileStamp>,
+	pub lighting: Option<FileStamp>,
+}
+
 impl SceneCache {
 	/// Counts a still of a playback of `path`; true once, when a run of them is a timeline drawn frame by
 	/// frame. Each such still parses the file and extracts the whole scene again; `ror video --times` makes
@@ -307,21 +318,39 @@ impl SceneCache {
 	/// What a video's input as it stands depends on: its file, the map drawn around it and the places
 	/// lending MaterialService and Lighting (each stamped by [`FileStamp`]), what it selects and
 	/// where its relative local paths are read from. `None` when the input is not a file (an asset).
-	pub(crate) fn video_key(&self, input: &str, select: Option<&str>, map: Option<&MapSetting>, (materials, lighting): (Option<&str>, Option<&str>), relative_to: Option<&Path>) -> Option<String> {
-		let stamp = |path: &str| -> Option<String> {
-			let stamp = FileStamp::of_file(Path::new(path))?;
-			Some(format!("{path:?} {}", stamp.key_suffix()))
+	#[cfg(test)]
+	pub(crate) fn video_key(&self, input: &str, select: Option<&str>, map: Option<&MapSetting>, lenders: (Option<&str>, Option<&str>), relative_to: Option<&Path>) -> Option<String> {
+		self.video_key_checked(input, select, map, lenders, relative_to).map(|vk| vk.key)
+	}
+
+	/// Like [`SceneCache::video_key`], returning the snapshots/stamps needed to prove every file
+	/// read matches the key before caching the [`crate::video::FixedInput`].
+	pub(crate) fn video_key_checked(&self, input: &str, select: Option<&str>, map: Option<&MapSetting>, (materials, lighting): (Option<&str>, Option<&str>), relative_to: Option<&Path>) -> Option<VideoKey> {
+		let input_path = PathBuf::from(input);
+		let input_snap = FileStamp::snapshot_file(&input_path)?;
+		let mut key = format!("{input:?} {} select {select:?} relative to {relative_to:?}", input_snap.stamp.key_suffix());
+		let map_stamp = if let Some(map) = map {
+			let stamp = FileStamp::of_file(Path::new(&map.file))?;
+			key += &format!(" map {:?} {} at {:?}", map.file, stamp.key_suffix(), map.origin.map(|origin| origin.map(f32::to_bits)));
+			Some(stamp)
+		} else {
+			None
 		};
-		let mut key = format!("{} select {select:?} relative to {relative_to:?}", stamp(input)?);
-		if let Some(map) = map {
-			key += &format!(" map {} at {:?}", stamp(&map.file)?, map.origin.map(|origin| origin.map(f32::to_bits)));
-		}
-		for (name, place) in [("materials", materials), ("lighting", lighting)] {
-			if let Some(path) = place {
-				key += &format!(" {name} {}", stamp(path)?);
-			}
-		}
-		Some(key)
+		let mat_stamp = if let Some(path) = materials {
+			let stamp = FileStamp::of_file(Path::new(path))?;
+			key += &format!(" materials {path:?} {}", stamp.key_suffix());
+			Some(stamp)
+		} else {
+			None
+		};
+		let light_stamp = if let Some(path) = lighting {
+			let stamp = FileStamp::of_file(Path::new(path))?;
+			key += &format!(" lighting {path:?} {}", stamp.key_suffix());
+			Some(stamp)
+		} else {
+			None
+		};
+		Some(VideoKey { key, input: (input_path, input_snap), map: map_stamp, materials: mat_stamp, lighting: light_stamp })
 	}
 
 	/// The video input kept under `key`.
@@ -360,29 +389,37 @@ impl SceneCache {
 	}
 
 	/// A map file's document, parsed once while the file is unchanged (a game map is tens of
-	/// thousands of instances).
-	fn map_document(&self, path: &Path) -> Result<Arc<scene::load::Document>> {
-		let stamp = FileStamp::try_of(path).with_context(|| format!("--map: reading {}", path.display()))?;
-		let cached = || self.maps.lock().get(path).filter(|(kept, _)| *kept == stamp).map(|(_, document)| document.clone());
-		if let Some(document) = cached() {
-			return Ok(document);
+	/// thousands of instances). Returns the proven [`FileStamp`] (`None` if the file moved while
+	/// being read, in which case the parsed document is returned for this draw alone and not kept).
+	fn map_document(&self, path: &Path) -> Result<(Arc<scene::load::Document>, Option<FileStamp>)> {
+		let snapshot = FileStamp::snapshot(path).with_context(|| format!("--map: reading {}", path.display()))?;
+		let stamp = snapshot.stamp;
+		let cached = || self.maps.lock().get(path).filter(|(kept, _)| *kept == stamp).map(|(_, document)| (document.clone(), Some(stamp)));
+		if let Some(hit) = cached() {
+			return Ok(hit);
 		}
 		self.loading.once("maps", path, cached, || {
-			let document = Arc::new(scene::load::read_file(path).with_context(|| format!("--map {}", path.display()))?);
-			let mut maps = self.maps.lock();
-			if maps.len() > 4 {
-				maps.clear();
+			crate::render::run_test_read_hook(path);
+			let bytes = std::fs::read(path).with_context(|| format!("--map: reading {}", path.display()))?;
+			let verified = snapshot.verify_read(path, &bytes);
+			let document = Arc::new(scene::load::read_bytes(&bytes).with_context(|| format!("--map {}", path.display()))?);
+			if verified {
+				let mut maps = self.maps.lock();
+				if maps.len() > 4 {
+					maps.clear();
+				}
+				maps.insert(path.to_path_buf(), (stamp, document.clone()));
 			}
-			maps.insert(path.to_path_buf(), (stamp, document.clone()));
-			Ok(document)
+			Ok((document, verified.then_some(stamp)))
 		})
 	}
 
-	/// Draws `map`'s world around the document's ([`scene::load::Document::add_setting`]).
-	pub(crate) fn add_map(&self, document: &mut scene::load::Document, map: &MapSetting) -> Result<()> {
-		let world = self.map_document(Path::new(&map.file))?;
+	/// Draws `map`'s world around the document's ([`scene::load::Document::add_setting`]), returning
+	/// the proven stamp of `map.file` (`None` if it moved while being read).
+	pub(crate) fn add_map(&self, document: &mut scene::load::Document, map: &MapSetting) -> Result<Option<FileStamp>> {
+		let (world, proven) = self.map_document(Path::new(&map.file))?;
 		document.add_setting(&world, map.origin);
-		Ok(())
+		Ok(proven)
 	}
 
 	/// The places that lend the scene its MaterialService and Lighting: those named, else the map's
@@ -391,39 +428,54 @@ impl SceneCache {
 		let Some(map) = map else {
 			return Ok((materials_from, lighting_from));
 		};
-		let world = self.map_document(Path::new(&map.file))?;
+		let (world, _) = self.map_document(Path::new(&map.file))?;
 		let materials = materials_from.or_else(|| world.material_service.map(|_| map.file.as_str()));
 		let lighting = lighting_from.or_else(|| world.lighting.map(|_| map.file.as_str()));
 		Ok((materials, lighting))
 	}
 
-	fn place(&self, path: &Path) -> Result<Arc<PlaceSettings>> {
-		let stamp = FileStamp::try_of(path).with_context(|| format!("reading {}", path.display()))?;
-		let cached = || self.places.lock().get(path).filter(|(kept, _)| *kept == stamp).map(|(_, place)| place.clone());
-		if let Some(place) = cached() {
-			return Ok(place);
+	fn place(&self, path: &Path) -> Result<(Arc<PlaceSettings>, Option<FileStamp>)> {
+		let snapshot = FileStamp::snapshot(path).with_context(|| format!("reading {}", path.display()))?;
+		let stamp = snapshot.stamp;
+		let cached = || self.places.lock().get(path).filter(|(kept, _)| *kept == stamp).map(|(_, place)| (place.clone(), Some(stamp)));
+		if let Some(hit) = cached() {
+			return Ok(hit);
 		}
 		self.loading.once("places", path, cached, || {
-			let document = scene::load::read_file(path)?;
+			crate::render::run_test_read_hook(path);
+			let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+			let verified = snapshot.verify_read(path, &bytes);
+			let document = scene::load::read_bytes(&bytes).with_context(|| format!("parsing {}", path.display()))?;
 			let place = Arc::new(PlaceSettings { materials: scene::extract::materials(&document), environment: scene::extract::environment(&document), lighting: scene::load::LightingCopy::of(&document) });
-			let mut places = self.places.lock();
-			if places.len() > 16 {
-				places.clear();
+			if verified {
+				let mut places = self.places.lock();
+				if places.len() > 16 {
+					places.clear();
+				}
+				places.insert(path.to_path_buf(), (stamp, place.clone()));
 			}
-			places.insert(path.to_path_buf(), (stamp, place.clone()));
-			Ok(place)
+			Ok((place, verified.then_some(stamp)))
 		})
 	}
 
-	/// Gives `scene` another place's MaterialService (`materials_from`) and Lighting (`lighting_from`).
-	pub(crate) fn lend(&self, scene: &mut Scene, materials_from: Option<&str>, lighting_from: Option<&str>) -> Result<()> {
-		if let Some(path) = materials_from {
-			scene.materials = self.place(Path::new(path))?.materials.clone();
-		}
-		if let Some(path) = lighting_from {
-			scene.environment = self.place(Path::new(path))?.environment.clone().with_context(|| format!("{path} has no Lighting"))?;
-		}
-		Ok(())
+	/// Gives `scene` another place's MaterialService (`materials_from`) and Lighting (`lighting_from`),
+	/// returning their proven stamps (`None` if absent or if the file moved while being read).
+	pub(crate) fn lend(&self, scene: &mut Scene, materials_from: Option<&str>, lighting_from: Option<&str>) -> Result<(Option<FileStamp>, Option<FileStamp>)> {
+		let mat_proven = if let Some(path) = materials_from {
+			let (place, proven) = self.place(Path::new(path))?;
+			scene.materials = place.materials.clone();
+			proven
+		} else {
+			None
+		};
+		let light_proven = if let Some(path) = lighting_from {
+			let (place, proven) = self.place(Path::new(path))?;
+			scene.environment = place.environment.clone().with_context(|| format!("{path} has no Lighting"))?;
+			proven
+		} else {
+			None
+		};
+		Ok((mat_proven, light_proven))
 	}
 
 	/// Gives a playback's document the Lighting and the Terrain's Clouds it changes, when it names
@@ -438,7 +490,7 @@ impl SceneCache {
 			document.give_lighting(None);
 			return Ok(false);
 		};
-		let place = self.place(Path::new(path))?;
+		let (place, _) = self.place(Path::new(path))?;
 		document.give_lighting(Some(place.lighting.as_ref().with_context(|| format!("{path} has no Lighting"))?));
 		Ok(true)
 	}
@@ -454,7 +506,8 @@ impl SceneCache {
 	}
 
 	fn load(&self, path: &Path, select: Option<&str>, relative_to: Option<&Path>, keep_invisible: bool) -> Result<(Arc<Scene>, bool)> {
-		let stamp = FileStamp::try_of(path).with_context(|| format!("reading {}", path.display()))?;
+		let snapshot = FileStamp::snapshot(path).with_context(|| format!("reading {}", path.display()))?;
+		let stamp = snapshot.stamp;
 		let key = (path.to_path_buf(), select.map(str::to_string), relative_to.map(Path::to_path_buf), keep_invisible);
 		let cached = || self.entries.lock().get(&key).filter(|(kept, _)| *kept == stamp).map(|(_, scene)| (scene.clone(), true));
 		if let Some(hit) = cached() {
@@ -463,7 +516,10 @@ impl SceneCache {
 		self.loading.once("scenes", path, cached, || {
 			// the parse and the extraction within the machine's free memory, as one load
 			let _budget = crate::budget::reserve(stamp.len());
-			let mut document = scene::load::read_file(path)?;
+			crate::render::run_test_read_hook(path);
+			let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+			let verified = snapshot.verify_read(path, &bytes);
+			let mut document = scene::load::read_bytes(&bytes).with_context(|| format!("parsing {}", path.display()))?;
 			document.keep_invisible = keep_invisible;
 			if let Some(select) = select {
 				document.select(select)?;
@@ -473,11 +529,13 @@ impl SceneCache {
 			}
 			let scene = Arc::new(scene::extract::extract(&document));
 			drop(document);
-			let mut entries = self.entries.lock();
-			if entries.len() > 256 {
-				entries.clear();
+			if verified {
+				let mut entries = self.entries.lock();
+				if entries.len() > 256 {
+					entries.clear();
+				}
+				entries.insert(key.clone(), (stamp, scene.clone()));
 			}
-			entries.insert(key.clone(), (stamp, scene.clone()));
 			Ok((scene, false))
 		})
 	}
@@ -1353,5 +1411,44 @@ mod tests {
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
 		assert!(failures.is_empty(), "stale cache hits after same-size same-mtime replacement ({}):\n{}", failures.len(), failures.join("\n"));
+	}
+
+	/// Deterministic A -> B -> A race test on `SceneCache::load` (zero sleeps): a scene file that
+	/// moves between snapshot and `std::fs::read` is returned for that load alone and never kept
+	/// under A's stamp, so returning to A loads A rather than cached B.
+	#[test]
+	fn scene_cache_a_to_b_to_a_never_caches_b_under_a() {
+		let state = std::env::temp_dir().join(format!("ror-scene-race-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&state);
+		std::fs::create_dir_all(&state).unwrap();
+		let model_xml = |width: f32| {
+			format!(
+				r#"<roblox version="4"><Item class="Part"><Properties><string name="Name">Box</string><Vector3 name="size"><X>{width:.1}</X><Y>2.0</Y><Z>2.0</Z></Vector3></Properties></Item></roblox>"#
+			)
+			.into_bytes()
+		};
+		let bytes_a = model_xml(2.0);
+		let bytes_b = model_xml(9.0);
+		let model = state.join("model.rbxmx");
+		std::fs::write(&model, &bytes_a).unwrap();
+
+		let scenes = SceneCache::default();
+		let hook_path = model.clone();
+		let hook_b = bytes_b.clone();
+		crate::render::set_test_read_hook(model.clone(), move || {
+			std::fs::write(&hook_path, &hook_b).unwrap();
+		});
+		let (during, cached_during) = scenes.load(&model, None, None, false).unwrap();
+		assert!(!cached_during);
+		assert!((during.parts[0].size.x - 9.0).abs() < 1e-4, "hook must have swapped file to B before read");
+
+		// Restore A on disk; SceneCache must NOT serve B under A's stamp.
+		std::fs::write(&model, &bytes_a).unwrap();
+		let (after, cached_after) = scenes.load(&model, None, None, false).unwrap();
+		assert!(!cached_after, "moving read of B must not have been cached under A's stamp");
+		assert!((after.parts[0].size.x - 2.0).abs() < 1e-4, "returning to A must load A, not cached B");
+		let (hit, cached_hit) = scenes.load(&model, None, None, false).unwrap();
+		assert!(cached_hit && (hit.parts[0].size.x - 2.0).abs() < 1e-4, "settled A should cache normally");
+		let _ = std::fs::remove_dir_all(&state);
 	}
 }

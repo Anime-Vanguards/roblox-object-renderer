@@ -709,7 +709,7 @@ impl super::Renderer {
 	/// (an attack run: an emitter whose flipbook the account may not download).
 	/// Each emitter's texture bind group, and whether its texture loaded (one that did not draws no
 	/// particle).
-	pub(super) fn particle_groups(&self, scene: &Scene, missing: &mut Vec<String>) -> Vec<(Arc<wgpu::BindGroup>, bool)> {
+	pub(super) fn particle_groups_with(&self, scene: &Scene, preloaded: &HashMap<String, Arc<super::resources::GpuTexture>>, missing: &mut Vec<String>) -> Vec<(Arc<wgpu::BindGroup>, bool)> {
 		let mut cache: HashMap<Option<String>, (Arc<wgpu::BindGroup>, bool)> = HashMap::new();
 		let groups: Vec<(Arc<wgpu::BindGroup>, bool)> = scene
 			.particles
@@ -718,11 +718,18 @@ impl super::Renderer {
 				cache
 					.entry(emitter.texture.clone())
 					.or_insert_with(|| {
-						let texture = emitter.texture.as_ref().map(|uri| match self.load_whole(&super::transcode::image_key(uri), TextureUse::Color) {
-							Ok(texture) => Some(texture),
-							Err(error) => {
-								missing.push(format!("{}: {error:#} (its particles are not drawn)", emitter.path));
-								None
+						let texture = emitter.texture.as_ref().map(|uri| {
+							let key = super::transcode::image_key(uri);
+							let loaded = match preloaded.get(&key) {
+								Some(tex) => Ok(tex.clone()),
+								None => self.load_whole(&key, TextureUse::Color),
+							};
+							match loaded {
+								Ok(texture) => Some(texture),
+								Err(error) => {
+									missing.push(format!("{}: {error:#} (its particles are not drawn)", emitter.path));
+									None
+								}
 							}
 						});
 						let loaded = matches!(texture, Some(Some(_)));

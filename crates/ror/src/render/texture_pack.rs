@@ -28,6 +28,8 @@ pub struct TexturePack {
 	/// metalness and roughness (BC1, red and green); usage 3 adds the emissive mask in blue and a
 	/// height map in alpha (BC3; notes/image.md "Texture transcodes").
 	pub usage: u32,
+	/// Local-file stamp provenance for this pack.
+	pub proof: super::resources::StampProof,
 }
 
 /// A tag's text (the tag may carry attributes: `<usage version="1">3</usage>`).
@@ -72,6 +74,7 @@ pub fn parse(bytes: &[u8]) -> Result<TexturePack> {
 		alpha_mode: tag(&text, "alphamode").and_then(|value| value.parse().ok()).unwrap_or(0),
 		tiling: tag(&text, "tiling").and_then(|value| value.parse().ok()).unwrap_or(0),
 		usage: tag(&text, "usage").and_then(|value| value.parse().ok()).unwrap_or(0),
+		proof: Default::default(),
 	})
 }
 

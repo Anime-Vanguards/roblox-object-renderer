@@ -48,6 +48,42 @@ pub(super) fn stamped_key(uri: &str) -> String {
 	if stamped { key(&composite) } else { uri.to_string() }
 }
 
+/// Computes the expected stamped composite key from a scene key's recorded local-file stamps.
+/// Returns `None` if any local layer image is missing from `local_keys`.
+pub(super) fn expected_stamped_key(uri: &str, local_keys: &std::collections::HashMap<String, String>) -> Option<String> {
+	let mut composite = from_key(uri)?;
+	let mut stamped = false;
+	for layer in [&mut composite.pants, &mut composite.shirt, &mut composite.graphic].into_iter().flatten() {
+		if super::names_local_file(&layer.image) {
+			layer.image = local_keys.get(&layer.image)?.clone();
+			stamped = true;
+		}
+	}
+	Some(if stamped { key(&composite) } else { uri.to_string() })
+}
+
+/// Snapshots every local clothing template layer in a composite URI before reading, returning the
+/// stamped composite key and `(layer_uri -> (path, FileSnapshot))`.
+pub(super) fn snapshot_layers(uri: &str) -> (String, std::collections::HashMap<String, (std::path::PathBuf, ror_assets::FileSnapshot)>) {
+	let mut snapshots = std::collections::HashMap::new();
+	let Some(mut composite) = from_key(uri) else {
+		return (uri.to_string(), snapshots);
+	};
+	let mut stamped = false;
+	for layer in [&mut composite.pants, &mut composite.shirt, &mut composite.graphic].into_iter().flatten() {
+		if let Some((path, snap)) = super::local_snapshot_for(&layer.image) {
+			let raw = layer.image.clone();
+			layer.image = snap.stamp.stamp_uri(&raw);
+			snapshots.insert(raw, (path, snap));
+			stamped = true;
+		} else if super::names_local_file(&layer.image) {
+			layer.image = super::content_key(&layer.image);
+			stamped = true;
+		}
+	}
+	(if stamped { key(&composite) } else { uri.to_string() }, snapshots)
+}
+
 /// A compositing mesh: positions in target pixels (y up), uv in its source image.
 struct Sheet {
 	positions: Vec<[f32; 2]>,
@@ -255,42 +291,86 @@ fn load_sheet(assets: &ror_assets::Assets, uri: &str) -> Result<Sheet> {
 	Ok(Sheet::from_mesh(&mesh))
 }
 
-fn load_source(assets: &ror_assets::Assets, uri: &str) -> Result<Source> {
-	let fetched = assets.fetch(uri).map_err(|error| anyhow!("{error}"))?;
-	let image = ror_image::decode(&fetched.bytes).map_err(|error| anyhow!("{uri}: {error}"))?;
+fn load_source_checked(
+	assets: &ror_assets::Assets,
+	uri: &str,
+	snapshots: &std::collections::HashMap<String, (std::path::PathBuf, ror_assets::FileSnapshot)>,
+) -> std::result::Result<(Source, bool), super::resources::LoadError> {
+	use super::resources::LoadError;
+	let (fetched, verified) = match snapshots.get(uri) {
+		Some((path, snap)) => {
+			super::run_test_read_hook(path);
+			match assets.fetch_local_with_snapshot(uri, path, *snap) {
+				Ok(pair) => pair,
+				Err(error) => {
+					let err = anyhow!("{error}");
+					return Err(if snap.still_unchanged(path) { LoadError::Cached(err) } else { LoadError::Uncached(err) });
+				}
+			}
+		}
+		None => (assets.fetch(uri).map_err(|error| LoadError::Cached(anyhow!("{error}")))?, !super::names_local_file(uri)),
+	};
+	let image = match ror_image::decode(&fetched.bytes) {
+		Ok(image) => image,
+		Err(error) => {
+			let err = anyhow!("{uri}: {error}");
+			return Err(if verified { LoadError::Cached(err) } else { LoadError::Uncached(err) });
+		}
+	};
 	let image = ror_image::to_rgba8(&image);
-	let pixels = image.levels.into_iter().next().context("image without pixels")?;
-	Ok(Source { width: image.width, height: image.height, pixels })
+	let pixels = match image.levels.into_iter().next() {
+		Some(pixels) => pixels,
+		None => return Err(if verified { LoadError::Cached(anyhow!("image without pixels")) } else { LoadError::Uncached(anyhow!("image without pixels")) }),
+	};
+	Ok((Source { width: image.width, height: image.height, pixels }, verified))
 }
 
-/// The composited texture's pixels (before mips).
-pub fn canvas(assets: &ror_assets::Assets, composite: &Composite) -> Result<Canvas> {
+/// The composited texture's pixels (before mips), also returning whether all local template layers
+/// matched their snapshots (`true` when no local layers exist or all verified).
+fn canvas_checked(
+	assets: &ror_assets::Assets,
+	composite: &Composite,
+	snapshots: &std::collections::HashMap<String, (std::path::PathBuf, ror_assets::FileSnapshot)>,
+) -> std::result::Result<(Canvas, bool), super::resources::LoadError> {
+	use super::resources::LoadError;
 	let sheets = sheets(composite.layout);
 	let scale = composite_scale();
 	let (units_wide, units_high) = sheets.size;
 	let mut canvas = Canvas::new((units_wide * scale).round() as u32, (units_high * scale).round() as u32);
 	for (uri, color) in sheets.bases.iter().zip(&composite.colors) {
-		draw(&mut canvas, &load_sheet(assets, uri)?, units_high, scale, &Fill::Solid(*color));
+		draw(&mut canvas, &load_sheet(assets, uri).map_err(LoadError::Cached)?, units_high, scale, &Fill::Solid(*color));
 	}
 	// in the compositing meshes' order (their z): pants, shirt, the T-shirt
 	let graphic = match (&composite.graphic, &sheets.graphic) {
-		(Some(layer), GraphicSheet::Mesh(uri)) => Some((layer, load_sheet(assets, uri)?)),
+		(Some(layer), GraphicSheet::Mesh(uri)) => Some((layer, load_sheet(assets, uri).map_err(LoadError::Cached)?)),
 		(Some(layer), GraphicSheet::Quad(rectangle)) => Some((layer, Sheet::quad(*rectangle))),
 		_ => None,
 	};
 	let mut layers: Vec<(&Layer, Sheet)> = Vec::new();
 	if let Some(layer) = &composite.pants {
-		layers.push((layer, load_sheet(assets, sheets.pants)?));
+		layers.push((layer, load_sheet(assets, sheets.pants).map_err(LoadError::Cached)?));
 	}
 	if let Some(layer) = &composite.shirt {
-		layers.push((layer, load_sheet(assets, sheets.shirt)?));
+		layers.push((layer, load_sheet(assets, sheets.shirt).map_err(LoadError::Cached)?));
 	}
 	layers.extend(graphic);
+	let mut all_verified = true;
 	for (layer, sheet) in layers {
-		let source = load_source(assets, &layer.image)?;
+		let (source, verified) = load_source_checked(assets, &layer.image, snapshots)?;
+		all_verified &= verified;
 		draw(&mut canvas, &sheet, units_high, scale, &Fill::Image(&source, layer.tint));
 	}
-	Ok(canvas)
+	Ok((canvas, all_verified))
+}
+
+/// The composited texture's pixels (before mips).
+#[allow(dead_code)]
+pub fn canvas(assets: &ror_assets::Assets, composite: &Composite) -> Result<Canvas> {
+	let empty = std::collections::HashMap::new();
+	match canvas_checked(assets, composite, &empty) {
+		Ok((canvas, _)) => Ok(canvas),
+		Err(super::resources::LoadError::Cached(e) | super::resources::LoadError::Uncached(e)) => Err(e),
+	}
 }
 
 impl Renderer {
@@ -306,13 +386,28 @@ impl Renderer {
 		}
 	}
 
-	/// The composited texture for a [`key`], with mips.
-	pub(super) fn composite_texture(&self, key: &str) -> Result<GpuTexture> {
-		let composite = from_key(key).context("malformed composite key")?;
-		let canvas = canvas(&self.assets, &composite)?;
+	/// The composited texture for a [`key`], with mips and local-layer stamp verification.
+	pub(super) fn composite_texture_verified(
+		&self,
+		key: &str,
+		stamped_key: &str,
+		snapshots: &std::collections::HashMap<String, (std::path::PathBuf, ror_assets::FileSnapshot)>,
+	) -> std::result::Result<super::resources::LoadOutcome<GpuTexture>, super::resources::LoadError> {
+		use super::resources::{LoadError, LoadOutcome, StampProof};
+		let composite = from_key(key).context("malformed composite key").map_err(LoadError::Cached)?;
+		let has_local = has_local_file(key);
+		let (canvas, verified) = canvas_checked(&self.assets, &composite, snapshots)?;
 		let mut image = ror_image::Image::from_rgba8(canvas.width, canvas.height, canvas.to_rgba8());
 		ror_image::generate_mips_with(&mut image, ror_image::MipFilter::Triangle, true);
-		GpuTexture::upload(&self.gpu, "composite", &image, TextureUse::Color)
+		let mut texture = GpuTexture::upload(&self.gpu, "composite", &image, TextureUse::Color).map_err(|err| if verified { LoadError::Cached(err) } else { LoadError::Uncached(err) })?;
+		texture.proof = if !has_local {
+			StampProof::Remote
+		} else if verified {
+			StampProof::Proven(stamped_key.to_string())
+		} else {
+			StampProof::Moved
+		};
+		Ok(LoadOutcome { value: texture, keep: !has_local || verified, offline_fallback: false })
 	}
 }
 

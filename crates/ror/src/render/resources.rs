@@ -16,6 +16,20 @@ use wgpu::util::DeviceExt;
 use super::geometry::CpuMesh;
 use super::gpu::Gpu;
 
+/// Provenance of a cached resource with respect to local files on disk: what stamp its bytes were
+/// proven to match at read time, so higher-level caches (materials, prepared parts/scenes, skies,
+/// effect bindings) only keep what matches their own key.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum StampProof {
+	/// Loaded from remote, built-in or embedded bytes (no local file read).
+	#[default]
+	Remote,
+	/// Loaded from local file(s) and verified to match this exact stamped key (`content_key(uri)`).
+	Proven(String),
+	/// A local file moved while being read: valid for this draw only, never cached.
+	Moved,
+}
+
 pub struct GpuMesh {
 	pub vertex_buffer: wgpu::Buffer,
 	pub index_buffer: wgpu::Buffer,
@@ -33,6 +47,8 @@ pub struct GpuMesh {
 	/// on a posed copy, whose decals draw on every triangle)
 	pub decal_faces: Option<Arc<DecalFaces>>,
 	pub bytes: u64,
+	/// Local-file stamp provenance for this mesh.
+	pub proof: StampProof,
 }
 
 /// The triangles of a mesh's finest level (`lods[0]`) a decal may draw on, per box face (NormalId
@@ -152,7 +168,18 @@ impl GpuMesh {
 		let bytes = (std::mem::size_of_val(mesh.vertices.as_slice()) + std::mem::size_of_val(mesh.indices.as_slice())) as u64;
 		// staged until a submission carries them, as queued writes are
 		gpu.uploaded(bytes);
-		Self { vertex_buffer, index_buffer, lods: mesh.lods.clone(), high_quality: mesh.high_quality, bounds: mesh.bounds, drawn: mesh.bounds, bind: None, decal_faces: DecalFaces::of(mesh), bytes }
+		Self {
+			vertex_buffer,
+			index_buffer,
+			lods: mesh.lods.clone(),
+			high_quality: mesh.high_quality,
+			bounds: mesh.bounds,
+			drawn: mesh.bounds,
+			bind: None,
+			decal_faces: DecalFaces::of(mesh),
+			bytes,
+			proof: StampProof::Remote,
+		}
 	}
 }
 
@@ -176,6 +203,8 @@ pub struct GpuTexture {
 	source: Option<super::texture_files::Source>,
 	/// Its slot in a view's residency feedback (render::residency), 0 when it is always held whole
 	pub id: u32,
+	/// Local-file stamp provenance for this texture.
+	pub proof: StampProof,
 }
 
 /// The levels of a texture the GPU holds: its level `base` down to its coarsest, as a texture of
@@ -278,13 +307,13 @@ impl GpuTexture {
 
 	/// A texture the GPU holds whole: `[has_alpha, dxt5nm, normal_rg]`, its levels' bytes.
 	pub fn whole(texture: wgpu::Texture, view: wgpu::TextureView, width: u32, height: u32, [has_alpha, dxt5nm, normal_rg]: [bool; 3], bytes: u64) -> Self {
-		Self { width, height, has_alpha, dxt5nm, normal_rg, full_bytes: bytes, held: parking_lot::RwLock::new(Some(Held { texture, view, base: 0, bytes })), source: None, id: 0 }
+		Self { width, height, has_alpha, dxt5nm, normal_rg, full_bytes: bytes, held: parking_lot::RwLock::new(Some(Held { texture, view, base: 0, bytes })), source: None, id: 0, proof: StampProof::Remote }
 	}
 
 	/// A texture whose levels are read from `source` once asked for, with its slot in the residency
 	/// feedback.
 	pub(super) fn on_disk(source: super::texture_files::Source, width: u32, height: u32, [has_alpha, dxt5nm, normal_rg]: [bool; 3], full_bytes: u64) -> Self {
-		Self { width, height, has_alpha, dxt5nm, normal_rg, full_bytes, held: parking_lot::RwLock::new(None), source: Some(source), id: super::residency::take_id() }
+		Self { width, height, has_alpha, dxt5nm, normal_rg, full_bytes, held: parking_lot::RwLock::new(None), source: Some(source), id: super::residency::take_id(), proof: StampProof::Remote }
 	}
 
 	/// What the GPU holds of it now.
@@ -384,8 +413,46 @@ impl Weighed for GpuTexture {
 	}
 }
 
+/// Result of a verified cache load ([`Cache::get_or_load_checked`]).
+pub struct LoadOutcome<V> {
+	pub value: V,
+	/// When `false` (e.g. a local file moved while being read), `value` is returned to the caller
+	/// for this draw alone without keeping it in the cache or handing it to concurrent waiters.
+	pub keep: bool,
+	/// True when an offline view fell back to a substitute (never promoted into the shared cache;
+	/// increments `offline_errors`).
+	pub offline_fallback: bool,
+}
+
+/// Failure from a verified cache load: `Cached` is remembered for [`FAILURE_TTL`], while
+/// `Uncached` (e.g. a local file moved mid-read) is removed immediately so the next request retries.
+pub enum LoadError {
+	Cached(anyhow::Error),
+	Uncached(anyhow::Error),
+}
+
+enum CellState<V> {
+	Cached(Arc<V>),
+	/// Leader returned an uncached value (moving local file or offline fallback); waiters retry.
+	Uncached,
+	CachedErr(String),
+	/// Leader hit a transient uncached failure; waiters retry.
+	UncachedErr,
+}
+
+impl<V> Clone for CellState<V> {
+	fn clone(&self) -> Self {
+		match self {
+			Self::Cached(value) => Self::Cached(value.clone()),
+			Self::Uncached => Self::Uncached,
+			Self::CachedErr(error) => Self::CachedErr(error.clone()),
+			Self::UncachedErr => Self::UncachedErr,
+		}
+	}
+}
+
 struct Entry<V> {
-	cell: Arc<OnceLock<std::result::Result<Arc<V>, String>>>,
+	cell: Arc<OnceLock<CellState<V>>>,
 	last_used: u64,
 	created: std::time::Instant,
 }
@@ -446,11 +513,11 @@ impl<K: Eq + Hash + Clone, V: Weighed> Cache<K, V> {
 		let now = std::time::Instant::now();
 		let mut first = {
 			let entries = self.entries.lock();
-			entries.values().filter(|entry| matches!(entry.cell.get(), Some(Err(_)))).map(|entry| entry.created + FAILURE_TTL).filter(|retried| *retried > now).min()
+			entries.values().filter(|entry| matches!(entry.cell.get(), Some(CellState::CachedErr(_)))).map(|entry| entry.created + FAILURE_TTL).filter(|retried| *retried > now).min()
 		};
 		if offline_view {
 			let offline = self.offline.lock();
-			let offline_first = offline.values().filter(|entry| matches!(entry.cell.get(), Some(Err(_)))).map(|entry| entry.created + FAILURE_TTL).filter(|retried| *retried > now).min();
+			let offline_first = offline.values().filter(|entry| matches!(entry.cell.get(), Some(CellState::CachedErr(_)))).map(|entry| entry.created + FAILURE_TTL).filter(|retried| *retried > now).min();
 			first = match (first, offline_first) {
 				(Some(a), Some(b)) => Some(a.min(b)),
 				(a, b) => a.or(b),
@@ -480,78 +547,99 @@ impl<K: Eq + Hash + Clone, V: Weighed> Cache<K, V> {
 	/// in-flight loads and [`FAILURE_TTL`] failures stay in `offline` so they deduplicate across
 	/// concurrent offline threads and repeat frames without poisoning online loads.
 	pub fn get_or_load_for(&self, key: &K, offline_view: bool, load: impl FnOnce() -> Result<V>) -> Result<Arc<V>> {
-		self.get_or_load_isolated(key, offline_view, || load().map(|value| (value, false)))
+		self.get_or_load_checked(key, offline_view, || load().map(|value| LoadOutcome { value, keep: true, offline_fallback: false }).map_err(LoadError::Cached))
 	}
 
 	/// Like [`Cache::get_or_load_for`], where `load` also signals `offline_fallback` (`true` when an
 	/// offline view fell back to a substitute such as an uploaded PNG in place of an uncached
 	/// transcode). An `offline_fallback` value is returned to the caller without promoting it into the
 	/// shared cache or keeping GPU bytes in `offline`, and increments [`Cache::offline_errors`].
+	#[cfg(test)]
 	pub fn get_or_load_isolated(&self, key: &K, offline_view: bool, load: impl FnOnce() -> Result<(V, bool)>) -> Result<Arc<V>> {
-		let tick = self.tick.fetch_add(1, Ordering::Relaxed);
-		if offline_view {
-			{
-				let mut entries = self.entries.lock();
-				if let Some(entry) = entries.get_mut(key) {
-					match entry.cell.get() {
-						Some(Ok(value)) => {
-							entry.last_used = tick;
-							self.hits.fetch_add(1, Ordering::Relaxed);
-							return Ok(value.clone());
-						}
-						Some(Err(error)) if entry.created.elapsed() <= FAILURE_TTL => {
-							entry.last_used = tick;
-							self.hits.fetch_add(1, Ordering::Relaxed);
-							return Err(anyhow!(error.clone()));
-						}
-						_ => {}
-					}
-				}
-			}
-			let cell = {
-				let mut offline = self.offline.lock();
-				match offline.get_mut(key) {
-					Some(entry) if !(matches!(entry.cell.get(), Some(Err(_))) && entry.created.elapsed() > FAILURE_TTL) => {
-						entry.last_used = tick;
-						entry.cell.clone()
-					}
-					_ => {
-						let cell = Arc::new(OnceLock::new());
-						offline.insert(key.clone(), Entry { cell: cell.clone(), last_used: tick, created: std::time::Instant::now() });
-						cell
-					}
-				}
-			};
-			let mut loaded = false;
-			let mut offline_fallback = false;
-			let result = cell
-				.get_or_init(|| {
-					loaded = true;
-					load()
-						.map(|(value, fallback)| {
-							offline_fallback = fallback;
-							Arc::new(value)
-						})
-						.map_err(|error| format!("{error:#}"))
-				})
-				.clone();
-			if loaded {
-				self.misses.fetch_add(1, Ordering::Relaxed);
-			} else {
-				self.hits.fetch_add(1, Ordering::Relaxed);
-			}
-			return match result {
-				Ok(value) => {
-					if loaded {
-						if offline_fallback {
-							self.offline_errors.fetch_add(1, Ordering::Relaxed);
-							let mut offline = self.offline.lock();
-							if offline.get(key).is_some_and(|entry| Arc::ptr_eq(&entry.cell, &cell)) {
-								offline.remove(key);
+		self.get_or_load_checked(key, offline_view, || {
+			load()
+				.map(|(value, offline_fallback)| LoadOutcome { value, keep: !offline_fallback, offline_fallback })
+				.map_err(LoadError::Cached)
+		})
+	}
+
+	/// Like [`Cache::get_or_load_for`], where `load` proves whether its result may be kept under
+	/// `key`. When `keep` is `false` (e.g. a local file moved while being read) or `LoadError::Uncached`
+	/// is returned, the entry is removed immediately and any concurrent waiter retries rather than
+	/// inheriting the moving read.
+	pub fn get_or_load_checked(&self, key: &K, offline_view: bool, load: impl FnOnce() -> std::result::Result<LoadOutcome<V>, LoadError>) -> Result<Arc<V>> {
+		let mut load = Some(load);
+		loop {
+			let tick = self.tick.fetch_add(1, Ordering::Relaxed);
+			if offline_view {
+				{
+					let mut entries = self.entries.lock();
+					if let Some(entry) = entries.get_mut(key) {
+						match entry.cell.get() {
+							Some(CellState::Cached(value)) => {
+								entry.last_used = tick;
+								self.hits.fetch_add(1, Ordering::Relaxed);
+								return Ok(value.clone());
 							}
-						} else {
+							Some(CellState::CachedErr(error)) if entry.created.elapsed() <= FAILURE_TTL => {
+								entry.last_used = tick;
+								self.hits.fetch_add(1, Ordering::Relaxed);
+								return Err(anyhow!(error.clone()));
+							}
+							_ => {}
+						}
+					}
+				}
+				let cell = {
+					let mut offline = self.offline.lock();
+					match offline.get_mut(key) {
+						Some(entry) if !matches!(entry.cell.get(), Some(CellState::Uncached | CellState::UncachedErr)) && !(matches!(entry.cell.get(), Some(CellState::CachedErr(_))) && entry.created.elapsed() > FAILURE_TTL) => {
+							entry.last_used = tick;
+							entry.cell.clone()
+						}
+						_ => {
+							let cell = Arc::new(OnceLock::new());
+							offline.insert(key.clone(), Entry { cell: cell.clone(), last_used: tick, created: std::time::Instant::now() });
+							cell
+						}
+					}
+				};
+				let mut loaded = false;
+				let mut offline_fallback = false;
+				let mut uncached_value: Option<Arc<V>> = None;
+				let mut uncached_error: Option<anyhow::Error> = None;
+				let state = cell
+					.get_or_init(|| {
+						loaded = true;
+						match (load.take().expect("leader runs load once"))() {
+							Ok(outcome) => {
+								offline_fallback = outcome.offline_fallback;
+								let value = Arc::new(outcome.value);
+								if outcome.keep && !outcome.offline_fallback {
+									CellState::Cached(value)
+								} else {
+									uncached_value = Some(value);
+									CellState::Uncached
+								}
+							}
+							Err(LoadError::Cached(error)) => CellState::CachedErr(format!("{error:#}")),
+							Err(LoadError::Uncached(error)) => {
+								uncached_error = Some(error);
+								CellState::UncachedErr
+							}
+						}
+					})
+					.clone();
+				if loaded {
+					self.misses.fetch_add(1, Ordering::Relaxed);
+				} else {
+					self.hits.fetch_add(1, Ordering::Relaxed);
+				}
+				match state {
+					CellState::Cached(value) => {
+						if loaded {
 							let shared = Arc::new(OnceLock::new());
-							let _ = shared.set(Ok(value.clone()));
+							let _ = shared.set(CellState::Cached(value.clone()));
 							let keep_in_offline = {
 								let mut entries = self.entries.lock();
 								match entries.get(key) {
@@ -560,14 +648,14 @@ impl<K: Eq + Hash + Clone, V: Weighed> Cache<K, V> {
 										false
 									}
 									Some(entry) => match entry.cell.get() {
-										Some(Err(_)) => {
+										Some(CellState::CachedErr(_) | CellState::Uncached | CellState::UncachedErr) => {
 											entries.insert(key.clone(), Entry { cell: shared, last_used: tick, created: std::time::Instant::now() });
 											false
 										}
 										// An online load is in flight: keep our Ok cell in `offline` until online
 										// settles so other concurrent offline callers share it instead of loading again.
 										None => true,
-										Some(Ok(_)) => false,
+										Some(CellState::Cached(_)) => false,
 									},
 								}
 							};
@@ -579,64 +667,130 @@ impl<K: Eq + Hash + Clone, V: Weighed> Cache<K, V> {
 							}
 							self.evict();
 						}
+						return Ok(value);
 					}
-					Ok(value)
+					CellState::Uncached => {
+						let mut offline = self.offline.lock();
+						if offline.get(key).is_some_and(|entry| Arc::ptr_eq(&entry.cell, &cell)) {
+							offline.remove(key);
+						}
+						drop(offline);
+						if loaded {
+							if offline_fallback {
+								self.offline_errors.fetch_add(1, Ordering::Relaxed);
+							}
+							return Ok(uncached_value.expect("leader produced uncached value"));
+						}
+						// Waiter: retry with our own `load` instead of taking a moving/fallback value.
+						continue;
+					}
+					CellState::CachedErr(error) => {
+						self.offline_errors.fetch_add(1, Ordering::Relaxed);
+						return Err(anyhow!(error));
+					}
+					CellState::UncachedErr => {
+						let mut offline = self.offline.lock();
+						if offline.get(key).is_some_and(|entry| Arc::ptr_eq(&entry.cell, &cell)) {
+							offline.remove(key);
+						}
+						drop(offline);
+						if loaded {
+							self.offline_errors.fetch_add(1, Ordering::Relaxed);
+							return Err(uncached_error.expect("leader produced uncached error"));
+						}
+						continue;
+					}
 				}
-				Err(error) => {
-					self.offline_errors.fetch_add(1, Ordering::Relaxed);
-					Err(anyhow!(error))
+			}
+			let cell = {
+				let mut entries = self.entries.lock();
+				// a hit neither clones the key nor allocates while the lock is held
+				match entries.get_mut(key) {
+					Some(entry) if !matches!(entry.cell.get(), Some(CellState::Uncached | CellState::UncachedErr)) && !(matches!(entry.cell.get(), Some(CellState::CachedErr(_))) && entry.created.elapsed() > FAILURE_TTL) => {
+						entry.last_used = tick;
+						entry.cell.clone()
+					}
+					_ => {
+						let cell = Arc::new(OnceLock::new());
+						entries.insert(key.clone(), Entry { cell: cell.clone(), last_used: tick, created: std::time::Instant::now() });
+						cell
+					}
 				}
 			};
-		}
-		let cell = {
-			let mut entries = self.entries.lock();
-			// a hit neither clones the key nor allocates while the lock is held
-			match entries.get_mut(key) {
-				Some(entry) if !(matches!(entry.cell.get(), Some(Err(_))) && entry.created.elapsed() > FAILURE_TTL) => {
-					entry.last_used = tick;
-					entry.cell.clone()
-				}
-				_ => {
-					let cell = Arc::new(OnceLock::new());
-					entries.insert(key.clone(), Entry { cell: cell.clone(), last_used: tick, created: std::time::Instant::now() });
-					cell
-				}
-			}
-		};
-		let mut loaded = false;
-		let result = cell
-			.get_or_init(|| {
-				loaded = true;
-				load().map(|(value, _)| Arc::new(value)).map_err(|error| format!("{error:#}"))
-			})
-			.clone();
-		if loaded {
-			self.misses.fetch_add(1, Ordering::Relaxed);
-		} else {
-			self.hits.fetch_add(1, Ordering::Relaxed);
-		}
-		match result {
-			Ok(value) => {
-				if loaded {
-					if let Some(removed) = self.offline.lock().remove(key)
-						&& matches!(removed.cell.get(), Some(Err(_)))
-					{
-						self.dropped_offline_failures.fetch_add(1, Ordering::Relaxed);
+			let mut loaded = false;
+			let mut uncached_value: Option<Arc<V>> = None;
+			let mut uncached_error: Option<anyhow::Error> = None;
+			let state = cell
+				.get_or_init(|| {
+					loaded = true;
+					match (load.take().expect("leader runs load once"))() {
+						Ok(outcome) => {
+							let value = Arc::new(outcome.value);
+							if outcome.keep {
+								CellState::Cached(value)
+							} else {
+								uncached_value = Some(value);
+								CellState::Uncached
+							}
+						}
+						Err(LoadError::Cached(error)) => CellState::CachedErr(format!("{error:#}")),
+						Err(LoadError::Uncached(error)) => {
+							uncached_error = Some(error);
+							CellState::UncachedErr
+						}
 					}
-					self.evict();
-				}
-				Ok(value)
+				})
+				.clone();
+			if loaded {
+				self.misses.fetch_add(1, Ordering::Relaxed);
+			} else {
+				self.hits.fetch_add(1, Ordering::Relaxed);
 			}
-			Err(error) => {
-				if loaded {
-					// Clear any temporary offline Ok parked while this online load was in flight so
-					// `offline` retains no GPU bytes at rest.
-					let mut offline = self.offline.lock();
-					if offline.get(key).is_some_and(|entry| matches!(entry.cell.get(), Some(Ok(_)))) {
-						offline.remove(key);
+			match state {
+				CellState::Cached(value) => {
+					if loaded {
+						if let Some(removed) = self.offline.lock().remove(key)
+							&& matches!(removed.cell.get(), Some(CellState::CachedErr(_)))
+						{
+							self.dropped_offline_failures.fetch_add(1, Ordering::Relaxed);
+						}
+						self.evict();
 					}
+					return Ok(value);
 				}
-				Err(anyhow!(error))
+				CellState::Uncached => {
+					let mut entries = self.entries.lock();
+					if entries.get(key).is_some_and(|entry| Arc::ptr_eq(&entry.cell, &cell)) {
+						entries.remove(key);
+					}
+					drop(entries);
+					if loaded {
+						return Ok(uncached_value.expect("leader produced uncached value"));
+					}
+					continue;
+				}
+				CellState::CachedErr(error) => {
+					if loaded {
+						// Clear any temporary offline Ok parked while this online load was in flight so
+						// `offline` retains no GPU bytes at rest.
+						let mut offline = self.offline.lock();
+						if offline.get(key).is_some_and(|entry| matches!(entry.cell.get(), Some(CellState::Cached(_)))) {
+							offline.remove(key);
+						}
+					}
+					return Err(anyhow!(error));
+				}
+				CellState::UncachedErr => {
+					let mut entries = self.entries.lock();
+					if entries.get(key).is_some_and(|entry| Arc::ptr_eq(&entry.cell, &cell)) {
+						entries.remove(key);
+					}
+					drop(entries);
+					if loaded {
+						return Err(uncached_error.expect("leader produced uncached error"));
+					}
+					continue;
+				}
 			}
 		}
 	}
@@ -646,14 +800,24 @@ impl<K: Eq + Hash + Clone, V: Weighed> Cache<K, V> {
 		let tick = self.tick.fetch_add(1, Ordering::Relaxed);
 		let mut entries = self.entries.lock();
 		let entry = entries.get_mut(key)?;
-		let value = entry.cell.get()?.as_ref().ok()?.clone();
+		let CellState::Cached(value) = entry.cell.get()? else {
+			return None;
+		};
+		let value = value.clone();
 		entry.last_used = tick;
 		self.hits.fetch_add(1, Ordering::Relaxed);
 		Some(value)
 	}
 
 	pub fn bytes(&self) -> u64 {
-		self.entries.lock().values().filter_map(|entry| entry.cell.get()).filter_map(|result| result.as_ref().ok()).map(|value| value.bytes()).sum()
+		self.entries
+			.lock()
+			.values()
+			.filter_map(|entry| match entry.cell.get() {
+				Some(CellState::Cached(value)) => Some(value.bytes()),
+				_ => None,
+			})
+			.sum()
 	}
 
 	/// The bytes of what no render holds: what the budget bounds, and what dropping frees.
@@ -664,7 +828,7 @@ impl<K: Eq + Hash + Clone, V: Weighed> Cache<K, V> {
 	/// An entry's bytes when only the cache holds its value.
 	fn idle(entry: &Entry<V>) -> Option<u64> {
 		match entry.cell.get() {
-			Some(Ok(value)) if Arc::strong_count(value) == 1 => Some(value.bytes()),
+			Some(CellState::Cached(value)) if Arc::strong_count(value) == 1 => Some(value.bytes()),
 			_ => None,
 		}
 	}
@@ -692,7 +856,7 @@ impl<K: Eq + Hash + Clone, V: Weighed> Cache<K, V> {
 			let mut offline = self.offline.lock();
 			let mut dropped = 0u64;
 			offline.retain(|_, entry| match entry.cell.get() {
-				Some(Err(_)) if budget == 0 || entry.created.elapsed() > FAILURE_TTL => {
+				Some(CellState::CachedErr(_)) if budget == 0 || entry.created.elapsed() > FAILURE_TTL => {
 					if entry.created.elapsed() <= FAILURE_TTL {
 						dropped += 1;
 					}
@@ -710,18 +874,18 @@ impl<K: Eq + Hash + Clone, V: Weighed> Cache<K, V> {
 		if total <= budget {
 			return 0;
 		}
-		let mut order: Vec<(u64, K)> = entries.iter().filter(|(_, entry)| matches!(entry.cell.get(), Some(Err(_))) || Self::idle(entry).is_some()).map(|(key, entry)| (entry.last_used, key.clone())).collect();
+		let mut order: Vec<(u64, K)> = entries.iter().filter(|(_, entry)| matches!(entry.cell.get(), Some(CellState::CachedErr(_))) || Self::idle(entry).is_some()).map(|(key, entry)| (entry.last_used, key.clone())).collect();
 		order.sort_by_key(|(tick, _)| *tick);
 		for (_, key) in order {
 			if total <= budget {
 				break;
 			}
 			match entries.remove(&key).as_ref().and_then(|entry| entry.cell.get()) {
-				Some(Ok(value)) => total = total.saturating_sub(value.bytes()),
-				Some(Err(_)) => {
+				Some(CellState::Cached(value)) => total = total.saturating_sub(value.bytes()),
+				Some(CellState::CachedErr(_)) => {
 					self.dropped_failures.fetch_add(1, Ordering::Relaxed);
 				}
-				None => {}
+				_ => {}
 			}
 		}
 		before - total
@@ -844,6 +1008,43 @@ mod tests {
 		});
 		assert!(cache.offline.lock().is_empty(), "online completion clears temporary offline entry");
 		assert_eq!(cache.dropped_failures_for(true), 0, "clearing a temporary offline success must not count as a dropped offline failure");
+	}
+
+	/// When a leader's checked load returns `keep = false` (a local file moved while being read),
+	/// the leader receives its own value without keeping it in the cache, and a concurrent waiter
+	/// retries with its own loader instead of inheriting the leader's moving value.
+	#[test]
+	fn uncached_moving_load_is_not_kept_and_waiter_retries() {
+		let cache: Cache<u32, Blob> = Cache::new(100);
+		let entered = std::sync::Barrier::new(2);
+		let release = std::sync::Barrier::new(2);
+		std::thread::scope(|scope| {
+			let leader = scope.spawn(|| {
+				cache
+					.get_or_load_checked(&1, false, || {
+						entered.wait();
+						release.wait();
+						Ok(LoadOutcome { value: Blob(99), keep: false, offline_fallback: false })
+					})
+					.unwrap()
+			});
+			entered.wait();
+			let waiter = scope.spawn(|| {
+				cache
+					.get_or_load_checked(&1, false, || Ok(LoadOutcome { value: Blob(42), keep: true, offline_fallback: false }))
+					.unwrap()
+			});
+			// Let the waiter attach to the leader's in-flight cell before releasing the leader.
+			while cache.entries.lock().get(&1).is_none_or(|e| Arc::strong_count(&e.cell) < 3) {
+				std::thread::yield_now();
+			}
+			release.wait();
+			let a = leader.join().unwrap();
+			let b = waiter.join().unwrap();
+			assert_eq!(a.0, 99, "leader gets its own uncached read");
+			assert_eq!(b.0, 42, "concurrent waiter must retry and get settled 42, not moving 99");
+		});
+		assert_eq!(cache.get(&1).unwrap().0, 42, "settled waiter's value is what stays cached");
 	}
 }
 

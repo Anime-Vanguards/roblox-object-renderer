@@ -1098,6 +1098,9 @@ struct PartMaterial {
 	/// Material textures: the colour map's far tiling (far tiles per tile, 0: none) and 1 / the view
 	/// depth where it has taken over (pre-2022 Slate, Concrete, Granite, CorrodedMetal).
 	far: [f32; 2],
+	/// Provenance of any local TexturePack files read while resolving this material (empty when no
+	/// local pack was read).
+	pack_proofs: Vec<(String, resources::StampProof)>,
 }
 
 /// A stable pseudo-random offset in tiles for a part, standing in for the random one Studio picks
@@ -1167,6 +1170,8 @@ struct SkyFaceImages {
 	blocks: Option<Vec<Vec<u8>>>,
 	width: u32,
 	height: u32,
+	/// True when the face is remote or its local file bytes were proven to match its snapshot.
+	verified: bool,
 }
 
 /// The skybox's six images for the sky pass (shaders/sky.wgsl `skybox`): a 2D array in Bk, Dn, Ft,
@@ -1212,23 +1217,39 @@ struct EffectBindings {
 /// Effect bindings kept (a clip's, a few clips' at once)
 const EFFECT_BINDINGS_KEPT: usize = 4;
 
-/// The effects' textures in order (`EffectBindings::hash`).
-fn effect_hash(scene: &Scene) -> u64 {
+/// The effects' textures in order (`EffectBindings::hash`), stamping any local files and returning
+/// the observed `(uri -> stamped_uri)` map so `effect_bindings` only caches bindings whose loaded
+/// textures match the stamps hashed into `hash`.
+fn effect_hash(scene: &Scene) -> (u64, HashMap<String, String>) {
 	use std::hash::{Hash, Hasher};
 	let mut hasher = std::collections::hash_map::DefaultHasher::new();
+	let mut local_keys: HashMap<String, String> = HashMap::new();
+	let mut hash_uri = |uri: Option<&str>, hasher: &mut std::collections::hash_map::DefaultHasher| match uri {
+		None => false.hash(hasher),
+		Some(uri) => {
+			true.hash(hasher);
+			let key = transcode::image_key(uri);
+			if names_local_file(&key) {
+				let stamped = local_keys.entry(key.clone()).or_insert_with(|| content_key(&key));
+				stamped.hash(hasher);
+			} else {
+				key.hash(hasher);
+			}
+		}
+	};
 	scene.particles.len().hash(&mut hasher);
 	for emitter in &scene.particles {
-		emitter.texture.hash(&mut hasher);
+		hash_uri(emitter.texture.as_deref(), &mut hasher);
 	}
 	scene.beams.len().hash(&mut hasher);
 	for beam in &scene.beams {
-		beam.texture.hash(&mut hasher);
+		hash_uri(beam.texture.as_deref(), &mut hasher);
 	}
 	scene.trails.len().hash(&mut hasher);
 	for trail in &scene.trails {
-		trail.texture.hash(&mut hasher);
+		hash_uri(trail.texture.as_deref(), &mut hasher);
 	}
-	hasher.finish()
+	(hasher.finish(), local_keys)
 }
 
 /// The preparation key of frames whose parts are all the same ([`Renderer::prepare_environment_sharing`]).
@@ -1246,6 +1267,8 @@ struct SkyBase {
 	upright: Option<(environment::CubeImage, environment::CubeImage)>,
 	images: Option<(wgpu::TextureView, u64)>,
 	bytes: u64,
+	/// True when every local skybox face was proven to match its snapshot (`false` if any moved).
+	stable: bool,
 }
 
 impl Weighed for SkyBase {
@@ -2504,38 +2527,103 @@ impl Renderer {
 	/// fewer), placed as the full mesh is (MeshPart scale comes from InitialSize): what a
 	/// Performance-fidelity copy shows at a distance (notes/cost.md "Levels of detail").
 	fn load_mesh(&self, uri: &str) -> Result<Arc<GpuMesh>> {
-		self.meshes.get_or_load_for(&format!("mesh:{}", content_key(uri)), self.assets.is_offline_view(), || {
-			let (source, level) = match uri.rsplit_once("#lod=") {
-				Some((source, level)) => (source, level.parse::<usize>().with_context(|| format!("{uri}: #lod= takes a level number"))?),
-				None => (uri, 0),
+		let (source, level) = match uri.rsplit_once("#lod=") {
+			Some((source, level)) => (source, level.parse::<usize>().with_context(|| format!("{uri}: #lod= takes a level number"))?),
+			None => (uri, 0),
+		};
+		let local_snap = local_snapshot_for(source);
+		let stamped = match &local_snap {
+			Some((_, snap)) => snap.stamp.stamp_uri(uri),
+			None => content_key(uri),
+		};
+		self.meshes.get_or_load_checked(&format!("mesh:{stamped}"), self.assets.is_offline_view(), || {
+			use resources::{LoadError, LoadOutcome, StampProof};
+			let (fetched, proof, keep) = match &local_snap {
+				Some((path, snap)) => {
+					run_test_read_hook(path);
+					match self.assets.fetch_local_with_snapshot(source, path, *snap) {
+						Ok((fetched, verified)) => (fetched, if verified { StampProof::Proven(stamped.clone()) } else { StampProof::Moved }, verified),
+						Err(error) => {
+							return Err(if snap.still_unchanged(path) { LoadError::Cached(anyhow!("{error}")) } else { LoadError::Uncached(anyhow!("{error}")) });
+						}
+					}
+				}
+				None => match self.assets.fetch(source) {
+					Ok(fetched) => (fetched, StampProof::Remote, true),
+					Err(error) => return Err(LoadError::Cached(anyhow!("{error}"))),
+				},
 			};
-			let fetched = self.assets.fetch(source).map_err(|error| anyhow!("{error}"))?;
-			let mut mesh = ror_mesh::decode_mesh(&fetched.bytes).map_err(|error| anyhow!("{uri}: {error}"))?;
+			let mut mesh = match ror_mesh::decode_mesh(&fetched.bytes) {
+				Ok(mesh) => mesh,
+				Err(error) => {
+					let err = anyhow!("{uri}: {error}");
+					return Err(if keep { LoadError::Cached(err) } else { LoadError::Uncached(err) });
+				}
+			};
 			if level > 0 && !mesh.lods.is_empty() {
 				mesh.lods = vec![mesh.lods[level.min(mesh.lods.len() - 1)].clone()];
 			}
 			let cpu = geometry::from_mesh(&mesh);
-			self.gpu_room((std::mem::size_of_val(cpu.vertices.as_slice()) + std::mem::size_of_val(cpu.indices.as_slice())) as u64)?;
-			Ok(GpuMesh::upload(&self.gpu, uri, &cpu))
+			if let Err(err) = self.gpu_room((std::mem::size_of_val(cpu.vertices.as_slice()) + std::mem::size_of_val(cpu.indices.as_slice())) as u64) {
+				return Err(LoadError::Uncached(err));
+			}
+			let mut uploaded = GpuMesh::upload(&self.gpu, uri, &cpu);
+			uploaded.proof = proof;
+			Ok(LoadOutcome { value: uploaded, keep, offline_fallback: false })
 		})
 	}
 
 	fn load_union(&self, asset: Option<&str>, data: Option<&Arc<Vec<u8>>>) -> Result<Arc<GpuMesh>> {
-		let key = match (data, asset) {
+		let local_snap = match (data, asset) {
+			(None, Some(asset)) => local_snapshot_for(asset),
+			_ => None,
+		};
+		let stamped_asset = match (&local_snap, asset) {
+			(Some((_, snap)), Some(asset)) => Some(snap.stamp.stamp_uri(asset)),
+			(None, Some(asset)) => Some(content_key(asset)),
+			_ => None,
+		};
+		let key = match (data, stamped_asset.as_deref()) {
 			(Some(data), _) => format!("union-data:{:016x}", fnv1a(data)),
-			(None, Some(asset)) => format!("union:{}", content_key(asset)),
+			(None, Some(stamped)) => format!("union:{stamped}"),
 			(None, None) => return Err(anyhow!("union without mesh data or AssetId")),
 		};
-		self.meshes.get_or_load_for(&key, self.assets.is_offline_view(), || {
-			let bytes = match (data, asset) {
-				(Some(data), _) => data.as_ref().clone(),
-				(None, Some(asset)) => self.assets.fetch(asset).map_err(|error| anyhow!("{error}"))?.bytes.clone(),
-				(None, None) => unreachable!(),
+		self.meshes.get_or_load_checked(&key, self.assets.is_offline_view(), || {
+			use resources::{LoadError, LoadOutcome, StampProof};
+			let (bytes, proof, keep) = match (data, asset, &local_snap) {
+				(Some(data), _, _) => (data.as_ref().clone(), StampProof::Remote, true),
+				(None, Some(asset), Some((path, snap))) => {
+					run_test_read_hook(path);
+					match self.assets.fetch_local_with_snapshot(asset, path, *snap) {
+						Ok((fetched, verified)) => {
+							let stamped = stamped_asset.clone().unwrap_or_default();
+							(fetched.bytes.clone(), if verified { StampProof::Proven(stamped) } else { StampProof::Moved }, verified)
+						}
+						Err(error) => {
+							return Err(if snap.still_unchanged(path) { LoadError::Cached(anyhow!("{error}")) } else { LoadError::Uncached(anyhow!("{error}")) });
+						}
+					}
+				}
+				(None, Some(asset), None) => match self.assets.fetch(asset) {
+					Ok(fetched) => (fetched.bytes.clone(), StampProof::Remote, true),
+					Err(error) => return Err(LoadError::Cached(anyhow!("{error}"))),
+				},
+				(None, None, _) => unreachable!(),
 			};
-			let mesh = ror_mesh::decode_union(&bytes).map_err(|error| anyhow!("union: {error}"))?;
+			let mesh = match ror_mesh::decode_union(&bytes) {
+				Ok(mesh) => mesh,
+				Err(error) => {
+					let err = anyhow!("union: {error}");
+					return Err(if keep { LoadError::Cached(err) } else { LoadError::Uncached(err) });
+				}
+			};
 			let cpu = geometry::from_mesh(&mesh);
-			self.gpu_room((std::mem::size_of_val(cpu.vertices.as_slice()) + std::mem::size_of_val(cpu.indices.as_slice())) as u64)?;
-			Ok(GpuMesh::upload(&self.gpu, "union", &cpu))
+			if let Err(err) = self.gpu_room((std::mem::size_of_val(cpu.vertices.as_slice()) + std::mem::size_of_val(cpu.indices.as_slice())) as u64) {
+				return Err(LoadError::Uncached(err));
+			}
+			let mut uploaded = GpuMesh::upload(&self.gpu, "union", &cpu);
+			uploaded.proof = proof;
+			Ok(LoadOutcome { value: uploaded, keep, offline_fallback: false })
 		})
 	}
 
@@ -2543,7 +2631,21 @@ impl Renderer {
 	/// its levels' source; one kept on disk goes to the GPU only once asked for (a material map's levels
 	/// from the finest a view samples, render::residency; [`Renderer::load_whole`]).
 	fn load_texture(&self, uri: &str, usage: TextureUse) -> Result<Arc<GpuTexture>> {
-		self.textures.get_or_load_isolated(&(content_key(uri), usage), self.assets.is_offline_view(), || self.make_texture_checked(uri, usage))
+		let composite_snaps = uri.starts_with(composite::KEY_PREFIX).then(|| composite::snapshot_layers(uri));
+		let local_snap = if composite_snaps.is_none() {
+			local_snapshot_for(uri).map(|(path, snap)| {
+				let stamped = snap.stamp.stamp_uri(uri);
+				(path, snap, stamped)
+			})
+		} else {
+			None
+		};
+		let cache_key = match (&composite_snaps, &local_snap) {
+			(Some((stamped, _)), _) => stamped.clone(),
+			(_, Some((_, _, stamped))) => stamped.clone(),
+			_ => content_key(uri),
+		};
+		self.textures.get_or_load_checked(&(cache_key, usage), self.assets.is_offline_view(), || self.make_texture_verified(uri, usage, local_snap.as_ref(), composite_snaps.as_ref()))
 	}
 
 	/// [`Renderer::load_texture`] with every level on the GPU (what effects, the sky's bodies and the
@@ -2556,9 +2658,34 @@ impl Renderer {
 
 	/// A texture pack (SurfaceAppearance / MaterialVariant TexturePack, a built-in material's pack).
 	fn texture_pack(&self, uri: &str) -> Result<Arc<TexturePack>> {
-		self.packs.get_or_load_for(&content_key(uri), self.assets.is_offline_view(), || {
-			let fetched = self.assets.fetch(uri).map_err(|error| anyhow!("{error}"))?;
-			texture_pack::parse(&fetched.bytes).with_context(|| format!("{uri}: texture pack"))
+		let local_snap = local_snapshot_for(uri);
+		let stamped = match &local_snap {
+			Some((_, snap)) => snap.stamp.stamp_uri(uri),
+			None => content_key(uri),
+		};
+		self.packs.get_or_load_checked(&stamped, self.assets.is_offline_view(), || {
+			use resources::{LoadError, LoadOutcome, StampProof};
+			let (fetched, proof, keep) = match &local_snap {
+				Some((path, snap)) => {
+					run_test_read_hook(path);
+					match self.assets.fetch_local_with_snapshot(uri, path, *snap) {
+						Ok((fetched, verified)) => (fetched, if verified { StampProof::Proven(stamped.clone()) } else { StampProof::Moved }, verified),
+						Err(error) => {
+							return Err(if snap.still_unchanged(path) { LoadError::Cached(anyhow!("{error}")) } else { LoadError::Uncached(anyhow!("{error}")) });
+						}
+					}
+				}
+				None => match self.assets.fetch(uri) {
+					Ok(fetched) => (fetched, StampProof::Remote, true),
+					Err(error) => return Err(LoadError::Cached(anyhow!("{error}"))),
+				},
+			};
+			let mut pack = match texture_pack::parse(&fetched.bytes).with_context(|| format!("{uri}: texture pack")) {
+				Ok(pack) => pack,
+				Err(err) => return Err(if keep { LoadError::Cached(err) } else { LoadError::Uncached(err) }),
+			};
+			pack.proof = proof;
+			Ok(LoadOutcome { value: pack, keep, offline_fallback: false })
 		})
 	}
 
@@ -2596,12 +2723,21 @@ impl Renderer {
 			layout: &self.pipelines.residency_material_layout,
 			entries: &[wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(sampler) }, wgpu::BindGroupEntry { binding: 6, resource: info.as_entire_binding() }],
 		});
-		// only fully loaded materials are kept; one with a failed texture asks the texture cache again
-		// next time (which remembers the failure for a while)
+		// only fully loaded materials whose local textures match `kept`'s stamps are kept; one with a
+		// failed or moving texture asks the texture cache again next time
 		let uris = [&key.color, &key.normal, &key.metalness, &key.roughness, &key.emissive];
+		let kept_uris = [&kept.color, &kept.normal, &kept.metalness, &kept.roughness, &kept.emissive];
 		let complete = uris.iter().zip(&maps).all(|(uri, texture)| uri.is_none() || texture.is_some());
+		let stable = uris.iter().zip(kept_uris).zip(&maps).all(|((raw, kept_uri), texture)| match (raw, kept_uri, texture) {
+			(Some(raw), Some(ku), Some(tex)) => match &tex.proof {
+				resources::StampProof::Remote => !names_local_file(raw),
+				resources::StampProof::Proven(actual) => actual == ku,
+				resources::StampProof::Moved => false,
+			},
+			_ => true,
+		});
 		let binding = Arc::new(MaterialBinding { maps, clamped: key.clamped, info, feedback, group: Mutex::new(None) });
-		if complete {
+		if complete && stable {
 			self.materials.lock().insert(kept.into_owned(), Arc::downgrade(&binding));
 		}
 		binding
@@ -2654,7 +2790,11 @@ impl Renderer {
 		// light too (light-night-sky2)
 		let tint = environment::sky_tint(lighting.clock_time, lighting.environment_diffuse_scale);
 		let tint_key = tint.map(|tint| format!("{tint:.4?}"));
-		let skybox: [String; 6] = std::array::from_fn(|index| content_key(&sky.skybox[index]));
+		let sky_snaps: [Option<(std::path::PathBuf, ror_assets::FileSnapshot)>; 6] = std::array::from_fn(|index| local_snapshot_for(&sky.skybox[index]));
+		let skybox: [String; 6] = std::array::from_fn(|index| match &sky_snaps[index] {
+			Some((_, snap)) => snap.stamp.stamp_uri(&sky.skybox[index]),
+			None => content_key(&sky.skybox[index]),
+		});
 		let sky_key = format!("{skybox:?}|{:?}", sky.skybox_orientation);
 		let key = format!("{sky_key}|{atmosphere_key:?}|{tint_key:?}");
 		if let Some(maps) = self.environments.get(&key) {
@@ -2671,10 +2811,18 @@ impl Renderer {
 		let result = std::thread::scope(|scope| {
 			scope
 				.spawn(|| {
-					let base = self.skies.get_or_load_for(&sky_key, transient_failure, || inner_pool().install(|| self.sky_base(&sky)));
-					self.environments.get_or_load_for(&key, transient_failure, || {
-						let base = base?;
-						Ok(inner_pool().install(|| self.environment_maps(&sky, &base, tint, atmosphere, glare_light, glare_tint, lighting.brightness)))
+					let base = self.skies.get_or_load_checked(&sky_key, transient_failure, || inner_pool().install(|| self.sky_base(&sky, &sky_snaps)));
+					self.environments.get_or_load_checked(&key, transient_failure, || {
+						let base = match base {
+							Ok(base) => base,
+							Err(error) => {
+								let moved = sky_snaps.iter().any(|snap| snap.as_ref().is_some_and(|(path, s)| !s.still_unchanged(path)));
+								return Err(if moved { resources::LoadError::Uncached(error) } else { resources::LoadError::Cached(error) });
+							}
+						};
+						let stable = base.stable;
+						let maps = inner_pool().install(|| self.environment_maps(&sky, &base, tint, atmosphere, glare_light, glare_tint, lighting.brightness));
+						Ok(resources::LoadOutcome { value: maps, keep: stable, offline_fallback: false })
 					})
 				})
 				.join()
@@ -2769,24 +2917,28 @@ impl Renderer {
 	}
 
 	/// A skybox's six images decoded: the cubes its maps start from and the images the sky pass draws.
-	fn sky_base(&self, sky: &crate::scene::environment::Sky) -> Result<SkyBase> {
-		let faces: Vec<Result<SkyFaceImages>> = sky.skybox.par_iter().map(|uri| self.sky_face(uri)).collect();
+	fn sky_base(&self, sky: &crate::scene::environment::Sky, snaps: &[Option<(std::path::PathBuf, ror_assets::FileSnapshot)>; 6]) -> std::result::Result<resources::LoadOutcome<SkyBase>, resources::LoadError> {
+		let faces: Vec<Result<SkyFaceImages>> = sky.skybox.par_iter().enumerate().map(|(index, uri)| self.sky_face(uri, snaps[index].as_ref())).collect();
 		if !faces.iter().all(|face| face.is_ok()) {
 			let reasons: Vec<String> = faces.into_iter().filter_map(|face| face.err()).map(|error| format!("{error:#}")).collect();
-			return Err(anyhow!("sky: {}", reasons.join("; ")));
+			let moved = snaps.iter().any(|snap| snap.as_ref().is_some_and(|(path, s)| !s.still_unchanged(path)));
+			let err = anyhow!("sky: {}", reasons.join("; "));
+			return Err(if moved { resources::LoadError::Uncached(err) } else { resources::LoadError::Cached(err) });
 		}
 		let mut cubes = Vec::new();
 		let mut lights = Vec::new();
 		let mut sizes = Vec::new();
 		let mut blocks = Vec::new();
+		let mut stable = true;
 		for face in faces.into_iter().flatten() {
+			stable &= face.verified;
 			cubes.push(face.radiance);
 			lights.push(face.light);
 			sizes.push((face.width, face.height));
 			blocks.push(face.blocks);
 		}
-		let faces: [environment::SkyFace; 6] = cubes.try_into().map_err(|_| anyhow!("six sky faces"))?;
-		let lights: [environment::SkyFace; 6] = lights.try_into().map_err(|_| anyhow!("six sky faces"))?;
+		let faces: [environment::SkyFace; 6] = cubes.try_into().map_err(|_| resources::LoadError::Cached(anyhow!("six sky faces")))?;
+		let lights: [environment::SkyFace; 6] = lights.try_into().map_err(|_| resources::LoadError::Cached(anyhow!("six sky faces")))?;
 		// the sky pass draws the images themselves when they share one square size: BC1 images (the
 		// default sky's DXT1 .tex files) as their blocks and mips, which the GPU decodes as it does
 		// Studio's
@@ -2807,15 +2959,21 @@ impl Renderer {
 		let upright = (sky.skybox_orientation != Vec3::ZERO).then(|| (environment::sky_cube(&faces, SKY_CUBE_TEXELS, Vec3::ZERO), environment::sky_cube(&lights, SKY_LIGHT_TEXELS, Vec3::ZERO)));
 		let cubes = [Some(&cube), Some(&light), upright.as_ref().map(|(cube, _)| cube), upright.as_ref().map(|(_, light)| light)];
 		let bytes = cubes.iter().flatten().map(|cube| cube.faces.iter().map(|face| face.len() as u64 * 12).sum::<u64>()).sum::<u64>() + images.as_ref().map_or(0, |(_, bytes)| *bytes);
-		Ok(SkyBase { cube, light, upright, images, bytes })
+		Ok(resources::LoadOutcome { value: SkyBase { cube, light, upright, images, bytes, stable }, keep: stable, offline_fallback: false })
 	}
 
 	/// A skybox image as radiance, the same at the sky light's resolution, and its texels as stored
 	/// for the sky pass.
-	fn sky_face(&self, uri: &str) -> Result<SkyFaceImages> {
+	fn sky_face(&self, uri: &str, snap: Option<&(std::path::PathBuf, ror_assets::FileSnapshot)>) -> Result<SkyFaceImages> {
 		// the uploaded image, not its transcode (lobby-sky: a place's skybox within 2 of 255 on
 		// 98.8-99.9 % of pixels from its PNGs, 76-84 % from their KTX2 transcodes)
-		let fetched = self.assets.fetch(uri).map_err(|error| anyhow!("{error}"))?;
+		let (fetched, verified) = match snap {
+			Some((path, snap)) => {
+				run_test_read_hook(path);
+				self.assets.fetch_local_with_snapshot(uri, path, *snap).map_err(|error| anyhow!("{error}"))?
+			}
+			None => (self.assets.fetch(uri).map_err(|error| anyhow!("{error}"))?, !names_local_file(uri)),
+		};
 		let image = ror_image::decode(&fetched.bytes).map_err(|error| anyhow!("{uri}: {error}"))?;
 		let blocks = (image.format == ror_image::PixelFormat::Bc1 && image.layers <= 1 && image.depth <= 1 && image.width % 4 == 0 && image.height % 4 == 0).then(|| image.levels.clone());
 		let mut image = ror_image::to_rgba8(&image);
@@ -2863,7 +3021,7 @@ impl Renderer {
 		let (width, height) = (image.width, image.height);
 		let rgba = std::mem::take(&mut image.levels[0]);
 		let face = environment::SkyFace { width, height, pixels: environment::SkyPixels::Texels { rgba, radiance: table } };
-		Ok(SkyFaceImages { radiance: face, light, blocks, width, height })
+		Ok(SkyFaceImages { radiance: face, light, blocks, width, height, verified })
 	}
 
 	/// The skybox's six images as stored (all `size` square) in a 2D array with mips box-filtered on
@@ -3192,24 +3350,28 @@ impl Renderer {
 			}
 			None => {
 				let failures = self.failures(offline_view);
-				let (mut geometry, moving, frame, remembered, offline_fallback) = self.prepare_geometry(scene, stats, neon_share, key.as_deref(), lease, views, defer_maps, last)?;
+				let (mut geometry, moving, frame, remembered, offline_fallback, all_stable) = self.prepare_geometry(scene, stats, neon_share, key.as_deref(), lease, views, defer_maps, last)?;
 				// A missing asset can succeed on a later request: a scene some of whose loads failed is kept
 				// only while the caches remember every failure it met, until the first of them is retried
 				// (prepared::Retry), keeping their ordinary retry policy. An offline view that hit any
 				// offline miss or silent fallback (e.g. TexturePack layers or Head mesh) stays offline-only
 				// so it can never poison online renders. A scene some of whose parts changed since the last
 				// is moving: its next frame differs again (its parts are kept instead, `prepare_geometry`),
-				// unless it is drawn again unchanged (Preparations::repeated).
+				// unless it is drawn again unchanged (Preparations::repeated). A scene whose local files
+				// moved between keying and loading (`!all_stable`) is drawn for this render alone and never
+				// kept under the stale key.
 				let had_failures = !geometry.missing.is_empty() || offline_fallback;
 				let retry = (had_failures && remembered).then(|| prepared::Retry::of(failures, self.failures(offline_view))).flatten();
 				let offline_only = offline_view && had_failures;
-				let keep = (!had_failures || retry.is_some()) && key.as_ref().is_some_and(|key| !moving || self.preparations.repeated(key));
+				let keep = all_stable && (!had_failures || retry.is_some()) && key.as_ref().is_some_and(|key| !moving || self.preparations.repeated(key));
 				if keep && moving {
 					// (prepare_geometry counts what a moving scene holds as nothing: it is not kept)
 					geometry.held = Self::held_by(&geometry.draws, geometry.organic_noise.as_ref(), geometry.surface_maps.as_ref());
 				}
 				let geometry = Arc::new(geometry);
-				if let (Some(clip), Some(frame), Some(key)) = (clip, frame, key.clone()) {
+				if all_stable
+					&& let (Some(clip), Some(frame), Some(key)) = (clip, frame, key.clone())
+				{
 					*clip.last.lock() = Some(frame.finish(key, geometry.clone(), moving));
 				}
 				if keep && let Some(key) = key && self.preparations.insert(key, geometry.clone(), retry, offline_only) {
@@ -3253,9 +3415,9 @@ impl Renderer {
 
 	/// The effects' textures and bind groups ([`EffectBindings`]): the last frames' when they drew the
 	/// same textures in the same order, else loaded (on every core) and made now, and kept unless one
-	/// failed (a failed one is tried again next time, as before).
+	/// failed or a local file moved between hashing and reading.
 	fn effect_bindings(&self, scene: &Scene, missing: &mut Vec<String>) -> Arc<EffectBindings> {
-		let hash = effect_hash(scene);
+		let (hash, local_keys) = effect_hash(scene);
 		if let Some(found) = self.effect_bindings.lock().iter().find(|effects| effects.hash == hash && effects.held.iter().all(|(texture, view)| texture.held().is_some_and(|held| held.base == 0 && held.view == *view))) {
 			return found.clone();
 		}
@@ -3263,7 +3425,7 @@ impl Renderer {
 		// the effects' textures loaded on every core first (as the parts' are, prepare_geometry), held
 		// until their bind groups hold them; one after another, a recorded fight's 145 particle and beam
 		// textures took 160 ms of its first frame. A failed one fails again below, where it is reported
-		let effect_textures: Vec<Arc<GpuTexture>> = {
+		let loaded_by_uri: HashMap<String, Arc<GpuTexture>> = {
 			let uris: std::collections::HashSet<String> = scene
 				.particles
 				.iter()
@@ -3273,34 +3435,38 @@ impl Renderer {
 				.map(transcode::image_key)
 				.collect();
 			// those already loaded found here, the rest loaded together (a clip's frames find them all)
-			let mut held: Vec<Arc<GpuTexture>> = Vec::new();
+			let mut found: Vec<(String, Arc<GpuTexture>)> = Vec::new();
 			let wanted: Vec<&String> = uris
 				.iter()
-				.filter(|uri| match self.textures.get(&(content_key(uri), TextureUse::Color)).filter(|texture| texture.held().is_some_and(|held| held.base == 0)) {
-					Some(texture) => {
-						held.push(texture);
-						false
+				.filter(|uri| {
+					let lookup = local_keys.get(uri.as_str()).cloned().unwrap_or_else(|| content_key(uri));
+					match self.textures.get(&(lookup, TextureUse::Color)).filter(|texture| texture.held().is_some_and(|held| held.base == 0)) {
+						Some(texture) => {
+							found.push(((*uri).clone(), texture));
+							false
+						}
+						None => true,
 					}
-					None => true,
 				})
 				.collect();
-			let load = |uri: &&String| self.load_whole(uri, TextureUse::Color).ok();
+			let load = |uri: &&String| self.load_whole(uri, TextureUse::Color).ok().map(|texture| ((*uri).clone(), texture));
 			if scene.live || wanted.len() < 2 || !crate::par::spread(wanted.len(), 8) {
-				held.extend(wanted.iter().filter_map(load));
+				found.extend(wanted.iter().filter_map(load));
 			} else {
-				held.par_extend(wanted.par_iter().filter_map(load));
+				found.par_extend(wanted.par_iter().filter_map(load));
 				// the decodes' buffers freed on rayon's workers, given back (as prepare_geometry's): kept by
 				// their heaps they held 240 MB through a GUI still's view
 				crate::release_free_memory();
 			}
-			held
+			found.into_iter().collect()
 		};
-		let beams = self.beam_textures(scene, missing);
-		let trails = self.trail_textures(scene, missing);
-		let particles = self.particle_groups(scene, missing);
-		let held = effect_textures.into_iter().filter_map(|texture| texture.held().map(|held| (texture, held.view))).collect();
+		let all_stable = loaded_by_uri.iter().all(|(uri, texture)| proof_matches(uri, &texture.proof, &local_keys));
+		let beams = self.beam_textures_with(scene, &loaded_by_uri, missing);
+		let trails = self.trail_textures_with(scene, &loaded_by_uri, missing);
+		let particles = self.particle_groups_with(scene, &loaded_by_uri, missing);
+		let held = loaded_by_uri.into_values().filter_map(|texture| texture.held().map(|held| (texture, held.view))).collect();
 		let made = Arc::new(EffectBindings { hash, held, particles, beams, trails });
-		if missing.len() == failed_before {
+		if missing.len() == failed_before && all_stable {
 			let mut kept = self.effect_bindings.lock();
 			if kept.len() >= EFFECT_BINDINGS_KEPT {
 				kept.remove(0);
@@ -3317,7 +3483,7 @@ impl Renderer {
 	/// the others are prepared now and kept when their assets loaded. A live scene's parts are not
 	/// kept: its skinned meshes are written over in place.
 	#[allow(clippy::too_many_arguments)]
-	fn prepare_geometry(&self, scene: &Scene, stats: &mut RenderStats, neon_share: f32, key: Option<&prepared::SceneKey>, lease: &reuse::Lease, views: &[ViewRequest], defer_maps: bool, last: Option<prepared::LastFrame>) -> Result<(prepared::PreparedGeometry, bool, Option<prepared::FramePieces>, bool, bool)> {
+	fn prepare_geometry(&self, scene: &Scene, stats: &mut RenderStats, neon_share: f32, key: Option<&prepared::SceneKey>, lease: &reuse::Lease, views: &[ViewRequest], defer_maps: bool, last: Option<prepared::LastFrame>) -> Result<(prepared::PreparedGeometry, bool, Option<prepared::FramePieces>, bool, bool, bool)> {
 		let assets_start = Instant::now();
 		let profile = std::env::var_os("ROR_PROFILE").is_some();
 		let missing_before = stats.missing.len();
@@ -3364,7 +3530,7 @@ impl Renderer {
 		// Load every new part's mesh and textures in parallel (the caches de-duplicate concurrent loads).
 		let loads_before = self.meshes.misses.load(std::sync::atomic::Ordering::Relaxed) + self.textures.misses.load(std::sync::atomic::Ordering::Relaxed);
 		let phase = Instant::now();
-		let meshes: Vec<Result<(Arc<GpuMesh>, Affine3A, bool)>> = each_of(scene, &fresh, |index, part| self.part_mesh(part).map(|drawn| self.skinned(part, drawn, scene.live.then_some(index))));
+		let meshes: Vec<Result<((Arc<GpuMesh>, Affine3A, bool), bool)>> = each_of(scene, &fresh, |index, part| self.part_mesh(part).map(|drawn| self.skinned_checked(part, drawn, scene.live.then_some(index))));
 		if profile {
 			eprintln!("profile: meshes {:.1} ms", phase.elapsed().as_secs_f64() * 1000.0);
 		}
@@ -3450,35 +3616,48 @@ impl Renderer {
 		stats.assets_ms = assets_start.elapsed().as_secs_f64() * 1000.0;
 
 		let phase = Instant::now();
-		let inputs: Vec<(usize, Result<(Arc<GpuMesh>, Affine3A, bool)>, PartMaterial, Option<Part>)> =
+		let local_keys = key.map(|key| &key.local_keys);
+		let inputs: Vec<(usize, Result<((Arc<GpuMesh>, Affine3A, bool), bool)>, PartMaterial, Option<Part>)> =
 			fresh.iter().copied().zip(meshes).zip(keys).zip(plain).map(|(((position, mesh), material), plain)| (position, mesh, material, plain)).collect();
-		let prepare = |(position, mesh, material, plain): (usize, Result<(Arc<GpuMesh>, Affine3A, bool)>, PartMaterial, Option<Part>)| {
-			Arc::new(self.prepare_part(plain.as_ref().unwrap_or(&scene.parts[position]), mesh, material, flags[position], &context))
+		let prepare = |(position, mesh, material, plain): (usize, Result<((Arc<GpuMesh>, Affine3A, bool), bool)>, PartMaterial, Option<Part>)| {
+			let (part, stable) = self.prepare_part(plain.as_ref().unwrap_or(&scene.parts[position]), mesh, material, flags[position], &context, local_keys);
+			(Arc::new(part), stable)
 		};
 		// as each_part
-		let prepared: Vec<Arc<prepared::PreparedPart>> = if scene.live || !crate::par::spread(inputs.len(), CLIP_PARTS) { inputs.into_iter().map(&prepare).collect() } else { inputs.into_par_iter().map(&prepare).collect() };
-		for part in &prepared {
+		let prepared_results: Vec<(Arc<prepared::PreparedPart>, bool)> = if scene.live || !crate::par::spread(inputs.len(), CLIP_PARTS) { inputs.into_iter().map(&prepare).collect() } else { inputs.into_par_iter().map(&prepare).collect() };
+		let mut prepared: Vec<Arc<prepared::PreparedPart>> = Vec::with_capacity(prepared_results.len());
+		let mut fresh_stable: Vec<bool> = Vec::with_capacity(prepared_results.len());
+		for (part, stable) in prepared_results {
 			stats.missing.extend(part.missing.iter().cloned());
+			prepared.push(part);
+			fresh_stable.push(stable);
 		}
+		let all_stable = fresh_stable.iter().all(|&stable| stable);
 		// a scene the GPU cannot hold fails as a whole, rather than drawing what fit
 		if let Some(full) = stats.missing.iter().find(|reason| reason.contains(GPU_FULL)) {
 			return Err(anyhow!("{} parts: {full}", scene.parts.len()));
 		}
-		// a part whose assets all loaded is kept for later scenes (a missing one may load next time); a
-		// skinned part's pose is cached by the skins themselves. Skip publishing parts to the shared
-		// table when an offline view hit any offline miss or silent fallback (e.g. pack layers, Head mesh).
+		// a part whose assets all loaded and matched the key's stamps is kept for later scenes (a
+		// missing or moving one may load cleanly next time); a skinned part's pose is cached by the
+		// skins themselves. Skip publishing parts to the shared table when an offline view hit any
+		// offline miss or silent fallback (e.g. pack layers, Head mesh).
 		let offline_fallback = offline_errors_before.is_some_and(|before| self.offline_errors() > before);
 		if !offline_fallback && let (Some(key), Some(table)) = (key, &table) {
-			let keep = fresh.iter().zip(&prepared).zip(&complete).filter(|((position, part), complete)| **complete && part.missing.is_empty() && scene.parts[**position].skeleton.is_none());
-			self.preparations.keep_parts(table, keep.map(|((position, part), _)| (&key.parts[*position][..], flags[*position], part.clone())));
+			let keep = fresh
+				.iter()
+				.zip(&prepared)
+				.zip(&complete)
+				.zip(&fresh_stable)
+				.filter(|(((position, part), complete), stable)| **stable && **complete && part.missing.is_empty() && scene.parts[**position].skeleton.is_none());
+			self.preparations.keep_parts(table, keep.map(|(((position, part), _), _)| (&key.parts[*position][..], flags[*position], part.clone())));
 		}
 		let moving = !prepared.is_empty() && prepared.len() < scene.parts.len();
 		// which parts a later frame may take as they are: what the kept table takes, and a skinned part too
 		// (its key holds its pose, and its posed mesh is its own unless the scene is live): a map's 253 tufts
 		// of grass, skinned and never moving, were prepared again every frame of a clip
 		let mut reusable: Vec<bool> = kept.iter().map(Option::is_some).collect();
-		for ((position, part), complete) in fresh.iter().zip(&prepared).zip(&complete) {
-			reusable[*position] = !offline_fallback && *complete && part.missing.is_empty() && (scene.parts[*position].skeleton.is_none() || !scene.live);
+		for (((position, part), complete), stable) in fresh.iter().zip(&prepared).zip(&complete).zip(&fresh_stable) {
+			reusable[*position] = !offline_fallback && *stable && *complete && part.missing.is_empty() && (scene.parts[*position].skeleton.is_none() || !scene.live);
 		}
 
 		// the frame's parts in order, each part's instances and draws after those before it: the last
@@ -3559,7 +3738,7 @@ impl Renderer {
 			instances.clear();
 		}
 		let frame = table.map(|context| prepared::FramePieces { context, flags, reusable, instances, drawn, offsets });
-		Ok((prepared, moving, frame, remembered, offline_fallback))
+		Ok((prepared, moving, frame, remembered, offline_fallback, all_stable))
 	}
 
 	/// Monotonic count of offline-view misses and isolated fallbacks across the preparation caches.
@@ -3619,30 +3798,53 @@ impl Renderer {
 	}
 
 	/// One part's draws and instances, indexed from its own first instance and draw
-	/// ([`Renderer::prepare_geometry`] lays them out after the parts before it).
-	fn prepare_part(&self, part: &Part, mesh: Result<(Arc<GpuMesh>, Affine3A, bool)>, material: PartMaterial, place: u8, context: &PartContext) -> prepared::PreparedPart {
+	/// ([`Renderer::prepare_geometry`] lays them out after the parts before it). Also returns
+	/// whether every local resource loaded for the part matched `local_keys` (the stamps encoded
+	/// into `SceneKey`).
+	fn prepare_part(&self, part: &Part, mesh: Result<((Arc<GpuMesh>, Affine3A, bool), bool)>, material: PartMaterial, place: u8, context: &PartContext, local_keys: Option<&HashMap<String, String>>) -> (prepared::PreparedPart, bool) {
 		let mut out = prepared::PreparedPart {
 			instances: Vec::new(),
 			draws: Vec::new(),
 			main: None,
-			drawn: mesh.as_ref().ok().map(|(mesh, local, _)| transformed_bounds(local, mesh.drawn)),
+			drawn: mesh.as_ref().ok().map(|((mesh, local, _), _)| transformed_bounds(local, mesh.drawn)),
 			organic: material.flags & TEX_ORGANIC != 0,
 			missing: Vec::new(),
 		};
+		let mut stable = true;
 		let (instances, draws, missing) = (&mut out.instances, &mut out.draws, &mut out.missing);
 		let neon_share = context.neon_share;
 		{
-			let PartMaterial { mut key, mut flags, params, studs_per_tile, emissive: emission, offset, noise_offset, noise_frequency, normal_strength, far } = material;
+			let PartMaterial { mut key, mut flags, params, studs_per_tile, emissive: emission, offset, noise_offset, noise_frequency, normal_strength, far, pack_proofs } = material;
+			if let Some(local_keys) = local_keys {
+				for (uri, proof) in &pack_proofs {
+					stable &= proof_matches(uri, proof, local_keys);
+				}
+			}
 			let (mesh, local, is_mesh) = match mesh {
-				Ok(mesh) => mesh,
+				Ok((mesh, skin_stable)) => {
+					stable &= skin_stable;
+					if let Some(local_keys) = local_keys {
+						let mesh_uri: Option<&str> = match &part.geometry {
+							Geometry::MeshPart { mesh, .. } => Some(mesh.as_str()),
+							Geometry::Union { asset: Some(asset), mesh_data: None, .. } => Some(asset.as_str()),
+							Geometry::Special { mesh_type: crate::scene::extract::mesh_type::FILE_MESH, mesh: Some(uri), .. } => Some(uri.as_str()),
+							_ => None,
+						};
+						if let Some(uri) = mesh_uri {
+							stable &= proof_matches(uri, &mesh.0.proof, local_keys);
+						}
+					}
+					mesh
+				}
 				// a MeshPart's or a FileMesh's mesh Studio cannot load draws nothing, decals and all
 				// (texture-missing "meshpart-no-mesh", "specialmesh-no-mesh")
 				Err(error) if part.body_part.is_none() && matches!(&part.geometry, Geometry::MeshPart { .. } | Geometry::Special { mesh_type: crate::scene::extract::mesh_type::FILE_MESH, mesh: Some(_), .. }) => {
 					missing.push(format!("{}: {error:#} (not drawn)", part.path));
-					return out;
+					return (out, false);
 				}
 				Err(error) => {
 					missing.push(format!("{}: {error:#}", part.path));
+					stable = false;
 					// a union's, a body part's (Studio's own limbs) or a FileMesh's without a MeshId: the
 					// part's box, so the shape is still there (texture-missing "specialmesh-empty-mesh")
 					(self.primitives[&Primitive::Block].clone(), Affine3A::from_scale(part.size), false)
@@ -3656,7 +3858,7 @@ impl Renderer {
 				&& let Some(error) = key.textures().find_map(|(uri, usage)| self.load_texture(uri, usage).err())
 			{
 				missing.push(format!("{}: {error:#} (its SurfaceAppearance hides it)", part.path));
-				return out;
+				return (out, false);
 			}
 			// a mesh texture Studio cannot load draws black (texture-missing "specialmesh", "meshpart":
 			// missing, refused or no image; filemesh-instance's under the default light, its sheen alone)
@@ -3711,6 +3913,9 @@ impl Renderer {
 					continue;
 				}
 				let decal_material = self.material_bind_group(&decal_key, missing);
+				if let (Some(local_keys), Some(uri), Some(tex)) = (local_keys, decal_key.color.as_deref(), decal_material.maps[0].as_ref()) {
+					stable &= proof_matches(uri, &tex.proof, local_keys);
+				}
 				let color = linear(decal.color);
 				let mut decal_flags = TEX_COLOR | TEX_DECAL;
 				let mut tiling = [0.0; 4];
@@ -3801,16 +4006,23 @@ impl Renderer {
 			let highlight_only = part.transparency >= 1.0 && !part.shadow_only;
 			let kept_glass = highlight_only && place & 2 != 0;
 			if highlight_only && !kept_glass && place & 1 == 0 {
-				return out;
+				return (out, stable);
 			}
 			// a shadow-only part (scene::SHADOW_ONLY) is here for the shadow maps alone
 			if part.shadow_only && !part.cast_shadow {
-				return out;
+				return (out, stable);
 			}
 			let material = self.material_bind_group(&key, missing);
-			let normal_texture = key.normal.as_ref().and_then(|uri| self.load_texture(uri, TextureUse::Normal).ok());
-			let normal_dxt5nm = normal_texture.as_ref().is_some_and(|texture| texture.dxt5nm);
-			let normal_rg = normal_texture.as_ref().is_some_and(|texture| texture.normal_rg);
+			if let Some(local_keys) = local_keys {
+				let uris = [&key.color, &key.normal, &key.metalness, &key.roughness, &key.emissive];
+				for (uri, tex) in uris.iter().zip(&material.maps) {
+					if let (Some(uri), Some(tex)) = (uri, tex) {
+						stable &= proof_matches(uri, &tex.proof, local_keys);
+					}
+				}
+			}
+			let normal_dxt5nm = material.maps[1].as_ref().is_some_and(|texture| texture.dxt5nm);
+			let normal_rg = material.maps[1].as_ref().is_some_and(|texture| texture.normal_rg);
 			let world = part.cframe * local;
 			let model = Mat4::from(world);
 			let normal_matrix = Mat4::from_mat3(glam::Mat3::from(world.matrix3).inverse().transpose());
@@ -3901,9 +4113,7 @@ impl Renderer {
 			// a SpecialMesh shows through where its texture's alpha does (classic accessories); with an
 			// opaque texture it draws like any part, its triangles depth-tested among themselves (the
 			// classic red cap's raised logo before the patch behind it, drawn later in its mesh)
-			let special_alpha = matches!(part.geometry, Geometry::Special { .. })
-				&& flags & TEX_COLOR != 0
-				&& key.color.as_deref().is_some_and(|uri| self.load_texture(uri, TextureUse::Color).is_ok_and(|texture| texture.has_alpha));
+			let special_alpha = matches!(part.geometry, Geometry::Special { .. }) && flags & TEX_COLOR != 0 && material.maps[0].as_ref().is_some_and(|texture| texture.has_alpha);
 			let texture_alpha = flags & TEX_ALPHA_TRANSPARENCY != 0 || special_alpha;
 			let transparent = forcefield || opacity < 1.0 || texture_alpha || part.shadow_only;
 			// the sun's and local lights' shadows alike (scene::casts_shadow); a shadow-only part's at any
@@ -3957,7 +4167,7 @@ impl Renderer {
 				highlight_only: highlight_only || part.shadow_only,
 			});
 		}
-		out
+		(out, stable)
 	}
 
 	/// What a preparation of these draws holds that its caches own too (prepared::PreparedGeometry::held).
@@ -5559,6 +5769,7 @@ impl Renderer {
 			noise_frequency: materials::VARIANT_ORGANIC_NOISE,
 			normal_strength: 1.0,
 			far: [0.0; 2],
+			pack_proofs: Vec::new(),
 		};
 		if params.shading == materials::SHADING_FORCEFIELD {
 			// a ForceField's TextureID only shows as a band sweeping through its texel values over
@@ -5566,14 +5777,20 @@ impl Renderer {
 			return material;
 		}
 		let composite_key = part.composite.as_ref().map(composite::key).filter(|key| self.composite_loads(key, &part.path, missing));
+		let mut pack_proofs: Vec<(String, resources::StampProof)> = Vec::new();
 		let mut pack_or = |pack: Option<&String>, maps: [Option<String>; 5]| -> [Option<String>; 5] {
 			// the per-map properties win; a published pack fills in when they are all empty
 			if maps.iter().any(Option::is_some) {
 				return maps;
 			}
-			match pack.map(|uri| self.texture_pack(uri)) {
-				Some(Ok(pack)) => pack_maps(&pack),
-				Some(Err(error)) => {
+			match pack.map(|uri| (uri, self.texture_pack(uri))) {
+				Some((uri, Ok(pack))) => {
+					if names_local_file(uri) {
+						pack_proofs.push((uri.clone(), pack.proof.clone()));
+					}
+					pack_maps(&pack)
+				}
+				Some((_, Err(error))) => {
 					missing.push(format!("{}: {error:#}", part.path));
 					maps
 				}
@@ -5809,6 +6026,7 @@ impl Renderer {
 		if matches!(part.geometry, Geometry::MeshPart { .. }) && tinted {
 			material.flags |= TEX_VERTEX_TINT;
 		}
+		material.pack_proofs = pack_proofs;
 		material
 	}
 }
@@ -5905,6 +6123,69 @@ pub(crate) fn names_local_file(uri: &str) -> bool {
 	}
 	matches!(ror_assets::ContentId::parse(path), Ok(ror_assets::ContentId::File(_)))
 }
+
+/// If `uri` (stripped of any `#fragment`) names a local file, takes its [`ror_assets::FileSnapshot`].
+pub(crate) fn local_snapshot_for(uri: &str) -> Option<(std::path::PathBuf, ror_assets::FileSnapshot)> {
+	if uri.starts_with(composite::KEY_PREFIX) {
+		return None;
+	}
+	let path = uri.split_once('#').map_or(uri, |(path, _)| path);
+	if let Some((scheme, _)) = path.split_once(':')
+		&& scheme.len() > 1
+		&& !scheme.contains(['/', '\\'])
+		&& !scheme.eq_ignore_ascii_case("file")
+	{
+		return None;
+	}
+	match ror_assets::ContentId::parse(path) {
+		Ok(ror_assets::ContentId::File(file)) => ror_assets::FileStamp::snapshot(&file).ok().map(|snap| (file, snap)),
+		_ => None,
+	}
+}
+
+/// Whether a loaded resource's [`resources::StampProof`] agrees with the stamped keys recorded in a
+/// `SceneKey` or `effect_hash`.
+fn proof_matches(uri: &str, proof: &resources::StampProof, local_keys: &HashMap<String, String>) -> bool {
+	match proof {
+		resources::StampProof::Remote => !names_local_file(uri),
+		resources::StampProof::Moved => false,
+		resources::StampProof::Proven(actual) => {
+			if uri.starts_with(composite::KEY_PREFIX) {
+				composite::expected_stamped_key(uri, local_keys).is_some_and(|expected| expected == *actual)
+			} else {
+				local_keys.get(uri).is_some_and(|expected| expected == actual)
+			}
+		}
+	}
+}
+
+#[cfg(test)]
+type ReadHook = Box<dyn FnMut() + Send>;
+
+#[cfg(test)]
+static TEST_READ_HOOKS: std::sync::OnceLock<Mutex<HashMap<std::path::PathBuf, ReadHook>>> = std::sync::OnceLock::new();
+
+/// Registers a one-shot hook that runs deterministically after stamping a local file and right
+/// before its bytes are read, for race tests (no sleeps).
+#[cfg(test)]
+pub(crate) fn set_test_read_hook(path: std::path::PathBuf, hook: impl FnMut() + Send + 'static) {
+	TEST_READ_HOOKS.get_or_init(Default::default).lock().insert(path, Box::new(hook));
+}
+
+#[cfg(test)]
+pub(crate) fn run_test_read_hook(path: &std::path::Path) {
+	let Some(hooks) = TEST_READ_HOOKS.get() else {
+		return;
+	};
+	let hook = hooks.lock().remove(path);
+	if let Some(mut f) = hook {
+		f();
+	}
+}
+
+#[cfg(not(test))]
+#[inline]
+pub(crate) fn run_test_read_hook(_path: &std::path::Path) {}
 
 pub(crate) fn content_key(uri: &str) -> String {
 	if uri.starts_with(composite::KEY_PREFIX) {
@@ -7335,6 +7616,120 @@ mod camera_reuse_tests {
 		assert_eq!(renderer.preparations.stats().0, 0, "process budget over 85% must still relieve idle caches");
 
 		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	/// Deterministic A -> B -> A race tests (zero sleeps):
+	/// 1. File moves A -> B between `load_texture`'s snapshot and `std::fs::read`, then returns to A.
+	/// 2. File moves A -> B between `SceneKey` (`prepare_environment`) and `load_texture` (`render_with`),
+	///    then returns to A.
+	/// In both cases, what is kept under A's key must never be B, so the final render on A draws A.
+	#[test]
+	fn a_to_b_to_a_during_render_never_caches_b_under_a() {
+		let state = std::env::temp_dir().join(format!("ror-race-render-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&state);
+		std::fs::create_dir_all(&state).unwrap();
+		let tex = state.join("tex.png");
+		let red_png = {
+			let p = state.join("red.png");
+			crate::output::write_png(&p, 8, 8, &[235, 30, 30, 255].repeat(64), true).unwrap();
+			std::fs::read(&p).unwrap()
+		};
+		let blue_png = {
+			let p = state.join("blue.png");
+			crate::output::write_png(&p, 8, 8, &[30, 60, 235, 255].repeat(64), true).unwrap();
+			std::fs::read(&p).unwrap()
+		};
+		std::fs::write(&tex, &red_png).unwrap();
+		let tex_uri = format!("file:///{}", tex.display().to_string().replace('\\', "/").replace(' ', "%20"));
+		let mut model = ModelBuilder::new("RacePanel");
+		model.part(&PartSpec { name: "Panel".into(), size: Vec3::new(6.0, 6.0, 1.0), color: [255, 255, 255], ..Default::default() });
+		let mut scene = crate::scene::extract::extract(&model.into_document());
+		Arc::make_mut(&mut scene.parts[0]).surface_appearance = Some(crate::scene::SurfaceAppearance {
+			color_map: Some(tex_uri),
+			normal_map: None,
+			metalness_map: None,
+			roughness_map: None,
+			texture_pack: None,
+			alpha_mode: 0,
+			color: Vec3::ONE,
+			emissive_mask: None,
+			emissive_strength: 0.0,
+			emissive_tint: Vec3::ONE,
+		});
+		let request = ViewRequest { width: 64, height: 64, camera: CameraSpec::LookAt { eye: [0.0, 0.0, -8.0], target: [0.0; 3], fov: 50.0 }, ..Default::default() };
+
+		// Capture clean reference renders for A (red) and B (blue).
+		let ref_renderer = renderer(&state.join("ref"));
+		let (want_red, _) = ref_renderer.render(&scene, std::slice::from_ref(&request)).unwrap();
+		std::fs::write(&tex, &blue_png).unwrap();
+		let (want_blue, _) = ref_renderer.render(&scene, std::slice::from_ref(&request)).unwrap();
+		assert_ne!(want_red[0].rgba, want_blue[0].rgba, "red and blue reference renders must differ");
+		drop(ref_renderer);
+
+		// Case 1: A -> B right after `load_texture`'s snapshot and before `std::fs::read`, then back to A.
+		let r1 = renderer(&state.join("case1"));
+		std::fs::write(&tex, &red_png).unwrap();
+		let hook_tex = tex.clone();
+		let hook_blue = blue_png.clone();
+		super::set_test_read_hook(tex.clone(), move || {
+			std::fs::write(&hook_tex, &hook_blue).unwrap();
+		});
+		let (during1, _) = r1.render(&scene, std::slice::from_ref(&request)).unwrap();
+		assert_eq!(during1[0].rgba, want_blue[0].rgba, "case 1: hook should have swapped file to B before read");
+		std::fs::write(&tex, &red_png).unwrap();
+		let (after1, stats1) = r1.render(&scene, std::slice::from_ref(&request)).unwrap();
+		assert!(!stats1.geometry_reused, "case 1: moving render must not have been kept in Preparations");
+		assert_eq!(after1[0].rgba, want_red[0].rgba, "case 1: returning to A must draw A, not cached B");
+		drop(r1);
+
+		// Case 2: A -> B between `SceneKey` (`prepare_environment`) and `load_texture` (`render_with`),
+		// then back to A (even though `load_texture` cleanly read B with a valid stamp for B!).
+		let r2 = renderer(&state.join("case2"));
+		std::fs::write(&tex, &red_png).unwrap();
+		let sky_keyed_at_a = r2.prepare_environment(&scene);
+		std::fs::write(&tex, &blue_png).unwrap();
+		let (during2, _) = r2.render_with(&scene, std::slice::from_ref(&request), sky_keyed_at_a).unwrap();
+		assert_eq!(during2[0].rgba, want_blue[0].rgba, "case 2: render saw B during load_texture");
+		std::fs::write(&tex, &red_png).unwrap();
+		let (after2, stats2) = r2.render(&scene, std::slice::from_ref(&request)).unwrap();
+		assert!(!stats2.geometry_reused, "case 2: mismatched SceneKey(A) + texture(B) must not be kept in Preparations");
+		assert_eq!(after2[0].rgba, want_red[0].rgba, "case 2: returning to A must draw A, not cached B");
+		drop(r2);
+
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	/// Deterministic A -> B -> A race test on `load_mesh` (zero sleeps): a local mesh that moves
+	/// between snapshot and read is never kept in `Renderer::meshes` under A's key.
+	#[test]
+	fn a_to_b_to_a_on_local_mesh_never_caches_b_under_a() {
+		let state = std::env::temp_dir().join(format!("ror-race-mesh-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&state);
+		std::fs::create_dir_all(&state).unwrap();
+		let mesh_bytes = |extent: f32| -> Vec<u8> {
+			format!("version 1.01\n1\n[0,0,0][0,0,1][0,0,0][{extent},0,0][0,0,1][1,0,0][0,{extent},0][0,0,1][0,1,0]\n").into_bytes()
+		};
+		let mesh_a = mesh_bytes(1.0);
+		let mesh_b = mesh_bytes(5.0);
+		let path = state.join("shape.mesh");
+		std::fs::write(&path, &mesh_a).unwrap();
+		let uri = format!("file:///{}", path.display().to_string().replace('\\', "/").replace(' ', "%20"));
+
+		let r = renderer(&state.join("state"));
+		let hook_path = path.clone();
+		let hook_b = mesh_b.clone();
+		super::set_test_read_hook(path.clone(), move || {
+			std::fs::write(&hook_path, &hook_b).unwrap();
+		});
+		let during = r.load_mesh(&uri).unwrap();
+		assert!((during.bounds.1.x - 5.0).abs() < 1e-3, "hook should have swapped mesh to B (bounds.x=5)");
+		assert_eq!(during.proof, super::resources::StampProof::Moved, "moving mesh must be marked Moved");
+		std::fs::write(&path, &mesh_a).unwrap();
+		let after = r.load_mesh(&uri).unwrap();
+		assert!((after.bounds.1.x - 1.0).abs() < 1e-3, "returning to A must load A (bounds.x=1), not cached B");
+		assert!(matches!(after.proof, super::resources::StampProof::Proven(_)), "settled load of A must be Proven");
+		drop(r);
 		let _ = std::fs::remove_dir_all(&state);
 	}
 }

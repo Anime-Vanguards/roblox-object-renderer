@@ -150,6 +150,10 @@ impl super::Renderer {
 	/// texture cannot be loaded, as Studio then draws no ribbon (texture-missing "beam-*": a texture
 	/// missing, refused (HTTP 403) or no image).
 	pub(super) fn beam_textures(&self, scene: &Scene, missing: &mut Vec<String>) -> Vec<Option<Arc<wgpu::BindGroup>>> {
+		self.beam_textures_with(scene, &HashMap::new(), missing)
+	}
+
+	pub(super) fn beam_textures_with(&self, scene: &Scene, preloaded: &HashMap<String, Arc<super::resources::GpuTexture>>, missing: &mut Vec<String>) -> Vec<Option<Arc<wgpu::BindGroup>>> {
 		let mut groups: HashMap<Option<String>, Option<Arc<wgpu::BindGroup>>> = HashMap::new();
 		scene
 			.beams
@@ -158,7 +162,13 @@ impl super::Renderer {
 				groups
 					.entry(beam.texture.clone())
 					.or_insert_with(|| {
-						let texture = match beam.texture.as_ref().map(|uri| self.load_whole(&super::transcode::image_key(uri), TextureUse::Color)) {
+						let texture = match beam.texture.as_ref().map(|uri| {
+							let key = super::transcode::image_key(uri);
+							match preloaded.get(&key) {
+								Some(tex) => Ok(tex.clone()),
+								None => self.load_whole(&key, TextureUse::Color),
+							}
+						}) {
 							None => None,
 							Some(Ok(texture)) => Some(texture),
 							Some(Err(error)) => {

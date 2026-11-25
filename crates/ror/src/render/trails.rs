@@ -36,6 +36,10 @@ impl super::Renderer {
 	/// Each trail's texture bind group: white without a texture, `None` while its texture cannot be
 	/// loaded, as Studio then draws no trail (texture-missing "trail-*", as beams).
 	pub(super) fn trail_textures(&self, scene: &Scene, missing: &mut Vec<String>) -> Vec<Option<Arc<wgpu::BindGroup>>> {
+		self.trail_textures_with(scene, &HashMap::new(), missing)
+	}
+
+	pub(super) fn trail_textures_with(&self, scene: &Scene, preloaded: &HashMap<String, Arc<super::resources::GpuTexture>>, missing: &mut Vec<String>) -> Vec<Option<Arc<wgpu::BindGroup>>> {
 		let mut groups: HashMap<Option<String>, Option<Arc<wgpu::BindGroup>>> = HashMap::new();
 		scene
 			.trails
@@ -44,7 +48,13 @@ impl super::Renderer {
 				groups
 					.entry(trail.texture.clone())
 					.or_insert_with(|| {
-						let texture = match trail.texture.as_ref().map(|uri| self.load_whole(&super::transcode::image_key(uri), TextureUse::Color)) {
+						let texture = match trail.texture.as_ref().map(|uri| {
+							let key = super::transcode::image_key(uri);
+							match preloaded.get(&key) {
+								Some(tex) => Ok(tex.clone()),
+								None => self.load_whole(&key, TextureUse::Color),
+							}
+						}) {
 							None => None,
 							Some(Ok(texture)) => Some(texture),
 							Some(Err(error)) => {

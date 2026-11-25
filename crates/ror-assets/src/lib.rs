@@ -62,7 +62,7 @@ use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 
 pub use sniff::sniff_kind;
-pub use stamp::FileStamp;
+pub use stamp::{FileSnapshot, FileStamp};
 pub use transcode::Transcode;
 pub use uri::{ContentId, Thumbnail, ThumbnailKind};
 pub use warm::{BATCH, Download, WarmReport};
@@ -562,11 +562,69 @@ impl Assets {
 	pub fn fetch(&self, uri: &str) -> Result<Arc<Fetched>, AssetError> {
 		let id = ContentId::parse(uri)?;
 		let key = id.canonical();
-		let stamp = match &id {
-			ContentId::File(path) => Some(FileStamp::of(path).ok_or_else(|| AssetError::NotFound(uri.to_string()))?),
-			_ => None,
-		};
-		self.fetch_keyed(&key, uri, stamp, || self.load(&id, &key, uri))
+		if let ContentId::File(path) = &id {
+			return self.fetch_local(path, &key, uri).map(|(fetched, _)| fetched);
+		}
+		self.fetch_keyed(&key, uri, None, || self.load(&id, &key, uri))
+	}
+
+	/// Like [`Assets::fetch`], also returning the [`FileStamp`] the read bytes were proven to match
+	/// when `uri` names a local file (`None` for non-file URIs, or when a local file moved while
+	/// being read so the bytes were not cached).
+	pub fn fetch_checked(&self, uri: &str) -> Result<(Arc<Fetched>, Option<FileStamp>), AssetError> {
+		let id = ContentId::parse(uri)?;
+		let key = id.canonical();
+		if let ContentId::File(path) = &id {
+			return self.fetch_local(path, &key, uri);
+		}
+		self.fetch_keyed(&key, uri, None, || self.load(&id, &key, uri)).map(|fetched| (fetched, None))
+	}
+
+	/// Fetches a local file against an already-taken [`FileSnapshot`], proving after the read that
+	/// the returned bytes match `snapshot.stamp`. Returns `(fetched, true)` when proven (caching
+	/// under `snapshot.stamp`), or `(fetched, false)` when the file moved while being read (never
+	/// caching the moving bytes).
+	pub fn fetch_local_with_snapshot(&self, uri: &str, path: &Path, snapshot: FileSnapshot) -> Result<(Arc<Fetched>, bool), AssetError> {
+		let key = ContentId::File(path.to_path_buf()).canonical();
+		if let Some(hit) = self.inner.memory.lock().get(&key, Some(snapshot.stamp)) {
+			return Ok((respell(hit, uri), true));
+		}
+		run_before_local_read_hook(path);
+		let fetched = self.load_local_file(path, uri)?;
+		let verified = snapshot.verify_read(path, &fetched.bytes);
+		let fetched = Arc::new(fetched);
+		if verified {
+			self.inner.memory.lock().insert(&key, fetched.clone(), Some(snapshot.stamp));
+		}
+		Ok((fetched, verified))
+	}
+
+	fn fetch_local(&self, path: &Path, key: &str, uri: &str) -> Result<(Arc<Fetched>, Option<FileStamp>), AssetError> {
+		let snapshot = FileStamp::snapshot(path).map_err(|e| match e.kind() {
+			std::io::ErrorKind::NotFound => AssetError::NotFound(uri.to_string()),
+			_ => AssetError::Io(format!("{uri}: {e}")),
+		})?;
+		if let Some(hit) = self.inner.memory.lock().get(key, Some(snapshot.stamp)) {
+			return Ok((respell(hit, uri), Some(snapshot.stamp)));
+		}
+		run_before_local_read_hook(path);
+		let fetched = self.load_local_file(path, uri)?;
+		let verified = snapshot.verify_read(path, &fetched.bytes);
+		let fetched = Arc::new(fetched);
+		if verified {
+			self.inner.memory.lock().insert(key, fetched.clone(), Some(snapshot.stamp));
+			Ok((fetched, Some(snapshot.stamp)))
+		} else {
+			Ok((fetched, None))
+		}
+	}
+
+	fn load_local_file(&self, path: &Path, uri: &str) -> Result<Fetched, AssetError> {
+		let bytes = std::fs::read(path).map_err(|e| match e.kind() {
+			std::io::ErrorKind::NotFound => AssetError::NotFound(uri.to_string()),
+			_ => AssetError::Io(format!("{uri}: {e}")),
+		})?;
+		Ok(Fetched { uri: uri.to_string(), bytes, source: Source::LocalFile })
 	}
 
 	/// Fetches one pack file of an asset's KTX2 texture transcode (blocking): what Roblox clients draw
@@ -1110,4 +1168,88 @@ struct ThumbnailEntry {
 	state: Option<String>,
 	#[serde(rename = "imageUrl")]
 	image_url: Option<String>,
+}
+
+#[cfg(test)]
+type LocalReadHook = Box<dyn FnMut() + Send>;
+
+#[cfg(test)]
+static BEFORE_LOCAL_READ: OnceLock<Mutex<HashMap<PathBuf, LocalReadHook>>> = OnceLock::new();
+
+#[cfg(test)]
+fn run_before_local_read_hook(path: &Path) {
+	let Some(hooks) = BEFORE_LOCAL_READ.get() else {
+		return;
+	};
+	let hook = hooks.lock().remove(path);
+	if let Some(mut f) = hook {
+		f();
+	}
+}
+
+#[cfg(not(test))]
+#[inline]
+fn run_before_local_read_hook(_path: &Path) {}
+
+#[cfg(test)]
+mod local_race_tests {
+	use super::*;
+
+	/// Deterministic A -> B -> A race test on `Assets::fetch` (no sleeps):
+	/// file is A when stamped, rewritten to B before `std::fs::read`, then rewritten back to A.
+	/// `Assets::fetch` must NOT keep B under A's stamp in `MemoryCache`, so the next fetch of A
+	/// returns A.
+	#[test]
+	fn fetch_does_not_cache_moving_local_file_on_a_to_b_to_a() {
+		let dir = std::env::temp_dir().join(format!("ror-assets-race-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		let state = dir.join("state");
+		let path = dir.join("asset.bin");
+		let bytes_a = b"asset-version-alpha";
+		let bytes_b = b"asset-version-bravo";
+
+		let assets = Assets::new(AssetConfig { offline: true, ..AssetConfig::new(&state) });
+		let uri = path.to_string_lossy().to_string();
+
+		// Fresh (content-stamped) A -> B -> A:
+		std::fs::write(&path, bytes_a).unwrap();
+		let hook_path = path.clone();
+		BEFORE_LOCAL_READ.get_or_init(Default::default).lock().insert(
+			path.clone(),
+			Box::new(move || {
+				std::fs::write(&hook_path, bytes_b).unwrap();
+			}),
+		);
+		let (during, proven) = assets.fetch_checked(&uri).unwrap();
+		assert_eq!(during.bytes.as_slice(), bytes_b, "hook must have swapped file to B before read");
+		assert!(proven.is_none(), "moving read must report unproven stamp");
+		// Now restore A on disk; MemoryCache must NOT serve B under A's stamp!
+		std::fs::write(&path, bytes_a).unwrap();
+		let (after, proven_after) = assets.fetch_checked(&uri).unwrap();
+		assert_eq!(after.bytes.as_slice(), bytes_a, "subsequent fetch after returning to A must read A, not cached B");
+		assert!(proven_after.is_some(), "settled read of A must be proven");
+
+		// Also test with an explicit OS-stamped (aged) snapshot via `fetch_local_with_snapshot`:
+		let os_a = FileStamp::os_stamp(&path).unwrap();
+		if os_a.trusted {
+			let snap_a = FileStamp::snapshot(&path).unwrap();
+			// Clear memory cache by using a fresh Assets instance.
+			let assets2 = Assets::new(AssetConfig { offline: true, ..AssetConfig::new(&state) });
+			let hook_path2 = path.clone();
+			BEFORE_LOCAL_READ.get_or_init(Default::default).lock().insert(
+				path.clone(),
+				Box::new(move || {
+					std::fs::write(&hook_path2, bytes_b).unwrap();
+				}),
+			);
+			let (during2, ok2) = assets2.fetch_local_with_snapshot(&uri, &path, snap_a).unwrap();
+			assert_eq!(during2.bytes.as_slice(), bytes_b);
+			assert!(!ok2, "fetch_local_with_snapshot must reject moving read");
+			std::fs::write(&path, bytes_a).unwrap();
+			let after2 = assets2.fetch(&uri).unwrap();
+			assert_eq!(after2.bytes.as_slice(), bytes_a, "second Assets must not have cached B under A");
+		}
+		let _ = std::fs::remove_dir_all(&dir);
+	}
 }

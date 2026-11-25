@@ -412,52 +412,109 @@ impl super::Renderer {
 	/// Like [`make_texture`], also returning `offline_fallback` (`true` when an offline view fell back
 	/// from an uncached transcode to an uploaded image, which is never persisted to `.tex` or promoted
 	/// to the shared online cache).
+	#[cfg(test)]
 	pub(super) fn make_texture_checked(&self, uri: &str, usage: TextureUse) -> Result<(GpuTexture, bool)> {
+		let local_snap = super::local_snapshot_for(uri).map(|(path, snap)| {
+			let stamped = snap.stamp.stamp_uri(uri);
+			(path, snap, stamped)
+		});
+		let composite_snaps = uri.starts_with(super::composite::KEY_PREFIX).then(|| super::composite::snapshot_layers(uri));
+		match self.make_texture_verified(uri, usage, local_snap.as_ref(), composite_snaps.as_ref()) {
+			Ok(outcome) => Ok((outcome.value, outcome.offline_fallback)),
+			Err(super::resources::LoadError::Cached(e) | super::resources::LoadError::Uncached(e)) => Err(e),
+		}
+	}
+
+	/// Builds a texture and proves its local-file [`super::resources::StampProof`] against the
+	/// snapshot taken before loading, returning [`super::resources::LoadOutcome`] so moving local
+	/// files are never kept under a stale stamp in the texture cache.
+	pub(super) fn make_texture_verified(
+		&self,
+		uri: &str,
+		usage: TextureUse,
+		local_snap: Option<&(PathBuf, ror_assets::FileSnapshot, String)>,
+		composite_snaps: Option<&(String, std::collections::HashMap<String, (PathBuf, ror_assets::FileSnapshot)>)>,
+	) -> std::result::Result<super::resources::LoadOutcome<GpuTexture>, super::resources::LoadError> {
+		use super::resources::{LoadError, LoadOutcome, StampProof};
 		if uri.starts_with(super::composite::KEY_PREFIX) {
-			return self.composite_texture(uri).map(|texture| (texture, false));
+			let (stamped_key, snaps) = match composite_snaps {
+				Some((k, s)) => (k.clone(), s.clone()),
+				None => super::composite::snapshot_layers(uri),
+			};
+			return self.composite_texture_verified(uri, &stamped_key, &snaps);
 		}
 		let config = self.assets.config();
 		let state_dir = &config.state_dir;
 		let store_root = config.store.as_deref();
 		let dir = directory_for(state_dir);
 		if let Some(path) = local_file_path(uri) {
-			let bytes = std::fs::read(&path).map_err(|error| match error.kind() {
-				std::io::ErrorKind::NotFound => anyhow::anyhow!("{uri} not found"),
-				_ => anyhow::anyhow!("{uri}: {error}"),
-			})?;
+			let snap_owned = local_snap.map(|(_, s, k)| (*s, k.clone())).or_else(|| {
+				ror_assets::FileStamp::snapshot(&path).ok().map(|s| {
+					let k = s.stamp.stamp_uri(uri);
+					(s, k)
+				})
+			});
+			super::run_test_read_hook(&path);
+			let bytes = match std::fs::read(&path) {
+				Ok(bytes) => bytes,
+				Err(error) => {
+					let err = match error.kind() {
+						std::io::ErrorKind::NotFound => anyhow::anyhow!("{uri} not found"),
+						_ => anyhow::anyhow!("{uri}: {error}"),
+					};
+					let cache_err = snap_owned.as_ref().is_some_and(|(s, _)| s.still_unchanged(&path));
+					return Err(if cache_err { LoadError::Cached(err) } else { LoadError::Uncached(err) });
+				}
+			};
+			let (verified, proof) = match &snap_owned {
+				Some((snap, stamped)) if snap.verify_read(&path, &bytes) => (true, StampProof::Proven(stamped.clone())),
+				_ => (false, StampProof::Moved),
+			};
 			let file_name = local_name(&bytes, usage, self.gpu.supports_bc());
 			let own = dir.join(&file_name);
 			if !config.refresh
-				&& let Some(texture) = open(&own, uri).or_else(|| take_kept_for(state_dir, store_root, &file_name, &own, uri))
+				&& let Some(mut texture) = open(&own, uri).or_else(|| take_kept_for(state_dir, store_root, &file_name, &own, uri))
 			{
 				mark_used_in(&dir);
-				return Ok((texture, false));
+				texture.proof = proof;
+				return Ok(LoadOutcome { value: texture, keep: verified, offline_fallback: false });
 			}
-			let image = decode_local(uri, &bytes, usage, self.gpu.supports_bc())?;
+			let image = match decode_local(uri, &bytes, usage, self.gpu.supports_bc()) {
+				Ok(image) => image,
+				Err(err) => return Err(if verified { LoadError::Cached(err) } else { LoadError::Uncached(err) }),
+			};
 			if write(&own, &GpuTexture::uploadable(&self.gpu, &image), usage)
-				&& let Some(texture) = open(&own, uri)
+				&& let Some(mut texture) = open(&own, uri)
 			{
 				publish_to(&own, store_root);
 				mark_used_in(&dir);
-				return Ok((texture, false));
+				texture.proof = proof;
+				return Ok(LoadOutcome { value: texture, keep: verified, offline_fallback: false });
 			}
-			self.gpu_room(image.levels.iter().map(|level| level.len() as u64).sum())?;
-			return GpuTexture::upload(&self.gpu, uri, &image, usage).map(|texture| (texture, false));
+			if let Err(err) = self.gpu_room(image.levels.iter().map(|level| level.len() as u64).sum()) {
+				return Err(LoadError::Uncached(err));
+			}
+			let mut texture = match GpuTexture::upload(&self.gpu, uri, &image, usage) {
+				Ok(texture) => texture,
+				Err(err) => return Err(if verified { LoadError::Cached(err) } else { LoadError::Uncached(err) }),
+			};
+			texture.proof = proof;
+			return Ok(LoadOutcome { value: texture, keep: verified, offline_fallback: false });
 		}
 		let kept = cacheable(uri).then(|| name(uri, usage, self.gpu.supports_bc()));
 		if let Some(name) = kept.as_deref().filter(|_| !config.refresh) {
 			let own = dir.join(name);
 			if let Some(texture) = open(&own, uri).or_else(|| take_kept_for(state_dir, store_root, name, &own, uri)) {
 				mark_used_in(&dir);
-				return Ok((texture, false));
+				return Ok(LoadOutcome { value: texture, keep: true, offline_fallback: false });
 			}
 		}
 		let (image, fallback) = match super::transcode::parse_layer_key(uri) {
 			Some((ror_assets::Transcode::Image, asset)) if self.assets.offline() => match self.transcode_image(asset, ror_assets::Transcode::Image) {
 				Ok(image) => (image, false),
-				Err(_) => (self.texture_image(asset, usage)?, true),
+				Err(_) => (self.texture_image(asset, usage).map_err(LoadError::Cached)?, true),
 			},
-			_ => (self.texture_image(uri, usage)?, false),
+			_ => (self.texture_image(uri, usage).map_err(LoadError::Cached)?, false),
 		};
 		if !fallback
 			&& let Some(name) = &kept
@@ -467,11 +524,12 @@ impl super::Renderer {
 				&& let Some(texture) = open(&own, uri)
 			{
 				publish_to(&own, store_root);
-				return Ok((texture, false));
+				return Ok(LoadOutcome { value: texture, keep: true, offline_fallback: false });
 			}
 		}
-		self.gpu_room(image.levels.iter().map(|level| level.len() as u64).sum())?;
-		GpuTexture::upload(&self.gpu, uri, &image, usage).map(|texture| (texture, fallback && self.assets.is_offline_view()))
+		self.gpu_room(image.levels.iter().map(|level| level.len() as u64).sum()).map_err(LoadError::Cached)?;
+		let texture = GpuTexture::upload(&self.gpu, uri, &image, usage).map_err(LoadError::Cached)?;
+		Ok(LoadOutcome { value: texture, keep: true, offline_fallback: fallback && self.assets.is_offline_view() })
 	}
 }
 

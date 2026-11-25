@@ -26,7 +26,7 @@ use wgpu::util::DeviceExt;
 
 use super::Renderer;
 use super::geometry::{self, Vertex};
-use super::resources::{Cache, GpuMesh, Weighed};
+use super::resources::{Cache, GpuMesh, LoadError, LoadOutcome, StampProof, Weighed};
 use crate::scene::{Geometry, Part, Skeleton};
 
 /// A pose closer than this to the bind pose (matrix entries; studs for the translation) draws the
@@ -50,6 +50,7 @@ pub struct SkinSource {
 	/// The vertices LOD0 draws (the only ones skinned).
 	used: Vec<u32>,
 	bytes: u64,
+	pub(super) proof: StampProof,
 }
 
 impl Weighed for SkinSource {
@@ -196,24 +197,43 @@ impl Renderer {
 	/// The mesh to draw for a part (`drawn` from `part_mesh`): a posed copy when its Bones deform its
 	/// skinned mesh, else `drawn` unchanged. `live`: the part's index in a live scene (`Scene::live`).
 	pub(super) fn skinned(&self, part: &Part, drawn: (Arc<GpuMesh>, Affine3A, bool), live: Option<usize>) -> (Arc<GpuMesh>, Affine3A, bool) {
+		self.skinned_checked(part, drawn, live).0
+	}
+
+	/// Like [`Renderer::skinned`], also returning `false` when a local skin source moved while
+	/// being read (even if the resulting bone matrices were identity or the mesh had no bones).
+	pub(super) fn skinned_checked(&self, part: &Part, drawn: (Arc<GpuMesh>, Affine3A, bool), live: Option<usize>) -> ((Arc<GpuMesh>, Affine3A, bool), bool) {
 		let (Some(skeleton), Geometry::MeshPart { mesh: uri, .. }) = (&part.skeleton, &part.geometry) else {
-			return drawn;
+			return (drawn, true);
 		};
 		match self.posed_mesh(uri, skeleton, part, &drawn.0, &drawn.1, live) {
-			Ok(Some(mesh)) => (mesh, drawn.1, drawn.2),
-			_ => drawn,
+			Ok((Some(mesh), stable)) => ((mesh, drawn.1, drawn.2), stable),
+			Ok((None, stable)) => (drawn, stable),
+			Err(_) => (drawn, !super::names_local_file(uri)),
 		}
 	}
 
-	fn posed_mesh(&self, uri: &str, skeleton: &Skeleton, part: &Part, bind: &Arc<GpuMesh>, local: &Affine3A, live: Option<usize>) -> Result<Option<Arc<GpuMesh>>> {
-		let stamped = super::content_key(uri);
-		let source = self.skins.sources.get_or_load_for(&stamped, self.assets.is_offline_view(), || self.skin_source(uri))?;
+	fn posed_mesh(&self, uri: &str, skeleton: &Skeleton, part: &Part, bind: &Arc<GpuMesh>, local: &Affine3A, live: Option<usize>) -> Result<(Option<Arc<GpuMesh>>, bool)> {
+		let local_snap = super::local_snapshot_for(uri);
+		let stamped = match &local_snap {
+			Some((_, snap)) => snap.stamp.stamp_uri(uri),
+			None => super::content_key(uri),
+		};
+		let source = self.skins.sources.get_or_load_checked(&stamped, self.assets.is_offline_view(), || self.skin_source(uri, local_snap.as_ref(), &stamped))?;
+		// Only cache a posed/live mesh when both the skin source and bind mesh are proven to match
+		// the same local-file stamp (or are both remote).
+		let proof = match (&source.proof, &bind.proof) {
+			(StampProof::Remote, StampProof::Remote) => StampProof::Remote,
+			(StampProof::Proven(a), StampProof::Proven(b)) if a == b && *a == stamped => StampProof::Proven(stamped.clone()),
+			_ => StampProof::Moved,
+		};
+		let stable = !matches!(proof, StampProof::Moved);
 		let Some(mesh_scale) = MeshScale::of(local).filter(|_| !source.bones.is_empty()) else {
-			return Ok(None);
+			return Ok((None, stable));
 		};
 		let matrices = bone_matrices(&source.bones, skeleton, &part.cframe, mesh_scale);
 		if matrices.iter().all(is_identity) {
-			return Ok(None);
+			return Ok((None, stable));
 		}
 		let mut hash = 0xcbf29ce484222325u64;
 		hash_values(&mut hash, mesh_scale.scale.to_array().into_iter().chain(mesh_scale.centre.to_array()));
@@ -221,7 +241,7 @@ impl Renderer {
 			hash_values(&mut hash, matrix.to_cols_array());
 		}
 		if let Some(index) = live {
-			return Ok(Some(self.live_mesh(&stamped, index, hash, &source, &matrices, mesh_scale, bind)));
+			return Ok((Some(self.live_mesh(&stamped, index, hash, &source, &matrices, mesh_scale, bind, proof)), stable));
 		}
 		let key = format!("{stamped}#{hash:016x}");
 		let pose = || {
@@ -242,17 +262,22 @@ impl Renderer {
 				vertex_buffer,
 				index_buffer: bind.index_buffer.clone(),
 				lods: bind.lods.clone(),
-			high_quality: bind.high_quality,
+				high_quality: bind.high_quality,
 				// the bind pose's bounds: the part's mesh transform stays the bind mesh's
 				bounds: bind.bounds,
 				drawn: drawn_bounds(&source, &vertices).unwrap_or(bind.drawn),
 				bind: Some(bind.vertex_buffer.clone()),
 				decal_faces: None,
 				bytes: std::mem::size_of_val(vertices.as_slice()) as u64,
+				proof: proof.clone(),
 			})
 		};
+		if !stable {
+			self.skins.posed.misses.fetch_add(1, Ordering::Relaxed);
+			return Ok((Some(Arc::new(pose()?)), false));
+		}
 		if let Some(mesh) = self.skins.posed.get(&key) {
-			return Ok(Some(mesh));
+			return Ok((Some(mesh), true));
 		}
 		let first = {
 			let mut seen = self.skins.seen.lock();
@@ -267,7 +292,7 @@ impl Renderer {
 		} else {
 			self.skins.posed.get_or_load(&key, pose)?
 		};
-		Ok(Some(mesh))
+		Ok((Some(mesh), true))
 	}
 
 	/// A live scene's skinned part: its one buffer, written over when the pose is not the one in it.
@@ -275,9 +300,11 @@ impl Renderer {
 	/// (Ruler) scrubbing its idle (two skinned parts, 1.17 MB a pose) the submit took 1.40 ms a frame
 	/// against 0.34 with the camera turning; written over, the vertices are the only upload.
 	#[allow(clippy::too_many_arguments)]
-	fn live_mesh(&self, uri: &str, index: usize, pose: u64, source: &SkinSource, matrices: &[Affine3A], mesh_scale: MeshScale, bind: &Arc<GpuMesh>) -> Arc<GpuMesh> {
+	fn live_mesh(&self, uri: &str, index: usize, pose: u64, source: &SkinSource, matrices: &[Affine3A], mesh_scale: MeshScale, bind: &Arc<GpuMesh>, proof: StampProof) -> Arc<GpuMesh> {
+		let stable = !matches!(proof, StampProof::Moved);
 		let slot = (uri.to_string(), index);
-		if let Some(part) = self.skins.live.lock().get(&slot)
+		if stable
+			&& let Some(part) = self.skins.live.lock().get(&slot)
 			&& part.pose == pose
 		{
 			return part.mesh.clone();
@@ -287,7 +314,7 @@ impl Renderer {
 		let skinned = start.elapsed();
 		let bytes: &[u8] = bytemuck::cast_slice(&vertices);
 		let mut live = self.skins.live.lock();
-		let vertex_buffer = match live.get(&slot).filter(|part| part.mesh.vertex_buffer.size() == bytes.len() as u64) {
+		let vertex_buffer = match stable.then(|| live.get(&slot).filter(|part| part.mesh.vertex_buffer.size() == bytes.len() as u64)).flatten() {
 			Some(part) => part.mesh.vertex_buffer.clone(),
 			None => self.gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some("live skinned mesh"), size: bytes.len() as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
 		};
@@ -304,11 +331,14 @@ impl Renderer {
 			bind: Some(bind.vertex_buffer.clone()),
 			decal_faces: None,
 			bytes: bytes.len() as u64,
+			proof,
 		});
-		if live.len() >= LIVE_KEPT && !live.contains_key(&slot) {
-			live.clear();
+		if stable {
+			if live.len() >= LIVE_KEPT && !live.contains_key(&slot) {
+				live.clear();
+			}
+			live.insert(slot, LivePart { pose, mesh: mesh.clone() });
 		}
-		live.insert(slot, LivePart { pose, mesh: mesh.clone() });
 		let totals = &self.skins.totals;
 		totals[0].fetch_add(1, Ordering::Relaxed);
 		totals[1].fetch_add(skinned.as_nanos() as u64, Ordering::Relaxed);
@@ -317,11 +347,35 @@ impl Renderer {
 		mesh
 	}
 
-	fn skin_source(&self, uri: &str) -> Result<SkinSource> {
-		let fetched = self.assets.fetch(uri).map_err(|error| anyhow!("{error}"))?;
-		let mesh = ror_mesh::decode_mesh(&fetched.bytes).map_err(|error| anyhow!("{uri}: {error}"))?;
+	fn skin_source(&self, uri: &str, local_snap: Option<&(std::path::PathBuf, ror_assets::FileSnapshot)>, stamped: &str) -> std::result::Result<LoadOutcome<SkinSource>, LoadError> {
+		let (fetched, proof, keep) = match local_snap {
+			Some((path, snap)) => {
+				super::run_test_read_hook(path);
+				match self.assets.fetch_local_with_snapshot(uri, path, *snap) {
+					Ok((fetched, verified)) => (fetched, if verified { StampProof::Proven(stamped.to_string()) } else { StampProof::Moved }, verified),
+					Err(error) => {
+						return Err(if snap.still_unchanged(path) { LoadError::Cached(anyhow!("{error}")) } else { LoadError::Uncached(anyhow!("{error}")) });
+					}
+				}
+			}
+			None => match self.assets.fetch(uri) {
+				Ok(fetched) => (fetched, StampProof::Remote, true),
+				Err(error) => return Err(LoadError::Cached(anyhow!("{error}"))),
+			},
+		};
+		let mesh = match ror_mesh::decode_mesh(&fetched.bytes) {
+			Ok(mesh) => mesh,
+			Err(error) => {
+				let err = anyhow!("{uri}: {error}");
+				return Err(if keep { LoadError::Cached(err) } else { LoadError::Uncached(err) });
+			}
+		};
 		let Some(skinning) = mesh.skinning.as_ref().filter(|skinning| !skinning.bones.is_empty() && skinning.joints.len() == mesh.vertex_count()) else {
-			return Ok(SkinSource { vertices: Vec::new(), joints: Vec::new(), weights: Vec::new(), bones: Vec::new(), used: Vec::new(), bytes: 64 });
+			return Ok(LoadOutcome {
+				value: SkinSource { vertices: Vec::new(), joints: Vec::new(), weights: Vec::new(), bones: Vec::new(), used: Vec::new(), bytes: 64, proof },
+				keep,
+				offline_fallback: false,
+			});
 		};
 		let cpu = geometry::from_mesh(&mesh);
 		let lod0 = cpu.lods.first().cloned().unwrap_or(0..cpu.indices.len() as u32);
@@ -332,7 +386,11 @@ impl Renderer {
 		let bones: Vec<SkinBone> =
 			skinning.bones.iter().map(|bone| SkinBone { name: bone.name.clone(), bind: bind_cframe(bone), parent: bone.parent.map(usize::from).filter(|&parent| parent < count) }).collect();
 		let bytes = (std::mem::size_of_val(cpu.vertices.as_slice()) + skinning.joints.len() * 24 + used.len() * 4) as u64;
-		Ok(SkinSource { vertices: cpu.vertices, joints: skinning.joints.clone(), weights: skinning.weights.clone(), bones, used, bytes })
+		Ok(LoadOutcome {
+			value: SkinSource { vertices: cpu.vertices, joints: skinning.joints.clone(), weights: skinning.weights.clone(), bones, used, bytes, proof },
+			keep,
+			offline_fallback: false,
+		})
 	}
 }
 
@@ -411,6 +469,7 @@ mod tests {
 			],
 			used,
 			bytes: 0,
+			proof: super::StampProof::Remote,
 		}
 	}
 
