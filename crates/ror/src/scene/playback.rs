@@ -551,12 +551,16 @@ pub fn rest_cframe(document: &Document, referent: Ref) -> Option<Affine3A> {
 	None
 }
 
-/// The world updates of a playback up to `end`: its frame times, or every 1/60 s from 0, and every
-/// 1/60 s of the prewarm before 0.
+/// The world updates of a playback up to `end`: its frame times (finite and sorted in ascending
+/// time order), or every 1/60 s from 0, and every 1/60 s of the prewarm before 0.
 fn frame_times(frames: Option<&[f32]>, end: f32, prewarm: f32) -> Vec<f32> {
 	let mut times: Vec<f32> = (1..=(prewarm.max(0.0) * FRAME_RATE).ceil() as usize).rev().map(|index| -(index as f32) / FRAME_RATE).collect();
 	match frames {
-		Some(frames) => times.extend(frames.iter().copied().filter(|&time| time >= 0.0 && time <= end + 1e-4)),
+		Some(frames) => {
+			let mut recorded: Vec<f32> = frames.iter().copied().filter(|&time| time.is_finite() && time >= 0.0 && time <= end + 1e-4).collect();
+			recorded.sort_by(f32::total_cmp);
+			times.extend(recorded);
+		}
 		None => times.extend((0..=(end.max(0.0) * FRAME_RATE + 1e-3).floor() as usize).map(|index| index as f32 / FRAME_RATE)),
 	}
 	times
@@ -1481,7 +1485,9 @@ struct RateScan {
 }
 
 /// A trail's grid-frame ribbon history through `self.frames[..index]`, before appending any
-/// between-frame head or trimming expired / over-length tail points.
+/// between-frame head or trimming expired / over-length tail points. Reused only when every
+/// transform bit (`inv0`, `inv1`, `cframe0`, `cframe1`) matches identically so `MinLength`
+/// decisions never drift with frame order, density, or thread scheduling.
 #[derive(Clone)]
 struct TrailScan {
 	time: f32,
@@ -1490,8 +1496,10 @@ struct TrailScan {
 	attachment1: Ref,
 	track0: Option<usize>,
 	track1: Option<usize>,
-	base0: Affine3A,
-	base1: Affine3A,
+	inv0: Option<Affine3A>,
+	inv1: Option<Affine3A>,
+	cframe0: Affine3A,
+	cframe1: Affine3A,
 	min_length: f32,
 	previous: f32,
 	fresh: bool,
@@ -1509,12 +1517,19 @@ struct BeamScan {
 	previous: Option<f32>,
 }
 
-fn affine_near(a: &Affine3A, b: &Affine3A) -> bool {
-	let eps = 1e-4;
-	a.translation.abs_diff_eq(b.translation, eps)
-		&& a.matrix3.x_axis.abs_diff_eq(b.matrix3.x_axis, eps)
-		&& a.matrix3.y_axis.abs_diff_eq(b.matrix3.y_axis, eps)
-		&& a.matrix3.z_axis.abs_diff_eq(b.matrix3.z_axis, eps)
+fn affine_bits_eq(a: &Affine3A, b: &Affine3A) -> bool {
+	a.translation.to_array().map(f32::to_bits) == b.translation.to_array().map(f32::to_bits)
+		&& a.matrix3.x_axis.to_array().map(f32::to_bits) == b.matrix3.x_axis.to_array().map(f32::to_bits)
+		&& a.matrix3.y_axis.to_array().map(f32::to_bits) == b.matrix3.y_axis.to_array().map(f32::to_bits)
+		&& a.matrix3.z_axis.to_array().map(f32::to_bits) == b.matrix3.z_axis.to_array().map(f32::to_bits)
+}
+
+fn opt_affine_bits_eq(a: &Option<Affine3A>, b: &Option<Affine3A>) -> bool {
+	match (a, b) {
+		(Some(a), Some(b)) => affine_bits_eq(a, b),
+		(None, None) => true,
+		_ => false,
+	}
 }
 
 /// One continuous emitter still enabled past the playback's last event (never disabled or moved
@@ -2667,8 +2682,6 @@ impl Resolved<'_> {
 			let track1 = self.track_of(document, trail.attachment1);
 			let inv0 = track0.map(|index| self.tracks[index].pose(time).inverse());
 			let inv1 = track1.map(|index| self.tracks[index].pose(time).inverse());
-			let base0 = inv0.map_or(trail.cframe0, |inv| inv * trail.cframe0);
-			let base1 = inv1.map_or(trail.cframe1, |inv| inv * trail.cframe1);
 			let sample = |t: f32| -> TrailPoint {
 				let cframe0 = match (track0, inv0) {
 					(Some(index), Some(inv)) => (self.tracks[index].pose(t) * inv) * trail.cframe0,
@@ -2698,15 +2711,19 @@ impl Resolved<'_> {
 							&& scan.track0 == track0
 							&& scan.track1 == track1
 							&& scan.min_length.to_bits() == trail.min_length.to_bits()
-							&& affine_near(&scan.base0, &base0)
-							&& affine_near(&scan.base1, &base1) =>
+							&& opt_affine_bits_eq(&scan.inv0, &inv0)
+							&& opt_affine_bits_eq(&scan.inv1, &inv1)
+							&& affine_bits_eq(&scan.cframe0, &trail.cframe0)
+							&& affine_bits_eq(&scan.cframe1, &trail.cframe1) =>
 					{
 						(scan.points.clone(), scan.previous, scan.fresh, scan.index)
 					}
 					_ => (Vec::new(), f32::NEG_INFINITY, true, 0usize),
 				}
 			};
-			for &frame in &self.frames[first..] {
+			let mut idx = first;
+			while idx < self.frames.len() {
+				let frame = self.frames[idx];
 				// Clear() drops what the trail left so far
 				if timeline.cleared_between(previous, frame) {
 					points.clear();
@@ -2714,8 +2731,22 @@ impl Resolved<'_> {
 				previous = frame;
 				if !timeline.enabled_at(frame) {
 					fresh = true;
+					// Fast-skip contiguous disabled spans while keeping Clear() state exact.
+					let next_idx = match timeline.next_enabled_after(frame) {
+						Some(next_on) => idx + 1 + self.frames[idx + 1..].partition_point(|&f| f < next_on - 1e-6),
+						None => self.frames.len(),
+					};
+					if next_idx > idx + 1 {
+						let last_skipped = self.frames[next_idx - 1];
+						if timeline.cleared_between(previous, last_skipped) {
+							points.clear();
+						}
+						previous = last_skipped;
+					}
+					idx = next_idx;
 					continue;
 				}
+				idx += 1;
 				let mut point = sample(frame);
 				// a new point once the attachments moved MinLength from the last one (their midpoint;
 				// trail-shape minlength: the circle's corners match)
@@ -2738,8 +2769,10 @@ impl Resolved<'_> {
 					attachment1: trail.attachment1,
 					track0,
 					track1,
-					base0,
-					base1,
+					inv0,
+					inv1,
+					cframe0: trail.cframe0,
+					cframe1: trail.cframe1,
 					min_length: trail.min_length,
 					previous,
 					fresh,
@@ -4484,11 +4517,12 @@ mod tests {
 			assert_eq!(scene_inc.trails.len(), scene_fresh.trails.len());
 			for (a, b) in scene_inc.trails.iter().zip(&scene_fresh.trails) {
 				assert_eq!(a.points.len(), b.points.len(), "trail {} point count mismatch at t={t}", a.path);
-				assert!((a.dropped_length - b.dropped_length).abs() < 1e-4, "trail dropped_length mismatch at t={t}");
+				assert_eq!(a.dropped_length.to_bits(), b.dropped_length.to_bits(), "trail dropped_length mismatch at t={t}");
 				for (pa, pb) in a.points.iter().zip(&b.points) {
 					assert_eq!(pa.time.to_bits(), pb.time.to_bits());
 					assert_eq!(pa.starts_strip, pb.starts_strip);
-					assert!(pa.position0.distance(pb.position0) < 1e-4 && pa.position1.distance(pb.position1) < 1e-4, "trail point mismatch at t={t}: {pa:?} vs {pb:?}");
+					assert_eq!(pa.position0.to_array().map(f32::to_bits), pb.position0.to_array().map(f32::to_bits), "trail point0 mismatch at t={t}: {pa:?} vs {pb:?}");
+					assert_eq!(pa.position1.to_array().map(f32::to_bits), pb.position1.to_array().map(f32::to_bits), "trail point1 mismatch at t={t}: {pa:?} vs {pb:?}");
 				}
 			}
 		}
@@ -4571,5 +4605,288 @@ mod tests {
 
 		assert_eq!(s_pretty, s_compact);
 		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	/// `frame_times` sorts unsorted user-provided `Playback::frames` and drops non-finite values so
+	/// downstream binary searches (`quantize`, `partition_point`) never see unsorted timestamps.
+	#[test]
+	fn frame_times_sorts_and_filters_non_finite_recorded_frames() {
+		let unsorted = vec![0.5f32, f32::NAN, 0.1, f32::INFINITY, 0.0, f32::NEG_INFINITY, 0.25, 2.0];
+		let grid = frame_times(Some(&unsorted), 1.0, 0.0);
+		assert_eq!(grid, vec![0.0, 0.1, 0.25, 0.5]);
+		assert!(grid.windows(2).all(|w| w[0] <= w[1]));
+
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use rbx_dom_weak::InstanceBuilder;
+		use rbx_dom_weak::types::NumberRange;
+
+		let mut model = ModelBuilder::new("UnsortedFrames");
+		let part = model.part(&PartSpec { name: "Part".into(), size: Vec3::splat(2.0), ..Default::default() });
+		model.child(part, InstanceBuilder::new("ParticleEmitter").with_name("E").with_property("Enabled", false).with_property("Rate", 30.0f32).with_property("Lifetime", NumberRange::new(1.0, 1.0)));
+		let mut doc_a = model.into_document();
+		let mut doc_b = doc_a.copy();
+		let action = Action { at: 0.12, target: "UnsortedFrames.Part.E".into(), enabled: Some(true), ..Default::default() };
+		let pb_unsorted = Playback { time: 0.4, frames: Some(vec![0.5, f32::NAN, 0.25, 0.0, 0.1, f32::INFINITY]), actions: vec![action.clone()], ..Default::default() };
+		let pb_sorted = Playback { time: 0.4, frames: Some(vec![0.0, 0.1, 0.25, 0.5]), actions: vec![action], ..Default::default() };
+
+		let ra = pb_unsorted.resolve(&doc_a).unwrap();
+		let ua = ra.apply_state(&mut doc_a).unwrap();
+		let mut sa = crate::scene::extract::extract(&doc_a);
+		ra.apply_history(&doc_a, &mut sa);
+		ua.restore(&mut doc_a);
+
+		let rb = pb_sorted.resolve(&doc_b).unwrap();
+		let ub = rb.apply_state(&mut doc_b).unwrap();
+		let mut sb = crate::scene::extract::extract(&doc_b);
+		rb.apply_history(&doc_b, &mut sb);
+		ub.restore(&mut doc_b);
+
+		assert_eq!(sa, sb);
+	}
+
+	/// Moving trails near `MinLength` must render byte-identical PNGs whether the target moment is
+	/// stepped densely (60 fps), sparsely (4 fps), alone, or inside a full `video::run_with` clip.
+	#[test]
+	fn moving_trail_renders_identical_png_bytes_dense_sparse_alone_and_in_clip() {
+		use std::sync::Arc;
+
+		use crate::render::camera::CameraSpec;
+		use crate::render::{Background, Renderer, ViewRequest};
+		use crate::scene::build::{ModelBuilder, PartSpec, cframe};
+		use rbx_dom_weak::InstanceBuilder;
+		use rbx_dom_weak::types::Variant;
+
+		let dir = std::env::temp_dir().join(format!("ror-trail-exact-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+
+		let mut model = ModelBuilder::new("TrailExact");
+		let mover = model.part(&PartSpec { name: "Mover".into(), size: Vec3::splat(0.5), ..Default::default() });
+		let a0 = model.child(mover, InstanceBuilder::new("Attachment").with_name("A0").with_property("CFrame", Variant::CFrame(cframe(Affine3A::from_translation(Vec3::new(0.0, -1.0, 0.0))))));
+		let a1 = model.child(mover, InstanceBuilder::new("Attachment").with_name("A1").with_property("CFrame", Variant::CFrame(cframe(Affine3A::from_translation(Vec3::new(0.0, 1.0, 0.0))))));
+		// MinLength = 0.5 with a speed of 30 studs/s -> ~0.5000 studs per 60 Hz frame, maximizing
+		// sensitivity to any ULP drift from reusing an earlier moment's `pose(T1)^-1 * cframe0(T1)`.
+		model.child(
+			mover,
+			InstanceBuilder::new("Trail")
+				.with_name("Ribbon")
+				.with_property("Attachment0", Variant::Ref(a0))
+				.with_property("Attachment1", Variant::Ref(a1))
+				.with_property("Enabled", true)
+				.with_property("Lifetime", 0.6f32)
+				.with_property("MinLength", 0.5f32),
+		);
+		let rbxm = dir.join("trail.rbxm");
+		std::fs::write(&rbxm, model.to_rbxm().unwrap()).unwrap();
+		let doc_base = model.into_document();
+
+		// Motion with translation + rotation across 60 Hz steps hovering right at MinLength = 0.5.
+		let mut keys = Vec::new();
+		for step in 0..=60 {
+			let t = step as f32 / 60.0;
+			let angle = t * 2.3;
+			let rot = glam::Quat::from_euler(glam::EulerRot::YXZ, angle, angle * 0.4, angle * 0.2);
+			let cf = Affine3A::from_rotation_translation(rot, Vec3::new(-10.0 + 30.0 * t, (t * 4.0).sin() * 0.5, (t * 3.0).cos() * 0.5));
+			let m = cf.matrix3;
+			let tr = cf.translation;
+			keys.push(MotionKey {
+				at: t,
+				cframe: vec![tr.x, tr.y, tr.z, m.x_axis.x, m.y_axis.x, m.z_axis.x, m.x_axis.y, m.y_axis.y, m.z_axis.y, m.x_axis.z, m.y_axis.z, m.z_axis.z],
+				easing: None,
+				direction: None,
+			});
+		}
+		let playback = Playback {
+			motion: vec![Motion { target: "TrailExact.Mover".into(), keys, ..Default::default() }],
+			..Default::default()
+		};
+
+		let target_t = 0.75f32;
+		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&dir) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let view = ViewRequest {
+			width: 96,
+			height: 64,
+			msaa: 1,
+			bloom: false,
+			background: Background::Color([0.05, 0.05, 0.08]),
+			camera: CameraSpec::LookAt { eye: [4.0, 2.0, 18.0], target: [4.0, 0.0, 0.0], fov: 50.0 },
+			..Default::default()
+		};
+
+		let encode_scene_png = |scene: &Scene, name: &str| -> Vec<u8> {
+			let (images, _) = renderer.render(scene, std::slice::from_ref(&view)).unwrap();
+			let file = dir.join(format!("{name}.png"));
+			crate::output::write_png(&file, images[0].width, images[0].height, &images[0].rgba, true).unwrap();
+			std::fs::read(&file).unwrap()
+		};
+
+		// 1. Alone (fresh resolve at t = 0.75)
+		let mut doc_alone = doc_base.copy();
+		let r_alone = playback.resolve_at(&doc_alone, target_t).unwrap();
+		let u_alone = r_alone.apply_state(&mut doc_alone).unwrap();
+		let mut s_alone = crate::scene::extract::extract(&doc_alone);
+		r_alone.apply_history(&doc_alone, &mut s_alone);
+		u_alone.restore(&mut doc_alone);
+		assert!(s_alone.trails[0].points.len() >= 5, "trail should have multiple active points");
+		let png_alone = encode_scene_png(&s_alone, "alone");
+
+		// 2. Dense 60 fps sequential stepping via `at()`
+		let mut doc_dense = doc_base.copy();
+		let mut r_dense = playback.resolve_at(&doc_dense, 0.0).unwrap();
+		let mut s_dense = Scene::default();
+		for frame in 0..=45 {
+			let t = frame as f32 / 60.0;
+			assert!(r_dense.at(t));
+			let u = r_dense.apply_state(&mut doc_dense).unwrap();
+			let mut s = crate::scene::extract::extract(&doc_dense);
+			r_dense.apply_history(&doc_dense, &mut s);
+			u.restore(&mut doc_dense);
+			if frame == 45 {
+				s_dense = s;
+			}
+		}
+		assert_eq!(s_dense.trails[0].points.len(), s_alone.trails[0].points.len());
+		let png_dense = encode_scene_png(&s_dense, "dense");
+
+		// 3. Sparse 4 fps sequential stepping via `at()`
+		let mut doc_sparse = doc_base.copy();
+		let mut r_sparse = playback.resolve_at(&doc_sparse, 0.0).unwrap();
+		let mut s_sparse = Scene::default();
+		for &t in &[0.0f32, 0.25, 0.5, target_t] {
+			assert!(r_sparse.at(t));
+			let u = r_sparse.apply_state(&mut doc_sparse).unwrap();
+			let mut s = crate::scene::extract::extract(&doc_sparse);
+			r_sparse.apply_history(&doc_sparse, &mut s);
+			u.restore(&mut doc_sparse);
+			s_sparse = s;
+		}
+		let png_sparse = encode_scene_png(&s_sparse, "sparse");
+
+		// 4. Full `video::run_with` clip at 20 fps (frame 15 is t = 0.75)
+		let scenes = crate::job::SceneCache::default();
+		let clip_out = dir.join("clip");
+		let clip_job = crate::video::VideoJob {
+			input: rbxm.display().to_string(),
+			select: None,
+			out: Some(clip_out.clone()),
+			view: view.clone(),
+			name: "front".into(),
+			playback: Some(playback.clone()),
+			playback_file: None,
+			playback_overlay: None,
+			start: 0.0,
+			duration: 0.8,
+			fps: 20.0,
+			speed: 1.0,
+			times: None,
+			orbit: 0.0,
+			format: crate::video::VideoFormat::Png,
+			sheet: 0,
+			materials_from: None,
+			lighting_from: None,
+			map: None,
+			frame: None,
+			focus: None,
+			ffmpeg: None,
+			camera_track: None,
+			keep_default_camera: false,
+			sheet_first: false,
+			copies: Vec::new(),
+			relative_to: None,
+			nvenc: None,
+		};
+		crate::video::run_with(&renderer, &scenes, &clip_job, None, None).unwrap();
+		let png_clip = std::fs::read(clip_out.join("frames").join("0015.png")).unwrap();
+
+		assert_eq!(png_dense, png_alone, "dense 60 fps trail PNG must match alone byte-for-byte");
+		assert_eq!(png_sparse, png_alone, "sparse 4 fps trail PNG must match alone byte-for-byte");
+		assert_eq!(png_clip, png_alone, "full video clip trail PNG must match alone byte-for-byte");
+
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	/// Legacy `Fire` expands into two `ParticleEmitter` systems (flame + secondary wisps) sharing one
+	/// `Ref` with distinct seeds and reach radii. Near the viewer frustum edge, per-system viewer
+	/// masking keyed by `(referent, emitter.seed)` must produce identical births regardless of
+	/// emitter evaluation order or parallel execution.
+	#[test]
+	fn legacy_fire_viewer_mask_is_deterministic_near_frustum_edge() {
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use rbx_dom_weak::InstanceBuilder;
+		use rayon::prelude::*;
+
+		let mut model = ModelBuilder::new("LegacyEdge");
+		let part = model.part(&PartSpec { name: "Torch".into(), size: Vec3::splat(1.0), ..Default::default() });
+		model.child(
+			part,
+			InstanceBuilder::new("Fire")
+				.with_name("Flame")
+				.with_property("Enabled", true)
+				.with_property("Size", 10.0f32)
+				.with_property("Heat", 20.0f32),
+		);
+		let doc = model.into_document();
+		let base_scene = crate::scene::extract::extract(&doc);
+		assert!(base_scene.particles.len() >= 2, "Fire must expand into flame + secondary systems");
+		let reaches: Vec<f32> = base_scene.particles.iter().map(|e| {
+			let (a, b, c) = reach_terms(e);
+			e.size.length() * 0.5 + a + b + c
+		}).collect();
+		let r_min = reaches.iter().copied().fold(f32::INFINITY, f32::min);
+		let r_max = reaches.iter().copied().fold(0.0f32, f32::max);
+		// Position viewer so the smaller-reach system sits just outside the frustum while the
+		// larger-reach system overlaps it (or right on the boundary).
+		let mid_r = (r_min + r_max) * 0.5;
+		let z = 10.0f32;
+		let half_y = z * (35.0f32.to_radians()).tan();
+		let cam_x = half_y * (16.0 / 9.0) + mid_r;
+		let playback = Playback {
+			time: 0.8,
+			viewer: vec![ViewerKey {
+				at: 0.0,
+				cframe: [cam_x, 0.0, z, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+				fov: 70.0,
+				aspect: 16.0 / 9.0,
+			}],
+			..Default::default()
+		};
+
+		// Forward order vs reversed emitter order on separate fresh resolutions must yield the
+		// exact same births per emitter seed.
+		let eval = |reverse: bool| -> Vec<(u64, Option<Vec<super::Birth>>)> {
+			let resolved = playback.resolve(&doc).unwrap();
+			let mut scene = crate::scene::extract::extract(&doc);
+			if reverse {
+				scene.particles.reverse();
+			}
+			resolved.apply_history(&doc, &mut scene);
+			let mut out: Vec<(u64, Option<Vec<super::Birth>>)> = scene.particles.into_iter().map(|e| (e.seed, e.births)).collect();
+			out.sort_by_key(|(seed, _)| *seed);
+			out
+		};
+		let forward = eval(false);
+		let reversed = eval(true);
+		assert_eq!(forward, reversed, "legacy Fire viewer mask must not depend on which sub-system evaluates first");
+
+		// Parallel evaluation on a shared Resolved across many runs must also match bit-for-bit.
+		let resolved = playback.resolve(&doc).unwrap();
+		let parallel: Vec<Vec<(u64, Option<Vec<super::Birth>>)>> = (0..16)
+			.into_par_iter()
+			.map(|i| {
+				let mut scene = base_scene.clone();
+				if i % 2 == 1 {
+					scene.particles.reverse();
+				}
+				resolved.apply_history(&doc, &mut scene);
+				let mut out: Vec<(u64, Option<Vec<super::Birth>>)> = scene.particles.into_iter().map(|e| (e.seed, e.births)).collect();
+				out.sort_by_key(|(seed, _)| *seed);
+				out
+			})
+			.collect();
+		for run in &parallel {
+			assert_eq!(run, &forward, "parallel legacy Fire viewer mask must match serial deterministically");
+		}
 	}
 }
