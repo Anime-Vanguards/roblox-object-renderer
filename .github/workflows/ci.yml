@@ -97,8 +97,10 @@ jobs:
           # The library jobs' cache (see below); they store it.
           shared-key: test
           save-if: false
-      - name: Build the examples
-        run: cargo build --release --locked -p ror --examples
+      # The examples, and ror's binary in the same build: the resource budgets below run it, whether or not the tests
+      # after this step build
+      - name: Build the examples and the ror binary
+        run: cargo build --release --locked -p ror --examples --bin ror
       # --test '*' picks every integration test; --tests would add the library's unit tests too
       - name: Test ror's binary and integration tests
         if: ${{ !cancelled() }}
@@ -107,7 +109,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --release --locked -p ror --doc -- --test-threads=1
       # Resource budgets (tools/resources; AGENTS.md "Resource budgets"): the ci suite's renders run through the render
-      # service with the ror the integration tests built, and what each one wrote to disk, kept on it, left behind and
+      # service with the ror the first build step made, and what each one wrote to disk, kept on it, left behind and
       # held in memory is checked against tools/resources/baseline.json. A figure over its budget fails the job; the
       # plain-language report is the job summary. Everything it writes is under the runner's temp folder, and no cache
       # is read or written.

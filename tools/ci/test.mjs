@@ -121,3 +121,31 @@ test("the workflow runs six library jobs through the entry, each building only t
 	// and the tools' own tests run
 	assert.match(WORKFLOW, /node --test tools\/ci\/test\.mjs/);
 });
+
+test("the resource budgets run once, at the end of the targets job, on a ror it builds, writing only under the runner's temp folder", () => {
+	const targets = WORKFLOW.split(/^  ror-targets:\n/m)[1].split(/^  ror:\n/m)[0];
+	const steps = targets.split(/^      - /m);
+	const index = name => steps.findIndex(step => step.startsWith(`name: ${name}\n`));
+	const budgets = steps[index("Resource budgets")];
+	const figures = steps[index("Keep the resource figures")];
+	assert.ok(budgets && figures, "the targets job has the resource budget steps");
+	assert.equal(WORKFLOW.split("tools/resources/measure.mjs").length, 2, "the budgets run once");
+	// the binary it measures comes from the job's first build, not only from a test that might not compile
+	const build = index("Build the examples and the ror binary");
+	assert.ok(build > 0 && /cargo build --release --locked -p ror --examples --bin ror\n/.test(steps[build]));
+	assert.match(budgets, /--ror target\/release\/ror\.exe /);
+	// after every test step, as the job's last two steps, run after a failed step too
+	const order = [build, index("Test ror's binary and integration tests"), index("Test ror documentation"), index("Resource budgets"), index("Keep the resource figures")];
+	assert.deepEqual(order, [...order].sort((a, b) => a - b));
+	assert.equal(index("Keep the resource figures"), steps.length - 1);
+	for (const step of [budgets, figures]) assert.match(step, /if: \$\{\{ !cancelled\(\) \}\}/);
+	// what it writes goes under runner.temp, passed through env (no context in the script itself)
+	for (const line of ["FIGURES: ${{ runner.temp }}/resource-figures", "WORK: ${{ runner.temp }}/resource-budgets", "TEMP: ${{ runner.temp }}", "TMP: ${{ runner.temp }}"]) {
+		assert.ok(budgets.includes(`          ${line}\n`), line);
+	}
+	assert.match(budgets, /--work \$env:WORK --out "\$env:FIGURES\/run\.json"/);
+	assert.doesNotMatch(budgets.split(/^        run: \|/m)[1], /\$\{\{/);
+	assert.doesNotMatch(budgets + figures, /actions\/cache|CARGO_|RUSTFLAGS/);
+	assert.match(figures, /uses: actions\/upload-artifact@[0-9a-f]{40} /);
+	assert.match(figures, /path: \$\{\{ runner\.temp \}\}\/resource-figures\n/);
+});
