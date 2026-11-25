@@ -3,9 +3,10 @@
 //! cached texture headers across frames, and writes `timeline.json` (`ror-cost-timeline/1`) plus a
 //! concise `analysis.txt`.
 //!
-//! Each frame matches a single-moment `ror cost --playback ... --time <t>` run using the same
-//! camera (never copying `--camera-track` into `Playback::viewer`, which would turn on offscreen
-//! emitter culling absent from single-moment runs).
+//! By default, the timeline populates `Playback::viewer` from `--camera-track` (or the fixed
+//! camera) so emitters out of the camera's view stand still (neither emitting nor ageing, matching
+//! Roblox's client rule). Pass `--all-emitters-running` for the worst case where every emitter runs
+//! regardless of camera view; `timeline.json` and `analysis.txt` record which rule ran.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -54,6 +55,23 @@ pub struct TimelineOptions {
 	/// Moving camera sampled at each frame moment (`--camera-track`).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub camera_track: Option<Vec<CameraKey>>,
+	/// Worst-case mode (`--all-emitters-running`): every emitter emits and ages even when out of
+	/// the camera's view. Default `false` pauses emitters out of view (`Playback::viewer`),
+	/// matching Roblox's client rule.
+	#[serde(default)]
+	pub all_emitters_running: bool,
+}
+
+/// Which offscreen emitter simulation rule ran for this timeline.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OffscreenEmittersReport {
+	/// `"paused-out-of-view"` (default, matching Roblox client) or `"all-running"` (`--all-emitters-running`).
+	pub rule: &'static str,
+	/// Source of the viewer frustum: `"camera-track"`, `"fixed-camera"`, `"playback-viewer"`, or `"disabled-by-flag"`.
+	pub source: &'static str,
+	/// Plain-language summary of what ran.
+	pub note: String,
 }
 
 /// One sampled moment along the timeline.
@@ -143,6 +161,7 @@ pub struct TimelineReport {
 	pub prices: Vec<Price>,
 	pub fidelity: serde_json::Value,
 	pub unmodeled: Vec<serde_json::Value>,
+	pub offscreen_emitters: OffscreenEmittersReport,
 	pub pixels_counted: bool,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub memory: Option<MemoryReport>,
@@ -307,7 +326,7 @@ pub fn run(
 	lent_lighting: bool,
 	lend: &dyn Fn(&mut Scene) -> Result<()>,
 ) -> Result<CostReport> {
-	let owned_playback = playback.cloned().unwrap_or_default();
+	let mut owned_playback = playback.cloned().unwrap_or_default();
 	let (times, start, duration, fps_opt) = sample_times(tl, &owned_playback, document);
 	let (view_w, view_h) = views.first().map(|v| (v.view.width, v.view.height)).unwrap_or((1920, 1080));
 	let dummy_cam = CameraSpec::LookAt { eye: [0.0, 0.0, 10.0], target: [0.0; 3], fov: 70.0 }.place(None, view_w.max(1), view_h.max(1));
@@ -321,6 +340,75 @@ pub fn run(
 		.map(|v| v.view.camera.clone())
 		.unwrap_or(CameraSpec::Orbit { yaw: 0.0, pitch: 20.0, distance: None, padding: 0.08, target: None, fov: 70.0 });
 	let has_track = tl.camera_track.as_deref().is_some_and(|t| !t.is_empty());
+	let viewer_aspect = preset.width.max(1) as f32 / preset.height.max(1) as f32;
+
+	let offscreen_emitters = if tl.all_emitters_running {
+		owned_playback.viewer.clear();
+		OffscreenEmittersReport {
+			rule: "all-running",
+			source: "disabled-by-flag",
+			note: "worst-case (--all-emitters-running): every emitter emits and ages even out of the camera's view; live Roblox clients pause emitters out of view".into(),
+		}
+	} else if !owned_playback.viewer.is_empty() {
+		owned_playback.viewer.sort_by(|a, b| a.at.total_cmp(&b.at));
+		OffscreenEmittersReport {
+			rule: "paused-out-of-view",
+			source: "playback-viewer",
+			note: "emitters out of the playback viewer's frustum stand still (neither emit nor age, matching Roblox client; pass --all-emitters-running for worst case)".into(),
+		}
+	} else if has_track {
+		let mut keys: Vec<crate::scene::playback::ViewerKey> = tl
+			.camera_track
+			.as_deref()
+			.unwrap_or(&[])
+			.iter()
+			.map(|key| crate::scene::playback::ViewerKey { at: key.at, cframe: key.cframe, fov: key.fov, aspect: viewer_aspect })
+			.collect();
+		keys.sort_by(|a, b| a.at.total_cmp(&b.at));
+		owned_playback.viewer = keys;
+		OffscreenEmittersReport {
+			rule: "paused-out-of-view",
+			source: "camera-track",
+			note: "emitters out of the camera track's view stand still (neither emit nor age, matching Roblox client; pass --all-emitters-running for worst case)".into(),
+		}
+	} else {
+		let fixed_cam = match &base_camera {
+			CameraSpec::CFrame { .. } | CameraSpec::LookAt { .. } => base_camera.place(None, preset.width.max(1), preset.height.max(1)),
+			CameraSpec::Orbit { .. } => {
+				let init_resolved = owned_playback.resolve_at(document, times[0] as f32)?;
+				let init_undo = init_resolved.apply_state(document)?;
+				let cam_res = (|| -> Result<crate::render::camera::Camera> {
+					let mut scene0 = crate::scene::extract::extract(document);
+					lend(&mut scene0)?;
+					let mut spec = base_camera.clone();
+					let framed = match (frame_box, focus) {
+						(Some([min, max]), _) => Some((Vec3::from(min).min(Vec3::from(max)), Vec3::from(min).max(Vec3::from(max)))),
+						(None, Some(focus_path)) => Some(scene0.bounds_at(focus_path).with_context(|| format!("focus {focus_path:?}: no part or effect is at or under it"))?),
+						(None, None) => scene0.framing_subject().and_then(|subject| crate::video::subject_box(renderer, &subject)),
+					};
+					if let Some(bounds) = framed {
+						spec = spec.framing(bounds, preset.width.max(1), preset.height.max(1));
+					}
+					let subject = scene0.framing_subject();
+					let bounds = renderer.framing_bounds(subject.as_ref().unwrap_or(&scene0));
+					Ok(spec.place(bounds, preset.width.max(1), preset.height.max(1)))
+				})();
+				init_undo.restore(document);
+				cam_res?
+			}
+		};
+		owned_playback.viewer = vec![crate::scene::playback::ViewerKey {
+			at: 0.0,
+			cframe: fixed_cam.cframe_components(),
+			fov: fixed_cam.fov,
+			aspect: viewer_aspect,
+		}];
+		OffscreenEmittersReport {
+			rule: "paused-out-of-view",
+			source: "fixed-camera",
+			note: "emitters out of the camera's view stand still (neither emit nor age, matching Roblox client; pass --all-emitters-running for worst case)".into(),
+		}
+	};
 
 	let mut resolved = owned_playback.resolve_at(document, times[0] as f32)?;
 	let mut mesh_cache: HashMap<String, Result<Arc<MeshStats>, String>> = HashMap::new();
@@ -528,6 +616,21 @@ pub fn run(
 	});
 	top_instances.truncate(TOP_INSTANCES);
 
+	let mut fidelity = prices::fidelity(&preset, options.pixels);
+	if let Some(map) = fidelity.as_object_mut() {
+		map.insert("offscreenEmitters".into(), serde_json::json!(offscreen_emitters.rule));
+		map.insert("offscreenEmittersSource".into(), serde_json::json!(offscreen_emitters.source));
+	}
+	let mut unmodeled = prices::unmodeled(&preset, &quality);
+	if tl.all_emitters_running {
+		unmodeled.push(serde_json::json!({
+			"kind": "offscreenEmittersAllRunning",
+			"scope": "particles,draws,gpu",
+			"reason": "--all-emitters-running forced every emitter to emit and age even out of the camera's view; live Roblox clients pause emitters out of view.",
+			"settleWith": "Omit --all-emitters-running to pause emitters out of the camera's view.",
+		}));
+	}
+
 	let report = TimelineReport {
 		schema: TIMELINE_SCHEMA,
 		input: input.to_string(),
@@ -539,8 +642,9 @@ pub fn run(
 		quality: quality.clone(),
 		technology,
 		prices: prices::table_for(&preset),
-		fidelity: prices::fidelity(&preset, options.pixels),
-		unmodeled: prices::unmodeled(&preset, &quality),
+		fidelity,
+		unmodeled,
+		offscreen_emitters,
 		pixels_counted: options.pixels,
 		memory: memory.clone(),
 		summary,
@@ -603,6 +707,16 @@ fn format_lines(report: &TimelineReport, desktop: bool) -> Vec<String> {
 	lines.push(format!(
 		"counts: draws mean {:.1} / peak {:.0} (t={:.3}s); triangles mean {:.0}k / peak {:.0}k; particles mean {:.1} / peak {:.0}; blended mean {:.2} / peak {:.2} vp",
 		s.draws.mean, s.draws.peak, s.draws.peak_time, s.triangles.mean / 1000.0, s.triangles.peak / 1000.0, s.particles.mean, s.particles.peak, s.blended_viewports.mean, s.blended_viewports.peak
+	));
+	lines.push(format!(
+		"offscreen emitters: {} ({}; {})",
+		report.offscreen_emitters.rule,
+		report.offscreen_emitters.source,
+		if report.offscreen_emitters.rule == "all-running" {
+			"worst-case flag active: emitters out of view still emit and age, unlike Roblox client"
+		} else {
+			"emitters out of view neither emit nor age, matching Roblox client; --all-emitters-running for worst case"
+		}
 	));
 	if let Some(memory) = &report.memory {
 		lines.push(memory::summary_line(memory, !desktop));
@@ -709,7 +823,7 @@ mod tests {
 		let cf0 = look_at_cframe(Vec3::new(0.0, 8.0, 22.0), Vec3::new(0.0, 2.0, 0.0));
 		let cf1 = look_at_cframe(Vec3::new(5.0, 10.0, 18.0), Vec3::new(0.0, 2.0, 0.0));
 		let track = vec![CameraKey { at: 0.0, cframe: cf0, fov: 70.0 }, CameraKey { at: 0.3, cframe: cf1, fov: 70.0 }];
-		let tl_opts = TimelineOptions { start: 0.0, duration: Some(0.6), auto_duration: false, fps: 10.0, times: None, camera_track: Some(track.clone()) };
+		let tl_opts = TimelineOptions { start: 0.0, duration: Some(0.6), auto_duration: false, fps: 10.0, times: None, camera_track: Some(track.clone()), all_emitters_running: false };
 		let cost_opts = CostOptions { attribute: true, pixels: true, preset: Some("phone".into()), no_images: true, ..Default::default() };
 		let views = vec![NamedView { name: "render".into(), view: crate::render::ViewRequest { width: 2532, height: 1170, ..Default::default() } }];
 
@@ -792,7 +906,7 @@ mod tests {
 		let renderer = make_test_renderer(&temp.join("cache"));
 		let (mut doc, playback) = build_dynamic_scene();
 
-		let tl_opts = TimelineOptions { start: 0.0, duration: Some(0.3), auto_duration: false, fps: 10.0, times: None, camera_track: None };
+		let tl_opts = TimelineOptions { start: 0.0, duration: Some(0.3), auto_duration: false, fps: 10.0, times: None, camera_track: None, all_emitters_running: false };
 		let views = vec![NamedView {
 			name: "render".into(),
 			view: crate::render::ViewRequest {
@@ -830,6 +944,113 @@ mod tests {
 		let tot_obj = mem_val["memory"]["totalGpuBytes"].as_object().unwrap();
 		assert!(tot_obj.contains_key("mobileEtc2"));
 		assert!(!tot_obj.keys().any(|k| k.to_ascii_lowercase().contains("astc")));
+		let _ = std::fs::remove_dir_all(&temp);
+	}
+
+	#[test]
+	fn timeline_pauses_offscreen_emitters_until_seen_and_flag_opts_into_all_running() {
+		let temp = std::env::temp_dir().join(format!("ror-timeline-offscreen-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&temp);
+		std::fs::create_dir_all(&temp).unwrap();
+		let renderer = make_test_renderer(&temp.join("cache"));
+
+		let mut model = ModelBuilder::new("Offscreen");
+		let front = model.part(&PartSpec { name: "FrontHost".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, 2.0, -20.0)), size: Vec3::ONE, transparency: 1.0, ..Default::default() });
+		model.child(
+			front,
+			InstanceBuilder::new("ParticleEmitter")
+				.with_name("FrontStream")
+				.with_property("Rate", 30.0f32)
+				.with_property("Lifetime", NumberRange::new(1.0, 1.0))
+				.with_property("Speed", NumberRange::new(1.0, 1.0))
+				.with_property("Enabled", true),
+		);
+		let behind = model.part(&PartSpec { name: "BehindHost".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, 2.0, 470.0)), size: Vec3::ONE, transparency: 1.0, ..Default::default() });
+		model.child(
+			behind,
+			InstanceBuilder::new("ParticleEmitter")
+				.with_name("BehindStream")
+				.with_property("Rate", 50.0f32)
+				.with_property("Lifetime", NumberRange::new(1.0, 1.0))
+				.with_property("Speed", NumberRange::new(1.0, 1.0))
+				.with_property("Enabled", true),
+		);
+		let mut doc = model.into_document();
+
+		let cf_front = look_at_cframe(Vec3::new(0.0, 2.0, 0.0), Vec3::new(0.0, 2.0, -20.0));
+		let cf_behind = look_at_cframe(Vec3::new(0.0, 2.0, 0.0), Vec3::new(0.0, 2.0, 470.0));
+		let track = vec![CameraKey { at: 0.0, cframe: cf_front, fov: 60.0 }, CameraKey { at: 2.0, cframe: cf_behind, fov: 60.0 }];
+		let views = vec![NamedView { name: "render".into(), view: crate::render::ViewRequest { width: 1280, height: 720, ..Default::default() } }];
+		let cost_opts = CostOptions { attribute: true, pixels: false, no_images: true, ..Default::default() };
+
+		// Default: emitters out of the camera's view stand still; BehindStream starts from 0 at t=2.0.
+		let out_default = temp.join("default");
+		std::fs::create_dir_all(&out_default).unwrap();
+		let tl_default = TimelineOptions { start: 0.0, duration: Some(3.2), auto_duration: false, fps: 10.0, times: None, camera_track: Some(track.clone()), all_emitters_running: false };
+		run(&renderer, &mut doc, None, &cost_opts, &tl_default, &views, None, None, &out_default, None, "offscreen.rbxmx", false, &|_| Ok(())).unwrap();
+		let j_def: serde_json::Value = serde_json::from_slice(&std::fs::read(out_default.join("timeline.json")).unwrap()).unwrap();
+		let t_def = std::fs::read_to_string(out_default.join("analysis.txt")).unwrap();
+		assert_eq!(j_def["offscreenEmitters"]["rule"], "paused-out-of-view");
+		assert_eq!(j_def["offscreenEmitters"]["source"], "camera-track");
+		assert_eq!(j_def["fidelity"]["offscreenEmitters"], "paused-out-of-view");
+		assert!(t_def.contains("offscreen emitters: paused-out-of-view (camera-track"), "{t_def}");
+		let f_def = j_def["frames"].as_array().unwrap();
+		let p = |i: usize| f_def[i]["particles"].as_u64().unwrap();
+		assert!((29..=31).contains(&p(19)), "expected FrontStream steady ~30 at t=1.9, got {}", p(19));
+		assert_eq!(p(20), 0, "BehindStream must start at 0 on first frame seen (t=2.0), got {}", p(20));
+		assert!((4..=6).contains(&p(21)), "BehindStream must ramp (~5 at t=2.1), got {}", p(21));
+		assert!((23..=27).contains(&p(25)), "BehindStream must ramp (~25 at t=2.5), got {}", p(25));
+		assert!((48..=52).contains(&p(30)), "BehindStream must reach steady ~50 at t=3.0, got {}", p(30));
+
+		// Opt-in worst case: --all-emitters-running keeps BehindStream full on the first frame seen.
+		let out_all = temp.join("all_running");
+		std::fs::create_dir_all(&out_all).unwrap();
+		let tl_all = TimelineOptions { all_emitters_running: true, ..tl_default };
+		run(&renderer, &mut doc, None, &cost_opts, &tl_all, &views, None, None, &out_all, None, "offscreen.rbxmx", false, &|_| Ok(())).unwrap();
+		let j_all: serde_json::Value = serde_json::from_slice(&std::fs::read(out_all.join("timeline.json")).unwrap()).unwrap();
+		let t_all = std::fs::read_to_string(out_all.join("analysis.txt")).unwrap();
+		assert_eq!(j_all["offscreenEmitters"]["rule"], "all-running");
+		assert_eq!(j_all["offscreenEmitters"]["source"], "disabled-by-flag");
+		assert_eq!(j_all["fidelity"]["offscreenEmitters"], "all-running");
+		assert!(j_all["unmodeled"].as_array().unwrap().iter().any(|u| u["kind"] == "offscreenEmittersAllRunning"));
+		assert!(t_all.contains("offscreen emitters: all-running"), "{t_all}");
+		let f_all = j_all["frames"].as_array().unwrap();
+		assert!((48..=52).contains(&f_all[20]["particles"].as_u64().unwrap()), "worst-case flag should have BehindStream full at t=2.0, got {}", f_all[20]["particles"]);
+
+		// Real-engine 10 s away check: Rate 2, Speed 5, Lifetime 10 -> 0, 1, 2, 3, 4, 5 at +0..+2.5 s.
+		let mut stream_model = ModelBuilder::new("Stream");
+		let source = stream_model.part(&PartSpec { name: "Source".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, 25.0, 0.0)), size: Vec3::ONE, transparency: 1.0, ..Default::default() });
+		stream_model.child(
+			source,
+			InstanceBuilder::new("ParticleEmitter")
+				.with_name("Column")
+				.with_property("Rate", 2.0f32)
+				.with_property("Lifetime", NumberRange::new(10.0, 10.0))
+				.with_property("Speed", NumberRange::new(5.0, 5.0))
+				.with_property("Enabled", true),
+		);
+		let mut stream_doc = stream_model.into_document();
+		let eye = Vec3::new(-60.0, 25.0, 0.0);
+		let target = Vec3::new(0.0, 25.0, 0.0);
+		let stream_track = vec![
+			CameraKey { at: 0.0, cframe: look_at_cframe(eye, eye + (eye - target)), fov: 60.0 },
+			CameraKey { at: 10.0, cframe: look_at_cframe(eye, target), fov: 60.0 },
+		];
+		let out_stream = temp.join("stream");
+		std::fs::create_dir_all(&out_stream).unwrap();
+		let tl_stream = TimelineOptions {
+			start: 0.0,
+			duration: None,
+			auto_duration: false,
+			fps: 10.0,
+			times: Some(vec![10.0, 10.5, 11.0, 11.5, 12.0, 12.5]),
+			camera_track: Some(stream_track),
+			all_emitters_running: false,
+		};
+		run(&renderer, &mut stream_doc, None, &cost_opts, &tl_stream, &views, None, None, &out_stream, None, "stream.rbxmx", false, &|_| Ok(())).unwrap();
+		let j_stream: serde_json::Value = serde_json::from_slice(&std::fs::read(out_stream.join("timeline.json")).unwrap()).unwrap();
+		let counts: Vec<u64> = j_stream["frames"].as_array().unwrap().iter().map(|f| f["particles"].as_u64().unwrap()).collect();
+		assert_eq!(counts, vec![0, 1, 2, 3, 4, 5], "10 s unseen emitter must ramp 0..5 at 0.5 s steps");
 		let _ = std::fs::remove_dir_all(&temp);
 	}
 }

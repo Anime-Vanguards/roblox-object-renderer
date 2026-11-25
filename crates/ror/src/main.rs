@@ -265,6 +265,10 @@ struct CostArgs {
 	/// With --duration or --times: moving camera track JSON (list of {"at", "cframe", "fov"} keys)
 	#[arg(long, value_name = "FILE")]
 	camera_track: Option<PathBuf>,
+	/// With --duration or --times: worst-case mode where emitters out of the camera's view still
+	/// emit and age (default pauses out-of-view emitters, matching Roblox's client)
+	#[arg(long)]
+	all_emitters_running: bool,
 }
 
 #[derive(clap::Args)]
@@ -1780,10 +1784,21 @@ fn cost(mut args: CostArgs) -> Result<()> {
 			bail!("--times must be a non-empty list of finite non-negative seconds");
 		}
 		let camera_track = args.camera_track.as_deref().map(read_camera_track).transpose()?;
-		Some(ror::cost::timeline::TimelineOptions { start, duration, auto_duration, fps, times, camera_track })
+		Some(ror::cost::timeline::TimelineOptions {
+			start,
+			duration,
+			auto_duration,
+			fps,
+			times,
+			camera_track,
+			all_emitters_running: args.all_emitters_running,
+		})
 	} else {
 		if args.camera_track.is_some() {
 			bail!("--camera-track requires --duration or --times");
+		}
+		if args.all_emitters_running {
+			bail!("--all-emitters-running requires --duration or --times");
 		}
 		None
 	};
