@@ -1166,17 +1166,14 @@ fn render(mut args: RenderArgs) -> Result<()> {
 	Ok(())
 }
 
-/// `--camera-track`'s keys, in time order (skipping a leading engine-default key at `t = 0` when a
-/// later key exists unless `keep_default` is set).
-fn read_camera_track(path: &std::path::Path, keep_default: bool) -> Result<Vec<ror::video::CameraKey>> {
+/// Parses `--camera-track`'s JSON array of camera keys (normalization and any default-key skip
+/// notice happen once inside `video::run_with` / `cost::timeline::run` so CLI and service/JSON
+/// jobs behave and log identically).
+fn read_camera_track(path: &std::path::Path) -> Result<Vec<ror::video::CameraKey>> {
 	let text = std::fs::read_to_string(path).with_context(|| format!("--camera-track {}", path.display()))?;
 	let keys: Vec<ror::video::CameraKey> = serde_json::from_str(&text).with_context(|| format!("--camera-track {}: a list of {{\"at\", \"cframe\", \"fov\"}} keys", path.display()))?;
 	if keys.is_empty() {
 		bail!("--camera-track {}: no keys", path.display());
-	}
-	let (keys, skipped) = ror::video::normalize_camera_track(keys, keep_default);
-	if skipped {
-		eprintln!("ror: note: skipped leading engine-default camera key at t=0 in {} (pass --keep-default-camera to keep it)", path.display());
 	}
 	Ok(keys)
 }
@@ -1304,7 +1301,7 @@ fn video(mut args: VideoArgs) -> Result<()> {
 		frame,
 		focus: args.focus,
 		ffmpeg: ror::video::find_ffmpeg(),
-		camera_track: args.camera_track.as_deref().map(|path| read_camera_track(path, args.keep_default_camera)).transpose()?,
+		camera_track: args.camera_track.as_deref().map(read_camera_track).transpose()?,
 		keep_default_camera: args.keep_default_camera,
 		sheet_first: args.sheet_first,
 		copies: args
@@ -1915,7 +1912,7 @@ fn cost(mut args: CostArgs) -> Result<()> {
 			None => (None, false),
 		};
 		let times = args.times.as_deref().map(parse_cost_times).transpose()?;
-		let camera_track = args.camera_track.as_deref().map(|path| read_camera_track(path, args.keep_default_camera)).transpose()?;
+		let camera_track = args.camera_track.as_deref().map(read_camera_track).transpose()?;
 		Some(ror::cost::timeline::TimelineOptions {
 			start,
 			duration,
@@ -2578,10 +2575,14 @@ mod tests {
 			{ "at": 0.01667, "cframe": [5.0, 10.0, -20.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], "fov": 60.0 }
 		]);
 		std::fs::write(&temp, track.to_string()).unwrap();
-		let stripped = read_camera_track(&temp, false).unwrap();
+		let parsed = read_camera_track(&temp).unwrap();
+		assert_eq!(parsed.len(), 2, "read_camera_track preserves raw keys so video/cost normalize and log once");
+		let (stripped, skipped) = ror::video::normalize_camera_track(parsed.clone(), false);
+		assert!(skipped);
 		assert_eq!(stripped.len(), 1);
 		assert_eq!(stripped[0].cframe[0], 5.0);
-		let kept = read_camera_track(&temp, true).unwrap();
+		let (kept, skipped_kept) = ror::video::normalize_camera_track(parsed, true);
+		assert!(!skipped_kept);
 		assert_eq!(kept.len(), 2);
 		assert_eq!(kept[0].cframe[1], 20.0);
 		let _ = std::fs::remove_file(&temp);

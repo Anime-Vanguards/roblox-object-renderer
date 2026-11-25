@@ -1028,12 +1028,23 @@ impl Renderer {
 		if missing.is_empty() {
 			return (textures, images);
 		}
-		let Some(rur) = rur::locate() else {
-			warnings.push(format!("{} GUIs not drawn: rur not found (set ROR_RUR or RUR_HOME to a roblox-ui-renderer checkout, put one beside this one, or put rur on PATH)", missing.len()));
-			for (_, key, ..) in &missing {
-				skipped.insert(*key, "rur not found (set ROR_RUR or RUR_HOME)".into());
+		let rur = match rur::locate_diagnosed() {
+			Ok(Some(rur)) => rur,
+			Ok(None) => {
+				warnings.push(format!("{} GUIs not drawn: rur not found (set ROR_RUR or RUR_HOME to a roblox-ui-renderer checkout, put one beside this one, or put rur on PATH)", missing.len()));
+				for (_, key, ..) in &missing {
+					skipped.insert(*key, "rur not found (set ROR_RUR or RUR_HOME)".into());
+				}
+				return (textures, images);
 			}
-			return (textures, images);
+			Err(problem) => {
+				crate::say(&format!("warning: {problem}"));
+				warnings.push(format!("{} GUIs not drawn: {problem}", missing.len()));
+				for (_, key, ..) in &missing {
+					skipped.insert(*key, problem.clone());
+				}
+				return (textures, images);
+			}
 		};
 		let profile = std::env::var_os("ROR_PROFILE").is_some();
 		let started = Instant::now();
@@ -2130,6 +2141,66 @@ mod tests {
 		let (staged_a, stable_a) = rur::stage_local_files(&reqs_settled, &work);
 		assert_eq!(stable_a, vec![true, true], "unchanged file must be marked stable");
 		assert_ne!(staged_race.get(&sign), staged_a.get(&sign), "staged content-addressed path must change between B and A");
+
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	/// A GUI that failed transiently during video prefetch (reported in `guis.1` without being
+	/// pinned in `self.gui_failures`) must still be retried at draw time and clear its stale
+	/// skip reason once recovered.
+	#[test]
+	fn draw_time_retries_gui_that_failed_transiently_during_prefetch() {
+		use std::sync::Arc;
+
+		use crate::render::camera::CameraSpec;
+		use crate::render::{Background, Renderer, ViewRequest};
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use rbx_dom_weak::InstanceBuilder;
+		use rbx_dom_weak::types::Enum;
+
+		let dir = std::env::temp_dir().join(format!("ror-gui-retry-test-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&dir) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+
+		let mut model = ModelBuilder::new("RetryGui");
+		let part = model.part(&PartSpec { name: "Board".into(), size: Vec3::new(4.0, 4.0, 1.0), ..Default::default() });
+		let gui = model.child(part, InstanceBuilder::new("SurfaceGui").with_name("Sign").with_property("Face", Enum::from_u32(5)));
+		model.child(gui, InstanceBuilder::new("Frame").with_property("BackgroundTransparency", 0.0f32));
+		let scene = crate::scene::extract::extract(&model.into_document());
+		let view = ViewRequest {
+			width: 64,
+			height: 64,
+			msaa: 1,
+			bloom: false,
+			background: Background::Color([0.0, 0.0, 0.0]),
+			camera: CameraSpec::LookAt { eye: [0.0, 0.0, -10.0], target: [0.0; 3], fov: 50.0 },
+			..Default::default()
+		};
+		let camera = view.camera.place(scene.bounds(), view.width, view.height);
+		let draws = plan(&scene, &camera, &view);
+		assert_eq!(draws.len(), 1);
+		let key = draws[0].key;
+
+		// Populate the renderer's GPU GUI cache as if the transient failure resolved before draw time.
+		let image = Arc::new(GuiImage::from_rgba(4, 4, vec![255u8; 4 * 4 * 4]).unwrap());
+		let mut textures = GuiTextures::new();
+		let mut warn = Vec::new();
+		let mut skipped = HashMap::new();
+		renderer.upload_guis(vec![(key, image, true)], &mut textures, &mut warn, &mut skipped);
+		assert!(renderer.gui_textures.get(&key).is_some());
+
+		// Pass an empty ready map + a prefetch failure entry for `key`: draw-time retry must
+		// pick up the recovered texture, draw the GUI, and leave `gui_report.skipped` empty.
+		let prefetch_failed = (GuiTextures::new(), HashMap::from([(key, "transient prefetch error".to_string())]));
+		let (_pending, stats) = renderer
+			.submit_views(&scene, std::slice::from_ref(&view), None, None, Some(prefetch_failed), None, None)
+			.expect("render with draw-time GUI retry");
+		assert_eq!(stats.guis, 1, "GUI must be drawn after draw-time retry recovers it");
+		assert_eq!(stats.gui_report.drawn.len(), 1, "recovered GUI must appear in gui_report.drawn: {:?}", stats.gui_report);
+		assert!(stats.gui_report.skipped.is_empty(), "recovered GUI must not remain in gui_report.skipped: {:?}", stats.gui_report);
 
 		let _ = std::fs::remove_dir_all(&dir);
 	}

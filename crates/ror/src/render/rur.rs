@@ -69,34 +69,53 @@ fn checkout_from_path_entry(dir: &Path) -> Option<PathBuf> {
 	None
 }
 
-fn locate_with(ror_rur: Option<std::ffi::OsString>, rur_home: Option<std::ffi::OsString>, checkout: Option<PathBuf>, path_env: Option<std::ffi::OsString>) -> Option<PathBuf> {
-	for value in [ror_rur, rur_home].into_iter().flatten() {
-		if value.is_empty() {
-			continue;
-		}
-		if let Some(root) = checkout_root(Path::new(&value)) {
-			return Some(root);
-		}
+fn locate_with_diagnosed(
+	ror_rur: Option<std::ffi::OsString>,
+	rur_home: Option<std::ffi::OsString>,
+	checkout: Option<PathBuf>,
+	path_env: Option<std::ffi::OsString>,
+) -> std::result::Result<Option<PathBuf>, String> {
+	if let Some(value) = ror_rur.filter(|value| !value.is_empty()) {
+		return match checkout_root(Path::new(&value)) {
+			Some(root) => Ok(Some(root)),
+			None => Err(format!("ROR_RUR points at {}, which is not a rur checkout (expected cli/rur.mjs)", Path::new(&value).display())),
+		};
+	}
+	if let Some(value) = rur_home.filter(|value| !value.is_empty())
+		&& let Some(root) = checkout_root(Path::new(&value))
+	{
+		return Ok(Some(root));
 	}
 	if let Some(sibling) = checkout.map(|dir| dir.join("..").join("roblox-ui-renderer"))
 		&& let Some(root) = checkout_root(&sibling)
 	{
-		return Some(root);
+		return Ok(Some(root));
 	}
 	if let Some(paths) = path_env {
 		for dir in std::env::split_paths(&paths) {
+			// Skip empty PATH segments (such as a trailing `;` / `:`) so we never probe cwd.
+			if dir.as_os_str().is_empty() {
+				continue;
+			}
 			if let Some(root) = checkout_from_path_entry(&dir) {
-				return Some(root);
+				return Ok(Some(root));
 			}
 		}
 	}
-	None
+	Ok(None)
 }
 
 /// The rur checkout to use, if there is one: `ROR_RUR`, then `RUR_HOME`, then a sibling
 /// `../roblox-ui-renderer` beside a `ror` checkout, then `rur` / `rur.mjs` on `PATH`.
+/// Returns `Err` when `ROR_RUR` is explicitly set to a path that is not a rur checkout instead of
+/// silently falling through to another installation.
+pub fn locate_diagnosed() -> std::result::Result<Option<PathBuf>, String> {
+	locate_with_diagnosed(std::env::var_os("ROR_RUR"), std::env::var_os("RUR_HOME"), crate::output::checkout_dir(), std::env::var_os("PATH"))
+}
+
+/// The rur checkout to use, if there is one (`None` when absent or when `ROR_RUR` is invalid).
 pub fn locate() -> Option<PathBuf> {
-	locate_with(std::env::var_os("ROR_RUR"), std::env::var_os("RUR_HOME"), crate::output::checkout_dir(), std::env::var_os("PATH"))
+	locate_diagnosed().ok().flatten()
 }
 
 /// rur's state dir as its CLI resolves it (cli/paths.mjs): RUR_STATE_DIR, RUR_CACHE_DIR, else the
@@ -1030,19 +1049,28 @@ mod tests {
 		let path_env = std::env::join_paths([on_path.join("cli")]).unwrap();
 
 		// ROR_RUR wins over RUR_HOME, sibling, and PATH
-		assert_eq!(locate_with(Some(env_ror.as_os_str().to_os_string()), Some(env_home.as_os_str().to_os_string()), Some(checkout.clone()), Some(path_env.clone())), Some(env_ror.clone()));
+		assert_eq!(locate_with_diagnosed(Some(env_ror.as_os_str().to_os_string()), Some(env_home.as_os_str().to_os_string()), Some(checkout.clone()), Some(path_env.clone())), Ok(Some(env_ror.clone())));
 		// RUR_HOME works when ROR_RUR is unset (directory or direct cli/rur.mjs path)
-		assert_eq!(locate_with(None, Some(env_home.as_os_str().to_os_string()), Some(checkout.clone()), Some(path_env.clone())), Some(env_home.clone()));
-		assert_eq!(locate_with(None, Some(env_home.join("cli").join("rur.mjs").into_os_string()), None, None), Some(env_home.clone()));
-		// Invalid ROR_RUR falls through to RUR_HOME
-		assert_eq!(locate_with(Some(root.join("missing").into_os_string()), Some(env_home.as_os_str().to_os_string()), None, None), Some(env_home.clone()));
+		assert_eq!(locate_with_diagnosed(None, Some(env_home.as_os_str().to_os_string()), Some(checkout.clone()), Some(path_env.clone())), Ok(Some(env_home.clone())));
+		assert_eq!(locate_with_diagnosed(None, Some(env_home.join("cli").join("rur.mjs").into_os_string()), None, None), Ok(Some(env_home.clone())));
+		// Explicit stale/invalid ROR_RUR must error loudly and NOT silently fall through to RUR_HOME, sibling, or PATH
+		let missing = root.join("missing");
+		let err = locate_with_diagnosed(Some(missing.clone().into_os_string()), Some(env_home.as_os_str().to_os_string()), Some(checkout.clone()), Some(path_env.clone())).expect_err("stale ROR_RUR must error");
+		assert!(err.contains("ROR_RUR") && err.contains("not a rur checkout"), "unexpected stale ROR_RUR error: {err}");
 		// Sibling beside checkout wins over PATH when env vars are unset
-		let found_sibling = locate_with(None, None, Some(checkout), Some(path_env.clone())).unwrap();
+		let found_sibling = locate_with_diagnosed(None, None, Some(checkout), Some(path_env.clone())).unwrap().unwrap();
 		assert_eq!(found_sibling.canonicalize().unwrap(), sibling.canonicalize().unwrap());
 		// PATH resolves a rur checkout when env vars and sibling are absent
-		assert_eq!(locate_with(None, None, None, Some(path_env)).unwrap().canonicalize().unwrap(), on_path.canonicalize().unwrap());
+		assert_eq!(locate_with_diagnosed(None, None, None, Some(path_env)).unwrap().unwrap().canonicalize().unwrap(), on_path.canonicalize().unwrap());
+		// Empty PATH segments (e.g. a trailing `;` / `:`) must never probe cwd or its parents.
+		let prev_cwd = std::env::current_dir().unwrap();
+		std::env::set_current_dir(on_path.join("cli")).unwrap();
+		let sep = if cfg!(windows) { ";" } else { ":" };
+		let empty_res = locate_with_diagnosed(None, None, None, Some(std::ffi::OsString::from(format!("{sep}{sep}"))));
+		std::env::set_current_dir(&prev_cwd).unwrap();
+		assert_eq!(empty_res, Ok(None), "empty PATH segments must not match a rur checkout in cwd");
 		// None when nothing provides rur
-		assert_eq!(locate_with(None, None, None, None), None);
+		assert_eq!(locate_with_diagnosed(None, None, None, None), Ok(None));
 
 		let _ = std::fs::remove_dir_all(&root);
 	}

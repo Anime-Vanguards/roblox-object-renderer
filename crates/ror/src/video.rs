@@ -239,17 +239,24 @@ pub fn is_default_camera_key(key: &CameraKey) -> bool {
 	(key.fov - default_fov).abs() <= 1e-3 && key.cframe.iter().zip(default_cf).all(|(a, b)| (a - b).abs() <= 1e-3)
 }
 
+/// Maximum timestamp (seconds) for the second camera key when treating a leading engine-default
+/// `(0, 20, 20)` key at `t = 0` as a frame-0 recording artifact (~1.5 frames at 60 Hz: catches
+/// `1/60 s ≈ 0.0167 s` plus jitter, while keeping intentional opening shots that switch later).
+const DEFAULT_CAMERA_SKIP_WINDOW: f32 = 0.025;
+
 /// Sorts a camera track in time order and, unless `keep_default` is set, drops a leading
-/// engine-default camera key at `t = 0` when a strictly later key exists (`ree` writes the engine's
-/// default `(0, 20, 20)` camera at frame 0 before scripts position `Workspace.CurrentCamera`).
-/// Single-key tracks and tracks whose first key is explicitly authored stay unchanged.
-/// Returns `(keys, skipped_default)`.
+/// engine-default camera key at `t = 0` when the next key arrives within one frame
+/// (`<= 0.025 s`, matching `ree` recording Roblox's unpositioned `(0, 20, 20)` camera on frame 0
+/// before scripts set `Workspace.CurrentCamera` on frame 1). Single-key tracks, explicitly
+/// authored keys, and tracks that stay on the default camera past the opening frame stay
+/// unchanged. Returns `(keys, skipped_default)`.
 pub fn normalize_camera_track(mut keys: Vec<CameraKey>, keep_default: bool) -> (Vec<CameraKey>, bool) {
 	keys.sort_by(|a, b| a.at.total_cmp(&b.at));
 	let skip = !keep_default
 		&& keys.len() >= 2
 		&& keys[0].at.abs() <= 1e-4
 		&& keys[1].at > keys[0].at + 1e-4
+		&& keys[1].at <= DEFAULT_CAMERA_SKIP_WINDOW
 		&& is_default_camera_key(&keys[0]);
 	if skip {
 		keys.remove(0);
@@ -2470,6 +2477,17 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 		CopyRuns::none()
 	};
 
+	let normalized_job;
+	let job = if let Some(track) = job.camera_track.as_ref().filter(|track| !track.is_empty()) {
+		let (keys, skipped) = normalize_camera_track(track.clone(), job.keep_default_camera);
+		if skipped {
+			crate::say("note: skipped leading engine-default camera key at t=0 (pass --keep-default-camera / keepDefaultCamera: true to keep it)");
+		}
+		normalized_job = VideoJob { camera_track: Some(keys), ..job.clone() };
+		&normalized_job
+	} else {
+		job
+	};
 	let builder = Builder::new(|| input_bytes(renderer, &job.input), job, scenes)?;
 	// the document the clip's moments are made on, with its playback resolved, from the framing on
 	let held = Mutex::new(Vec::new());
@@ -3624,8 +3642,17 @@ mod tests {
 		assert_eq!(kept_delayed.len(), 2);
 		assert_eq!(kept_delayed[0], delayed_default);
 
-		// 6) VideoJob's watched() viewer uses the normalized track (and respects keep_default_camera).
-		let make_job = |keep_default_camera: bool| VideoJob {
+		// 5b) Leading default key at t=0 followed by a late scripted switch (e.g. t=0.1s or t=3s,
+		//     well past the opening frame) MUST be kept so the opening shot is not erased.
+		for late_at in [0.1f32, 3.0f32] {
+			let scripted = CameraKey { at: late_at, ..real_key.clone() };
+			let (kept_late, skipped_late) = normalize_camera_track(vec![default_key.clone(), scripted.clone()], false);
+			assert!(!skipped_late, "leading default key before a late switch at t={late_at}s must not be dropped");
+			assert_eq!(kept_late, vec![default_key.clone(), scripted]);
+		}
+
+		// 6) VideoJob's watched() viewer uses the normalized track (respects keep_default_camera and the 1-frame window).
+		let make_job = |track: Vec<CameraKey>, keep_default_camera: bool| VideoJob {
 			input: "x.rbxm".into(),
 			select: None,
 			out: None,
@@ -3648,19 +3675,71 @@ mod tests {
 			frame: None,
 			focus: None,
 			ffmpeg: None,
-			camera_track: Some(vec![default_key.clone(), real_key.clone()]),
+			camera_track: Some(track),
 			keep_default_camera,
 			sheet_first: false,
 			copies: Vec::new(),
 			relative_to: None,
 			nvenc: None,
 		};
-		let pb_stripped = watched(&make_job(false)).unwrap();
+		let pb_stripped = watched(&make_job(vec![default_key.clone(), real_key.clone()], false)).unwrap();
 		assert_eq!(pb_stripped.viewer.len(), 1);
 		assert_eq!(pb_stripped.viewer[0].cframe, real_key.cframe);
-		let pb_kept = watched(&make_job(true)).unwrap();
+		let pb_kept = watched(&make_job(vec![default_key.clone(), real_key.clone()], true)).unwrap();
 		assert_eq!(pb_kept.viewer.len(), 2);
 		assert_eq!(pb_kept.viewer[0].cframe, default_key.cframe);
+		let late_switch = CameraKey { at: 3.0, ..real_key.clone() };
+		let pb_late = watched(&make_job(vec![default_key.clone(), late_switch.clone()], false)).unwrap();
+		assert_eq!(pb_late.viewer.len(), 2, "watched() viewer must keep default@0 when next key is at 3.0s");
+		assert_eq!(pb_late.viewer[0].cframe, default_key.cframe);
+
+		// 7) JSON/service VideoJob running through run_with logs via crate::say when it drops a
+		//    frame-0 engine-default key, and does NOT log when the next key is late.
+		struct NoteSink(parking_lot::Mutex<Vec<String>>);
+		impl crate::Caller for NoteSink {
+			fn hear(&self, text: &str) {
+				self.0.lock().push(text.to_string());
+			}
+			fn gone(&self) -> bool {
+				false
+			}
+			fn setting(&self, _name: &str) -> Option<String> {
+				None
+			}
+		}
+		let dir = std::env::temp_dir().join(format!("ror-cam-track-say-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		let mut model = crate::scene::build::ModelBuilder::new("CamBox");
+		model.part(&crate::scene::build::PartSpec { name: "Box".into(), size: Vec3::splat(2.0), ..Default::default() });
+		let rbxm = dir.join("box.rbxm");
+		std::fs::write(&rbxm, model.to_rbxm().unwrap()).unwrap();
+		let gpu = std::sync::Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&dir) });
+		let renderer = crate::render::Renderer::new(gpu, assets).expect("a renderer");
+		let scenes = crate::job::SceneCache::default();
+
+		let mut job_short = make_job(vec![default_key.clone(), real_key.clone()], false);
+		job_short.input = rbxm.display().to_string();
+		job_short.out = Some(dir.join("short"));
+		job_short.view = ViewRequest { width: 32, height: 32, msaa: 1, bloom: false, ..Default::default() };
+		job_short.times = Some(vec![0.0]);
+		let sink = std::rc::Rc::new(NoteSink(parking_lot::Mutex::new(Vec::new())));
+		let res = crate::for_caller(sink.clone(), || run_with(&renderer, &scenes, &job_short, None, None)).unwrap();
+		assert_eq!(res.views[0].camera, real_key.cframe, "frame 0 must use the frame-1 scripted camera");
+		let notes = sink.0.lock().clone();
+		assert_eq!(notes.iter().filter(|n| n.contains("skipped leading engine-default camera key")).count(), 1, "JSON/service video job must log the skip once via crate::say, got: {notes:?}");
+
+		let mut job_late = make_job(vec![default_key.clone(), late_switch], false);
+		job_late.input = rbxm.display().to_string();
+		job_late.out = Some(dir.join("late"));
+		job_late.view = ViewRequest { width: 32, height: 32, msaa: 1, bloom: false, ..Default::default() };
+		job_late.times = Some(vec![0.0]);
+		let sink_late = std::rc::Rc::new(NoteSink(parking_lot::Mutex::new(Vec::new())));
+		let res_late = crate::for_caller(sink_late.clone(), || run_with(&renderer, &scenes, &job_late, None, None)).unwrap();
+		assert_eq!(res_late.views[0].camera, default_key.cframe, "frame 0 must keep the default camera when scripted key is at 3.0s");
+		assert!(sink_late.0.lock().iter().all(|n| !n.contains("skipped leading engine-default")), "late switch must not log a skip");
+		let _ = std::fs::remove_dir_all(&dir);
 	}
 
 	#[test]

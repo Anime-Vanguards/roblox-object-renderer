@@ -2505,10 +2505,24 @@ impl Renderer {
 		let gui_textures = if gui_draws.is_empty() {
 			HashMap::new()
 		} else {
-			// what was resolved ahead (a video frame's), the rest found now
-			let rest: Vec<&guis::GuiDraw> = gui_draws.iter().copied().filter(|draw| draw.keys().any(|key| !ready.contains_key(&key) && !gui_failures.contains_key(&key))).collect();
+			// What was resolved ahead (a video frame's), plus any missing keys retried at draw time
+			// (restoring recovery for GUIs that failed transiently during prefetch while avoiding
+			// duplicate warnings; persistent failures stay cached in `self.gui_failures`).
+			let rest: Vec<&guis::GuiDraw> = gui_draws.iter().copied().filter(|draw| draw.keys().any(|key| !ready.contains_key(&key))).collect();
 			if !rest.is_empty() {
-				ready.extend(self.gui_textures_reported(scene, &rest, &mut stats.warnings, &mut gui_failures));
+				let mut retry_warnings = Vec::new();
+				let mut retry_failures = HashMap::new();
+				let recovered = self.gui_textures_reported(scene, &rest, &mut retry_warnings, &mut retry_failures);
+				for key in recovered.keys() {
+					gui_failures.remove(key);
+				}
+				ready.extend(recovered);
+				gui_failures.extend(retry_failures);
+				for warning in retry_warnings {
+					if !stats.warnings.contains(&warning) {
+						stats.warnings.push(warning);
+					}
+				}
 			}
 			ready
 		};

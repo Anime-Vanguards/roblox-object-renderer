@@ -584,7 +584,13 @@ pub fn run(
 		.camera_track
 		.as_ref()
 		.filter(|track| !track.is_empty())
-		.map(|track| crate::video::normalize_camera_track(track.clone(), tl.keep_default_camera).0);
+		.map(|track| {
+			let (keys, skipped) = crate::video::normalize_camera_track(track.clone(), tl.keep_default_camera);
+			if skipped {
+				crate::say("note: skipped leading engine-default camera key at t=0 (pass --keep-default-camera / keepDefaultCamera: true to keep it)");
+			}
+			keys
+		});
 	let has_track = normalized_track.is_some();
 	let viewer_aspect = preset.width.max(1) as f32 / preset.height.max(1) as f32;
 
@@ -2208,6 +2214,64 @@ mod tests {
 		let txt = std::fs::read_to_string(out.join("analysis.txt")).unwrap();
 		assert!(rep.warnings.iter().any(|w| w.contains("rbxassetid://99999992")), "{:?}", rep.warnings);
 		assert!(txt.contains("warning: texture not loaded (bytes uncounted): rbxassetid://99999992"), "{txt}");
+		let _ = std::fs::remove_dir_all(&temp);
+	}
+
+	/// `cost::timeline` keeps a leading engine-default camera key when the next key arrives late
+	/// (e.g. `t = 3 s`), and skips + logs via `crate::say` when it arrives within one frame.
+	#[test]
+	fn timeline_camera_track_keeps_late_switch_and_logs_frame0_default_skip() {
+		struct NoteSink(parking_lot::Mutex<Vec<String>>);
+		impl crate::Caller for NoteSink {
+			fn hear(&self, text: &str) {
+				self.0.lock().push(text.to_string());
+			}
+			fn gone(&self) -> bool {
+				false
+			}
+			fn setting(&self, _name: &str) -> Option<String> {
+				None
+			}
+		}
+		let temp = std::env::temp_dir().join(format!("ror-timeline-cam-track-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&temp);
+		std::fs::create_dir_all(&temp).unwrap();
+		let renderer = make_test_renderer(&temp.join("cache"));
+		let mut model = ModelBuilder::new("CamTl");
+		model.part(&PartSpec { name: "Box".into(), size: Vec3::splat(2.0), ..Default::default() });
+		let base_doc = model.into_document();
+		let views = vec![NamedView {
+			name: "render".into(),
+			view: crate::render::ViewRequest { width: 320, height: 180, ..Default::default() },
+		}];
+		let default_key = crate::video::CameraKey { at: 0.0, cframe: crate::video::default_camera_cframe(), fov: 70.0 };
+		let scripted_frame1 = crate::video::CameraKey { at: 0.01667, cframe: [0.0, 2.0, 12.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], fov: 60.0 };
+		let scripted_late = crate::video::CameraKey { at: 3.0, ..scripted_frame1.clone() };
+
+		// 1. Frame-1 scripted key: skips default@0 and logs once via crate::say.
+		let out_short = temp.join("short");
+		std::fs::create_dir_all(&out_short).unwrap();
+		let tl_short = TimelineOptions { times: Some(vec![0.0]), camera_track: Some(vec![default_key.clone(), scripted_frame1]), ..Default::default() };
+		let sink_short = std::rc::Rc::new(NoteSink(parking_lot::Mutex::new(Vec::new())));
+		let mut doc_short = base_doc.copy();
+		crate::for_caller(sink_short.clone(), || {
+			run(&renderer, &mut doc_short, None, &CostOptions { attribute: true, pixels: false, no_images: true, ..Default::default() }, &tl_short, &views, None, None, &out_short, None, "cam.rbxmx", false, &|_| Ok(()))
+		})
+		.unwrap();
+		assert_eq!(sink_short.0.lock().iter().filter(|n| n.contains("skipped leading engine-default camera key")).count(), 1);
+
+		// 2. Late scripted key at t=3s: keeps default@0 and does not log a skip.
+		let out_late = temp.join("late");
+		std::fs::create_dir_all(&out_late).unwrap();
+		let tl_late = TimelineOptions { times: Some(vec![0.0]), camera_track: Some(vec![default_key, scripted_late]), ..Default::default() };
+		let sink_late = std::rc::Rc::new(NoteSink(parking_lot::Mutex::new(Vec::new())));
+		let mut doc_late = base_doc.copy();
+		crate::for_caller(sink_late.clone(), || {
+			run(&renderer, &mut doc_late, None, &CostOptions { attribute: true, pixels: false, no_images: true, ..Default::default() }, &tl_late, &views, None, None, &out_late, None, "cam.rbxmx", false, &|_| Ok(()))
+		})
+		.unwrap();
+		assert!(sink_late.0.lock().iter().all(|n| !n.contains("skipped leading engine-default")));
+
 		let _ = std::fs::remove_dir_all(&temp);
 	}
 }
