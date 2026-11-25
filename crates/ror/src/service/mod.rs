@@ -621,7 +621,20 @@ fn successor(state: Arc<State>, source: String, state_dir: PathBuf) {
 }
 
 fn handle(state: &State, stream: &TcpStream) -> Result<()> {
-	let request = http::read_request(stream)?;
+	handle_with_limit(state, stream, http::MAX_BODY)
+}
+
+fn handle_with_limit(state: &State, stream: &TcpStream, limit: usize) -> Result<()> {
+	let request = match http::read_request_with_limit(stream, limit) {
+		Ok(request) => request,
+		Err(http::ReadError::TooLarge { length, limit }) => {
+			let message = format!("request body is {length} bytes, over the {limit}-byte limit (pass large playbacks via playbackFile instead of inline)");
+			eprintln!("ror: refused request (413): {message}");
+			let body = serde_json::json!({ "error": message }).to_string();
+			return http::write_response_and_close(stream, 413, "application/json", body.as_bytes());
+		}
+		Err(http::ReadError::Other(error)) => return Err(error),
+	};
 	*state.last_activity.lock() = Instant::now();
 	let local_host = request.header("host").is_some_and(|host| host.starts_with("127.0.0.1:") || host.starts_with("localhost:"));
 	if request.header("x-ror") != Some("1") || !local_host {
@@ -1223,6 +1236,9 @@ mod tests {
 				let (stream, _) = listener.accept().unwrap();
 				handle(&server_state, &stream).unwrap();
 			}
+			// Fourth request tests an explicit over-limit body refusal through `handle_with_limit`.
+			let (stream, _) = listener.accept().unwrap();
+			handle_with_limit(&server_state, &stream, 64 * 1024).unwrap();
 		});
 
 		// 1. `/render` with `playbackFile` alone preserves the file's `time: 0.5` (block becomes hidden).
@@ -1267,6 +1283,14 @@ mod tests {
 		let video: serde_json::Value = serde_json::from_slice(&body).unwrap();
 		assert_eq!(video["frames"], 2);
 		assert_eq!(video["stats"]["parts"], 1);
+
+		// 4. An over-limit request body returns HTTP 413 with a clear refusal reason naming `playbackFile`.
+		let oversized = vec![b'a'; 256 * 1024];
+		let (status, body) = http::request_hearing(port, "POST", "/video", "X-ROR: 1", &oversized, Duration::from_secs(10), &mut |_| {}).expect("client must read 413 refusal");
+		assert_eq!(status, 413, "expected 413 Payload Too Large, got {status}: {}", String::from_utf8_lossy(&body));
+		let refusal: serde_json::Value = serde_json::from_slice(&body).unwrap();
+		let error = refusal["error"].as_str().unwrap_or("");
+		assert!(error.contains("262144") && error.contains("65536") && error.contains("playbackFile"), "unexpected 413 message: {error}");
 
 		server.join().unwrap();
 		drop(state);

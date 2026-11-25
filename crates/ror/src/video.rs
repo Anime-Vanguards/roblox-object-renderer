@@ -1479,7 +1479,14 @@ struct HelperSlot;
 
 impl HelperSlot {
 	fn take(most: usize) -> Option<Self> {
-		HELPERS.try_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire, |helpers| (helpers < most).then_some(helpers + 1)).ok().map(|_| Self)
+		let mut helpers = HELPERS.load(std::sync::atomic::Ordering::Acquire);
+		while helpers < most {
+			match HELPERS.compare_exchange_weak(helpers, helpers + 1, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire) {
+				Ok(_) => return Some(Self),
+				Err(current) => helpers = current,
+			}
+		}
+		None
 	}
 }
 

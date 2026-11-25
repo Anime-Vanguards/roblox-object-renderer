@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 
 pub struct Request {
 	pub method: String,
@@ -20,15 +20,47 @@ impl Request {
 	}
 }
 
-/// Chunk size when streaming a request body from a local client (no whole-body size limit).
+/// Maximum accepted HTTP request body size (512 MiB). Playbacks passed by path (`playbackFile`)
+/// keep normal requests to a few kilobytes; over-limit bodies get a clear HTTP 413 refusal.
+pub const MAX_BODY: usize = 512 << 20;
+
+/// Chunk size when streaming a request body from a local client.
 const BODY_CHUNK: usize = 1 << 20;
 
+/// How reading an HTTP request can fail.
+#[derive(Debug)]
+pub enum ReadError {
+	/// `Content-Length` exceeded the configured body limit.
+	TooLarge { length: usize, limit: usize },
+	/// Malformed HTTP, timeout, or I/O failure.
+	Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for ReadError {
+	fn from(error: anyhow::Error) -> Self {
+		Self::Other(error)
+	}
+}
+
+impl From<std::io::Error> for ReadError {
+	fn from(error: std::io::Error) -> Self {
+		Self::Other(error.into())
+	}
+}
+
 pub fn read_request(stream: &TcpStream) -> Result<Request> {
+	read_request_with_limit(stream, MAX_BODY).map_err(|error| match error {
+		ReadError::TooLarge { length, limit } => anyhow!("request body is {length} bytes, over the {limit}-byte limit"),
+		ReadError::Other(error) => error,
+	})
+}
+
+pub fn read_request_with_limit(stream: &TcpStream, limit: usize) -> std::result::Result<Request, ReadError> {
 	stream.set_read_timeout(Some(Duration::from_secs(30)))?;
 	let mut reader = BufReader::new(stream);
 	let mut line = String::new();
 	if reader.read_line(&mut line).context("request line")? == 0 {
-		bail!("empty request");
+		return Err(anyhow!("empty request").into());
 	}
 	let mut parts = line.split_whitespace();
 	let method = parts.next().context("method")?.to_string();
@@ -37,7 +69,7 @@ pub fn read_request(stream: &TcpStream) -> Result<Request> {
 	loop {
 		line.clear();
 		if reader.read_line(&mut line).context("header")? == 0 {
-			bail!("incomplete headers");
+			return Err(anyhow!("incomplete headers").into());
 		}
 		let trimmed = line.trim_end();
 		if trimmed.is_empty() {
@@ -47,15 +79,17 @@ pub fn read_request(stream: &TcpStream) -> Result<Request> {
 			headers.push((key.trim().to_string(), value.trim().to_string()));
 		}
 		if headers.len() > 100 {
-			bail!("too many headers");
+			return Err(anyhow!("too many headers").into());
 		}
 	}
 	let length: usize = match headers.iter().find(|(key, _)| key.eq_ignore_ascii_case("content-length")) {
 		Some((_, value)) => value.parse().with_context(|| format!("invalid Content-Length {value:?}"))?,
 		None => 0,
 	};
-	// Stream the body in chunks so arbitrarily large payloads never hit a fixed body cap and never
-	// pre-allocate gigabytes for a bogus Content-Length before bytes arrive.
+	if length > limit {
+		return Err(ReadError::TooLarge { length, limit });
+	}
+	// Stream the body in chunks so large payloads never pre-allocate gigabytes before bytes arrive.
 	let mut body = Vec::with_capacity(length.min(BODY_CHUNK));
 	let mut remaining = length;
 	let mut chunk = vec![0u8; remaining.min(BODY_CHUNK)];
@@ -63,7 +97,7 @@ pub fn read_request(stream: &TcpStream) -> Result<Request> {
 		let want = remaining.min(chunk.len());
 		let read = reader.read(&mut chunk[..want]).context("body")?;
 		if read == 0 {
-			bail!("unexpected EOF in request body ({} of {length} bytes read)", length - remaining);
+			return Err(anyhow!("unexpected EOF in request body ({} of {length} bytes read)", length - remaining).into());
 		}
 		body.extend_from_slice(&chunk[..read]);
 		remaining -= read;

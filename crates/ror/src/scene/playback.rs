@@ -2400,7 +2400,7 @@ impl Resolved<'_> {
 	/// frame could draw the emitter's particles (a ball about where it emits as far as they reach),
 	/// else 0, masked into `time_scale` and `spawn_scale` with precomputed [`ScaleCurve`]s. Worked
 	/// out once per grid.
-	fn watched_timeline(&self, referent: Ref, base: &Timeline, emitter: &super::particles::ParticleEmitter, track: Option<usize>, parent_now: Affine3A, inv: Option<Affine3A>, size_channel: Option<&Channel<'_>>) -> Option<std::sync::Arc<Timeline>> {
+	fn watched_timeline(&self, referent: Ref, base: &Timeline, emitter: &super::particles::ParticleEmitter, track: Option<(usize, Affine3A)>, parent_now: Affine3A, size_channel: Option<&Channel<'_>>) -> Option<std::sync::Arc<Timeline>> {
 		let viewer = &self.playback.viewer;
 		if viewer.is_empty() {
 			return None;
@@ -2428,9 +2428,9 @@ impl Resolved<'_> {
 				}
 				last_seen
 			} else {
-				let center = match (track, inv) {
-					(Some(track_idx), Some(inv)) => Vec3::from(((self.tracks[track_idx].pose(frame) * inv) * parent_now).translation),
-					_ => static_center,
+				let center = match track {
+					Some((track_idx, inv)) => Vec3::from(((self.tracks[track_idx].pose(frame) * inv) * parent_now).translation),
+					None => static_center,
 				};
 				let size = size_channel.and_then(|channel| channel.at_vec3(frame)).unwrap_or(emitter.size);
 				let radius = size.length() * 0.5 + reach_a + reach_b + reach_c;
@@ -2838,7 +2838,7 @@ impl Resolved<'_> {
 			let size_at = |t: f32| -> Vec3 { size_channel.and_then(|channel| channel.at_vec3(t)).unwrap_or(emitter.size) };
 			let velocity_at = |t: f32| (Vec3::from(frame_at(t + 1.0 / 120.0).translation) - Vec3::from(frame_at(t - 1.0 / 120.0).translation)) * 60.0;
 			// out of the viewer's view the emitter's clock stands still: it neither emits nor ages
-			let watched_tl = self.watched_timeline(referent, base_timeline, emitter, track, parent_now, inv, size_channel);
+			let watched_tl = self.watched_timeline(referent, base_timeline, emitter, track.zip(inv), parent_now, size_channel);
 			let timeline = watched_tl.as_deref().unwrap_or(base_timeline);
 			let start = -self.playback.prewarm;
 			let now = timeline.particle_time(start, time);
@@ -4494,5 +4494,82 @@ mod tests {
 		}
 		// Idle emitter is never enabled -> 0 substeps; Stream skips [0, 0.5) and [1.5, 2.8) -> well below 2 * 240.
 		assert!(total_substeps > 0 && total_substeps < 200, "disabled spans must be fast-skipped (got {total_substeps} substeps)");
+	}
+
+	#[test]
+	fn pretty_and_compact_playback_json_parse_identically() {
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use rbx_dom_weak::InstanceBuilder;
+		use rbx_dom_weak::types::NumberRange;
+
+		let sample = serde_json::json!({
+			"time": 0.6,
+			"prewarm": 0.25,
+			"frames": [0.0, 0.0166667, 0.0333333, 0.25, 0.5, 0.75, 1.0],
+			"actions": [
+				{ "at": 0.1, "target": "Fx.Part.Emitter", "enabled": true, "timeScale": 0.75 },
+				{ "at": 0.25, "target": "Fx.Part.Emitter", "emit": 4 },
+				{ "at": 0.4, "target": "Fx.Part", "set": { "Transparency": 0.25 } }
+			],
+			"motion": [
+				{
+					"target": "Fx.Part",
+					"keys": [
+						{ "at": 0.0, "cframe": [0.0, 1.0, 0.0] },
+						{ "at": 1.0, "cframe": [4.0, 2.0, -3.0] }
+					]
+				}
+			],
+			"tweens": [
+				{
+					"at": 0.0,
+					"duration": 1.0,
+					"target": "Fx.Part",
+					"property": "Size",
+					"to": [3.0, 3.0, 3.0],
+					"easing": "Quad",
+					"direction": "Out"
+				}
+			],
+			"viewer": [
+				{ "at": 0.0, "cframe": [0.0, 4.0, 20.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], "fov": 60.0, "aspect": 1.777778 }
+			]
+		});
+
+		let dir = std::env::temp_dir().join(format!("ror-playback-compact-pretty-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		let pretty_path = dir.join("pretty.json");
+		let compact_path = dir.join("compact.json");
+		let pretty_text = serde_json::to_string_pretty(&sample).unwrap();
+		let compact_text = serde_json::to_string(&sample).unwrap();
+		assert!(compact_text.len() < pretty_text.len(), "compact JSON must be smaller than pretty JSON");
+		std::fs::write(&pretty_path, &pretty_text).unwrap();
+		std::fs::write(&compact_path, &compact_text).unwrap();
+
+		let pretty = Playback::load_file(&pretty_path).unwrap();
+		let compact = Playback::load_file(&compact_path).unwrap();
+		assert_eq!(serde_json::to_value(&pretty).unwrap(), serde_json::to_value(&compact).unwrap());
+
+		let mut model = ModelBuilder::new("Fx");
+		let part = model.part(&PartSpec { name: "Part".into(), size: Vec3::splat(2.0), ..PartSpec::default() });
+		model.child(part, InstanceBuilder::new("ParticleEmitter").with_name("Emitter").with_property("Enabled", false).with_property("Rate", 20.0f32).with_property("Lifetime", NumberRange::new(1.0, 1.0)));
+		let mut doc_pretty = model.into_document();
+		let mut doc_compact = doc_pretty.copy();
+
+		let r_pretty = pretty.resolve(&doc_pretty).unwrap();
+		let u_pretty = r_pretty.apply_state(&mut doc_pretty).unwrap();
+		let mut s_pretty = crate::scene::extract::extract(&doc_pretty);
+		r_pretty.apply_history(&doc_pretty, &mut s_pretty);
+		u_pretty.restore(&mut doc_pretty);
+
+		let r_compact = compact.resolve(&doc_compact).unwrap();
+		let u_compact = r_compact.apply_state(&mut doc_compact).unwrap();
+		let mut s_compact = crate::scene::extract::extract(&doc_compact);
+		r_compact.apply_history(&doc_compact, &mut s_compact);
+		u_compact.restore(&mut doc_compact);
+
+		assert_eq!(s_pretty, s_compact);
+		let _ = std::fs::remove_dir_all(&dir);
 	}
 }
