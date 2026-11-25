@@ -78,21 +78,23 @@ pub fn encode_mask(
 		};
 		let occluded = prepared.draws.iter().any(|&(_, highlight)| prepared.styles[highlight].depth_mode == 1);
 		if occluded {
-			pass.set_pipeline(&pipelines.highlight_depth);
 			for item in draws.iter().filter(|item| !item.transparent && !item.decal) {
+				pass.set_pipeline(pipelines.highlight_depth.get(item.double_sided));
 				draw(&mut pass, item);
 			}
-			pass.set_pipeline(&pipelines.highlight_occluded);
 			for &(index, highlight) in &prepared.draws {
 				if prepared.styles[highlight].depth_mode == 1 {
-					draw(&mut pass, &draws[index]);
+					let item = &draws[index];
+					pass.set_pipeline(pipelines.highlight_occluded.get(item.double_sided));
+					draw(&mut pass, item);
 				}
 			}
 		}
-		pass.set_pipeline(&pipelines.highlight_on_top);
 		for &(index, highlight) in &prepared.draws {
 			if prepared.styles[highlight].depth_mode != 1 {
-				draw(&mut pass, &draws[index]);
+				let item = &draws[index];
+				pass.set_pipeline(pipelines.highlight_on_top.get(item.double_sided));
+				draw(&mut pass, item);
 			}
 		}
 	}
@@ -131,6 +133,87 @@ mod tests {
 		}
 		// a corner's diagonal neighbour is not (a cross kernel)
 		assert_eq!(at(0, 0), [100, 100, 100]);
+	}
+
+	/// Measured on Roblox client 0.748: a camera inside a single-sided Part sees neither that part's
+	/// Highlight (AlwaysOnTop or Occluded) nor Highlight occlusion from its back faces; a
+	/// DoubleSided part draws its Highlight and occludes Highlights behind it from inside.
+	#[test]
+	fn camera_inside_single_sided_part_culls_highlight_and_highlight_occlusion() {
+		use std::sync::Arc;
+
+		use glam::{Affine3A, Vec3};
+
+		use crate::render::camera::CameraSpec;
+		use crate::render::{Background, Renderer, ViewRequest};
+		use crate::scene::build::{ModelBuilder, PartSpec};
+
+		let state = std::env::temp_dir().join(format!("ror-inside-highlight-test-{}", std::process::id()));
+		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+
+		let mut model = ModelBuilder::new("InsideHighlight");
+		model.part(&PartSpec { name: "Enclosure".into(), size: Vec3::splat(4.0), color: [0, 0, 255], ..Default::default() });
+		model.part(&PartSpec { name: "Backdrop".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, 0.0, -10.0)), size: Vec3::new(40.0, 40.0, 1.0), color: [255, 0, 0], ..Default::default() });
+		let base = crate::scene::extract::extract(&model.into_document());
+		let enclosure = base.parts.iter().position(|part| part.path.ends_with("Enclosure")).unwrap();
+		let backdrop = base.parts.iter().position(|part| part.path.ends_with("Backdrop")).unwrap();
+
+		let view = ViewRequest {
+			width: 64,
+			height: 64,
+			msaa: 1,
+			bloom: false,
+			background: Background::Sky,
+			camera: CameraSpec::LookAt { eye: [0.0, 0.0, 0.0], target: [0.0, 0.0, -10.0], fov: 70.0 },
+			..Default::default()
+		};
+		let center = (32 * 64 + 32) * 4;
+		let blue_highlight = |depth_mode: u32| Highlight {
+			parts: vec![enclosure],
+			fill_color: Vec3::new(0.0, 0.0, 1.0),
+			fill_transparency: 0.0,
+			outline_color: Vec3::new(0.0, 0.0, 1.0),
+			outline_transparency: 1.0,
+			depth_mode,
+		};
+		let cyan_occluded = Highlight {
+			parts: vec![backdrop],
+			fill_color: Vec3::new(0.0, 1.0, 1.0),
+			fill_transparency: 0.0,
+			outline_color: Vec3::new(0.0, 1.0, 1.0),
+			outline_transparency: 1.0,
+			depth_mode: 1,
+		};
+
+		// 1. Single-sided enclosure with AlwaysOnTop blue Highlight + Backdrop with Occluded cyan Highlight:
+		//    enclosure's back faces must draw no blue Highlight and must NOT occlude Backdrop's Highlight.
+		for depth_mode in [0u32, 1u32] {
+			let mut scene = base.clone();
+			scene.highlights = vec![blue_highlight(depth_mode), cyan_occluded.clone()];
+			let (images, _) = renderer.render(&scene, std::slice::from_ref(&view)).expect("single-sided highlight render");
+			let rgb = &images[0].rgba[center..center + 3];
+			assert_eq!(rgb, [0, 255, 255], "depth_mode={depth_mode}: expected unoccluded cyan backdrop, got {rgb:?}");
+		}
+
+		// 2. DoubleSided enclosure with AlwaysOnTop blue Highlight: back faces DO draw pure blue.
+		let mut double_hl = base.clone();
+		Arc::make_mut(&mut double_hl.parts[enclosure]).double_sided = true;
+		double_hl.highlights = vec![blue_highlight(0)];
+		let (images, _) = renderer.render(&double_hl, std::slice::from_ref(&view)).expect("double-sided highlight render");
+		assert_eq!(&images[0].rgba[center..center + 3], [0, 0, 255]);
+
+		// 3. DoubleSided enclosure without Highlight in front of Backdrop with Occluded cyan Highlight:
+		//    DoubleSided back faces DO occlude Backdrop's Highlight.
+		let mut double_occ = base.clone();
+		Arc::make_mut(&mut double_occ.parts[enclosure]).double_sided = true;
+		double_occ.highlights = vec![cyan_occluded];
+		let (images, _) = renderer.render(&double_occ, std::slice::from_ref(&view)).expect("double-sided occlusion render");
+		let rgb = &images[0].rgba[center..center + 3];
+		assert!(rgb[2] > 100 && rgb[1] < 80, "expected DoubleSided enclosure to occlude cyan backdrop highlight, got {rgb:?}");
+
+		let _ = std::fs::remove_dir_all(&state);
 	}
 }
 

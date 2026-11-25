@@ -12,16 +12,31 @@ const IDS: &str = include_str!("../../shaders/ids.wgsl");
 pub const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Uint;
 pub const PART_ID_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 
+/// A pair of id/depth pipelines matching the main pass's culling: back-face culled for single-sided
+/// parts, unculled for `DoubleSided` ones (measured on Roblox client 0.748: cameras inside a
+/// single-sided part see through its back faces in the main pass, in Highlights, and in Highlight
+/// occlusion; `DoubleSided = true` MeshParts draw and occlude from inside).
+pub struct CullPair {
+	pub single: wgpu::RenderPipeline,
+	pub double: wgpu::RenderPipeline,
+}
+
+impl CullPair {
+	pub fn get(&self, double_sided: bool) -> &wgpu::RenderPipeline {
+		if double_sided { &self.double } else { &self.single }
+	}
+}
+
 pub struct IdPipelines {
 	ids_layout: wgpu::BindGroupLayout,
 	/// every opaque part's depth (for Highlights' DepthMode Occluded), no ids
-	pub highlight_depth: wgpu::RenderPipeline,
+	pub highlight_depth: CullPair,
 	/// Highlight ids where nothing nearer covers them
-	pub highlight_occluded: wgpu::RenderPipeline,
+	pub highlight_occluded: CullPair,
 	/// Highlight ids over everything
-	pub highlight_on_top: wgpu::RenderPipeline,
+	pub highlight_on_top: CullPair,
 	/// the frontmost part's id
-	pub part_ids: wgpu::RenderPipeline,
+	pub part_ids: CullPair,
 }
 
 impl IdPipelines {
@@ -37,12 +52,12 @@ impl IdPipelines {
 		});
 		let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("ids"), source: wgpu::ShaderSource::Wgsl(format!("{COMMON}\n{IDS}").into()) });
 		let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("ids"), bind_group_layouts: &[frame_layout, &ids_layout], push_constant_ranges: &[] });
-		let pipeline = |label: &str, format: wgpu::TextureFormat, write_depth: bool, compare: wgpu::CompareFunction, write_ids: bool| {
+		let pipeline = |label: &str, format: wgpu::TextureFormat, write_depth: bool, compare: wgpu::CompareFunction, write_ids: bool, cull_mode: Option<wgpu::Face>| {
 			device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
 				label: Some(label),
 				layout: Some(&layout),
 				vertex: wgpu::VertexState { module: &module, entry_point: Some("vs_ids"), buffers: &[Vertex::layout()], compilation_options: Default::default() },
-				primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+				primitive: wgpu::PrimitiveState { cull_mode, ..Default::default() },
 				depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: write_depth, depth_compare: compare, stencil: Default::default(), bias: Default::default() }),
 				multisample: Default::default(),
 				fragment: Some(wgpu::FragmentState {
@@ -55,12 +70,16 @@ impl IdPipelines {
 				cache,
 			})
 		};
+		let pair = |label: &str, format: wgpu::TextureFormat, write_depth: bool, compare: wgpu::CompareFunction, write_ids: bool| CullPair {
+			single: pipeline(label, format, write_depth, compare, write_ids, Some(wgpu::Face::Back)),
+			double: pipeline(&format!("{label} double-sided"), format, write_depth, compare, write_ids, None),
+		};
 		// reversed depth (cleared to 0, nearer is greater), as the main pass
 		Self {
-			highlight_depth: pipeline("highlight depth", MASK_FORMAT, true, wgpu::CompareFunction::GreaterEqual, false),
-			highlight_occluded: pipeline("highlight occluded", MASK_FORMAT, false, wgpu::CompareFunction::GreaterEqual, true),
-			highlight_on_top: pipeline("highlight on top", MASK_FORMAT, false, wgpu::CompareFunction::Always, true),
-			part_ids: pipeline("part ids", PART_ID_FORMAT, true, wgpu::CompareFunction::GreaterEqual, true),
+			highlight_depth: pair("highlight depth", MASK_FORMAT, true, wgpu::CompareFunction::GreaterEqual, false),
+			highlight_occluded: pair("highlight occluded", MASK_FORMAT, false, wgpu::CompareFunction::GreaterEqual, true),
+			highlight_on_top: pair("highlight on top", MASK_FORMAT, false, wgpu::CompareFunction::Always, true),
+			part_ids: pair("part ids", PART_ID_FORMAT, true, wgpu::CompareFunction::GreaterEqual, true),
 			ids_layout,
 		}
 	}
@@ -258,10 +277,10 @@ pub fn encode_layers(
 			timestamp_writes: profile.pass("layers opaque"),
 			occlusion_query_set: None,
 		});
-		pass.set_pipeline(&ids.part_ids);
 		pass.set_bind_group(0, frame_group, &[]);
 		pass.set_bind_group(1, &owners_group, &[]);
 		for item in draws.iter().filter(|item| !item.decal && !item.highlight_only && !item.transparent) {
+			pass.set_pipeline(ids.part_ids.get(item.double_sided));
 			pass.set_vertex_buffer(0, item.mesh.vertex_buffer.slice(..));
 			pass.set_index_buffer(item.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 			pass.draw_indexed(item.indices.clone(), 0, item.instance..item.instance + 1);
@@ -369,10 +388,10 @@ pub fn encode_part_ids(
 			timestamp_writes: profile.pass("part ids"),
 			occlusion_query_set: None,
 		});
-		pass.set_pipeline(&pipelines.part_ids);
 		pass.set_bind_group(0, frame_group, &[]);
 		pass.set_bind_group(1, ids, &[]);
 		for item in draws.iter().filter(|item| !item.decal && !item.highlight_only) {
+			pass.set_pipeline(pipelines.part_ids.get(item.double_sided));
 			pass.set_vertex_buffer(0, item.mesh.vertex_buffer.slice(..));
 			pass.set_index_buffer(item.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 			pass.draw_indexed(item.indices.clone(), 0, item.instance..item.instance + 1);
@@ -438,6 +457,48 @@ mod tests {
 		let total: u32 = layers.blended.iter().sum();
 		assert_eq!(layers.part_blended[left] + layers.part_blended[all] + layers.part_blended[wall], total, "each part's fragments add up to the pixels' layers");
 		assert!(layers.part_blended[all] > layers.part_blended[left] * 3 / 2, "the full sheet covers about twice the half one");
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	/// A camera inside a single-sided Part sees through its back faces in `part_ids` (`--ids`) and
+	/// `layers` just as it does in the main pass; a `DoubleSided` part keeps its back faces in both.
+	#[test]
+	fn camera_inside_single_sided_part_culls_back_faces_in_ids_and_layers() {
+		let state = std::env::temp_dir().join(format!("ror-inside-ids-test-{}", std::process::id()));
+		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let mut model = ModelBuilder::new("Inside");
+		model.part(&PartSpec { name: "Enclosure".into(), size: Vec3::splat(4.0), color: [0, 0, 255], ..Default::default() });
+		model.part(&PartSpec { name: "Backdrop".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, 0.0, -10.0)), size: Vec3::new(40.0, 40.0, 1.0), color: [255, 0, 0], ..Default::default() });
+		let mut scene = crate::scene::extract::extract(&model.into_document());
+		let enclosure = scene.parts.iter().position(|part| part.path.ends_with("Enclosure")).unwrap();
+		let backdrop = scene.parts.iter().position(|part| part.path.ends_with("Backdrop")).unwrap();
+		let view = ViewRequest {
+			width: 64,
+			height: 64,
+			msaa: 1,
+			bloom: false,
+			ids: true,
+			layers: true,
+			background: Background::Sky,
+			camera: CameraSpec::LookAt { eye: [0.0, 0.0, 0.0], target: [0.0, 0.0, -10.0], fov: 70.0 },
+			..Default::default()
+		};
+		let (images, _) = renderer.render(&scene, std::slice::from_ref(&view)).expect("single-sided render");
+		let center = 32 * 64 + 32;
+		assert_eq!(images[0].ids.as_ref().unwrap()[center], backdrop as u32 + 1, "single-sided enclosure back faces must not claim part_ids");
+		assert_eq!(images[0].layers.as_ref().unwrap().opaque[center], backdrop as u32 + 1, "single-sided enclosure back faces must not claim opaque layers");
+		let pixel = &images[0].rgba[center * 4..center * 4 + 3];
+		assert!(pixel[0] > 120 && pixel[2] < 60, "expected red backdrop through single-sided enclosure, got {pixel:?}");
+
+		// A DoubleSided enclosure draws its back faces in RGBA, part_ids, and layers.
+		Arc::make_mut(&mut scene.parts[enclosure]).double_sided = true;
+		let (images, _) = renderer.render(&scene, std::slice::from_ref(&view)).expect("double-sided render");
+		assert_eq!(images[0].ids.as_ref().unwrap()[center], enclosure as u32 + 1, "DoubleSided enclosure back faces must appear in part_ids");
+		assert_eq!(images[0].layers.as_ref().unwrap().opaque[center], enclosure as u32 + 1, "DoubleSided enclosure back faces must appear in opaque layers");
+		let pixel = &images[0].rgba[center * 4..center * 4 + 3];
+		assert!(pixel[2] > 100 && pixel[0] < 60, "expected blue DoubleSided enclosure interior, got {pixel:?}");
 		let _ = std::fs::remove_dir_all(&state);
 	}
 }
