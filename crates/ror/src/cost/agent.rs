@@ -117,8 +117,8 @@ pub struct Costed {
 	/// device, not only the preset's. The same as the counted pixels' parts where the preset culls
 	/// nothing; `None` without pixels.
 	pub shown: Option<std::collections::HashSet<usize>>,
-	/// Deduplicated mesh and texture memory in bytes for the scene.
-	pub memory: MemoryReport,
+	/// Deduplicated mesh and texture memory upper-bound estimate in bytes (only when `options.memory` is set).
+	pub memory: Option<MemoryReport>,
 }
 
 pub struct Setup<'a> {
@@ -153,6 +153,10 @@ pub fn preset_of(options: &CostOptions, shots: &[(Camera, u32, u32)]) -> Result<
 
 /// Costs `scene` from every view: the model's counts, the layers' pixels and the attribution.
 pub fn cost(setup: &Setup, scene: &Scene, document: &Document, ids: &InstanceIds, merges: &HashMap<usize, String>) -> Result<Costed> {
+	cost_inner(setup, scene, document, ids, merges, setup.options.memory)
+}
+
+fn cost_inner(setup: &Setup, scene: &Scene, document: &Document, ids: &InstanceIds, merges: &HashMap<usize, String>, measure_memory: bool) -> Result<Costed> {
 	let options = setup.options;
 	let analysis = Analysis::new_with(scene, document, &setup.renderer.assets, options, merges);
 	let costs: Vec<ViewCost> = setup.names.par_iter().zip(setup.shots.par_iter()).map(|(name, (camera, width, height))| analysis.view(name, camera, *width as f32 / (*height).max(1) as f32, options)).collect();
@@ -233,7 +237,7 @@ pub fn cost(setup: &Setup, scene: &Scene, document: &Document, ids: &InstanceIds
 		.zip(pixels.par_iter())
 		.map(|((cost, (camera, _, _)), counted)| attribute::view(scene, &analysis, &owners, ids, cost, camera, counted.as_ref(), &setup.preset, &setup.quality))
 		.collect();
-	let memory = memory::measure(scene, &analysis.meshes, &setup.renderer.assets);
+	let memory = measure_memory.then(|| memory::measure(scene, &analysis.meshes, &setup.renderer.assets));
 	Ok(Costed { analysis, owners, costs, pixels, works, frames, shown, memory })
 }
 
@@ -308,7 +312,7 @@ pub fn run(setup: &Setup, scene: &Scene, document: &Document, reload: Option<&dy
 	let over: Vec<&ViewLine> = views.iter().filter(|view| !view.over_budget.is_empty()).collect();
 	let parents: std::collections::HashSet<&str> = tree.iter().filter_map(|node| node.parent.as_deref()).collect();
 	let top_nodes: Vec<&Node> = tree.iter().filter(|node| !parents.contains(node.id.as_str()) && node.id != attribute::SHARED).take(20).collect();
-	let analysis_json = json!({
+	let mut analysis_json = json!({
 		"schema": SCHEMA,
 		"input": input,
 		"preset": setup.preset,
@@ -322,15 +326,17 @@ pub fn run(setup: &Setup, scene: &Scene, document: &Document, reload: Option<&dy
 		"views": views,
 		"mean": mean,
 		"worst": worst_view.map(|work| json!({ "view": work.name, "work": work.total.rounded() })),
-		"memory": costed.memory,
 		"budget": budget.as_ref().map(|budget| json!({ "limits": budget, "viewsOver": over.len(), "views": views.len() })),
 		"topInstances": top_nodes,
 		"findings": found,
 		"files": { "tree": "tree.json", "summary": "analysis.txt", "costs": "cost.json" },
 	});
+	if let Some(memory) = &costed.memory {
+		analysis_json["memory"] = serde_json::to_value(memory)?;
+	}
 	crate::output::write_json_atomic(&out.join("analysis.json"), &analysis_json, true)?;
 	crate::output::write_json_atomic(&out.join("tree.json"), &json!({ "schema": TREE_SCHEMA, "views": costed.works.iter().map(|work| work.name.clone()).collect::<Vec<_>>(), "nodes": tree }), false)?;
-	let mut lines = summary_lines(input, setup, &views, &mean, worst_view, &costed.memory, &tree, &found, budget.as_ref());
+	let mut lines = summary_lines(input, setup, &views, &mean, worst_view, costed.memory.as_ref(), &tree, &found, budget.as_ref());
 	if options.heat {
 		write_heat(&costed, out)?;
 		lines.push(format!("heat images: <view>.heat-cost.png, .heat-overdraw.png, .heat-lights.png, .heat-density.png in {}", out.display()));
@@ -360,7 +366,7 @@ fn ms(value: f64) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn summary_lines(input: &str, setup: &Setup, views: &[ViewLine], mean: &Work, worst: Option<&ViewWork>, memory: &MemoryReport, tree: &[Node], found: &[Finding], budget: Option<&Budget>) -> Vec<String> {
+fn summary_lines(input: &str, setup: &Setup, views: &[ViewLine], mean: &Work, worst: Option<&ViewWork>, memory: Option<&MemoryReport>, tree: &[Node], found: &[Finding], budget: Option<&Budget>) -> Vec<String> {
 	let mut lines = Vec::new();
 	let quality_label = match setup.quality.client_level {
 		Some(bar) => format!("quality {} (client bar {bar}, {:.0} studs)", setup.quality.level, setup.quality.view_distance),
@@ -399,7 +405,9 @@ fn summary_lines(input: &str, setup: &Setup, views: &[ViewLine], mean: &Work, wo
 		}
 		lines.push("fidelity: desktop CPU ms is estimated from one reference PC ratio (1/2.224, not players' desktops); desktop GPU ms is uncalibrated (gpuMs = null); findings rank by combined CPU + gpuUnits share".into());
 	}
-	lines.push(memory::summary_line(memory, !desktop));
+	if let Some(memory) = memory {
+		lines.push(memory::summary_line(memory, !desktop));
+	}
 	if let Some(budget) = budget {
 		let over: Vec<&ViewLine> = views.iter().filter(|view| !view.over_budget.is_empty()).collect();
 		lines.push(format!("budget {} ({} draws, {}k triangles, {} per view): {} of {} views over", budget.name, budget.draws, budget.triangles / 1000, ms(budget.ms), over.len(), views.len()));
@@ -668,7 +676,7 @@ fn whatif(setup: &Setup, scene: &Scene, ids: &InstanceIds, baseline: &Costed, fi
 			edited.materials = scene.materials.clone();
 		}
 		let merges = merge_indices(&edited, &applied.merges);
-		let after = cost(setup, &edited, &document, &trial_ids, &merges)?;
+		let after = cost_inner(setup, &edited, &document, &trial_ids, &merges, false)?;
 		let after_images = if options.look { Some(setup.renderer.render_gated(&edited, &look_requests, setup.gpu)?.0) } else { None };
 		let folder = out.join("look").join(&folder_name);
 		let mut views = Vec::new();
@@ -1041,31 +1049,42 @@ mod tests {
 		}];
 		let shots = vec![(spec.place(None, 320, 180), 320, 180)];
 
-		let run_case = |name: &str, options: CostOptions| -> (Vec<String>, Vec<String>) {
+		let run_case = |name: &str, options: CostOptions| -> (crate::cost::CostReport, std::path::PathBuf) {
 			let out = state.join(name);
 			std::fs::create_dir_all(&out).unwrap();
 			let rep = crate::cost::run(&renderer, &scene, &document, &options, &views, &shots, &out, None, None, "map", (false, false)).unwrap();
-			(rep.lines, rep.agent)
+			(rep, out)
 		};
 
 		let mem_lines = |lines: &[String], agent: &[String]| -> Vec<String> {
 			lines.iter().chain(agent.iter()).filter(|l| l.starts_with("memory (")).cloned().collect()
 		};
 
-		let (plain_lines, plain_agent) = run_case("plain", CostOptions { attribute: true, pixels: false, no_images: true, ..Default::default() });
-		let (phone_lines, phone_agent) = run_case("phone", CostOptions { attribute: true, pixels: false, no_images: true, preset: Some("phone".into()), ..Default::default() });
-		let (desk_lines, desk_agent) = run_case("desktop", CostOptions { attribute: true, pixels: false, no_images: true, preset: Some("desktop".into()), ..Default::default() });
-		let (no_agent_lines, no_agent) = run_case("no_agent", CostOptions { attribute: false, pixels: false, no_images: true, ..Default::default() });
+		// Without --memory (default): reads zero textures and emits no memory block or line.
+		let before_bytes = renderer.assets.memory_cache_bytes();
+		let (opt_out, opt_out_dir) = run_case("opt_out", CostOptions { attribute: true, pixels: false, no_images: true, ..Default::default() });
+		assert!(opt_out.memory.is_none(), "default run without --memory must omit CostReport.memory");
+		assert!(mem_lines(&opt_out.lines, &opt_out.agent).is_empty(), "default run without --memory must emit zero memory lines");
+		let opt_out_analysis: Value = serde_json::from_slice(&std::fs::read(opt_out_dir.join("analysis.json")).unwrap()).unwrap();
+		assert!(opt_out_analysis.get("memory").is_none(), "default analysis.json without --memory must omit memory key");
+		assert_eq!(renderer.assets.memory_cache_bytes(), before_bytes, "cost run without --memory must not read scene textures");
 
-		let plain_mem = mem_lines(&plain_lines, &plain_agent);
-		let phone_mem = mem_lines(&phone_lines, &phone_agent);
-		let desk_mem = mem_lines(&desk_lines, &desk_agent);
-		let no_agent_mem = mem_lines(&no_agent_lines, &no_agent);
+		// With --memory: prints one memory line matching preset pricing and populates memory report.
+		let (plain, _) = run_case("plain", CostOptions { attribute: true, pixels: false, no_images: true, memory: true, ..Default::default() });
+		let (phone, _) = run_case("phone", CostOptions { attribute: true, pixels: false, no_images: true, memory: true, preset: Some("phone".into()), ..Default::default() });
+		let (desk, _) = run_case("desktop", CostOptions { attribute: true, pixels: false, no_images: true, memory: true, preset: Some("desktop".into()), ..Default::default() });
+		let (no_agent, _) = run_case("no_agent", CostOptions { attribute: false, pixels: false, no_images: true, memory: true, ..Default::default() });
+		assert!(renderer.assets.memory_cache_bytes() > before_bytes, "--memory run must read the texture");
 
-		assert_eq!(plain_mem.len(), 1, "plain stdout must print one memory line: lines={plain_lines:?} agent={plain_agent:?}");
-		assert_eq!(phone_mem.len(), 1, "phone stdout must print one memory line: lines={phone_lines:?} agent={phone_agent:?}");
-		assert_eq!(desk_mem.len(), 1, "desktop stdout must print one memory line: lines={desk_lines:?} agent={desk_agent:?}");
-		assert_eq!(no_agent_mem.len(), 1, "non-attributed stdout must print one memory line: {no_agent_lines:?}");
+		let plain_mem = mem_lines(&plain.lines, &plain.agent);
+		let phone_mem = mem_lines(&phone.lines, &phone.agent);
+		let desk_mem = mem_lines(&desk.lines, &desk.agent);
+		let no_agent_mem = mem_lines(&no_agent.lines, &no_agent.agent);
+
+		assert_eq!(plain_mem.len(), 1, "plain --memory stdout must print one memory line: lines={:?} agent={:?}", plain.lines, plain.agent);
+		assert_eq!(phone_mem.len(), 1, "phone --memory stdout must print one memory line: lines={:?} agent={:?}", phone.lines, phone.agent);
+		assert_eq!(desk_mem.len(), 1, "desktop --memory stdout must print one memory line: lines={:?} agent={:?}", desk.lines, desk.agent);
+		assert_eq!(no_agent_mem.len(), 1, "non-attributed --memory stdout must print one memory line: {:?}", no_agent.lines);
 		assert_eq!(plain_mem[0], phone_mem[0], "plain (phone frame) and --preset phone must report the exact same memory line");
 		assert!(plain_mem[0].contains("ETC2") && !plain_mem[0].contains("BCn"), "plain phone-frame run must print ETC2: {}", plain_mem[0]);
 		assert!(desk_mem[0].contains("BCn") && !desk_mem[0].contains("ETC2"), "desktop run must print BCn: {}", desk_mem[0]);

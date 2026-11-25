@@ -458,6 +458,35 @@ pub fn measure_many(scenes: &[&Scene], mesh_stats: &HashMap<String, Arc<MeshStat
 	mesh_mem.top = mesh_entries;
 
 	// 2. Collect authored texture references across all scenes (deduplicated by canonical URI).
+	// When online, batch-warm any uncached TexturePack XMLs first so pack inspection runs without
+	// serial HTTP round-trips.
+	let offline_assets = assets.with_offline(true);
+	if !assets.offline() {
+		let mut uncached_packs = Vec::new();
+		let mut seen_packs = std::collections::HashSet::new();
+		for scene in scenes {
+			for part in &scene.parts {
+				if let Some(pack) = part.surface_appearance.as_ref().and_then(|a| a.texture_pack.as_deref())
+					&& is_asset_id(pack)
+					&& seen_packs.insert(meshes::canonical(pack))
+					&& offline_assets.fetch(pack).is_err()
+				{
+					uncached_packs.push(Download::Asset(pack.trim().to_string()));
+				}
+				if let Some(pack) = scene.materials.variant(part.material, &part.material_variant).and_then(|v| v.texture_pack.as_deref())
+					&& is_asset_id(pack)
+					&& seen_packs.insert(meshes::canonical(pack))
+					&& offline_assets.fetch(pack).is_err()
+				{
+					uncached_packs.push(Download::Asset(pack.trim().to_string()));
+				}
+			}
+		}
+		if !uncached_packs.is_empty() {
+			assets.warm(&uncached_packs, &ktx2_pack_count_fast);
+		}
+	}
+
 	let mut wanted: BTreeMap<String, TextureWanted> = BTreeMap::new();
 	let mut pack_cache: HashMap<String, Option<PackMaps>> = HashMap::new();
 	let use_transcodes = transcodes_enabled();
@@ -475,36 +504,78 @@ pub fn measure_many(scenes: &[&Scene], mesh_stats: &HashMap<String, Arc<MeshStat
 		}
 	}
 
-	// Warm any uncached remote textures in batch when online.
+	// Phase 1: inspect every uncached texture from disk/memory once (no network, no zstd decode
+	// on Roblox KTX2 files). Only genuinely missing assets or missing progressive packs hit the
+	// network in Phase 2, so warm runs never call `assets.warm` or re-read cached pack 0 files.
 	let uncached: Vec<(&String, &TextureWanted)> = wanted.iter().filter(|(key, _)| !cache.entries.contains_key(*key)).collect();
-	if !uncached.is_empty() && !assets.offline() {
-		let mut downloads = Vec::new();
-		for (_, item) in &uncached {
-			if let Some(layer) = item.pack_layer {
-				if is_asset_id(&item.uri) {
-					downloads.push(Download::Transcode(item.uri.clone(), layer));
+	if !uncached.is_empty() {
+		let probed: Vec<(&String, &TextureWanted, ProbeResult)> = uncached
+			.into_par_iter()
+			.map(|(key, item)| (key, item, probe_texture_offline(item, &offline_assets, assets.offline(), use_transcodes)))
+			.collect();
+
+		let mut needs_network: Vec<(&String, &TextureWanted)> = Vec::new();
+		let mut missing_packs: Vec<(&String, TextureInfo, String, Transcode, Vec<u32>)> = Vec::new();
+		for (key, item, outcome) in probed {
+			match outcome {
+				ProbeResult::Done(info) => {
+					cache.entries.insert(key.clone(), info);
 				}
-			} else if is_asset_id(&item.uri) {
-				downloads.push(if item.prefer_transcode && use_transcodes {
-					Download::Transcode(item.uri.clone(), Transcode::Image)
-				} else {
-					Download::Asset(item.uri.clone())
-				});
+				ProbeResult::MissingPacks { info, uri, layer, packs } => {
+					missing_packs.push((key, info, uri, layer, packs));
+				}
+				ProbeResult::NeedsNetwork => {
+					needs_network.push((key, item));
+				}
 			}
 		}
-		if !downloads.is_empty() {
-			assets.warm(&downloads, &crate::render::transcode_packs);
-		}
-	}
 
-	// Decode uncached textures in parallel.
-	if !uncached.is_empty() {
-		let decoded: Vec<(String, Option<TextureInfo>)> = uncached
-			.into_par_iter()
-			.map(|(key, item)| (key.clone(), inspect_texture(item, assets, use_transcodes)))
-			.collect();
-		for (key, info) in decoded {
-			cache.entries.insert(key, info);
+		// Phase 2a: warm and inspect only textures whose pack 0 / upload was not cached on disk.
+		if !needs_network.is_empty() {
+			let mut downloads = Vec::new();
+			for (_, item) in &needs_network {
+				if let Some(layer) = item.pack_layer {
+					if is_asset_id(&item.uri) {
+						downloads.push(Download::Transcode(item.uri.clone(), layer));
+					}
+				} else if is_asset_id(&item.uri) {
+					downloads.push(if item.prefer_transcode && use_transcodes {
+						Download::Transcode(item.uri.clone(), Transcode::Image)
+					} else {
+						Download::Asset(item.uri.clone())
+					});
+				}
+			}
+			if !downloads.is_empty() {
+				assets.warm(&downloads, &ktx2_pack_count_fast);
+			}
+			let fetched: Vec<(String, Option<TextureInfo>)> = needs_network
+				.into_par_iter()
+				.map(|(key, item)| (key.clone(), inspect_texture(item, assets, use_transcodes)))
+				.collect();
+			for (key, info) in fetched {
+				cache.entries.insert(key, info);
+			}
+		}
+
+		// Phase 2b: for transcodes whose pack 0 was already read once in Phase 1, fetch ONLY the
+		// missing packs 1..N without reading or parsing pack 0 again.
+		if !missing_packs.is_empty() {
+			let completed: Vec<(String, Option<TextureInfo>)> = missing_packs
+				.into_par_iter()
+				.map(|(key, mut info, uri, layer, packs)| {
+					for pack in packs {
+						if let Ok(fetched) = assets.fetch_transcode(&uri, layer, pack) {
+							info.file_bytes += fetched.bytes.len() as u64;
+							info.packs_loaded += 1;
+						}
+					}
+					(key.clone(), Some(info))
+				})
+				.collect();
+			for (key, info) in completed {
+				cache.entries.insert(key, info);
+			}
 		}
 	}
 
@@ -854,9 +925,199 @@ fn collect_scene_textures(
 	}
 }
 
-fn inspect_transcode(uri: &str, layer: Transcode, assets: &Assets) -> Option<TextureInfo> {
-	let pack0 = assets.fetch_transcode(uri, layer, 0).ok()?;
-	let first = ror_image::decode(&pack0.bytes).ok()?;
+const KTX2_IDENTIFIER: [u8; 12] = [0xab, b'K', b'T', b'X', b' ', b'2', b'0', 0xbb, b'\r', b'\n', 0x1a, b'\n'];
+
+struct Ktx2HeaderMeta {
+	width: u32,
+	height: u32,
+	layers: u32,
+	depth: u32,
+	format: PixelFormat,
+	/// `None` when the format can carry alpha and KVD has no `avgAlpha` (falls back to full decode).
+	has_alpha: Option<bool>,
+	packs_expected: u32,
+}
+
+fn u32_le(bytes: &[u8], offset: usize) -> u32 {
+	u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]])
+}
+
+fn parse_ktx2_kvd_entries(kvd: &[u8]) -> (Option<u32>, Option<u32>, Option<u32>, Vec<(u32, u32)>) {
+	let mut transcoded_w = None;
+	let mut transcoded_h = None;
+	let mut avg_alpha = None;
+	let mut pack_entries: BTreeMap<u32, (u32, u32)> = BTreeMap::new();
+	let mut offset = 0usize;
+	while offset + 4 <= kvd.len() {
+		let len = u32_le(kvd, offset) as usize;
+		let start = offset + 4;
+		let Some(end) = start.checked_add(len).filter(|&e| e <= kvd.len()) else {
+			break;
+		};
+		let entry = &kvd[start..end];
+		if let Some(nul) = entry.iter().position(|&b| b == 0) {
+			let key = std::str::from_utf8(&entry[..nul]).ok();
+			let mut raw_val = &entry[nul + 1..];
+			while let [rest @ .., 0] = raw_val {
+				raw_val = rest;
+			}
+			let val = std::str::from_utf8(raw_val).ok().map(str::trim);
+			if let (Some(k), Some(v)) = (key, val) {
+				match k {
+					"transcodedWidth" => transcoded_w = v.parse::<u32>().ok().filter(|&n| n > 0),
+					"transcodedHeight" => transcoded_h = v.parse::<u32>().ok().filter(|&n| n > 0),
+					"avgAlpha" => avg_alpha = v.parse::<u32>().ok(),
+					_ if k.starts_with("pack_") => {
+						if let Ok(idx) = k["pack_".len()..].parse::<u32>() {
+							let mut parts = v.split(',').map(|p| p.trim().parse::<u32>().ok());
+							if let (Some(first), Some(count)) = (parts.next().flatten(), parts.next().flatten())
+								&& count > 0
+							{
+								pack_entries.insert(idx, (first, count));
+							}
+						}
+					}
+					_ => {}
+				}
+			}
+		}
+		offset = end.div_ceil(4) * 4;
+	}
+	let mut table = Vec::new();
+	for idx in 0u32.. {
+		let Some(&pair) = pack_entries.get(&idx) else {
+			break;
+		};
+		table.push(pair);
+	}
+	(transcoded_w, transcoded_h, avg_alpha, table)
+}
+
+/// Parses a KTX2 file's 80-byte header and key/value data without decompressing level payloads.
+fn parse_ktx2_header(bytes: &[u8], layer: Transcode) -> Option<Ktx2HeaderMeta> {
+	if bytes.len() < 80 || bytes[..12] != KTX2_IDENTIFIER {
+		return None;
+	}
+	let vk = u32_le(bytes, 12);
+	let (format, opaque) = match vk {
+		131 | 132 => (PixelFormat::Bc1, true),
+		133 | 134 => (PixelFormat::Bc1, false),
+		135 | 136 => (PixelFormat::Bc2, false),
+		137 | 138 => (PixelFormat::Bc3, false),
+		139 => (PixelFormat::Bc4, true),
+		141 => (PixelFormat::Bc5, true),
+		145 | 146 => (PixelFormat::Bc7, false),
+		9 | 15 | 16 | 22 | 23 | 29 | 30 | 36 => (PixelFormat::Rgba8, true),
+		37 | 43 | 44 | 50 => (PixelFormat::Rgba8, false),
+		_ => return None,
+	};
+	let raw_w = u32_le(bytes, 20);
+	if raw_w == 0 {
+		return None;
+	}
+	let raw_h = u32_le(bytes, 24).max(1);
+	let depth = u32_le(bytes, 28).max(1);
+	let layer_count = u32_le(bytes, 32).max(1);
+	let face_count = u32_le(bytes, 36);
+	if !matches!(face_count, 1 | 6) {
+		return None;
+	}
+	let layers = layer_count.checked_mul(face_count)?;
+	let kvd_offset = u32_le(bytes, 56) as usize;
+	let kvd_len = u32_le(bytes, 60) as usize;
+	let kvd = if kvd_len > 0 { bytes.get(kvd_offset..kvd_offset.checked_add(kvd_len)?)? } else { &[] };
+	let (transcoded_w, transcoded_h, avg_alpha, table) = parse_ktx2_kvd_entries(kvd);
+	let (width, height) = match (transcoded_w, transcoded_h) {
+		(Some(w), Some(h)) => (w, h),
+		_ => {
+			let shift = table.first().map_or(0, |&(first_level, _)| first_level.min(16));
+			(raw_w.checked_shl(shift).unwrap_or(raw_w).max(1), raw_h.checked_shl(shift).unwrap_or(raw_h).max(1))
+		}
+	};
+	let has_alpha = if opaque || layer == Transcode::PackNormal {
+		Some(false)
+	} else {
+		avg_alpha.map(|alpha| alpha < 255)
+	};
+	Some(Ktx2HeaderMeta {
+		width,
+		height,
+		layers,
+		depth,
+		format,
+		has_alpha,
+		packs_expected: (table.len() as u32).max(1),
+	})
+}
+
+/// Fast header-only pack-count callback for [`Assets::warm`], avoiding zstd decompression.
+fn ktx2_pack_count_fast(pack0: &[u8]) -> u32 {
+	if pack0.len() >= 80 && pack0[..12] == KTX2_IDENTIFIER {
+		let kvd_offset = u32_le(pack0, 56) as usize;
+		let kvd_len = u32_le(pack0, 60) as usize;
+		if let Some(end) = kvd_offset.checked_add(kvd_len)
+			&& end <= pack0.len()
+		{
+			let (_, _, _, table) = parse_ktx2_kvd_entries(&pack0[kvd_offset..end]);
+			return table.len() as u32;
+		}
+	}
+	crate::render::transcode_packs(pack0)
+}
+
+/// Fast header-only reader for opaque RGB/grayscale PNGs (no alpha channel and no `tRNS` chunk),
+/// avoiding full zlib pixel decompression when dimensions and opacity are known from headers alone.
+fn parse_png_opaque_header(bytes: &[u8]) -> Option<(u32, u32, u32, u32, PixelFormat, bool)> {
+	if bytes.len() < 33 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") || &bytes[12..16] != b"IHDR" {
+		return None;
+	}
+	let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+	let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+	let color_type = bytes[25];
+	if width == 0 || height == 0 || !matches!(color_type, 0 | 2) {
+		return None;
+	}
+	let mut offset = 33usize;
+	while offset + 12 <= bytes.len() {
+		let len = u32::from_be_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]) as usize;
+		let kind = &bytes[offset + 4..offset + 8];
+		if kind == b"tRNS" {
+			return None;
+		}
+		if kind == b"IDAT" {
+			return Some((width, height, 1, 1, PixelFormat::Rgba8, false));
+		}
+		offset = offset.checked_add(12)?.checked_add(len)?;
+	}
+	None
+}
+
+enum ProbeResult {
+	Done(Option<TextureInfo>),
+	MissingPacks { info: TextureInfo, uri: String, layer: Transcode, packs: Vec<u32> },
+	NeedsNetwork,
+}
+
+fn inspect_transcode_pack0(pack0: &[u8], layer: Transcode) -> Option<(TextureInfo, u32)> {
+	if let Some(meta) = parse_ktx2_header(pack0, layer)
+		&& let Some(has_alpha) = meta.has_alpha
+	{
+		let info = TextureInfo {
+			source: TextureSource::Transcode,
+			width: meta.width,
+			height: meta.height,
+			layers: meta.layers.max(1),
+			depth: meta.depth.max(1),
+			format: meta.format,
+			has_alpha,
+			file_bytes: pack0.len() as u64,
+			packs_loaded: 1,
+			packs_expected: meta.packs_expected,
+		};
+		return Some((info, meta.packs_expected));
+	}
+	// Fallback when header lacks alpha info (e.g. non-Roblox BC3 without `avgAlpha`).
+	let first = ror_image::decode(pack0).ok()?;
 	let table = ror_image::ktx2_pack_table(&first);
 	let (width, height) = match (
 		first.meta("transcodedWidth").and_then(|value| value.trim().parse::<u32>().ok()),
@@ -869,22 +1130,12 @@ fn inspect_transcode(uri: &str, layer: Transcode, assets: &Assets) -> Option<Tex
 		}
 	};
 	let packs_expected = (table.len() as u32).max(1);
-	let mut packs_loaded = 1u32;
-	let mut file_bytes = pack0.bytes.len() as u64;
-	if table.len() > 1 {
-		for pack in 1..table.len() as u32 {
-			if let Ok(fetched) = assets.fetch_transcode(uri, layer, pack) {
-				file_bytes += fetched.bytes.len() as u64;
-				packs_loaded += 1;
-			}
-		}
-	}
 	let has_alpha = if layer == Transcode::Image && first.dxt5nm {
 		first.meta("avgAlpha").and_then(|alpha| alpha.trim().parse::<u32>().ok()).is_none_or(|alpha| alpha < 255)
 	} else {
 		first.has_alpha
 	};
-	Some(TextureInfo {
+	let info = TextureInfo {
 		source: TextureSource::Transcode,
 		width,
 		height,
@@ -892,21 +1143,99 @@ fn inspect_transcode(uri: &str, layer: Transcode, assets: &Assets) -> Option<Tex
 		depth: first.depth.max(1),
 		format: first.format,
 		has_alpha,
-		file_bytes,
-		packs_loaded,
+		file_bytes: pack0.len() as u64,
+		packs_loaded: 1,
 		packs_expected,
-	})
+	};
+	Some((info, packs_expected))
+}
+
+fn probe_transcode_offline(uri: &str, layer: Transcode, offline: &Assets, run_offline: bool) -> Option<ProbeResult> {
+	let pack0 = offline.fetch_transcode(uri, layer, 0).ok()?;
+	let (mut info, packs_expected) = inspect_transcode_pack0(&pack0.bytes, layer)?;
+	let mut missing = Vec::new();
+	for pack in 1..packs_expected {
+		if let Ok(fetched) = offline.fetch_transcode(uri, layer, pack) {
+			info.file_bytes += fetched.bytes.len() as u64;
+			info.packs_loaded += 1;
+		} else {
+			missing.push(pack);
+		}
+	}
+	if missing.is_empty() || run_offline {
+		Some(ProbeResult::Done(Some(info)))
+	} else {
+		Some(ProbeResult::MissingPacks { info, uri: uri.to_string(), layer, packs: missing })
+	}
+}
+
+fn probe_texture_offline(item: &TextureWanted, offline: &Assets, run_offline: bool, use_transcodes: bool) -> ProbeResult {
+	if let Some(layer) = item.pack_layer {
+		return match probe_transcode_offline(&item.uri, layer, offline, run_offline) {
+			Some(res) => res,
+			None if run_offline || !is_asset_id(&item.uri) => ProbeResult::Done(None),
+			None => ProbeResult::NeedsNetwork,
+		};
+	}
+	if is_asset_id(&item.uri) && use_transcodes && item.prefer_transcode {
+		if let Some(res) = probe_transcode_offline(&item.uri, Transcode::Image, offline, run_offline) {
+			return res;
+		}
+		if run_offline {
+			return ProbeResult::Done(inspect_raw(&item.uri, offline));
+		}
+		return ProbeResult::NeedsNetwork;
+	}
+	if let Some(info) = inspect_raw(&item.uri, offline) {
+		return ProbeResult::Done(Some(info));
+	}
+	if is_asset_id(&item.uri) && use_transcodes {
+		if let Some(res) = probe_transcode_offline(&item.uri, Transcode::Image, offline, run_offline) {
+			return res;
+		}
+	}
+	if run_offline || !is_asset_id(&item.uri) {
+		ProbeResult::Done(None)
+	} else {
+		ProbeResult::NeedsNetwork
+	}
+}
+
+fn inspect_transcode(uri: &str, layer: Transcode, assets: &Assets) -> Option<TextureInfo> {
+	let pack0 = assets.fetch_transcode(uri, layer, 0).ok()?;
+	let (mut info, packs_expected) = inspect_transcode_pack0(&pack0.bytes, layer)?;
+	for pack in 1..packs_expected {
+		if let Ok(fetched) = assets.fetch_transcode(uri, layer, pack) {
+			info.file_bytes += fetched.bytes.len() as u64;
+			info.packs_loaded += 1;
+		}
+	}
+	Some(info)
 }
 
 fn inspect_raw(uri: &str, assets: &Assets) -> Option<TextureInfo> {
 	let fetched = assets.fetch(uri).ok()?;
-	let ext = uri.rsplit('.').next().filter(|ext| ext.len() <= 8).unwrap_or("");
-	let image = ror_image::decode_with_extension(&fetched.bytes, ext).ok()?;
 	let source = match ContentId::parse(uri) {
 		Ok(ContentId::StudioAsset(_)) => TextureSource::Studio,
 		Ok(ContentId::File(_)) => TextureSource::Local,
 		_ => TextureSource::Upload,
 	};
+	if let Some((width, height, layers, depth, format, has_alpha)) = parse_png_opaque_header(&fetched.bytes) {
+		return Some(TextureInfo {
+			source,
+			width,
+			height,
+			layers,
+			depth,
+			format,
+			has_alpha,
+			file_bytes: fetched.bytes.len() as u64,
+			packs_loaded: 1,
+			packs_expected: 1,
+		});
+	}
+	let ext = uri.rsplit('.').next().filter(|ext| ext.len() <= 8).unwrap_or("");
+	let image = ror_image::decode_with_extension(&fetched.bytes, ext).ok()?;
 	Some(TextureInfo {
 		source,
 		width: image.width,
@@ -1409,6 +1738,46 @@ mod tests {
 		assert_eq!(mr.mobile_etc2_mip_bytes, 2_744);
 		assert_eq!(report.textures.desktop_bc_mip_bytes, 2_744 + 5_488 + 2_744);
 		assert_eq!(report.textures.mobile_etc2_mip_bytes, 2_744 + 5_488 + 2_744);
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	#[test]
+	fn ktx2_header_parser_reads_cached_packs_without_zstd_decompression() {
+		let dir = std::env::temp_dir().join(format!("ror-memory-ktx2-fast-test-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		let cache_dir = dir.join("cache");
+		std::fs::create_dir_all(&cache_dir).unwrap();
+
+		// Build a KTX2 pack 0 declaring supercompressionScheme=2 (zstd) with intentionally bogus
+		// level payload bytes so `ror_image::decode` would fail if called, proving memory reads
+		// header + KVD only without decompressing payloads.
+		let mut pack0 = make_ktx2_bc(137, 32, 32, &[("transcodedWidth", "64"), ("transcodedHeight", "64"), ("avgAlpha", "180"), ("pack_0", "1,6"), ("pack_1", "0,1"), ("packIndex", "0")]);
+		pack0[44..48].copy_from_slice(&2u32.to_le_bytes()); // supercompressionScheme = Zstd
+		assert!(ror_image::decode(&pack0).is_err(), "bogus zstd payload must fail full decode");
+		assert_eq!(ktx2_pack_count_fast(&pack0), 2);
+
+		let pack1 = vec![0xAAu8; 321];
+		cache_write_key(&cache_dir, &format!("rbxassetid://3001#ktx2/7rdo/{}", Transcode::Image.fidelity(0)), &pack0);
+		cache_write_key(&cache_dir, &format!("rbxassetid://3001#ktx2/7rdo/{}", Transcode::Image.fidelity(1)), &pack1);
+
+		let mut model = ModelBuilder::new("FastKtx2");
+		let part = model.part(&PartSpec { name: "Block".into(), ..Default::default() });
+		model.child(part, InstanceBuilder::new("Decal").with_property("Texture", ContentId::from("rbxassetid://3001")).with_property("Face", Enum::from_u32(1)));
+		let document = model.into_document();
+		let scene = crate::scene::extract::extract(&document);
+		let assets = Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&cache_dir) });
+		let meshes = Meshes::load(&scene.parts, &assets);
+		let report = measure(&scene, &meshes, &assets);
+
+		assert!(!report.partial);
+		assert_eq!(report.textures.unique, 1);
+		assert_eq!(report.textures.loaded, 1);
+		assert_eq!(report.textures.missing, 0);
+		assert_eq!(report.textures.file_bytes, (pack0.len() + pack1.len()) as u64);
+		let entry = &report.textures.top[0];
+		assert_eq!((entry.width, entry.height, entry.format, entry.has_alpha), (64, 64, "bc3", true));
+		assert_eq!((entry.packs_loaded, entry.packs_expected), (2, 2));
+		assert_eq!(entry.desktop_bc_mip_bytes, 5_488);
 		let _ = std::fs::remove_dir_all(&dir);
 	}
 }

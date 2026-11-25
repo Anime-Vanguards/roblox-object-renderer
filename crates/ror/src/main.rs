@@ -168,6 +168,10 @@ struct CostArgs {
 	/// triangles) and the ones occlusion culling hides: what each copy costs, view by view
 	#[arg(long)]
 	items: bool,
+	/// Estimate deduplicated mesh and texture memory in bytes (reads and warms texture headers/files;
+	/// omitted by default so cost runs without --memory do not read or download textures)
+	#[arg(long)]
+	memory: bool,
 	/// Every emitter in the view's `fullest` list, not the fullest few
 	#[arg(long)]
 	all_emitters: bool,
@@ -1761,6 +1765,7 @@ fn cost(mut args: CostArgs) -> Result<()> {
 			grid: args.grid,
 			grid_area,
 			items: args.items,
+			memory: args.memory,
 			all_emitters: args.all_emitters,
 			attribute: args.grid.is_none(),
 			pixels: !args.no_pixels,

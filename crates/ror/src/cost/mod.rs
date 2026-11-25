@@ -174,6 +174,10 @@ pub struct CostOptions {
 	/// triangles) and the ones occlusion hides.
 	#[serde(default)]
 	pub items: bool,
+	/// Estimate deduplicated mesh and texture memory in bytes (`ror cost --memory`; off by default
+	/// so runs that do not ask for memory read no textures and download no packs).
+	#[serde(default)]
+	pub memory: bool,
 	/// Every emitter in `visible.fullest` (`ror cost --all-emitters`), not the fullest few.
 	#[serde(default)]
 	pub all_emitters: bool,
@@ -1876,8 +1880,9 @@ pub struct CostReport {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub mesh_streaming: Option<u32>,
 	pub scene: SceneCounts,
-	/// Deduplicated mesh and texture memory in bytes (encoded file bytes, GPU buffers, mip chains and compressed formats).
-	pub memory: memory::MemoryReport,
+	/// Deduplicated mesh and texture memory upper-bound estimate in bytes (populated only when `--memory` is requested).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub memory: Option<memory::MemoryReport>,
 	pub views: Vec<ViewCost>,
 	/// The views' opportunities, what they would save on average over the views first.
 	pub opportunities: Vec<report::Summary>,
@@ -1924,7 +1929,7 @@ pub fn run(
 		let analysis = Analysis::new(scene, document, &renderer.assets, options);
 		// each view on every core (a map's 20-stud grid, 440 views: 4.6 s one after another)
 		let costs: Vec<ViewCost> = views.par_iter().zip(shots.par_iter()).map(|(view, (camera, width, height))| analysis.view(&view.name, camera, *width as f32 / (*height).max(1) as f32, options)).collect();
-		let memory = memory::measure(scene, &analysis.meshes, &renderer.assets);
+		let memory = options.memory.then(|| memory::measure(scene, &analysis.meshes, &renderer.assets));
 		(analysis, costs, memory, Vec::new(), 0)
 	};
 	let mut grid_lines = Vec::new();

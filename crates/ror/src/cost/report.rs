@@ -448,8 +448,11 @@ pub fn lines(report: &CostReport) -> Vec<String> {
 		scene.characters,
 		scene.batches
 	));
-	if report.agent.is_empty() && (report.memory.meshes.unique > 0 || report.memory.textures.unique > 0) {
-		lines.push(super::memory::summary_line(&report.memory, true));
+	if report.agent.is_empty()
+		&& let Some(memory) = &report.memory
+		&& (memory.meshes.unique > 0 || memory.textures.unique > 0)
+	{
+		lines.push(super::memory::summary_line(memory, true));
 	}
 	// each view's line, unless there are too many to read (a grid's): cost.json has them all
 	for view in report.views.iter().take(if report.views.len() > 64 { 0 } else { usize::MAX }) {
