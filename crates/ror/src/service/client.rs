@@ -13,6 +13,11 @@ use crate::job::Job;
 
 const START_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// How long a client waits for a render's answer: a dormant service makes its GPU device and every
+/// pipeline for the job first, and the first draws on a renderer prepare more (30-63 s, then 7 s, on a
+/// software adapter given 4 CPUs).
+pub(crate) const RENDER_TIMEOUT: Duration = Duration::from_secs(600);
+
 fn read_info(path: &Path) -> Option<ServiceInfo> {
 	let text = std::fs::read_to_string(path).ok()?;
 	serde_json::from_str(&text).ok()
@@ -401,7 +406,7 @@ pub fn render(state_dir: &Path, job: &Job, offline: bool) -> Result<serde_json::
 		map.file = file_here(&map.file);
 	}
 	job.out = job.out.as_deref().map(absolute);
-	post(state_dir, "/render", &serde_json::to_vec(&job)?, offline, Duration::from_secs(600))
+	post(state_dir, "/render", &serde_json::to_vec(&job)?, offline, RENDER_TIMEOUT)
 }
 
 /// Starts this build's service if it is not running and asks it to bring the GPU up to its working

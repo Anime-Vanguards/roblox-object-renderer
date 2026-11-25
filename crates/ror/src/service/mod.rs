@@ -924,13 +924,16 @@ mod tests {
 			}
 		});
 
+		// Each request waits as long as ror's client gives a render: the first wakes the dormant service, which
+		// makes its GPU device and every pipeline (longer than 30 s on CI's software adapter).
+
 		// 1. Offline request on an uncached asset id is refused locally with an offline error.
 		let missing_job = serde_json::json!({
 			"input": "rbxassetid://999999999999",
 			"views": [{ "name": "front", "width": 32, "height": 32, "msaa": 1, "bloom": false, "background": { "color": [0.0, 0.0, 0.0] } }],
 			"noPng": true,
 		});
-		let (status, body) = http::request_as(port, "POST", "/render", "X-ROR: 1\r\nX-ROR-Offline: 1", missing_job.to_string().as_bytes(), Duration::from_secs(30)).unwrap();
+		let (status, body) = http::request_as(port, "POST", "/render", "X-ROR: 1\r\nX-ROR-Offline: 1", missing_job.to_string().as_bytes(), client::RENDER_TIMEOUT).unwrap();
 		assert_eq!(status, 400, "uncached asset under X-ROR-Offline must fail: {}", String::from_utf8_lossy(&body));
 		assert!(String::from_utf8_lossy(&body).to_ascii_lowercase().contains("offline"), "error should mention offline: {}", String::from_utf8_lossy(&body));
 
@@ -940,16 +943,17 @@ mod tests {
 			"views": [{ "name": "front", "width": 32, "height": 32, "msaa": 1, "bloom": false, "background": { "color": [0.0, 0.0, 0.0] } }],
 			"noPng": true,
 		});
-		let (status, body) = http::request_as(port, "POST", "/render", "X-ROR: 1", local_job.to_string().as_bytes(), Duration::from_secs(30)).unwrap();
+		let (status, body) = http::request_as(port, "POST", "/render", "X-ROR: 1", local_job.to_string().as_bytes(), client::RENDER_TIMEOUT).unwrap();
 		assert_eq!(status, 200, "old-client online render failed: {}", String::from_utf8_lossy(&body));
 		let first: serde_json::Value = serde_json::from_slice(&body).unwrap();
 		assert_eq!(first["timings"]["sceneCached"], false);
 
 		// 3. Offline request on the same local scene hits the exact same SceneCache and Renderer.
-		let (status, body) = http::request_as(port, "POST", "/render", "X-ROR: 1\r\nX-ROR-Offline: 1", local_job.to_string().as_bytes(), Duration::from_secs(30)).unwrap();
+		let (status, body) = http::request_as(port, "POST", "/render", "X-ROR: 1\r\nX-ROR-Offline: 1", local_job.to_string().as_bytes(), client::RENDER_TIMEOUT).unwrap();
 		assert_eq!(status, 200, "offline render failed: {}", String::from_utf8_lossy(&body));
 		let second: serde_json::Value = serde_json::from_slice(&body).unwrap();
 		assert_eq!(second["timings"]["sceneCached"], true, "online and offline must share SceneCache: {second}");
+		assert_eq!(state.wakes.load(Ordering::SeqCst), 1, "the first job's wake made the device every later job drew on");
 
 		server.join().unwrap();
 		drop(state);
