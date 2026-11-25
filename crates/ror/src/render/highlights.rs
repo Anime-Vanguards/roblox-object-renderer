@@ -215,6 +215,118 @@ mod tests {
 
 		let _ = std::fs::remove_dir_all(&state);
 	}
+
+	/// Measured on Roblox client 0.748.0.7481526:
+	/// - Built-in primitive `SpecialMesh`es (`Brick`, `Wedge`, `Sphere`, `Cylinder`, `Head`) apply
+	///   `abs(Scale)`: negative axes never mirror them or turn them inside-out in main, Highlight,
+	///   or `--ids` passes (an inner box stays hidden from outside, back faces stay culled inside).
+	/// - `SpecialMesh` `FileMesh` applies signed `Scale` with standard back-face culling: odd
+	///   negative axes invert triangle winding across main, Highlight, and `--ids` passes (front
+	///   culled, back drawn).
+	#[test]
+	fn negative_scale_special_mesh_matches_roblox_culling() {
+		use std::sync::Arc;
+
+		use glam::{Affine3A, Vec3};
+		use rbx_dom_weak::InstanceBuilder;
+		use rbx_dom_weak::types::{ContentId, Enum, Vector3};
+
+		use crate::render::camera::CameraSpec;
+		use crate::render::{Background, Renderer, ViewRequest};
+		use crate::scene::build::{ModelBuilder, PartSpec};
+
+		let state = std::env::temp_dir().join(format!("ror-neg-scale-special-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&state);
+		std::fs::create_dir_all(&state).unwrap();
+		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+
+		let outside_view = ViewRequest {
+			width: 64,
+			height: 64,
+			msaa: 1,
+			bloom: false,
+			ids: true,
+			background: Background::Sky,
+			camera: CameraSpec::LookAt { eye: [0.0, 0.0, 10.0], target: [0.0, 0.0, 0.0], fov: 60.0 },
+			..Default::default()
+		};
+		let inside_view = ViewRequest {
+			camera: CameraSpec::LookAt { eye: [0.0, 0.0, 0.0], target: [0.0, 0.0, -10.0], fov: 60.0 },
+			..outside_view.clone()
+		};
+		let center = 32 * 64 + 32;
+
+		// 1. Primitive SpecialMesh Brick with Scale = (-1, 1, 1) around a yellow inner box:
+		//    must stay right-side-out (outer blue face hides inner yellow box in RGBA, Highlight,
+		//    and part_ids; from inside, back faces cull to show red wall).
+		let mut model = ModelBuilder::new("NegPrimitive");
+		let outer = model.part(&PartSpec { name: "Outer".into(), size: Vec3::splat(4.0), color: [0, 0, 255], ..Default::default() });
+		model.child(
+			outer,
+			InstanceBuilder::new("SpecialMesh")
+				.with_property("MeshType", Enum::from_u32(crate::scene::extract::mesh_type::BRICK))
+				.with_property("Scale", Vector3::new(-1.0, 1.0, 1.0)),
+		);
+		model.part(&PartSpec { name: "Inner".into(), size: Vec3::splat(1.5), color: [255, 255, 0], ..Default::default() });
+		model.part(&PartSpec { name: "Wall".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, 0.0, -15.0)), size: Vec3::new(60.0, 60.0, 1.0), color: [255, 0, 0], ..Default::default() });
+		let mut scene = crate::scene::extract::extract(&model.into_document());
+		let outer_idx = scene.parts.iter().position(|p| p.path.ends_with("Outer")).unwrap();
+		let wall_idx = scene.parts.iter().position(|p| p.path.ends_with("Wall")).unwrap();
+		scene.highlights = vec![Highlight {
+			parts: vec![outer_idx],
+			fill_color: Vec3::new(0.0, 1.0, 0.0),
+			fill_transparency: 0.0,
+			outline_color: Vec3::new(0.0, 1.0, 0.0),
+			outline_transparency: 1.0,
+			depth_mode: 1, // Occluded
+		}];
+		let (images, _) = renderer.render(&scene, &[outside_view.clone(), inside_view]).expect("primitive render");
+		assert_eq!(images[0].ids.as_ref().unwrap()[center], outer_idx as u32 + 1, "negative-scale primitive Brick must not cull its front face in part_ids");
+		assert_eq!(&images[0].rgba[center * 4..center * 4 + 3], [0, 255, 0], "Occluded Highlight must cover Outer's front face (not Inner behind it)");
+		assert_eq!(images[1].ids.as_ref().unwrap()[center], wall_idx as u32 + 1, "negative-scale primitive Brick must still cull back faces from inside");
+		let in_rgb = &images[1].rgba[center * 4..center * 4 + 3];
+		assert!(in_rgb[0] > 120 && in_rgb[1] < 40, "from inside, red wall should show through culled back faces, got {in_rgb:?}");
+
+		// 2. Single-sided FileMesh quad (CCW facing +Z) with Scale = (-4, 4, 4) vs (4, 4, 4):
+		//    signed Scale mirrors vertices and flips winding, so (-4, 4, 4) is culled from +Z
+		//    in RGBA, Highlight, and part_ids, and visible from -Z.
+		let quad_mesh = state.join("quad.mesh");
+		let v = |x: i32, y: i32| format!("[{x},{y},0][0,0,1][0,0,0]");
+		let faces = [(-1, -1), (1, -1), (1, 1), (-1, -1), (1, 1), (-1, 1)].map(|(x, y)| v(x, y)).concat();
+		std::fs::write(&quad_mesh, format!("version 1.01\n2\n{faces}\n")).unwrap();
+		let back_view = ViewRequest {
+			camera: CameraSpec::LookAt { eye: [0.0, 0.0, -10.0], target: [0.0, 0.0, 0.0], fov: 60.0 },
+			..outside_view.clone()
+		};
+		let mut fm = ModelBuilder::new("NegFileMesh");
+		let q = fm.part(&PartSpec { name: "Quad".into(), size: Vec3::splat(4.0), color: [0, 0, 255], ..Default::default() });
+		fm.child(
+			q,
+			InstanceBuilder::new("SpecialMesh")
+				.with_property("MeshType", Enum::from_u32(crate::scene::extract::mesh_type::FILE_MESH))
+				.with_property("MeshId", ContentId::from(quad_mesh.display().to_string()))
+				.with_property("Scale", Vector3::new(-4.0, 4.0, 4.0)),
+		);
+		let mut fm_scene = crate::scene::extract::extract(&fm.into_document());
+		let q_idx = fm_scene.parts.iter().position(|p| p.path.ends_with("Quad")).unwrap();
+		fm_scene.highlights = vec![Highlight {
+			parts: vec![q_idx],
+			fill_color: Vec3::new(0.0, 1.0, 0.0),
+			fill_transparency: 0.0,
+			outline_color: Vec3::new(0.0, 1.0, 0.0),
+			outline_transparency: 1.0,
+			depth_mode: 0, // AlwaysOnTop
+		}];
+		let (images, _) = renderer.render(&fm_scene, &[outside_view, back_view]).expect("filemesh render");
+		assert_eq!(images[0].ids.as_ref().unwrap()[center], 0, "FileMesh with odd negative scale must flip winding (culled from +Z)");
+		assert_ne!(&images[0].rgba[center * 4..center * 4 + 3], [0, 255, 0], "culled front of negative-scale FileMesh must draw no Highlight");
+		assert_eq!(images[1].ids.as_ref().unwrap()[center], q_idx as u32 + 1, "FileMesh with odd negative scale must draw from -Z in part_ids");
+		assert_eq!(&images[1].rgba[center * 4..center * 4 + 3], [0, 255, 0], "FileMesh with odd negative scale must draw Highlight from -Z");
+
+		let _ = std::fs::remove_dir_all(&state);
+	}
 }
 
 /// Blends the Highlights into the finished straight-alpha RGBA8 image (display values, as Studio:

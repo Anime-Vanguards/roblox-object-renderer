@@ -3339,26 +3339,32 @@ impl Renderer {
 			}
 			Geometry::Special { mesh_type, mesh, scale, offset } => {
 				use crate::scene::extract::mesh_type as kind;
+				// Measured on Roblox client 0.748.0.7481526: built-in primitive SpecialMeshes
+				// (Brick, Sphere, Cylinder, Wedge, Head) apply `abs(Scale)` (never mirrored or
+				// inverted), whereas FileMesh applies signed `Scale` with standard back-face
+				// culling (odd negative axes intentionally invert winding across main, Highlight,
+				// and occlusion passes).
+				let abs_scale = scale.abs();
 				match *mesh_type {
 					kind::FILE_MESH => {
 						let uri = mesh.as_ref().context("FileMesh without MeshId")?;
 						(self.load_mesh(uri)?, Affine3A::from_translation(*offset) * Affine3A::from_scale(*scale), true)
 					}
-					kind::SPHERE => (primitive(Primitive::Sphere), Affine3A::from_translation(*offset) * Affine3A::from_scale(size * *scale), false),
+					kind::SPHERE => (primitive(Primitive::Sphere), Affine3A::from_translation(*offset) * Affine3A::from_scale(size * abs_scale), false),
 					// along X, like Part cylinders (specialmesh-sizes: its top view is a rectangle)
-					kind::CYLINDER => (primitive(Primitive::Cylinder), Affine3A::from_translation(*offset) * Affine3A::from_scale(size * *scale), false),
-					kind::WEDGE => (primitive(Primitive::Wedge), Affine3A::from_translation(*offset) * Affine3A::from_scale(size * *scale), false),
+					kind::CYLINDER => (primitive(Primitive::Cylinder), Affine3A::from_translation(*offset) * Affine3A::from_scale(size * abs_scale), false),
+					kind::WEDGE => (primitive(Primitive::Wedge), Affine3A::from_translation(*offset) * Affine3A::from_scale(size * abs_scale), false),
 					kind::HEAD => {
 						// Studio's head mesh, sized by the part's smaller horizontal extent and its height
 						// (notes/render.md "SpecialMesh"); a block until the mesh is available
-						let horizontal = (size.x * scale.x).min(size.z * scale.z);
-						let vertical = size.y * scale.y;
+						let horizontal = (size.x * abs_scale.x).min(size.z * abs_scale.z);
+						let vertical = size.y * abs_scale.y;
 						match self.load_mesh(HEAD_MESH) {
 							Ok(mesh) => (mesh, Affine3A::from_translation(*offset) * Affine3A::from_scale(Vec3::new(horizontal * 0.797, vertical * 0.822, horizontal * 0.797)), false),
 							Err(_) => (primitive(Primitive::Cylinder), Affine3A::from_translation(*offset) * Affine3A::from_scale(Vec3::new(horizontal * 0.955, vertical * 0.988, horizontal * 0.955)) * Affine3A::from_rotation_z(std::f32::consts::FRAC_PI_2), false),
 						}
 					}
-					_ => (primitive(Primitive::Block), Affine3A::from_translation(*offset) * Affine3A::from_scale(size * *scale), false),
+					_ => (primitive(Primitive::Block), Affine3A::from_translation(*offset) * Affine3A::from_scale(size * abs_scale), false),
 				}
 			}
 		})
