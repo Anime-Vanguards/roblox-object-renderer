@@ -265,6 +265,9 @@ struct CostArgs {
 	/// With --duration or --times: moving camera track JSON (list of {"at", "cframe", "fov"} keys)
 	#[arg(long, value_name = "FILE")]
 	camera_track: Option<PathBuf>,
+	/// With --camera-track: keep a leading engine-default (0, 20, 20) camera key at t=0
+	#[arg(long, requires = "camera_track")]
+	keep_default_camera: bool,
 	/// With --duration or --times: worst-case mode where emitters out of the camera's view still
 	/// emit and age (default pauses out-of-view emitters, matching Roblox's client)
 	#[arg(long)]
@@ -715,9 +718,14 @@ struct VideoArgs {
 	#[arg(long, value_name = "DIR", conflicts_with_all = ["frame", "focus", "camera"])]
 	camera_from: Option<PathBuf>,
 	/// A moving camera in place of the view: a JSON file of keys [{"at": s, "cframe": [12 numbers],
-	/// "fov": deg}], each held from its moment until the next (a recording's camera.json)
+	/// "fov": deg}], each held from its moment until the next (a recording's camera.json). A leading
+	/// engine-default (0, 20, 20) key at t=0 is skipped when a later key exists unless
+	/// --keep-default-camera is passed
 	#[arg(long, value_name = "FILE", conflicts_with_all = ["camera", "yaw", "camera_from", "frame", "focus"])]
 	camera_track: Option<PathBuf>,
+	/// With --camera-track: keep a leading engine-default (0, 20, 20) camera key at t=0
+	#[arg(long, requires = "camera_track")]
+	keep_default_camera: bool,
 	/// sky, transparent, or a colour (#rrggbb or r,g,b)
 	#[arg(long, default_value = "sky")]
 	background: String,
@@ -1158,14 +1166,18 @@ fn render(mut args: RenderArgs) -> Result<()> {
 	Ok(())
 }
 
-/// `--camera-track`'s keys, in time order.
-fn read_camera_track(path: &std::path::Path) -> Result<Vec<ror::video::CameraKey>> {
+/// `--camera-track`'s keys, in time order (skipping a leading engine-default key at `t = 0` when a
+/// later key exists unless `keep_default` is set).
+fn read_camera_track(path: &std::path::Path, keep_default: bool) -> Result<Vec<ror::video::CameraKey>> {
 	let text = std::fs::read_to_string(path).with_context(|| format!("--camera-track {}", path.display()))?;
-	let mut keys: Vec<ror::video::CameraKey> = serde_json::from_str(&text).with_context(|| format!("--camera-track {}: a list of {{\"at\", \"cframe\", \"fov\"}} keys", path.display()))?;
+	let keys: Vec<ror::video::CameraKey> = serde_json::from_str(&text).with_context(|| format!("--camera-track {}: a list of {{\"at\", \"cframe\", \"fov\"}} keys", path.display()))?;
 	if keys.is_empty() {
 		bail!("--camera-track {}: no keys", path.display());
 	}
-	keys.sort_by(|a, b| a.at.total_cmp(&b.at));
+	let (keys, skipped) = ror::video::normalize_camera_track(keys, keep_default);
+	if skipped {
+		eprintln!("ror: note: skipped leading engine-default camera key at t=0 in {} (pass --keep-default-camera to keep it)", path.display());
+	}
 	Ok(keys)
 }
 
@@ -1292,7 +1304,8 @@ fn video(mut args: VideoArgs) -> Result<()> {
 		frame,
 		focus: args.focus,
 		ffmpeg: ror::video::find_ffmpeg(),
-		camera_track: args.camera_track.as_deref().map(read_camera_track).transpose()?,
+		camera_track: args.camera_track.as_deref().map(|path| read_camera_track(path, args.keep_default_camera)).transpose()?,
+		keep_default_camera: args.keep_default_camera,
 		sheet_first: args.sheet_first,
 		copies: args
 			.copy
@@ -1902,7 +1915,7 @@ fn cost(mut args: CostArgs) -> Result<()> {
 			None => (None, false),
 		};
 		let times = args.times.as_deref().map(parse_cost_times).transpose()?;
-		let camera_track = args.camera_track.as_deref().map(read_camera_track).transpose()?;
+		let camera_track = args.camera_track.as_deref().map(|path| read_camera_track(path, args.keep_default_camera)).transpose()?;
 		Some(ror::cost::timeline::TimelineOptions {
 			start,
 			duration,
@@ -1910,6 +1923,7 @@ fn cost(mut args: CostArgs) -> Result<()> {
 			fps,
 			times,
 			camera_track,
+			keep_default_camera: args.keep_default_camera,
 			all_emitters_running: args.all_emitters_running,
 		})
 	} else {
@@ -2544,5 +2558,32 @@ mod tests {
 		let err = parse_cost_times("2.0,0.5,1.0").expect_err("out-of-order --times must be refused");
 		assert!(err.to_string().contains("non-decreasing order"), "got: {err}");
 		assert!(parse_cost_times("-0.1,0.5").is_err());
+	}
+
+	#[test]
+	fn video_and_cost_cli_parse_keep_default_camera_with_camera_track() {
+		let video_ok = Cli::try_parse_from(["ror", "video", "fx.rbxmx", "--camera-track", "cam.json", "--keep-default-camera"]).expect("video flag parse");
+		assert!(matches!(video_ok.command, Command::Video(args) if args.keep_default_camera));
+		assert!(Cli::try_parse_from(["ror", "video", "fx.rbxmx", "--keep-default-camera"]).is_err(), "--keep-default-camera requires --camera-track");
+
+		let cost_ok = parse_cost(&["--duration", "1", "--camera-track", "cam.json", "--keep-default-camera"]);
+		assert!(cost_ok.keep_default_camera);
+		assert!(validate_cost_timeline_args(&cost_ok, Some(1)).is_ok());
+		assert!(Cli::try_parse_from(["ror", "cost", "fx.rbxmx", "--duration", "1", "--keep-default-camera"]).is_err());
+
+		let temp = std::env::temp_dir().join(format!("ror-cam-track-{}.json", std::process::id()));
+		let default_cf = ror::video::default_camera_cframe();
+		let track = serde_json::json!([
+			{ "at": 0.0, "cframe": default_cf, "fov": 70.0 },
+			{ "at": 0.01667, "cframe": [5.0, 10.0, -20.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], "fov": 60.0 }
+		]);
+		std::fs::write(&temp, track.to_string()).unwrap();
+		let stripped = read_camera_track(&temp, false).unwrap();
+		assert_eq!(stripped.len(), 1);
+		assert_eq!(stripped[0].cframe[0], 5.0);
+		let kept = read_camera_track(&temp, true).unwrap();
+		assert_eq!(kept.len(), 2);
+		assert_eq!(kept[0].cframe[1], 20.0);
+		let _ = std::fs::remove_file(&temp);
 	}
 }

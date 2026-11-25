@@ -82,6 +82,7 @@ pub fn main() -> Result<()> {
 			focus: None,
 			ffmpeg: None,
 			camera_track: None,
+			keep_default_camera: false,
 			sheet_first: false,
 			copies: Vec::new(),
 			relative_to: None,

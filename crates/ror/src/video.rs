@@ -161,6 +161,11 @@ pub struct VideoJob {
 	/// before its own), as a recording's game camera moved (ree's `camera.json`).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub camera_track: Option<Vec<CameraKey>>,
+	/// Keep a leading engine-default camera key at `t = 0` in `camera_track` (by default it is
+	/// skipped when a later key exists, because `ree` records Roblox's default `(0, 20, 20)` camera
+	/// at frame 0 before scripts position `CurrentCamera`).
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub keep_default_camera: bool,
 	/// Through the service: the sheet's moments drawn first, and the result sent back once `sheet.png`
 	/// is written (the clip itself finished after it: [`run_with`]).
 	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -211,12 +216,57 @@ pub struct CameraKey {
 	pub fov: f32,
 }
 
+/// Roblox's default `Camera.CFrame` (`(0, 20, 20)` looking toward the origin), read from the
+/// reflection database with the exact `CFrame.lookAt((0, 20, 20), (0, 0, 0))` fallback.
+pub fn default_camera_cframe() -> [f32; 12] {
+	let db = crate::scene::props::database();
+	if let Some(desc) = db.classes.get("Camera")
+		&& let Some(rbx_dom_weak::types::Variant::CFrame(cf)) = db.find_default_property(desc, "CFrame").or_else(|| db.find_default_property(desc, "CoordinateFrame"))
+	{
+		let p = cf.position;
+		let m = cf.orientation;
+		return [p.x, p.y, p.z, m.x.x, m.x.y, m.x.z, m.y.x, m.y.y, m.y.z, m.z.x, m.z.y, m.z.z];
+	}
+	let s = std::f32::consts::FRAC_1_SQRT_2;
+	[0.0, 20.0, 20.0, 1.0, 0.0, 0.0, 0.0, s, s, 0.0, -s, s]
+}
+
+/// Whether `key` matches Roblox's default camera (`(0, 20, 20)` looking at the origin, `fov = 70`),
+/// within `1e-3` to absorb recording float rounding.
+pub fn is_default_camera_key(key: &CameraKey) -> bool {
+	let default_cf = default_camera_cframe();
+	let default_fov = crate::render::camera::default_fov();
+	(key.fov - default_fov).abs() <= 1e-3 && key.cframe.iter().zip(default_cf).all(|(a, b)| (a - b).abs() <= 1e-3)
+}
+
+/// Sorts a camera track in time order and, unless `keep_default` is set, drops a leading
+/// engine-default camera key at `t = 0` when a strictly later key exists (`ree` writes the engine's
+/// default `(0, 20, 20)` camera at frame 0 before scripts position `Workspace.CurrentCamera`).
+/// Single-key tracks and tracks whose first key is explicitly authored stay unchanged.
+/// Returns `(keys, skipped_default)`.
+pub fn normalize_camera_track(mut keys: Vec<CameraKey>, keep_default: bool) -> (Vec<CameraKey>, bool) {
+	keys.sort_by(|a, b| a.at.total_cmp(&b.at));
+	let skip = !keep_default
+		&& keys.len() >= 2
+		&& keys[0].at.abs() <= 1e-4
+		&& keys[1].at > keys[0].at + 1e-4
+		&& is_default_camera_key(&keys[0]);
+	if skip {
+		keys.remove(0);
+	}
+	(keys, skip)
+}
+
+fn effective_camera_track(job: &VideoJob) -> Option<Vec<CameraKey>> {
+	job.camera_track.as_ref().filter(|track| !track.is_empty()).map(|track| normalize_camera_track(track.clone(), job.keep_default_camera).0)
+}
+
 /// The job's playback (loaded from `playback_file` when not supplied inline, with any CLI overlay
 /// merged in), watched through its camera track when it has one (Studio updates only the emitters
 /// that camera could draw: [`scene::playback::ViewerKey`]).
 fn watched(job: &VideoJob) -> Result<Playback> {
 	let mut playback = Playback::resolve_source(job.playback.as_ref(), job.playback_file.as_deref(), job.playback_overlay.as_ref(), None)?.unwrap_or_default();
-	if let Some(track) = job.camera_track.as_deref().filter(|_| playback.viewer.is_empty()) {
+	if let Some(track) = effective_camera_track(job).filter(|_| playback.viewer.is_empty()) {
 		let aspect = job.view.width.max(1) as f32 / job.view.height.max(1) as f32;
 		let mut keys: Vec<scene::playback::ViewerKey> = track.iter().map(|key| scene::playback::ViewerKey { at: key.at, cframe: key.cframe, fov: key.fov, aspect }).collect();
 		keys.sort_by(|a, b| a.at.total_cmp(&b.at));
@@ -1513,8 +1563,8 @@ type Framing = (Vec<CameraSpec>, Option<(Vec3, Vec3)>);
 /// sampled moment draws (or the box or instance given), the same distance all round when it turns;
 /// any other camera as given. Also the box framed.
 fn cameras<'s>(renderer: &Renderer, builder: &'s Builder, times: &[f32], job: &VideoJob, held: &Mutex<Vec<Kept<'s>>>) -> Result<Framing> {
-	if let Some(track) = job.camera_track.as_deref().filter(|track| !track.is_empty()) {
-		return Ok((times.iter().map(|&time| track_camera(track, time)).collect(), None));
+	if let Some(track) = effective_camera_track(job) {
+		return Ok((times.iter().map(|&time| track_camera(&track, time)).collect(), None));
 	}
 	let (width, height) = (job.view.width.max(1), job.view.height.max(1));
 	let CameraSpec::Orbit { yaw, pitch, distance, padding, target, fov } = job.view.camera else {
@@ -2936,6 +2986,7 @@ mod tests {
 			focus: None,
 			ffmpeg: None,
 			camera_track: None,
+			keep_default_camera: false,
 			sheet_first: false,
 			copies: Vec::new(),
 			relative_to: None,
@@ -3003,6 +3054,7 @@ mod tests {
 			focus: None,
 			ffmpeg: None,
 			camera_track: None,
+			keep_default_camera: false,
 			sheet_first: false,
 			copies: Vec::new(),
 			relative_to: None,
@@ -3084,6 +3136,7 @@ mod tests {
 			focus: None,
 			ffmpeg: None,
 			camera_track: None,
+			keep_default_camera: false,
 			sheet_first: false,
 			copies: Vec::new(),
 			relative_to: None,
@@ -3150,6 +3203,7 @@ mod tests {
 			focus: None,
 			ffmpeg: None,
 			camera_track: None,
+			keep_default_camera: false,
 			sheet_first,
 			copies: Vec::new(),
 			relative_to: None,
@@ -3220,6 +3274,7 @@ mod tests {
 			focus: None,
 			ffmpeg: Some(ffmpeg.clone()),
 			camera_track: None,
+			keep_default_camera: false,
 			sheet_first: false,
 			copies: vec![
 				VideoCopy { file: good.clone(), args: ["-vf", "scale=48:32", "-c:v", "mpeg4", "-q:v", "5"].map(String::from).to_vec() },
@@ -3296,6 +3351,7 @@ mod tests {
 			focus: None,
 			ffmpeg: None,
 			camera_track: None,
+			keep_default_camera: false,
 			sheet_first: false,
 			copies: Vec::new(),
 			relative_to: None,
@@ -3386,6 +3442,97 @@ mod tests {
 		assert!(matches!(track_camera(&late, 0.0), CameraSpec::CFrame { components, fov, near: None } if components == late[0].cframe && fov == 70.0), "before its first key a track holds that key");
 		let parsed: Vec<CameraKey> = serde_json::from_str(r#"[{"at": 0.25, "cframe": [0,20,20,1,0,0,0,0.7,0.7,0,-0.7,0.7]}]"#).unwrap();
 		assert_eq!(parsed[0].fov, 70.0, "fov defaults as a camera's does");
+	}
+
+	#[test]
+	fn camera_track_skips_leading_engine_default_unless_kept_or_authored() {
+		let default_cf = default_camera_cframe();
+		assert!((default_cf[0] - 0.0).abs() < 1e-4 && (default_cf[1] - 20.0).abs() < 1e-4 && (default_cf[2] - 20.0).abs() < 1e-4, "Roblox default Camera.CFrame is at (0, 20, 20): {default_cf:?}");
+		// Rounded as ree's camera.json writes it (5 decimal places)
+		let rounded_default = default_cf.map(|v| (v * 1e5).round() / 1e5);
+		let default_key = CameraKey { at: 0.0, cframe: rounded_default, fov: 70.0 };
+		let real_key = CameraKey { at: 0.01667, cframe: [10.0, 12.0, -30.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], fov: 65.0 };
+		let later_key = CameraKey { at: 1.0, cframe: [25.0, 12.0, -30.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], fov: 65.0 };
+
+		// 1) Recorded track: engine default at t=0 followed by a later key -> default skipped so frame 0 uses real_key.
+		let (normalized, skipped) = normalize_camera_track(vec![real_key.clone(), default_key.clone(), later_key.clone()], false);
+		assert!(skipped, "leading engine-default key at t=0 must be skipped when a later key exists");
+		assert_eq!(normalized.len(), 2);
+		assert_eq!(normalized[0], real_key);
+		assert!(matches!(track_camera(&normalized, 0.0), CameraSpec::CFrame { components, fov, .. } if components == real_key.cframe && fov == real_key.fov));
+		// Idempotent: normalizing the already-normalized track does not strip again.
+		let (again, skipped_again) = normalize_camera_track(normalized.clone(), false);
+		assert!(!skipped_again);
+		assert_eq!(again, normalized);
+
+		// 2) keep_default = true preserves the t=0 engine-default key.
+		let (kept, skipped_kept) = normalize_camera_track(vec![default_key.clone(), real_key.clone()], true);
+		assert!(!skipped_kept);
+		assert_eq!(kept.len(), 2);
+		assert_eq!(kept[0], default_key);
+
+		// 3) Single-key track stays unchanged even if it is the engine default.
+		let (single, skipped_single) = normalize_camera_track(vec![default_key.clone()], false);
+		assert!(!skipped_single);
+		assert_eq!(single, vec![default_key.clone()]);
+
+		// 4) Explicitly authored key at t=0 (different pose or different FOV) stays unchanged.
+		let authored_pose = CameraKey { at: 0.0, cframe: [0.0, 20.0, 20.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], fov: 70.0 };
+		let (kept_pose, skipped_pose) = normalize_camera_track(vec![authored_pose.clone(), real_key.clone()], false);
+		assert!(!skipped_pose);
+		assert_eq!(kept_pose.len(), 2);
+		assert_eq!(kept_pose[0], authored_pose);
+
+		let authored_fov = CameraKey { at: 0.0, cframe: rounded_default, fov: 50.0 };
+		let (kept_fov, skipped_fov) = normalize_camera_track(vec![authored_fov.clone(), real_key.clone()], false);
+		assert!(!skipped_fov);
+		assert_eq!(kept_fov.len(), 2);
+		assert_eq!(kept_fov[0], authored_fov);
+
+		// 5) Default key placed after t=0 stays unchanged.
+		let delayed_default = CameraKey { at: 0.5, ..default_key.clone() };
+		let (kept_delayed, skipped_delayed) = normalize_camera_track(vec![delayed_default.clone(), later_key.clone()], false);
+		assert!(!skipped_delayed);
+		assert_eq!(kept_delayed.len(), 2);
+		assert_eq!(kept_delayed[0], delayed_default);
+
+		// 6) VideoJob's watched() viewer uses the normalized track (and respects keep_default_camera).
+		let make_job = |keep_default_camera: bool| VideoJob {
+			input: "x.rbxm".into(),
+			select: None,
+			out: None,
+			view: ViewRequest::default(),
+			name: default_name(),
+			playback: None,
+			playback_file: None,
+			playback_overlay: None,
+			start: 0.0,
+			duration: 1.0,
+			fps: 10.0,
+			speed: 1.0,
+			times: None,
+			orbit: 0.0,
+			format: VideoFormat::Png,
+			sheet: 0,
+			materials_from: None,
+			lighting_from: None,
+			map: None,
+			frame: None,
+			focus: None,
+			ffmpeg: None,
+			camera_track: Some(vec![default_key.clone(), real_key.clone()]),
+			keep_default_camera,
+			sheet_first: false,
+			copies: Vec::new(),
+			relative_to: None,
+			nvenc: None,
+		};
+		let pb_stripped = watched(&make_job(false)).unwrap();
+		assert_eq!(pb_stripped.viewer.len(), 1);
+		assert_eq!(pb_stripped.viewer[0].cframe, real_key.cframe);
+		let pb_kept = watched(&make_job(true)).unwrap();
+		assert_eq!(pb_kept.viewer.len(), 2);
+		assert_eq!(pb_kept.viewer[0].cframe, default_key.cframe);
 	}
 
 	#[test]

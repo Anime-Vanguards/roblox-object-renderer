@@ -56,6 +56,9 @@ pub struct TimelineOptions {
 	/// Moving camera sampled at each frame moment (`--camera-track`).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub camera_track: Option<Vec<CameraKey>>,
+	/// Keep a leading engine-default `(0, 20, 20)` camera key at `t = 0` in `camera_track`.
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub keep_default_camera: bool,
 	/// Worst-case mode (`--all-emitters-running`): every emitter emits and ages even when out of
 	/// the camera's view. Default `false` pauses emitters out of view (`Playback::viewer`),
 	/// matching Roblox's client rule.
@@ -577,7 +580,12 @@ pub fn run(
 		.first()
 		.map(|v| v.view.camera.clone())
 		.unwrap_or(CameraSpec::Orbit { yaw: 0.0, pitch: 20.0, distance: None, padding: 0.08, target: None, fov: 70.0 });
-	let has_track = tl.camera_track.as_deref().is_some_and(|t| !t.is_empty());
+	let normalized_track = tl
+		.camera_track
+		.as_ref()
+		.filter(|track| !track.is_empty())
+		.map(|track| crate::video::normalize_camera_track(track.clone(), tl.keep_default_camera).0);
+	let has_track = normalized_track.is_some();
 	let viewer_aspect = preset.width.max(1) as f32 / preset.height.max(1) as f32;
 
 	let offscreen_emitters = if tl.all_emitters_running {
@@ -594,11 +602,8 @@ pub fn run(
 			source: "playback-viewer",
 			note: "emitters out of the playback viewer's frustum stand still (neither emit nor age, matching Roblox client; pass --all-emitters-running for worst case)".into(),
 		}
-	} else if has_track {
-		let mut keys: Vec<crate::scene::playback::ViewerKey> = tl
-			.camera_track
-			.as_deref()
-			.unwrap_or(&[])
+	} else if let Some(track) = normalized_track.as_deref() {
+		let mut keys: Vec<crate::scene::playback::ViewerKey> = track
 			.iter()
 			.map(|key| crate::scene::playback::ViewerKey { at: key.at, cframe: key.cframe, fov: key.fov, aspect: viewer_aspect })
 			.collect();
@@ -668,8 +673,8 @@ pub fn run(
 			resolved.apply_history(document, &mut scene);
 			lend(&mut scene)?;
 
-			let mut spec = if has_track {
-				track_camera(tl.camera_track.as_deref().unwrap_or(&[]), t_f32)
+			let mut spec = if let Some(track) = normalized_track.as_deref() {
+				track_camera(track, t_f32)
 			} else {
 				base_camera.clone()
 			};
@@ -1435,7 +1440,7 @@ mod tests {
 		let cf0 = look_at_cframe(Vec3::new(0.0, 8.0, 22.0), Vec3::new(0.0, 2.0, 0.0));
 		let cf1 = look_at_cframe(Vec3::new(5.0, 10.0, 18.0), Vec3::new(0.0, 2.0, 0.0));
 		let track = vec![CameraKey { at: 0.0, cframe: cf0, fov: 70.0 }, CameraKey { at: 0.3, cframe: cf1, fov: 70.0 }];
-		let tl_opts = TimelineOptions { start: 0.0, duration: Some(0.6), auto_duration: false, fps: 10.0, times: None, camera_track: Some(track.clone()), all_emitters_running: false };
+		let tl_opts = TimelineOptions { start: 0.0, duration: Some(0.6), auto_duration: false, fps: 10.0, times: None, camera_track: Some(track.clone()), keep_default_camera: false, all_emitters_running: false };
 		let cost_opts = CostOptions { attribute: true, pixels: true, preset: Some("phone".into()), no_images: true, ..Default::default() };
 		let views = vec![NamedView { name: "render".into(), view: crate::render::ViewRequest { width: 2532, height: 1170, ..Default::default() } }];
 
@@ -1518,7 +1523,7 @@ mod tests {
 		let renderer = make_test_renderer(&temp.join("cache"));
 		let (mut doc, playback) = build_dynamic_scene();
 
-		let tl_opts = TimelineOptions { start: 0.0, duration: Some(0.3), auto_duration: false, fps: 10.0, times: None, camera_track: None, all_emitters_running: false };
+		let tl_opts = TimelineOptions { start: 0.0, duration: Some(0.3), auto_duration: false, fps: 10.0, times: None, camera_track: None, keep_default_camera: false, all_emitters_running: false };
 		let views = vec![NamedView {
 			name: "render".into(),
 			view: crate::render::ViewRequest {
@@ -1598,7 +1603,7 @@ mod tests {
 		// Default: emitters out of the camera's view stand still; BehindStream starts from 0 at t=2.0.
 		let out_default = temp.join("default");
 		std::fs::create_dir_all(&out_default).unwrap();
-		let tl_default = TimelineOptions { start: 0.0, duration: Some(3.2), auto_duration: false, fps: 10.0, times: None, camera_track: Some(track.clone()), all_emitters_running: false };
+		let tl_default = TimelineOptions { start: 0.0, duration: Some(3.2), auto_duration: false, fps: 10.0, times: None, camera_track: Some(track.clone()), keep_default_camera: false, all_emitters_running: false };
 		run(&renderer, &mut doc, None, &cost_opts, &tl_default, &views, None, None, &out_default, None, "offscreen.rbxmx", false, &|_| Ok(())).unwrap();
 		let j_def: serde_json::Value = serde_json::from_slice(&std::fs::read(out_default.join("timeline.json")).unwrap()).unwrap();
 		let t_def = std::fs::read_to_string(out_default.join("analysis.txt")).unwrap();
@@ -1657,6 +1662,7 @@ mod tests {
 			fps: 10.0,
 			times: Some(vec![10.0, 10.5, 11.0, 11.5, 12.0, 12.5]),
 			camera_track: Some(stream_track),
+			keep_default_camera: false,
 			all_emitters_running: false,
 		};
 		run(&renderer, &mut stream_doc, None, &cost_opts, &tl_stream, &views, None, None, &out_stream, None, "stream.rbxmx", false, &|_| Ok(())).unwrap();
@@ -1746,7 +1752,7 @@ mod tests {
 		// 1) --duration auto on endless + burst: reaches steady state, separates climb vs steady (~30 particles headline).
 		let out_auto = temp.join("auto");
 		std::fs::create_dir_all(&out_auto).unwrap();
-		let tl_auto = TimelineOptions { start: 0.0, duration: None, auto_duration: true, fps: 10.0, times: None, camera_track: None, all_emitters_running: false };
+		let tl_auto = TimelineOptions { start: 0.0, duration: None, auto_duration: true, fps: 10.0, times: None, camera_track: None, keep_default_camera: false, all_emitters_running: false };
 		run(&renderer, &mut doc, Some(&pb_with_burst), &cost_opts, &tl_auto, &views, None, None, &out_auto, None, "looping.rbxmx", false, &|_| Ok(())).unwrap();
 		let j_auto: serde_json::Value = serde_json::from_slice(&std::fs::read(out_auto.join("timeline.json")).unwrap()).unwrap();
 		let t_auto = std::fs::read_to_string(out_auto.join("analysis.txt")).unwrap();
@@ -1769,7 +1775,7 @@ mod tests {
 		// 2) Short explicit --duration 1.0 (last sample t=0.9 < 1.5): steady state NOT reached + clear WARNING line.
 		let out_short = temp.join("short");
 		std::fs::create_dir_all(&out_short).unwrap();
-		let tl_short = TimelineOptions { start: 0.0, duration: Some(1.0), auto_duration: false, fps: 10.0, times: None, camera_track: None, all_emitters_running: false };
+		let tl_short = TimelineOptions { start: 0.0, duration: Some(1.0), auto_duration: false, fps: 10.0, times: None, camera_track: None, keep_default_camera: false, all_emitters_running: false };
 		run(&renderer, &mut doc, None, &cost_opts, &tl_short, &views, None, None, &out_short, None, "looping.rbxmx", false, &|_| Ok(())).unwrap();
 		let j_short: serde_json::Value = serde_json::from_slice(&std::fs::read(out_short.join("timeline.json")).unwrap()).unwrap();
 		let t_short = std::fs::read_to_string(out_short.join("analysis.txt")).unwrap();
@@ -1785,7 +1791,7 @@ mod tests {
 		// 3) --start 1.5 --duration 1.0: skips climb completely, starts directly in steady state.
 		let out_start = temp.join("start_steady");
 		std::fs::create_dir_all(&out_start).unwrap();
-		let tl_start = TimelineOptions { start: 1.5, duration: Some(1.0), auto_duration: false, fps: 10.0, times: None, camera_track: None, all_emitters_running: false };
+		let tl_start = TimelineOptions { start: 1.5, duration: Some(1.0), auto_duration: false, fps: 10.0, times: None, camera_track: None, keep_default_camera: false, all_emitters_running: false };
 		run(&renderer, &mut doc, None, &cost_opts, &tl_start, &views, None, None, &out_start, None, "looping.rbxmx", false, &|_| Ok(())).unwrap();
 		let j_start: serde_json::Value = serde_json::from_slice(&std::fs::read(out_start.join("timeline.json")).unwrap()).unwrap();
 		assert_eq!(j_start["looping"]["steadyStateReached"], true);
@@ -1837,7 +1843,7 @@ mod tests {
 				..Default::default()
 			},
 		}];
-		let tl_opts = TimelineOptions { start: 0.0, duration: None, auto_duration: true, fps: 10.0, times: None, camera_track: None, all_emitters_running: false };
+		let tl_opts = TimelineOptions { start: 0.0, duration: None, auto_duration: true, fps: 10.0, times: None, camera_track: None, keep_default_camera: false, all_emitters_running: false };
 
 		// 1) Generous budget passes cleanly (over_budget == 0).
 		let out_pass = temp.join("pass");
@@ -1886,7 +1892,7 @@ mod tests {
 		// 4) Short duration before steady state labels budget mean check as climbMean.
 		let out_climb = temp.join("climb_mean");
 		std::fs::create_dir_all(&out_climb).unwrap();
-		let tl_short = TimelineOptions { start: 0.0, duration: Some(0.5), auto_duration: false, fps: 10.0, times: None, camera_track: None, all_emitters_running: false };
+		let tl_short = TimelineOptions { start: 0.0, duration: Some(0.5), auto_duration: false, fps: 10.0, times: None, camera_track: None, keep_default_camera: false, all_emitters_running: false };
 		run(&renderer, &mut doc, None, &fail_opts, &tl_short, &views, None, None, &out_climb, None, "budget.rbxmx", false, &|_| Ok(())).unwrap();
 		let j_climb: serde_json::Value = serde_json::from_slice(&std::fs::read(out_climb.join("timeline.json")).unwrap()).unwrap();
 		let t_climb = std::fs::read_to_string(out_climb.join("analysis.txt")).unwrap();
@@ -1912,7 +1918,7 @@ mod tests {
 				..Default::default()
 			},
 		}];
-		let tl_opts = TimelineOptions { start: 0.0, duration: Some(0.5), auto_duration: false, fps: 10.0, times: None, camera_track: None, all_emitters_running: false };
+		let tl_opts = TimelineOptions { start: 0.0, duration: Some(0.5), auto_duration: false, fps: 10.0, times: None, camera_track: None, keep_default_camera: false, all_emitters_running: false };
 
 		// --explain + --top honoured.
 		let out_a = temp.join("before");
@@ -2023,7 +2029,7 @@ mod tests {
 				..Default::default()
 			},
 		}];
-		let tl_opts = TimelineOptions { start: 0.0, duration: Some(0.6), auto_duration: false, fps: 10.0, times: None, camera_track: None, all_emitters_running: false };
+		let tl_opts = TimelineOptions { start: 0.0, duration: Some(0.6), auto_duration: false, fps: 10.0, times: None, camera_track: None, keep_default_camera: false, all_emitters_running: false };
 		let cost_opts = CostOptions { attribute: true, pixels: true, preset: Some("phone".into()), no_images: true, ..Default::default() };
 		let out = temp.join("out");
 		std::fs::create_dir_all(&out).unwrap();
