@@ -34,12 +34,8 @@ pub(super) fn has_local_file(uri: &str) -> bool {
 
 /// Cache key for a composite URI: unchanged when all layers are remote assets, or with each local
 /// template layer's file stamp folded in so a replaced local clothing image invalidates the cache.
-pub(super) fn stamped_key(uri: &str) -> String {
-	stamped_key_checked(uri).0
-}
-
-/// Like [`stamped_key`], also returning how many local clothing layers required a full-file hash
-/// because their volume provided no trusted OS change token.
+/// Also returns how many local clothing layers required a full-file hash because their volume
+/// provided no trusted OS change token.
 pub(super) fn stamped_key_checked(uri: &str) -> (String, usize) {
 	let Some(mut composite) = from_key(uri) else {
 		return (uri.to_string(), 0);

@@ -3849,19 +3849,18 @@ impl Renderer {
 					stable &= proof_matches(uri, proof, local_keys);
 				}
 			}
+			let mesh_uri: Option<&str> = match &part.geometry {
+				Geometry::MeshPart { mesh, .. } => Some(mesh.as_str()),
+				Geometry::Union { asset: Some(asset), mesh_data: None, .. } => Some(asset.as_str()),
+				Geometry::Special { mesh_type: crate::scene::extract::mesh_type::FILE_MESH, mesh: Some(uri), .. } => Some(uri.as_str()),
+				_ => None,
+			};
+			let local_mesh = mesh_uri.is_some_and(names_local_file);
 			let (mesh, local, is_mesh) = match mesh {
 				Ok((mesh, skin_stable)) => {
 					stable &= skin_stable;
-					if let Some(local_keys) = local_keys {
-						let mesh_uri: Option<&str> = match &part.geometry {
-							Geometry::MeshPart { mesh, .. } => Some(mesh.as_str()),
-							Geometry::Union { asset: Some(asset), mesh_data: None, .. } => Some(asset.as_str()),
-							Geometry::Special { mesh_type: crate::scene::extract::mesh_type::FILE_MESH, mesh: Some(uri), .. } => Some(uri.as_str()),
-							_ => None,
-						};
-						if let Some(uri) = mesh_uri {
-							stable &= proof_matches(uri, &mesh.0.proof, local_keys);
-						}
+					if let (Some(local_keys), Some(uri)) = (local_keys, mesh_uri) {
+						stable &= proof_matches(uri, &mesh.0.proof, local_keys);
 					}
 					mesh
 				}
@@ -3869,11 +3868,11 @@ impl Renderer {
 				// (texture-missing "meshpart-no-mesh", "specialmesh-no-mesh")
 				Err(error) if part.body_part.is_none() && matches!(&part.geometry, Geometry::MeshPart { .. } | Geometry::Special { mesh_type: crate::scene::extract::mesh_type::FILE_MESH, mesh: Some(_), .. }) => {
 					missing.push(format!("{}: {error:#} (not drawn)", part.path));
-					return (out, false);
+					return (out, stable && !local_mesh);
 				}
 				Err(error) => {
 					missing.push(format!("{}: {error:#}", part.path));
-					stable = false;
+					stable &= !local_mesh;
 					// a union's, a body part's (Studio's own limbs) or a FileMesh's without a MeshId: the
 					// part's box, so the shape is still there (texture-missing "specialmesh-empty-mesh")
 					(self.primitives[&Primitive::Block].clone(), Affine3A::from_scale(part.size), false)
@@ -3884,10 +3883,10 @@ impl Renderer {
 			// missing, refused (HTTP 403) or no image; one whose TexturePack fails draws as without maps)
 			// (in a recording of play such a part comes here without its appearance: Renderer::playable)
 			if part.surface_appearance.is_some()
-				&& let Some(error) = key.textures().find_map(|(uri, usage)| self.load_texture(uri, usage).err())
+				&& let Some((uri, error)) = key.textures().find_map(|(uri, usage)| self.load_texture(uri, usage).err().map(|error| (uri, error)))
 			{
 				missing.push(format!("{}: {error:#} (its SurfaceAppearance hides it)", part.path));
-				return (out, false);
+				return (out, stable && !names_local_file(uri));
 			}
 			// a mesh texture Studio cannot load draws black (texture-missing "specialmesh", "meshpart":
 			// missing, refused or no image; filemesh-instance's under the default light, its sheen alone)
@@ -3898,6 +3897,9 @@ impl Renderer {
 				&& let Err(error) = self.load_texture(color, TextureUse::Color)
 			{
 				missing.push(format!("{}: {error:#} (drawn black)", part.path));
+				if names_local_file(color) {
+					stable = false;
+				}
 				key.color = None;
 				flags &= !(TEX_COLOR | TEX_ALPHA_OVERLAY);
 				black = true;
@@ -3939,6 +3941,9 @@ impl Renderer {
 				// a decal whose image Studio cannot load draws nothing (texture-missing "decal-*", "texture")
 				if let Some(Err(error)) = decal_key.color.as_deref().map(|uri| self.load_texture(uri, TextureUse::Color)) {
 					missing.push(format!("{}: {error:#} (its decal is not drawn)", part.path));
+					if decal_key.color.as_deref().is_some_and(names_local_file) {
+						stable = false;
+					}
 					continue;
 				}
 				let decal_material = self.material_bind_group(&decal_key, missing);
