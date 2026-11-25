@@ -14,7 +14,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
 // paths whose push starts a dry run
 const ARTIFACTS = ["ror-windows-x86_64", "ror-linux-x86_64", "ror-macos-aarch64"];
 const BUILD_JOBS = ["build", "smoke"];
-const PUSH_PATHS = [".github/workflows/release.yml", "tools/release/**", "**/Cargo.toml", "**/Cargo.lock", "**/build.rs", ".cargo/config.toml", "LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md", "licenses/**"];
+const PUSH_PATHS = [".github/workflows/release.yml", "tools/release/**", "**/Cargo.toml", "**/Cargo.lock", "**/build.rs", ".cargo/config.toml", "crates/*/src/**", "crates/*/shaders/**", "vendor/**", "LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md", "licenses/**"];
 
 // The rest is the same in each tool repository
 // A workflow's push paths, as the tests' repositories list them

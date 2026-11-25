@@ -117,7 +117,7 @@ test("the canary notes need the run and a build time", (t) => {
 });
 
 test("workflow builds nightly in a concurrency group of its own and publishes the canary tag", () => {
-	assert.match(workflow, /\n  schedule:\n    - cron: "11 1 \* \* \*"\n/);
+	assert.match(workflow, /\n  schedule:\n    - cron: "11 \*\/2 \* \* \*"\n/);
 	assert.match(workflow, /\n    tags: \['v\[0-9\]\+\.\[0-9\]\+\.\[0-9\]\+', 'canary'\]\n/);
 	// pushes to main keep their path filter
 	assert.match(workflow, /\n    paths:\n      - \.github\/workflows\/release\.yml\n/);
@@ -152,12 +152,14 @@ test("workflow publishes the canary as a prerelease under lasting names without 
 
 	const canaryStep = step("Create or update the canary prerelease for the existing tag");
 	assert.match(canaryStep, /if: \$\{\{ github.ref == 'refs\/tags\/canary' \}\}/);
-	assert.match(canaryStep, /title="Canary \(main \$\{GITHUB_SHA:0:10\}\)"/);
+	assert.match(canaryStep, /BUILT: \$\{\{ needs\.version\.outputs\.dry-run-date \}\}/);
+	assert.match(canaryStep, /title="Canary \(main \$\{GITHUB_SHA:0:10\}, \$\{BUILT:0:10\} \$\{BUILT:11:5\}Z\)"/);
 	assert.match(canaryStep, /gh release create "\$TAG" --verify-tag --prerelease --latest=false /);
 	assert.match(canaryStep, /gh release edit "\$TAG" --prerelease --latest=false /);
 	// no ref is ever created or moved
 	assert.doesNotMatch(canaryStep.slice(canaryStep.indexOf("run: |")), /--target|target_commitish|git (?:tag|push)|refs\//);
-	// each asset is replaced before the stale ones go
+	// each asset is replaced (with retry on transient 5xx) before the stale ones go
+	assert.match(canaryStep, /for attempt in 1 2 3; do\n\s+if gh release upload "\$TAG" --clobber -R "\$GITHUB_REPOSITORY" "\$\{assets\[@\]\}"; then break; fi\n\s+if \[ "\$attempt" -eq 3 \]; then exit 1; fi\n\s+sleep \$\(\(attempt \* 5\)\)\n\s+done/);
 	assert.ok(canaryStep.indexOf("gh release upload \"$TAG\" --clobber") >= 0);
 	assert.ok(canaryStep.indexOf("--clobber") < canaryStep.indexOf("gh release delete-asset"));
 	// the publish job alone writes

@@ -33,13 +33,16 @@ on:
       - '**/Cargo.lock'
       - '**/build.rs'
       - .cargo/config.toml
+      - 'crates/*/src/**'
+      - 'crates/*/shaders/**'
+      - 'vendor/**'
       - LICENSE
       - NOTICE
       - THIRD_PARTY_NOTICES.md
       - licenses/**
-  # nightly, at main's head
+  # Scheduled sweep every 2 hours at main's head (skips in seconds when nothing shipped)
   schedule:
-    - cron: "11 1 * * *"
+    - cron: "11 */2 * * *"
   workflow_dispatch:
 
 permissions:
@@ -388,16 +391,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
+          BUILT: ${{ needs.version.outputs.dry-run-date }}
         run: |
           set -euo pipefail
-          title="Canary (main ${GITHUB_SHA:0:10})"
+          title="Canary (main ${GITHUB_SHA:0:10}, ${BUILT:0:10} ${BUILT:11:5}Z)"
           assets=(assets/*.zip assets/SHA256SUMS)
           if ! gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json tagName > /dev/null; then
             gh release create "$TAG" --verify-tag --prerelease --latest=false --title "$title" \
               --notes-file notes/release-notes.md -R "$GITHUB_REPOSITORY" "${assets[@]}"
             exit 0
           fi
-          gh release upload "$TAG" --clobber -R "$GITHUB_REPOSITORY" "${assets[@]}"
+          for attempt in 1 2 3; do
+            if gh release upload "$TAG" --clobber -R "$GITHUB_REPOSITORY" "${assets[@]}"; then break; fi
+            if [ "$attempt" -eq 3 ]; then exit 1; fi
+            sleep $((attempt * 5))
+          done
           names=$(printf '%s\n' "${assets[@]##*/}")
           gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | while IFS= read -r name; do
             if ! grep -qxF -- "$name" <<< "$names"; then
