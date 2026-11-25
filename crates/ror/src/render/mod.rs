@@ -33,6 +33,8 @@ pub mod camera;
 pub mod clouds;
 pub mod composite;
 mod culling;
+#[cfg(test)]
+mod cutout_depth_tests;
 pub mod environment;
 pub mod geometry;
 pub mod gpu;
