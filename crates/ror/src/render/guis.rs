@@ -1492,7 +1492,7 @@ impl Renderer {
 		if overlays.is_empty() {
 			return None;
 		}
-		overlays.sort_by(|a, b| overlay_order((a.screen, camera.depth(a.center)), (b.screen, camera.depth(b.center))));
+		overlays.sort_by(|a, b| overlay_order((a.screen, a.center.distance_squared(camera.eye)), (b.screen, b.center.distance_squared(camera.eye))));
 		let device = &self.gpu.device;
 		let frame = self.frame_uniform(Some(camera), width, height, 0);
 		let frame_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("gui overlay frame"), contents: bytemuck::bytes_of(&frame), usage: wgpu::BufferUsages::UNIFORM });
@@ -1547,8 +1547,8 @@ impl Renderer {
 	}
 }
 
-/// The order of the overlay layer's GUIs (each its ScreenGui DisplayOrder, its depth along the
-/// camera's forward axis, Camera::depth), first drawn first: the world's AlwaysOnTop GUIs far to near, then the ScreenGuis by
+/// The order of the overlay layer's GUIs (each its ScreenGui DisplayOrder, its squared distance from
+/// the camera), first drawn first: the world's AlwaysOnTop GUIs far to near, then the ScreenGuis by
 /// DisplayOrder, the higher over (screen-gui-probes: DisplayOrder 2 over 1); a tie keeps the scene's order.
 fn overlay_order(a: (Option<i32>, f32), b: (Option<i32>, f32)) -> std::cmp::Ordering {
 	match (a.0, b.0) {
