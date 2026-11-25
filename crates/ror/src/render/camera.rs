@@ -102,7 +102,8 @@ impl Camera {
 	/// tall at Transparency 0.3 with rows of unlit effects along its top face; from one eye 32 studs out,
 	/// looking 10.6 degrees down all four rows draw over the face and looking 7.1 degrees up only the
 	/// nearest, the eye unmoved; a row nearer the eye than the part's middle by 16 studs but 8 deeper
-	/// along the look draws under; 1,287 of 1,440 readings against 1,164 by distance).
+	/// along the look draws under; of the 1,260 readings in the 63 frames kept, 1,028 follow this and
+	/// 912 follow distance).
 	pub fn depth(&self, point: Vec3) -> f32 {
 		(point - self.eye).dot(-Vec3::from(self.world.matrix3.z_axis))
 	}

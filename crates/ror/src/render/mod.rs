@@ -7344,13 +7344,14 @@ mod blend_order_tests {
 	use super::*;
 	use crate::scene::build::{ModelBuilder, PartSpec};
 	use rbx_dom_weak::InstanceBuilder;
-	use rbx_dom_weak::types::{Color3, ColorSequence, ColorSequenceKeypoint, NumberSequence, NumberSequenceKeypoint, Variant};
+	use rbx_dom_weak::types::{Color3, ColorSequence, ColorSequenceKeypoint, ContentId, NumberRange, NumberSequence, NumberSequenceKeypoint, Variant};
 
 	/// A see-through part (Transparency 0.3, its top face at y 0, 40 x 24 studs) with four unlit red beams
 	/// 0.1 over the face at x -15, -5, 5 and 15, each facing the camera and ordered whole: a beam is drawn over the face or
 	/// under it by its depth along the camera's forward axis against the part's middle's, not by their
 	/// distances from the eye (blend-depth-order, the engine 0.747, rows x -15 / -5 / 5 / 15). By distance
-	/// the second and third cases read over in every row and the fourth under at x -15 and 15.
+	/// the second and third cases read over in every row and the fourth under at x -15 and 15. Drawn once
+	/// with the beams and once with an emitter's still particles in their place: both take the one key.
 	#[test]
 	fn a_see_through_part_and_effects_order_by_depth_along_the_cameras_forward_axis() {
 		let state = std::env::temp_dir().join(format!("ror-blend-order-test-{}", std::process::id()));
@@ -7360,13 +7361,33 @@ mod blend_order_tests {
 		const ROWS: [f32; 4] = [-15.0, -5.0, 5.0, 15.0];
 		// each row a little further across, so that from a low eye no beam stands before the next row's
 		const STAGGER: f32 = 0.6;
-		let scene = |height: f32| {
+		std::fs::create_dir_all(&state).unwrap();
+		let white = state.join("white.png");
+		crate::output::write_png(&white, 8, 8, &[255u8; 4].repeat(64), false).unwrap();
+		let white = format!("file:///{}", white.display().to_string().replace('\\', "/"));
+		let scene = |height: f32, emitters: bool| {
 			let mut model = ModelBuilder::new("Order");
 			model.part(&PartSpec { name: "Water".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, -height * 0.5, 0.0)), size: Vec3::new(40.0, height, 24.0), color: [0, 110, 255], transparency: 0.3, cast_shadow: false, ..Default::default() });
 			let red = Color3::new(1.0, 0.0, 0.0);
 			for x in ROWS {
 				let holder = model.part(&PartSpec { name: "Holder".into(), cframe: Affine3A::from_translation(Vec3::new(x, 0.1, x * STAGGER)), size: Vec3::splat(0.2), transparency: 1.0, cast_shadow: false, ..Default::default() });
-				let end = |z: f32| InstanceBuilder::new("Attachment").with_property("CFrame", crate::scene::build::cframe(Affine3A::from_translation(Vec3::new(0.0, 0.0, z))));
+				if emitters {
+					// ten particles that stay where they were emitted: a red square 2 studs across at the holder
+					model.child(
+						holder,
+						InstanceBuilder::new("ParticleEmitter")
+							.with_property("Texture", ContentId::from(white.clone()))
+							.with_property("Color", ColorSequence { keypoints: vec![ColorSequenceKeypoint::new(0.0, red), ColorSequenceKeypoint::new(1.0, red)] })
+							.with_property("Size", NumberSequence { keypoints: vec![NumberSequenceKeypoint::new(0.0, 2.0, 0.0), NumberSequenceKeypoint::new(1.0, 2.0, 0.0)] })
+							.with_property("Lifetime", NumberRange::new(5.0, 5.0))
+							.with_property("Speed", NumberRange::new(0.0, 0.0))
+							.with_property("Rate", 2.0f32)
+							.with_property("LightEmission", 0.0f32)
+							.with_property("LightInfluence", 0.0f32),
+					);
+					continue;
+				}
+				let end =|z: f32| InstanceBuilder::new("Attachment").with_property("CFrame", crate::scene::build::cframe(Affine3A::from_translation(Vec3::new(0.0, 0.0, z))));
 				let (a0, a1) = (model.child(holder, end(-1.5)), model.child(holder, end(1.5)));
 				model.child(
 					holder,
@@ -7392,10 +7413,11 @@ mod blend_order_tests {
 			(180.0, [-150.0, 12.0, 0.0], [0.0, 0.0, 0.0], 16.0, [true, true, true, false]),
 			(0.4, [0.0, 100.0, 0.0], [0.0, 0.0, 0.0], 30.0, [true, true, true, true]),
 		];
-		for (height, eye, target, fov, over) in cases {
+		for (emitters, (height, eye, target, fov, over)) in [false, true].into_iter().flat_map(|emitters| cases.map(|case| (emitters, case))) {
+			let effects = if emitters { "emitters" } else { "beams" };
 			let spec = CameraSpec::LookAt { eye, target, fov };
 			let view = ViewRequest { width: SIZE.0, height: SIZE.1, camera: spec.clone(), background: Background::Color([0.0, 0.0, 0.0]), bloom: false, ..Default::default() };
-			let (images, _) = renderer.render(&scene(height), &[view]).unwrap();
+			let (images, _) = renderer.render(&scene(height, emitters), &[view]).unwrap();
 			let project = spec.place(None, SIZE.0, SIZE.1).view_projection(SIZE.0 as f32 / SIZE.1 as f32);
 			let mut read = Vec::new();
 			let drawn: Vec<bool> = ROWS
@@ -7405,12 +7427,12 @@ mod blend_order_tests {
 					let (column, row) = (((clip.x / clip.w * 0.5 + 0.5) * SIZE.0 as f32) as usize, ((0.5 - clip.y / clip.w * 0.5) * SIZE.1 as f32) as usize);
 					let pixel = &images[0].rgba[(row * SIZE.0 as usize + column) * 4..][..3];
 					read.push([pixel[0], pixel[1], pixel[2]]);
-					assert!(pixel[0] > 60, "eye {eye:?} looking at {target:?}: no beam at x {x} ({pixel:?})");
+					assert!(pixel[0] > 60, "{effects}, eye {eye:?} looking at {target:?}: nothing drawn at x {x} ({pixel:?})");
 					// its own red, or that under 0.7 of the part's blue
 					pixel[2] < 60
 				})
 				.collect();
-			assert_eq!(drawn, over, "part {height} studs tall, eye {eye:?} looking at {target:?}: the rows drawn over the face (read {read:?})");
+			assert_eq!(drawn, over, "{effects}, part {height} studs tall, eye {eye:?} looking at {target:?}: the rows drawn over the face (read {read:?})");
 		}
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
