@@ -404,9 +404,17 @@ impl super::Renderer {
 	/// The texture of a texture cache key: a composite's, a transcode layer's (an image asset's, else
 	/// its upload), a local image file's (kept on disk by content hash so unchanged files skip decode
 	/// and stream mips through `residency`), or an image's with ror's own mips.
+	#[cfg(test)]
 	pub(super) fn make_texture(&self, uri: &str, usage: TextureUse) -> Result<GpuTexture> {
+		self.make_texture_checked(uri, usage).map(|(texture, _)| texture)
+	}
+
+	/// Like [`make_texture`], also returning `offline_fallback` (`true` when an offline view fell back
+	/// from an uncached transcode to an uploaded image, which is never persisted to `.tex` or promoted
+	/// to the shared online cache).
+	pub(super) fn make_texture_checked(&self, uri: &str, usage: TextureUse) -> Result<(GpuTexture, bool)> {
 		if uri.starts_with(super::composite::KEY_PREFIX) {
-			return self.composite_texture(uri);
+			return self.composite_texture(uri).map(|texture| (texture, false));
 		}
 		let config = self.assets.config();
 		let state_dir = &config.state_dir;
@@ -423,7 +431,7 @@ impl super::Renderer {
 				&& let Some(texture) = open(&own, uri).or_else(|| take_kept_for(state_dir, store_root, &file_name, &own, uri))
 			{
 				mark_used_in(&dir);
-				return Ok(texture);
+				return Ok((texture, false));
 			}
 			let image = decode_local(uri, &bytes, usage, self.gpu.supports_bc())?;
 			if write(&own, &GpuTexture::uploadable(&self.gpu, &image), usage)
@@ -431,31 +439,39 @@ impl super::Renderer {
 			{
 				publish_to(&own, store_root);
 				mark_used_in(&dir);
-				return Ok(texture);
+				return Ok((texture, false));
 			}
 			self.gpu_room(image.levels.iter().map(|level| level.len() as u64).sum())?;
-			return GpuTexture::upload(&self.gpu, uri, &image, usage);
+			return GpuTexture::upload(&self.gpu, uri, &image, usage).map(|texture| (texture, false));
 		}
 		let kept = cacheable(uri).then(|| name(uri, usage, self.gpu.supports_bc()));
 		if let Some(name) = kept.as_deref().filter(|_| !config.refresh) {
 			let own = dir.join(name);
 			if let Some(texture) = open(&own, uri).or_else(|| take_kept_for(state_dir, store_root, name, &own, uri)) {
 				mark_used_in(&dir);
-				return Ok(texture);
+				return Ok((texture, false));
 			}
 		}
-		let image = self.texture_image(uri, usage)?;
-		if let Some(name) = &kept {
+		let (image, fallback) = match super::transcode::parse_layer_key(uri) {
+			Some((ror_assets::Transcode::Image, asset)) if self.assets.offline() => match self.transcode_image(asset, ror_assets::Transcode::Image) {
+				Ok(image) => (image, false),
+				Err(_) => (self.texture_image(asset, usage)?, true),
+			},
+			_ => (self.texture_image(uri, usage)?, false),
+		};
+		if !fallback
+			&& let Some(name) = &kept
+		{
 			let own = dir.join(name);
 			if write(&own, &GpuTexture::uploadable(&self.gpu, &image), usage)
 				&& let Some(texture) = open(&own, uri)
 			{
 				publish_to(&own, store_root);
-				return Ok(texture);
+				return Ok((texture, false));
 			}
 		}
 		self.gpu_room(image.levels.iter().map(|level| level.len() as u64).sum())?;
-		GpuTexture::upload(&self.gpu, uri, &image, usage)
+		GpuTexture::upload(&self.gpu, uri, &image, usage).map(|texture| (texture, fallback && self.assets.is_offline_view()))
 	}
 }
 

@@ -409,6 +409,9 @@ pub struct Cache<K, V> {
 	dropped_failures: AtomicU64,
 	/// Offline-view failures let go of or superseded by a later online success
 	dropped_offline_failures: AtomicU64,
+	/// Offline-view misses or isolated fallbacks seen so far, so callers can tell when an offline
+	/// prepare took a silent fallback path even if no user-visible `missing` entry was recorded.
+	offline_errors: AtomicU64,
 }
 
 impl<K: Eq + Hash + Clone, V: Weighed> Cache<K, V> {
@@ -422,7 +425,13 @@ impl<K: Eq + Hash + Clone, V: Weighed> Cache<K, V> {
 			misses: AtomicU64::new(0),
 			dropped_failures: AtomicU64::new(0),
 			dropped_offline_failures: AtomicU64::new(0),
+			offline_errors: AtomicU64::new(0),
 		}
+	}
+
+	/// Monotonic count of offline-view misses and isolated fallbacks seen by this cache.
+	pub fn offline_errors(&self) -> u64 {
+		self.offline_errors.load(Ordering::Relaxed)
 	}
 
 	/// When the first failure it remembers now is retried (`None`: it remembers none), and
@@ -471,6 +480,14 @@ impl<K: Eq + Hash + Clone, V: Weighed> Cache<K, V> {
 	/// in-flight loads and [`FAILURE_TTL`] failures stay in `offline` so they deduplicate across
 	/// concurrent offline threads and repeat frames without poisoning online loads.
 	pub fn get_or_load_for(&self, key: &K, offline_view: bool, load: impl FnOnce() -> Result<V>) -> Result<Arc<V>> {
+		self.get_or_load_isolated(key, offline_view, || load().map(|value| (value, false)))
+	}
+
+	/// Like [`Cache::get_or_load_for`], where `load` also signals `offline_fallback` (`true` when an
+	/// offline view fell back to a substitute such as an uploaded PNG in place of an uncached
+	/// transcode). An `offline_fallback` value is returned to the caller without promoting it into the
+	/// shared cache or keeping GPU bytes in `offline`, and increments [`Cache::offline_errors`].
+	pub fn get_or_load_isolated(&self, key: &K, offline_view: bool, load: impl FnOnce() -> Result<(V, bool)>) -> Result<Arc<V>> {
 		let tick = self.tick.fetch_add(1, Ordering::Relaxed);
 		if offline_view {
 			{
@@ -506,10 +523,16 @@ impl<K: Eq + Hash + Clone, V: Weighed> Cache<K, V> {
 				}
 			};
 			let mut loaded = false;
+			let mut offline_fallback = false;
 			let result = cell
 				.get_or_init(|| {
 					loaded = true;
-					load().map(Arc::new).map_err(|error| format!("{error:#}"))
+					load()
+						.map(|(value, fallback)| {
+							offline_fallback = fallback;
+							Arc::new(value)
+						})
+						.map_err(|error| format!("{error:#}"))
 				})
 				.clone();
 			if loaded {
@@ -520,29 +543,49 @@ impl<K: Eq + Hash + Clone, V: Weighed> Cache<K, V> {
 			return match result {
 				Ok(value) => {
 					if loaded {
-						let shared = Arc::new(OnceLock::new());
-						let _ = shared.set(Ok(value.clone()));
-						{
-							let mut entries = self.entries.lock();
-							let replace = match entries.get(key) {
-								None => true,
-								Some(entry) => matches!(entry.cell.get(), Some(Err(_))),
-							};
-							if replace {
-								entries.insert(key.clone(), Entry { cell: shared, last_used: tick, created: std::time::Instant::now() });
-							}
-						}
-						{
+						if offline_fallback {
+							self.offline_errors.fetch_add(1, Ordering::Relaxed);
 							let mut offline = self.offline.lock();
 							if offline.get(key).is_some_and(|entry| Arc::ptr_eq(&entry.cell, &cell)) {
 								offline.remove(key);
 							}
+						} else {
+							let shared = Arc::new(OnceLock::new());
+							let _ = shared.set(Ok(value.clone()));
+							let keep_in_offline = {
+								let mut entries = self.entries.lock();
+								match entries.get(key) {
+									None => {
+										entries.insert(key.clone(), Entry { cell: shared, last_used: tick, created: std::time::Instant::now() });
+										false
+									}
+									Some(entry) => match entry.cell.get() {
+										Some(Err(_)) => {
+											entries.insert(key.clone(), Entry { cell: shared, last_used: tick, created: std::time::Instant::now() });
+											false
+										}
+										// An online load is in flight: keep our Ok cell in `offline` until online
+										// settles so other concurrent offline callers share it instead of loading again.
+										None => true,
+										Some(Ok(_)) => false,
+									},
+								}
+							};
+							if !keep_in_offline {
+								let mut offline = self.offline.lock();
+								if offline.get(key).is_some_and(|entry| Arc::ptr_eq(&entry.cell, &cell)) {
+									offline.remove(key);
+								}
+							}
+							self.evict();
 						}
-						self.evict();
 					}
 					Ok(value)
 				}
-				Err(error) => Err(anyhow!(error)),
+				Err(error) => {
+					self.offline_errors.fetch_add(1, Ordering::Relaxed);
+					Err(anyhow!(error))
+				}
 			};
 		}
 		let cell = {
@@ -564,7 +607,7 @@ impl<K: Eq + Hash + Clone, V: Weighed> Cache<K, V> {
 		let result = cell
 			.get_or_init(|| {
 				loaded = true;
-				load().map(Arc::new).map_err(|error| format!("{error:#}"))
+				load().map(|(value, _)| Arc::new(value)).map_err(|error| format!("{error:#}"))
 			})
 			.clone();
 		if loaded {
@@ -575,14 +618,26 @@ impl<K: Eq + Hash + Clone, V: Weighed> Cache<K, V> {
 		match result {
 			Ok(value) => {
 				if loaded {
-					if self.offline.lock().remove(key).is_some() {
+					if let Some(removed) = self.offline.lock().remove(key)
+						&& matches!(removed.cell.get(), Some(Err(_)))
+					{
 						self.dropped_offline_failures.fetch_add(1, Ordering::Relaxed);
 					}
 					self.evict();
 				}
 				Ok(value)
 			}
-			Err(error) => Err(anyhow!(error)),
+			Err(error) => {
+				if loaded {
+					// Clear any temporary offline Ok parked while this online load was in flight so
+					// `offline` retains no GPU bytes at rest.
+					let mut offline = self.offline.lock();
+					if offline.get(key).is_some_and(|entry| matches!(entry.cell.get(), Some(Ok(_)))) {
+						offline.remove(key);
+					}
+				}
+				Err(anyhow!(error))
+			}
 		}
 	}
 
@@ -747,6 +802,48 @@ mod tests {
 		let shared = cache.get_or_load(&2, || panic!("should hit cached offline success")).unwrap();
 		assert!(Arc::ptr_eq(&from_disk, &shared));
 		assert!(cache.offline.lock().is_empty(), "offline map holds zero GPU values at rest");
+	}
+
+	#[test]
+	fn offline_load_beside_inflight_online_deduplicates_and_does_not_miscount_dropped_failures() {
+		let cache: Cache<u32, Blob> = Cache::new(100);
+		let entered = std::sync::Barrier::new(2);
+		let release = std::sync::Barrier::new(2);
+		let offline_loads = std::sync::atomic::AtomicUsize::new(0);
+		std::thread::scope(|scope| {
+			let online = scope.spawn(|| {
+				cache
+					.get_or_load(&1, || {
+						entered.wait();
+						release.wait();
+						Ok(Blob(50))
+					})
+					.unwrap()
+			});
+			entered.wait();
+			// While online is in flight, two offline callers share one offline load instead of loading twice.
+			let first = cache
+				.get_or_load_for(&1, true, || {
+					offline_loads.fetch_add(1, Ordering::SeqCst);
+					Ok(Blob(50))
+				})
+				.unwrap();
+			let second = cache
+				.get_or_load_for(&1, true, || {
+					offline_loads.fetch_add(1, Ordering::SeqCst);
+					Ok(Blob(50))
+				})
+				.unwrap();
+			let same = Arc::ptr_eq(&first, &second);
+			let loads = offline_loads.load(Ordering::SeqCst);
+			release.wait();
+			let settled = online.join().unwrap();
+			assert!(same, "concurrent offline callers beside in-flight online load should share one value");
+			assert_eq!(loads, 1, "concurrent offline callers beside in-flight online load should deduplicate");
+			assert_eq!(settled.0, 50);
+		});
+		assert!(cache.offline.lock().is_empty(), "online completion clears temporary offline entry");
+		assert_eq!(cache.dropped_failures_for(true), 0, "clearing a temporary offline success must not count as a dropped offline failure");
 	}
 }
 

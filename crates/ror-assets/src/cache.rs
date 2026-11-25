@@ -125,14 +125,26 @@ impl DiskCache {
 			if let Ok(bytes) = std::fs::read(&store_bin) {
 				if meta_of(&store_json).is_some_and(|meta| meta.uri == key && meta.size == bytes.len()) {
 					crate::store::touch(&store_bin);
+					crate::store::touch(&store_json);
 					// a failed link only costs the next process the same lookup
 					if link_atomic(&store_bin, &bin).is_ok() {
 						let _ = link_atomic(&store_json, &json);
 					}
 					return Some(bytes);
 				}
-				let _ = std::fs::remove_file(&store_bin);
-				let _ = std::fs::remove_file(&store_json);
+				// Only remove an entry whose metadata exists (corrupt or mismatched) or whose binary
+				// has lingered without metadata past a concurrent publish window (older binaries link
+				// `.bin` before `.json`).
+				let orphan_old = !store_json.exists()
+					&& std::fs::metadata(&store_bin)
+						.and_then(|meta| meta.modified())
+						.ok()
+						.and_then(|time| time.elapsed().ok())
+						.is_some_and(|age| age > Duration::from_secs(5));
+				if store_json.exists() || orphan_old {
+					let _ = std::fs::remove_file(&store_bin);
+					let _ = std::fs::remove_file(&store_json);
+				}
 			}
 		}
 		for dir in &self.shared {
@@ -155,12 +167,12 @@ impl DiskCache {
 	}
 
 	/// Gives the content store this state dir's download of a key's `hash` (a name of the same file).
+	/// Links metadata before content so a concurrent reader never sees `.bin` before `.json`.
 	fn publish(&self, hash: &str) {
 		let Some(store) = &self.store else { return };
 		let (bin, json) = files(&self.dir, hash);
 		let (store_bin, store_json) = files(store, hash);
-		if json.is_file() && link_atomic(&bin, &store_bin).is_ok() {
-			let _ = link_atomic(&json, &store_json);
+		if json.is_file() && link_atomic(&json, &store_json).is_ok() && link_atomic(&bin, &store_bin).is_ok() {
 			crate::store::maybe_prune(store.parent().unwrap_or(store));
 		}
 	}
@@ -454,5 +466,34 @@ mod tests {
 		let leftovers = std::fs::read_dir(dir.join("x")).unwrap().count();
 		assert_eq!(leftovers, 1);
 		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	#[test]
+	fn store_read_preserves_fresh_entry_without_metadata_and_removes_mismatched_one() {
+		let root = std::env::temp_dir().join(format!("ror-assets-store-order-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&root);
+		let store = root.join("store");
+		let disk = DiskCache::new(&root.join("state"), &[], Some(&store));
+		let key = "rbxassetid://123456";
+		let hash = hash_key(key);
+		let (store_bin, store_json) = files(&store.join("assets"), &hash);
+		// A freshly written `.bin` whose `.json` has not landed yet must not be deleted by a concurrent reader.
+		write_atomic(&store_bin, b"payload").unwrap();
+		assert!(disk.read(key).is_none());
+		assert!(store_bin.is_file(), "fresh store .bin without .json yet must not be deleted");
+		// Once matching metadata lands, read succeeds and keeps both files.
+		let meta = Meta { uri: key.into(), fetched_at: 1, source_host: "test".into(), size: 7, kind: "bin".into() };
+		write_atomic(&store_json, &serde_json::to_vec(&meta).unwrap()).unwrap();
+		assert_eq!(disk.read(key).as_deref(), Some(&b"payload"[..]));
+		// A mismatched metadata file in the store is genuinely corrupt and removed on read.
+		let bad_key = "rbxassetid://123457";
+		let bad_hash = hash_key(bad_key);
+		let (bad_bin, bad_json) = files(&store.join("assets"), &bad_hash);
+		write_atomic(&bad_bin, b"wrong").unwrap();
+		let bad_meta = Meta { uri: bad_key.into(), fetched_at: 1, source_host: "test".into(), size: 999, kind: "bin".into() };
+		write_atomic(&bad_json, &serde_json::to_vec(&bad_meta).unwrap()).unwrap();
+		assert!(disk.read(bad_key).is_none());
+		assert!(!bad_bin.exists() && !bad_json.exists(), "mismatched store entry should be removed");
+		let _ = std::fs::remove_dir_all(&root);
 	}
 }

@@ -2423,7 +2423,7 @@ impl Renderer {
 	/// its levels' source; one kept on disk goes to the GPU only once asked for (a material map's levels
 	/// from the finest a view samples, render::residency; [`Renderer::load_whole`]).
 	fn load_texture(&self, uri: &str, usage: TextureUse) -> Result<Arc<GpuTexture>> {
-		self.textures.get_or_load_for(&(content_key(uri), usage), self.assets.is_offline_view(), || self.make_texture(uri, usage))
+		self.textures.get_or_load_isolated(&(content_key(uri), usage), self.assets.is_offline_view(), || self.make_texture_checked(uri, usage))
 	}
 
 	/// [`Renderer::load_texture`] with every level on the GPU (what effects, the sky's bodies and the
@@ -3071,15 +3071,18 @@ impl Renderer {
 			}
 			None => {
 				let failures = self.failures(offline_view);
-				let (mut geometry, moving, frame, remembered) = self.prepare_geometry(scene, stats, neon_share, key.as_deref(), lease, views, defer_maps, last)?;
+				let (mut geometry, moving, frame, remembered, offline_fallback) = self.prepare_geometry(scene, stats, neon_share, key.as_deref(), lease, views, defer_maps, last)?;
 				// A missing asset can succeed on a later request: a scene some of whose loads failed is kept
 				// only while the caches remember every failure it met, until the first of them is retried
-				// (prepared::Retry), keeping their ordinary retry policy. A scene some of whose parts
-				// changed since the last is moving: its next frame differs again (its parts are kept
-				// instead, `prepare_geometry`), unless it is drawn again unchanged (Preparations::repeated).
-				let retry = (!geometry.missing.is_empty() && remembered).then(|| prepared::Retry::of(failures, self.failures(offline_view))).flatten();
-				let offline_only = offline_view && !geometry.missing.is_empty();
-				let keep = (geometry.missing.is_empty() || retry.is_some()) && key.as_ref().is_some_and(|key| !moving || self.preparations.repeated(key));
+				// (prepared::Retry), keeping their ordinary retry policy. An offline view that hit any
+				// offline miss or silent fallback (e.g. TexturePack layers or Head mesh) stays offline-only
+				// so it can never poison online renders. A scene some of whose parts changed since the last
+				// is moving: its next frame differs again (its parts are kept instead, `prepare_geometry`),
+				// unless it is drawn again unchanged (Preparations::repeated).
+				let had_failures = !geometry.missing.is_empty() || offline_fallback;
+				let retry = (had_failures && remembered).then(|| prepared::Retry::of(failures, self.failures(offline_view))).flatten();
+				let offline_only = offline_view && had_failures;
+				let keep = (!had_failures || retry.is_some()) && key.as_ref().is_some_and(|key| !moving || self.preparations.repeated(key));
 				if keep && moving {
 					// (prepare_geometry counts what a moving scene holds as nothing: it is not kept)
 					geometry.held = Self::held_by(&geometry.draws, geometry.organic_noise.as_ref(), geometry.surface_maps.as_ref());
@@ -3193,10 +3196,11 @@ impl Renderer {
 	/// the others are prepared now and kept when their assets loaded. A live scene's parts are not
 	/// kept: its skinned meshes are written over in place.
 	#[allow(clippy::too_many_arguments)]
-	fn prepare_geometry(&self, scene: &Scene, stats: &mut RenderStats, neon_share: f32, key: Option<&prepared::SceneKey>, lease: &reuse::Lease, views: &[ViewRequest], defer_maps: bool, last: Option<prepared::LastFrame>) -> Result<(prepared::PreparedGeometry, bool, Option<prepared::FramePieces>, bool)> {
+	fn prepare_geometry(&self, scene: &Scene, stats: &mut RenderStats, neon_share: f32, key: Option<&prepared::SceneKey>, lease: &reuse::Lease, views: &[ViewRequest], defer_maps: bool, last: Option<prepared::LastFrame>) -> Result<(prepared::PreparedGeometry, bool, Option<prepared::FramePieces>, bool, bool)> {
 		let assets_start = Instant::now();
 		let profile = std::env::var_os("ROR_PROFILE").is_some();
 		let missing_before = stats.missing.len();
+		let offline_errors_before = self.assets.is_offline_view().then(|| self.offline_errors());
 		// the textures loaded whole below whose levels could not be read: not a failure the texture
 		// cache remembers
 		let mut remembered = true;
@@ -3340,8 +3344,10 @@ impl Renderer {
 			return Err(anyhow!("{} parts: {full}", scene.parts.len()));
 		}
 		// a part whose assets all loaded is kept for later scenes (a missing one may load next time); a
-		// skinned part's pose is cached by the skins themselves
-		if let (Some(key), Some(table)) = (key, &table) {
+		// skinned part's pose is cached by the skins themselves. Skip publishing parts to the shared
+		// table when an offline view hit any offline miss or silent fallback (e.g. pack layers, Head mesh).
+		let offline_fallback = offline_errors_before.is_some_and(|before| self.offline_errors() > before);
+		if !offline_fallback && let (Some(key), Some(table)) = (key, &table) {
 			let keep = fresh.iter().zip(&prepared).zip(&complete).filter(|((position, part), complete)| **complete && part.missing.is_empty() && scene.parts[**position].skeleton.is_none());
 			self.preparations.keep_parts(table, keep.map(|((position, part), _)| (&key.parts[*position][..], flags[*position], part.clone())));
 		}
@@ -3351,7 +3357,7 @@ impl Renderer {
 		// of grass, skinned and never moving, were prepared again every frame of a clip
 		let mut reusable: Vec<bool> = kept.iter().map(Option::is_some).collect();
 		for ((position, part), complete) in fresh.iter().zip(&prepared).zip(&complete) {
-			reusable[*position] = *complete && part.missing.is_empty() && (scene.parts[*position].skeleton.is_none() || !scene.live);
+			reusable[*position] = !offline_fallback && *complete && part.missing.is_empty() && (scene.parts[*position].skeleton.is_none() || !scene.live);
 		}
 
 		// the frame's parts in order, each part's instances and draws after those before it: the last
@@ -3432,7 +3438,12 @@ impl Renderer {
 			instances.clear();
 		}
 		let frame = table.map(|context| prepared::FramePieces { context, flags, reusable, instances, drawn, offsets });
-		Ok((prepared, moving, frame, remembered))
+		Ok((prepared, moving, frame, remembered, offline_fallback))
+	}
+
+	/// Monotonic count of offline-view misses and isolated fallbacks across the preparation caches.
+	fn offline_errors(&self) -> u64 {
+		self.meshes.offline_errors() + self.textures.offline_errors() + self.packs.offline_errors() + self.skins.sources.offline_errors()
 	}
 
 	/// Whether a texture [`Renderer::load_whole`] gave (`loaded`) loaded, or failed as the texture cache
@@ -7002,6 +7013,109 @@ mod camera_reuse_tests {
 			assert_fresh(&state, &scene, std::slice::from_ref(*request), (images, missing), &format!("render {round}"));
 		}
 		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	/// Direct renderer wiring: `load_mesh` on an offline view must isolate its failure from the shared online cache.
+	#[test]
+	fn offline_load_mesh_does_not_poison_online_failure_cache() {
+		let state = std::env::temp_dir().join(format!("ror-offline-mesh-wiring-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&state);
+		std::fs::create_dir_all(&state).unwrap();
+		let gpu = Arc::new(super::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let config = ror_assets::AssetConfig { offline: false, store: None, studio_content: Some(state.join("no-studio")), ..ror_assets::AssetConfig::new(&state) };
+		let online_assets = ror_assets::Assets::new(config);
+		let online = Renderer::new(gpu, online_assets.clone()).expect("a renderer");
+		let offline = online.with_assets(online_assets.with_offline(true));
+		assert!(offline.load_mesh("rbxassetid://8080808").is_err());
+		assert_eq!(online.meshes.failures(), (None, 0), "offline load_mesh miss poisoned online failure cache");
+		assert!(online.meshes.failures_for(true).0.is_some(), "offline load_mesh miss should be remembered for offline callers");
+		drop((offline, online));
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	/// A silent offline fallback (`SurfaceAppearance.TexturePack` uncached while `ColorMap` is local,
+	/// leaving `stats.missing` empty) must neither publish shared `PreparedPart`s nor cache a
+	/// non-`offline_only` `PreparedGeometry`, while still letting repeat offline views reuse it.
+	#[test]
+	fn silent_offline_pack_fallback_does_not_poison_online_preparations() {
+		let state = std::env::temp_dir().join(format!("ror-silent-pack-fallback-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&state);
+		std::fs::create_dir_all(&state).unwrap();
+		let gpu = Arc::new(super::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let config = ror_assets::AssetConfig { offline: false, store: None, studio_content: Some(state.join("no-studio")), ..ror_assets::AssetConfig::new(&state) };
+		let online_assets = ror_assets::Assets::new(config);
+		let online = Renderer::new(gpu, online_assets.clone()).expect("a renderer");
+		let offline = online.with_assets(online_assets.with_offline(true));
+		let png = state.join("albedo.png");
+		crate::output::write_png(&png, 4, 4, &[200, 100, 50, 255].repeat(16), true).unwrap();
+		let png_uri = format!("file:///{}", png.display().to_string().replace('\\', "/").replace(' ', "%20"));
+		let mut model = ModelBuilder::new("SilentPack");
+		model.part(&PartSpec { name: "Block".into(), size: Vec3::splat(4.0), ..Default::default() });
+		let mut scene = crate::scene::extract::extract(&model.into_document());
+		Arc::make_mut(&mut scene.parts[0]).surface_appearance = Some(crate::scene::SurfaceAppearance {
+			color_map: Some(png_uri),
+			normal_map: None,
+			metalness_map: None,
+			roughness_map: None,
+			texture_pack: Some("rbxassetid://9090909".into()),
+			alpha_mode: 0,
+			color: Vec3::ONE,
+			emissive_mask: None,
+			emissive_strength: 0.0,
+			emissive_tint: Vec3::ONE,
+		});
+		let request = view([8.0, 6.0, -10.0]);
+		let (_, first) = offline.render(&scene, std::slice::from_ref(&request)).unwrap();
+		assert!(first.missing.iter().all(|m| !m.contains("9090909")), "pack fallback is silent: {:?}", first.missing);
+		let key = super::scene_key(&scene).unwrap();
+		assert!(online.preparations.get(&key, online.dropped_failures(false), false).is_none(), "silent offline pack fallback poisoned online Preparations");
+		assert_eq!(online.preparations.part_stats().0, 0, "silent offline pack fallback published shared PreparedParts");
+		let (_, second) = offline.render(&scene, std::slice::from_ref(&request)).unwrap();
+		assert!(second.geometry_reused, "offline view should still reuse its isolated offline_only preparation");
+		drop((offline, online));
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	/// An offline `Transcode::Image` fallback to a cached uploaded PNG must neither write a `.tex`
+	/// file under the transcode key to disk/store nor promote the fallback into the shared texture cache.
+	#[test]
+	fn offline_transcode_fallback_does_not_poison_online_textures_or_store() {
+		let state = std::env::temp_dir().join(format!("ror-offline-transcode-fallback-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&state);
+		std::fs::create_dir_all(&state).unwrap();
+		let store = state.join("store");
+		let gpu = Arc::new(super::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let config = ror_assets::AssetConfig { offline: false, store: Some(store.clone()), studio_content: Some(state.join("no-studio")), ..ror_assets::AssetConfig::new(&state) };
+		let online_assets = ror_assets::Assets::new(config);
+		let online = Renderer::new(gpu, online_assets.clone()).expect("a renderer");
+		let offline = online.with_assets(online_assets.with_offline(true));
+		let png = state.join("upload.png");
+		crate::output::write_png(&png, 4, 4, &[40, 180, 90, 255].repeat(16), true).unwrap();
+		let raw_uri = "rbxassetid://7070707";
+		let mut hash = 0x6c62272e07bb014262b821756295c58du128;
+		for byte in raw_uri.as_bytes() {
+			hash ^= *byte as u128;
+			hash = hash.wrapping_mul(0x0000000001000000000000000000013b);
+		}
+		let hex = format!("{hash:032x}");
+		let asset_dir = state.join("assets").join(&hex[..2]);
+		std::fs::create_dir_all(&asset_dir).unwrap();
+		let png_bytes = std::fs::read(&png).unwrap();
+		std::fs::write(asset_dir.join(format!("{hex}.bin")), &png_bytes).unwrap();
+		let meta = serde_json::json!({"uri": raw_uri, "fetched_at": 1, "source_host": "test", "size": png_bytes.len(), "kind": "png"});
+		std::fs::write(asset_dir.join(format!("{hex}.json")), meta.to_string()).unwrap();
+
+		let transcode_key = super::transcode::image_key(raw_uri);
+		let tex_count_before = online.textures.len();
+		let fallback_tex = offline.load_texture(&transcode_key, super::resources::TextureUse::Color).expect("falls back to cached upload PNG");
+		assert_eq!((fallback_tex.width, fallback_tex.height), (4, 4));
+		assert_eq!(online.textures.len(), tex_count_before, "offline transcode fallback must not promote into shared online texture cache");
+		assert!(online.textures.get(&(super::content_key(&transcode_key), super::resources::TextureUse::Color)).is_none());
+		let store_tex_dir = store.join("textures").join(env!("ROR_TEXTURE_CODE"));
+		let store_tex_count = std::fs::read_dir(&store_tex_dir).map(|entries| entries.flatten().filter(|e| e.path().extension().is_some_and(|ext| ext == "tex")).count()).unwrap_or(0);
+		assert_eq!(store_tex_count, 0, "offline transcode fallback must not publish a .tex file to the shared store");
+		drop((fallback_tex, offline, online));
 		let _ = std::fs::remove_dir_all(&state);
 	}
 }

@@ -73,7 +73,7 @@ const SEEN_POSES: usize = 1 << 16;
 
 /// Skinning data per mesh and skinned copies per (mesh, scale, pose).
 pub struct Skins {
-	sources: Cache<String, SkinSource>,
+	pub(super) sources: Cache<String, SkinSource>,
 	/// Posed copies drawn more than once: a still's pose drawn again, a clip's character standing still.
 	/// An animation's poses are each a frame's own (a clip of a unit's idle filled the cache's 1 GB
 	/// of GPU memory with copies never drawn again; 2,484 of them in an aged service, hit 39 % of the
