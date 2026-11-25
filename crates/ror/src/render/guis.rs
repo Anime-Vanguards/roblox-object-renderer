@@ -441,6 +441,23 @@ impl GuiDraw {
 	pub(super) fn keys(&self) -> impl Iterator<Item = GuiKey> + '_ {
 		std::iter::once(self.key).chain(self.framed.iter().filter_map(|framed| framed.over))
 	}
+
+	/// Collects distinct local files referenced by this GUI draw that had to be hashed in full
+	/// because their volume provided no trusted OS change token.
+	pub(super) fn untrusted_paths(&self, out: &mut std::collections::HashSet<PathBuf>) {
+		for (path, snap) in self.local_snaps.iter() {
+			if snap.is_some_and(|snap| snap.is_untrusted_hash()) {
+				out.insert(path.clone());
+			}
+		}
+		for framed in &self.framed {
+			for (path, snap) in framed.over_snaps.iter() {
+				if snap.is_some_and(|snap| snap.is_untrusted_hash()) {
+					out.insert(path.clone());
+				}
+			}
+		}
+	}
 }
 
 /// A framed ViewportFrame's picture is drawn no smaller than this (pixels), and its longer side no

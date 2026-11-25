@@ -22,6 +22,7 @@ ror render Model.rbxm --no-service   # Bypass the service for one invocation
 - **Startup & Vulkan tuning:** Starts in under a second and prefers a discrete Vulkan GPU. On Windows it caches the selected driver in `<state dir>/gpu.json` (`ROR_VULKAN_FILTER=0` disables) and disables implicit Vulkan layers (overlays/capture hooks) unless `VK_LOADER_LAYERS_DISABLE` is set or `ROR_VULKAN_LAYERS=1`. Pipelines cache under `<state dir>/pipelines` (`ROR_PIPELINE_CACHE=0` disables).
 - **GPU clock warmup (`ror service warm` / `POST /warm`):** Runs a short GPU burst (at most 0.5 s, canceled immediately when a real job arrives) to wake an idle GPU out of low-power clocks before a clip starts.
 - **Working directory:** The service runs inside `<state dir>`, not the caller's working directory. Clients send absolute paths plus `relativeTo` for resolving relative asset links inside input files.
+- **Local file invalidation:** Local models, maps, textures, meshes, skies, and GUI assets are keyed by file stamp rather than path alone so edits invalidate warm caches automatically; see [local-files.md](local-files.md).
 
 ## GPU caches
 

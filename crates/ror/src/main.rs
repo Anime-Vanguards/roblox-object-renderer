@@ -1111,6 +1111,9 @@ fn render(mut args: RenderArgs) -> Result<()> {
 			eprintln!("ror: missing: {}", missing.as_str().unwrap_or_default());
 		}
 	}
+	if let Some(count) = result.pointer("/stats/untrustedStampHashes").and_then(|value| value.as_u64()).filter(|&count| count > 0) {
+		eprintln!("ror: note: {count} local file(s) hashed in full because their volume provided no trusted OS stamp (docs/local-files.md)");
+	}
 	// the authoring lints (crate::lint)
 	if let Some(line) = result.pointer("/weightless/line").and_then(|value| value.as_str()) {
 		eprintln!("ror: {line}");
@@ -1281,6 +1284,9 @@ fn video(mut args: VideoArgs) -> Result<()> {
 		for missing in missing {
 			eprintln!("ror: missing: {}", missing.as_str().unwrap_or_default());
 		}
+	}
+	if let Some(count) = result.pointer("/stats/untrustedStampHashes").and_then(|value| value.as_u64()).filter(|&count| count > 0) {
+		eprintln!("ror: note: {count} local file(s) hashed in full because their volume provided no trusted OS stamp (docs/local-files.md)");
 	}
 	// the authoring lints (crate::lint), the frames' brightness peaks and the effects' counts
 	if let Some(line) = result.pointer("/weightless/line").and_then(|value| value.as_str()) {

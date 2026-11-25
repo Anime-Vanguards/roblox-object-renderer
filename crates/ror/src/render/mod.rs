@@ -233,6 +233,9 @@ pub struct RenderStats {
 	/// Assets that could not be loaded, with the reason (the part draws without them), each reason once
 	/// however many views met it.
 	pub missing: Vec<String>,
+	/// Local files hashed in full because their volume provided no trusted OS change token
+	/// (docs/local-files.md).
+	pub untrusted_stamp_hashes: usize,
 	/// GUI quads drawn (over every view) and the time spent getting their textures (rur's renders
 	/// included).
 	pub guis: usize,
@@ -1198,6 +1201,8 @@ pub struct PreparedSky {
 	key: Option<Arc<prepared::SceneKey>>,
 	/// Every emitter's particles, made with the rest ahead of the draw thread (`particles::simulate_all`)
 	particles: Option<Vec<Vec<particles::Particle>>>,
+	/// Local skybox faces hashed in full because their volume provided no trusted OS stamp.
+	untrusted_hashes: usize,
 }
 
 /// The effects' textures and bind groups a frame drew with ([`Renderer::effect_bindings`]): the
@@ -1220,17 +1225,22 @@ const EFFECT_BINDINGS_KEPT: usize = 4;
 /// The effects' textures in order (`EffectBindings::hash`), stamping any local files and returning
 /// the observed `(uri -> stamped_uri)` map so `effect_bindings` only caches bindings whose loaded
 /// textures match the stamps hashed into `hash`.
-fn effect_hash(scene: &Scene) -> (u64, HashMap<String, String>) {
+fn effect_hash(scene: &Scene) -> (u64, HashMap<String, String>, usize) {
 	use std::hash::{Hash, Hasher};
 	let mut hasher = std::collections::hash_map::DefaultHasher::new();
 	let mut local_keys: HashMap<String, String> = HashMap::new();
+	let mut untrusted = 0usize;
 	let mut hash_uri = |uri: Option<&str>, hasher: &mut std::collections::hash_map::DefaultHasher| match uri {
 		None => false.hash(hasher),
 		Some(uri) => {
 			true.hash(hasher);
 			let key = transcode::image_key(uri);
 			if names_local_file(&key) {
-				let stamped = local_keys.entry(key.clone()).or_insert_with(|| content_key(&key));
+				let stamped = local_keys.entry(key.clone()).or_insert_with(|| {
+					let (stamped, is_untrusted) = content_key_checked(&key);
+					untrusted += usize::from(is_untrusted);
+					stamped
+				});
 				stamped.hash(hasher);
 			} else {
 				key.hash(hasher);
@@ -1249,7 +1259,7 @@ fn effect_hash(scene: &Scene) -> (u64, HashMap<String, String>) {
 	for trail in &scene.trails {
 		hash_uri(trail.texture.as_deref(), &mut hasher);
 	}
-	(hasher.finish(), local_keys)
+	(hasher.finish(), local_keys, untrusted)
 }
 
 /// The preparation key of frames whose parts are all the same ([`Renderer::prepare_environment_sharing`]).
@@ -2293,12 +2303,13 @@ impl Renderer {
 	/// ahead of the draws (held here, whatever the cache lets go of meanwhile).
 	pub fn prepare_environment(&self, scene: &Scene) -> PreparedSky {
 		let mut missing = Vec::new();
-		let maps = self.environment(scene, &mut missing);
+		let mut untrusted_hashes = 0usize;
+		let maps = self.environment(scene, &mut missing, &mut untrusted_hashes);
 		// the key its preparation is found by, made here too, off the thread that draws (a map clip's
 		// 3,710 parts encode 1.5 MB, 0.6-0.8 ms of each frame): unless the render draws a copy of the
 		// scene instead (submit_views)
 		let key = (scene.environment.viewport.is_none() || !scene.has_more_than_parts()).then(|| scene_key(scene)).flatten().map(|key| self.shared_key(key));
-		PreparedSky { maps, missing, key, particles: Some(particles::simulate_all(scene)) }
+		PreparedSky { maps, missing, key, particles: Some(particles::simulate_all(scene)), untrusted_hashes }
 	}
 
 	/// [`Renderer::prepare_environment`] for a clip's frames whose parts are all the same (a playback that
@@ -2306,9 +2317,10 @@ impl Renderer {
 	/// 3,710 parts encoded 1.5 MB a frame, 12 % of a busy service's samples under eight clips).
 	pub fn prepare_environment_sharing(&self, scene: &Scene, parts: &PartsKey) -> PreparedSky {
 		let mut missing = Vec::new();
-		let maps = self.environment(scene, &mut missing);
+		let mut untrusted_hashes = 0usize;
+		let maps = self.environment(scene, &mut missing, &mut untrusted_hashes);
 		let key = if scene.environment.viewport.is_none() || !scene.has_more_than_parts() { parts.0.get_or_init(|| scene_key(scene).map(|key| self.shared_key(key))).clone() } else { None };
-		PreparedSky { maps, missing, key, particles: Some(particles::simulate_all(scene)) }
+		PreparedSky { maps, missing, key, particles: Some(particles::simulate_all(scene)), untrusted_hashes }
 	}
 
 	/// `key`, or an equal one an earlier frame made still holds: a clip's frames of an unchanging
@@ -2437,6 +2449,13 @@ impl Renderer {
 		let gui_start = Instant::now();
 		let gui_plans: Vec<Vec<guis::GuiDraw>> = views.iter().map(|view| guis::plan(scene, &view.camera.place(prepared.bounds, view.width.max(1), view.height.max(1)), view)).collect();
 		let gui_draws: Vec<&guis::GuiDraw> = gui_plans.iter().flatten().collect();
+		if !gui_draws.is_empty() {
+			let mut untrusted_gui = std::collections::HashSet::new();
+			for draw in &gui_draws {
+				draw.untrusted_paths(&mut untrusted_gui);
+			}
+			stats.untrusted_stamp_hashes += untrusted_gui.len();
+		}
 		let gui_textures = if gui_draws.is_empty() {
 			HashMap::new()
 		} else {
@@ -2773,7 +2792,7 @@ impl Renderer {
 		made
 	}
 
-	fn environment(&self, scene: &Scene, missing: &mut Vec<String>) -> Arc<EnvironmentMaps> {
+	fn environment(&self, scene: &Scene, missing: &mut Vec<String>, untrusted: &mut usize) -> Arc<EnvironmentMaps> {
 		let sky = scene.environment.sky.clone().unwrap_or_default();
 		let optional = scene.environment.default_sky_unused();
 		// the Atmosphere's haze and glare change the sky drawn and reflected (atmosphere-light), so they
@@ -2791,6 +2810,13 @@ impl Renderer {
 		let tint = environment::sky_tint(lighting.clock_time, lighting.environment_diffuse_scale);
 		let tint_key = tint.map(|tint| format!("{tint:.4?}"));
 		let sky_snaps: [Option<(std::path::PathBuf, ror_assets::FileSnapshot)>; 6] = std::array::from_fn(|index| local_snapshot_for(&sky.skybox[index]));
+		let mut untrusted_sky = std::collections::HashSet::new();
+		for (path, snap) in sky_snaps.iter().flatten() {
+			if snap.is_untrusted_hash() {
+				untrusted_sky.insert(path.clone());
+			}
+		}
+		*untrusted += untrusted_sky.len();
 		let skybox: [String; 6] = std::array::from_fn(|index| match &sky_snaps[index] {
 			Some((_, snap)) => snap.stamp.stamp_uri(&sky.skybox[index]),
 			None => content_key(&sky.skybox[index]),
@@ -3328,10 +3354,11 @@ impl Renderer {
 		self.memory_checkpoint("prepare");
 		let neon_share = scene.environment.viewport.as_ref().map_or(1.0, |_| environment::viewport_neon());
 		let (sky, key, ahead) = match sky {
-			Some(PreparedSky { maps, missing, key, particles }) => (Some((maps, missing)), key, particles),
+			Some(PreparedSky { maps, missing, key, particles, untrusted_hashes }) => (Some((maps, missing, untrusted_hashes)), key, particles),
 			None => (None, None, None),
 		};
 		let key = key.or_else(|| scene_key(scene));
+		stats.untrusted_stamp_hashes += key.as_ref().map_or(0, |key| key.untrusted_hashes);
 		// a clip's frame after one that moved starts from that frame (prepared::ClipGeometry): it is not
 		// a scene kept whole (moving scenes are not), and looking for one compared its whole key
 		let last = clip.and_then(|clip| clip.last.lock().take());
@@ -3386,13 +3413,14 @@ impl Renderer {
 		};
 		let assets_start = Instant::now();
 		let environment = match sky {
-			Some((maps, missing)) => {
+			Some((maps, missing, untrusted_hashes)) => {
 				stats.missing.extend(missing);
+				stats.untrusted_stamp_hashes += untrusted_hashes;
 				maps
 			}
-			None => self.environment(scene, &mut stats.missing),
+			None => self.environment(scene, &mut stats.missing, &mut stats.untrusted_stamp_hashes),
 		};
-		let effects = self.effect_bindings(scene, &mut stats.missing);
+		let effects = self.effect_bindings(scene, &mut stats.missing, &mut stats.untrusted_stamp_hashes);
 		let (beam_textures, trail_textures) = (effects.beams.clone(), effects.trails.clone());
 		let particles = self.prepare_particles(scene, &effects.particles, ahead);
 		drop(effects);
@@ -3416,8 +3444,9 @@ impl Renderer {
 	/// The effects' textures and bind groups ([`EffectBindings`]): the last frames' when they drew the
 	/// same textures in the same order, else loaded (on every core) and made now, and kept unless one
 	/// failed or a local file moved between hashing and reading.
-	fn effect_bindings(&self, scene: &Scene, missing: &mut Vec<String>) -> Arc<EffectBindings> {
-		let (hash, local_keys) = effect_hash(scene);
+	fn effect_bindings(&self, scene: &Scene, missing: &mut Vec<String>, untrusted: &mut usize) -> Arc<EffectBindings> {
+		let (hash, local_keys, untrusted_effects) = effect_hash(scene);
+		*untrusted += untrusted_effects;
 		if let Some(found) = self.effect_bindings.lock().iter().find(|effects| effects.hash == hash && effects.held.iter().all(|(texture, view)| texture.held().is_some_and(|held| held.base == 0 && held.view == *view))) {
 			return found.clone();
 		}
@@ -6188,8 +6217,15 @@ pub(crate) fn run_test_read_hook(path: &std::path::Path) {
 pub(crate) fn run_test_read_hook(_path: &std::path::Path) {}
 
 pub(crate) fn content_key(uri: &str) -> String {
+	content_key_checked(uri).0
+}
+
+/// Like [`content_key`], also returning `true` when the file had to be hashed in full because its
+/// volume provided no trusted OS change token.
+pub(crate) fn content_key_checked(uri: &str) -> (String, bool) {
 	if uri.starts_with(composite::KEY_PREFIX) {
-		return composite::stamped_key(uri);
+		let (keyed, untrusted) = composite::stamped_key_checked(uri);
+		return (keyed, untrusted > 0);
 	}
 	let path = uri.split_once('#').map_or(uri, |(path, _)| path);
 	// a URI with a scheme other than file: (rbxassetid://, a transcode's or a composite's key) names no
@@ -6200,14 +6236,14 @@ pub(crate) fn content_key(uri: &str) -> String {
 		&& !scheme.contains(['/', '\\'])
 		&& !scheme.eq_ignore_ascii_case("file")
 	{
-		return uri.to_string();
+		return (uri.to_string(), false);
 	}
 	match ror_assets::ContentId::parse(path) {
 		Ok(ror_assets::ContentId::File(file)) => match ror_assets::FileStamp::of(&file) {
-			Some(stamp) => stamp.stamp_uri(uri),
-			None => uri.to_string(),
+			Some(stamp) => (stamp.stamp_uri(uri), stamp.is_untrusted_hash()),
+			None => (uri.to_string(), false),
 		},
-		_ => uri.to_string(),
+		_ => (uri.to_string(), false),
 	}
 }
 

@@ -430,6 +430,9 @@ pub struct VideoStats {
 	/// Frames that drew no particle while the scene has emitters (an effect not started or over).
 	pub frames_without_particles: usize,
 	pub missing: Vec<String>,
+	/// Local files hashed in full because their volume provided no trusted OS change token
+	/// (docs/local-files.md).
+	pub untrusted_stamp_hashes: usize,
 }
 
 /// The parts, ParticleEmitters, beams and trails a clip's frames hold, each counted once however many
@@ -843,6 +846,8 @@ struct Builder<'a> {
 	/// The playback's tweens that fade linearly, and where the effects hang (crate::lint).
 	fades: Vec<crate::lint::Fade>,
 	roots: crate::lint::EffectRoots,
+	/// Input, map, or lending place files hashed in full because their volume provided no trusted OS stamp.
+	untrusted_hashes: usize,
 }
 
 impl<'a> Builder<'a> {
@@ -864,9 +869,13 @@ impl<'a> Builder<'a> {
 			guis: false,
 			fades: Vec::new(),
 			roots: Default::default(),
+			untrusted_hashes: 0,
 		};
 		let fixed = builder.playback.changes_nothing() && !builder.playback.touches_lighting() && !builder.playback.play;
 		let key = fixed.then(|| scenes.video_key_checked(&job.input, builder.select, builder.map, builder.lend, builder.relative_to)).flatten();
+		if let Some(vk) = key.as_ref() {
+			builder.untrusted_hashes = vk.untrusted_hashes();
+		}
 		if let Some(input) = key.as_ref().and_then(|key| scenes.video_input(&key.key)) {
 			builder.fades = crate::lint::tween_fades(&input.document, &builder.playback);
 			builder.roots = input.roots.clone();
@@ -876,6 +885,9 @@ impl<'a> Builder<'a> {
 		}
 		builder.bytes = read()?;
 		let (document, lent, map_proven) = builder.document_proven()?;
+		if key.is_none() && map_proven.is_some_and(|s| s.is_untrusted_hash()) {
+			builder.untrusted_hashes += 1;
+		}
 		builder.lent = lent;
 		builder.fades = crate::lint::tween_fades(&document, &builder.playback);
 		builder.roots = crate::lint::EffectRoots::of(&document);
@@ -2516,6 +2528,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 				profile.draw_ms += frame_stats.draw_ms;
 				profile.readback_ms += frame_stats.readback_ms;
 				particles_per_frame[index] = frame_stats.particles;
+				stats.untrusted_stamp_hashes = stats.untrusted_stamp_hashes.max(frame_stats.untrusted_stamp_hashes);
 				if frame_stats.particles > stats.particles_max {
 					stats.particles_max = frame_stats.particles;
 					stats.particles_max_at = times[index];
@@ -2590,6 +2603,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 	timings.encode_ms = drawn_at.elapsed().as_secs_f64() * 1000.0;
 	timings.frame_ms = timings.render_ms / count as f64;
 	(stats.parts, stats.emitters, stats.beams, stats.trails) = census.counts();
+	stats.untrusted_stamp_hashes += builder.untrusted_hashes;
 	stats.frames_without_particles = if stats.emitters > 0 { particles_per_frame.iter().filter(|&&particles| particles == 0).count() } else { 0 };
 
 	let sheet_start = Instant::now();

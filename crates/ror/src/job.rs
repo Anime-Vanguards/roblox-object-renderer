@@ -300,6 +300,15 @@ pub(crate) struct VideoKey {
 	pub lighting: Option<FileStamp>,
 }
 
+impl VideoKey {
+	pub(crate) fn untrusted_hashes(&self) -> usize {
+		usize::from(self.input.1.is_untrusted_hash())
+			+ usize::from(self.map.is_some_and(|s| s.is_untrusted_hash()))
+			+ usize::from(self.materials.is_some_and(|s| s.is_untrusted_hash()))
+			+ usize::from(self.lighting.is_some_and(|s| s.is_untrusted_hash()))
+	}
+}
+
 impl SceneCache {
 	/// Counts a still of a playback of `path`; true once, when a run of them is a timeline drawn frame by
 	/// frame. Each such still parses the file and extracts the whole scene again; `ror video --times` makes
@@ -505,11 +514,17 @@ impl SceneCache {
 		Ok(scene)
 	}
 
+	#[cfg(test)]
 	fn load(&self, path: &Path, select: Option<&str>, relative_to: Option<&Path>, keep_invisible: bool) -> Result<(Arc<Scene>, bool)> {
+		self.load_checked(path, select, relative_to, keep_invisible).map(|(scene, cached, _)| (scene, cached))
+	}
+
+	fn load_checked(&self, path: &Path, select: Option<&str>, relative_to: Option<&Path>, keep_invisible: bool) -> Result<(Arc<Scene>, bool, bool)> {
 		let snapshot = FileStamp::snapshot(path).with_context(|| format!("reading {}", path.display()))?;
 		let stamp = snapshot.stamp;
+		let untrusted = stamp.is_untrusted_hash();
 		let key = (path.to_path_buf(), select.map(str::to_string), relative_to.map(Path::to_path_buf), keep_invisible);
-		let cached = || self.entries.lock().get(&key).filter(|(kept, _)| *kept == stamp).map(|(_, scene)| (scene.clone(), true));
+		let cached = || self.entries.lock().get(&key).filter(|(kept, _)| *kept == stamp).map(|(_, scene)| (scene.clone(), true, untrusted));
 		if let Some(hit) = cached() {
 			return Ok(hit);
 		}
@@ -536,7 +551,7 @@ impl SceneCache {
 				}
 				entries.insert(key.clone(), (stamp, scene.clone()));
 			}
-			Ok((scene, false))
+			Ok((scene, false, untrusted))
 		})
 	}
 }
@@ -591,6 +606,7 @@ fn render_in_groups(renderer: &Renderer, scene: &Scene, requests: &[ViewRequest]
 				stats.guis += more.guis;
 				stats.gui_ms += more.gui_ms;
 				stats.particles += more.particles;
+				stats.untrusted_stamp_hashes = stats.untrusted_stamp_hashes.max(more.untrusted_stamp_hashes);
 				for missing in more.missing {
 					if !stats.missing.contains(&missing) {
 						stats.missing.push(missing);
@@ -679,6 +695,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 	let mut lent_lighting = false;
 	// the cost model reads the document the scene came from (its parts' referents point into it)
 	let mut cost_document = None;
+	let mut input_untrusted = 0usize;
 	let (scene, cached) = if job.playback.is_some() || job.map.is_some() || job.cost.is_some() {
 		// every such job has a document of its own: its parse and scene within the machine's free memory, as one load
 		let _budget = crate::budget::reserve(std::fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0));
@@ -697,7 +714,9 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 			document.read_relative_to(folder);
 		}
 		if let Some(map) = &job.map {
-			scenes.add_map(&mut document, map)?;
+			if scenes.add_map(&mut document, map)?.is_some_and(|s| s.is_untrusted_hash()) {
+				input_untrusted += 1;
+			}
 		}
 		// Multi-frame timeline costing steps one loaded document across moments without mutating it.
 		if let Some(options) = &job.cost
@@ -786,7 +805,9 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 			}
 		}
 	} else if path.is_file() {
-		scenes.load(path, job.select.as_deref(), job.relative_to.as_deref(), job.collision.is_some())?
+		let (scene, cached, untrusted) = scenes.load_checked(path, job.select.as_deref(), job.relative_to.as_deref(), job.collision.is_some())?;
+		input_untrusted += usize::from(untrusted);
+		(scene, cached)
 	} else {
 		let uri = if job.input.chars().all(|c| c.is_ascii_digit()) { format!("rbxassetid://{}", job.input) } else { job.input.clone() };
 		let fetched = renderer.assets.fetch(&uri).map_err(|error| anyhow::anyhow!("{} is not a file, and as an asset: {error}", job.input))?;
@@ -807,7 +828,8 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 	let lent = (lighting_from.is_some() || lent_lighting, materials_from.is_some());
 	let scene = if materials_from.is_some() || lighting_from.is_some() {
 		let mut scene = scene.as_ref().clone();
-		scenes.lend(&mut scene, materials_from, lighting_from)?;
+		let (mat_stamp, light_stamp) = scenes.lend(&mut scene, materials_from, lighting_from)?;
+		input_untrusted += usize::from(mat_stamp.is_some_and(|s| s.is_untrusted_hash())) + usize::from(light_stamp.is_some_and(|s| s.is_untrusted_hash()));
 		Arc::new(scene)
 	} else {
 		scene
@@ -867,6 +889,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 	} else {
 		render_in_groups(renderer, &scene, &requests, gpu)?
 	};
+	stats.untrusted_stamp_hashes += input_untrusted;
 	let alone = match &job.alone {
 		Some(path) if images.iter().any(|image| image.ids.is_some()) => alone(renderer, &scene, path, &requests, &images, gpu)?,
 		_ => Vec::new(),

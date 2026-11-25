@@ -63,9 +63,27 @@ enum StampKind {
 
 /// Identity of a local file's contents, to detect edits, renames, time-preserving copies and
 /// tools that restore Windows `ChangeTime`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug)]
 pub struct FileStamp {
 	kind: StampKind,
+	/// True when this stamp hashed the file's full bytes because its volume provided no trusted OS
+	/// change token (`!os.trusted`). Excluded from equality and hashing so cache keys depend only
+	/// on `kind`.
+	untrusted_hash: bool,
+}
+
+impl PartialEq for FileStamp {
+	fn eq(&self, other: &Self) -> bool {
+		self.kind == other.kind
+	}
+}
+
+impl Eq for FileStamp {}
+
+impl std::hash::Hash for FileStamp {
+	fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+		self.kind.hash(state);
+	}
 }
 
 /// A [`FileStamp`] paired with the raw [`OsStamp`] and recent-window state observed when it was
@@ -141,6 +159,12 @@ impl FileSnapshot {
 		};
 		os_after == self.os
 	}
+
+	/// Whether this snapshot hashed the file's full bytes because its volume provided no trusted OS
+	/// change token.
+	pub fn is_untrusted_hash(&self) -> bool {
+		self.stamp.untrusted_hash
+	}
 }
 
 impl FileStamp {
@@ -166,7 +190,7 @@ impl FileStamp {
 	/// Content-hashed stamp of an in-memory byte slice, matching what [`FileStamp`] produces when
 	/// hashing a file on disk.
 	pub fn of_bytes(bytes: &[u8]) -> FileStamp {
-		FileStamp { kind: StampKind::Content { len: bytes.len() as u64, hash: hash_bytes(bytes) } }
+		FileStamp { kind: StampKind::Content { len: bytes.len() as u64, hash: hash_bytes(bytes) }, untrusted_hash: false }
 	}
 
 	/// Reads `path`'s metadata (and content hash when recent or untrusted) and builds its stamp.
@@ -210,8 +234,8 @@ impl FileStamp {
 		if !os.trusted {
 			run_before_hash_hook(path);
 			return match hash_file(path) {
-				Some((len, hash)) => FileStamp { kind: StampKind::Content { len, hash } },
-				None => FileStamp { kind: StampKind::Os(os) },
+				Some((len, hash)) => FileStamp { kind: StampKind::Content { len, hash }, untrusted_hash: true },
+				None => FileStamp { kind: StampKind::Os(os), untrusted_hash: false },
 			};
 		}
 		let recent = is_os_recent(&os, modified_time, change_time);
@@ -220,9 +244,9 @@ impl FileStamp {
 		if !recent {
 			let cached = hashes.lock().get(&id_key).copied();
 			match cached {
-				None => return FileStamp { kind: StampKind::Os(os) },
+				None => return FileStamp { kind: StampKind::Os(os), untrusted_hash: false },
 				Some((kept_os, hash, true)) if kept_os == os => {
-					return FileStamp { kind: StampKind::Content { len: os.len, hash } };
+					return FileStamp { kind: StampKind::Content { len: os.len, hash }, untrusted_hash: false };
 				}
 				Some((kept_os, _, false)) if kept_os == os => {
 					// First look after aging past the recent window: hash once more to close any
@@ -234,20 +258,20 @@ impl FileStamp {
 							let mut table = hashes.lock();
 							table.insert(id_key, (os, hash, true));
 						}
-						return FileStamp { kind: StampKind::Content { len, hash } };
+						return FileStamp { kind: StampKind::Content { len, hash }, untrusted_hash: false };
 					}
-					return FileStamp { kind: StampKind::Os(os) };
+					return FileStamp { kind: StampKind::Os(os), untrusted_hash: false };
 				}
 				Some(_) => {
 					// File changed on disk and is already outside the recent window: drop the old
 					// entry and key by the new trusted OS stamp.
 					hashes.lock().remove(&id_key);
-					return FileStamp { kind: StampKind::Os(os) };
+					return FileStamp { kind: StampKind::Os(os), untrusted_hash: false };
 				}
 			}
 		}
 		if os.len > RECENT_HASH_MAX_BYTES {
-			return FileStamp { kind: StampKind::Os(os) };
+			return FileStamp { kind: StampKind::Os(os), untrusted_hash: false };
 		}
 		run_before_hash_hook(path);
 		match hash_file(path) {
@@ -259,9 +283,9 @@ impl FileStamp {
 					}
 					table.insert(id_key, (os, hash, false));
 				}
-				FileStamp { kind: StampKind::Content { len, hash } }
+				FileStamp { kind: StampKind::Content { len, hash }, untrusted_hash: false }
 			}
-			None => FileStamp { kind: StampKind::Os(os) },
+			None => FileStamp { kind: StampKind::Os(os), untrusted_hash: false },
 		}
 	}
 
@@ -281,6 +305,12 @@ impl FileStamp {
 	/// Whether this stamp is keyed by a content hash rather than OS metadata alone.
 	pub fn is_content_hashed(&self) -> bool {
 		matches!(self.kind, StampKind::Content { .. })
+	}
+
+	/// Whether this stamp had to hash the file's full bytes because its volume provided no trusted
+	/// OS change token (`!os.trusted`).
+	pub fn is_untrusted_hash(&self) -> bool {
+		self.untrusted_hash
 	}
 
 	/// Stable string encoding of this stamp (for string-keyed caches).
@@ -697,7 +727,7 @@ mod tests {
 		// 2. OS-stamped (aged, trusted) file: construct an aged OS snapshot directly (zero sleeps).
 		let (os_a, _, _, _) = read_os_stamp(&path).unwrap();
 		if os_a.trusted {
-			let snap_os = FileSnapshot { stamp: FileStamp { kind: StampKind::Os(os_a) }, os: os_a, recent: false };
+			let snap_os = FileSnapshot { stamp: FileStamp { kind: StampKind::Os(os_a), untrusted_hash: false }, os: os_a, recent: false };
 			assert!(snap_os.verify_read(&path, bytes_a), "unchanged trusted OS stamp verifies");
 			assert!(snap_os.still_unchanged(&path), "unchanged trusted OS stamp reports still_unchanged");
 			// File moves A -> B -> A: monotonic USN (Windows) / ctime (Unix) cannot return to os_a.
@@ -740,6 +770,31 @@ mod tests {
 		let after = FileStamp::from_os_stamp(&path, os_b, Some(old), Some(old));
 		assert_ne!(after, settled, "changed OS stamp must not reuse settled hash of earlier bytes");
 		assert!(!after.is_content_hashed(), "aged changed file should drop stale settled entry and return Os(os_b)");
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	#[test]
+	fn untrusted_os_stamp_reports_untrusted_hash_without_affecting_equality() {
+		let dir = std::env::temp_dir().join(format!("ror-stamp-untrusted-flag-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("file.bin");
+		let bytes = b"untrusted-volume-payload";
+		std::fs::write(&path, bytes).unwrap();
+		let old = SystemTime::now() - Duration::from_secs(3600);
+		let untrusted = FileStamp::from_parts(&path, bytes.len() as u64, Some(old), Some(old));
+		let of_bytes = FileStamp::of_bytes(bytes);
+		assert!(untrusted.is_content_hashed());
+		assert!(untrusted.is_untrusted_hash(), "untrusted OS stamp must mark untrusted_hash");
+		assert!(!of_bytes.is_untrusted_hash(), "in-memory stamp must not mark untrusted_hash");
+		assert_eq!(untrusted, of_bytes, "untrusted_hash flag must not change stamp equality");
+		let (os, _, mod_t, chg_t) = read_os_stamp(&path).unwrap();
+		if os.trusted {
+			let trusted_fresh = FileStamp::from_os_stamp(&path, os, mod_t, chg_t);
+			assert!(!trusted_fresh.is_untrusted_hash(), "trusted fresh hash must not report untrusted_hash");
+			let trusted_aged = FileStamp::from_os_stamp(&path, os, Some(old), Some(old));
+			assert!(!trusted_aged.is_untrusted_hash(), "trusted aged stamp must not report untrusted_hash");
+		}
 		let _ = std::fs::remove_dir_all(&dir);
 	}
 }

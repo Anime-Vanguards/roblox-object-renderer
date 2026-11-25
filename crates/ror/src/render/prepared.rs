@@ -685,6 +685,8 @@ pub(super) struct SceneKey {
 	/// when the scene references no local files). Used to verify that every local resource loaded
 	/// during preparation matches the key before caching a part or scene.
 	pub local_keys: HashMap<String, String>,
+	/// Local files hashed in full because their volume provided no trusted OS change token.
+	pub untrusted_hashes: usize,
 }
 
 impl SceneKey {
@@ -887,7 +889,7 @@ thread_local! {
 	/// as [`keyed`] writes it, read once a key rather than once for every part naming the file (a scene
 	/// of 3,000 parts, 800 of them naming 20 files, read the stamps 2,000 times a frame: 26 ms of its
 	/// key's 27)
-	static STAMPED: std::cell::RefCell<Option<HashMap<String, String>>> = const { std::cell::RefCell::new(None) };
+	static STAMPED: std::cell::RefCell<Option<HashMap<String, (String, bool)>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// A content URI as [`Key::content`] writes it, noting a local file's.
@@ -900,11 +902,11 @@ fn keyed(uri: &str) -> String {
 		let Some(stamped) = stamped else {
 			return super::content_key(uri);
 		};
-		if let Some(keyed) = stamped.get(uri) {
+		if let Some((keyed, _)) = stamped.get(uri) {
 			return keyed.clone();
 		}
-		let keyed = super::content_key(uri);
-		stamped.insert(uri.to_string(), keyed.clone());
+		let (keyed, untrusted) = super::content_key_checked(uri);
+		stamped.insert(uri.to_string(), (keyed.clone(), untrusted));
 		keyed
 	})
 }
@@ -918,10 +920,18 @@ impl Stamping {
 		Self
 	}
 
-	fn finish(self) -> HashMap<String, String> {
+	fn finish(self) -> (HashMap<String, String>, usize) {
 		let map = STAMPED.take().unwrap_or_default();
 		std::mem::forget(self);
-		map
+		let mut untrusted = 0usize;
+		let keys = map
+			.into_iter()
+			.map(|(uri, (stamped, is_untrusted))| {
+				untrusted += usize::from(is_untrusted);
+				(uri, stamped)
+			})
+			.collect();
+		(keys, untrusted)
 	}
 }
 
@@ -1022,7 +1032,7 @@ pub(super) fn key(scene: &Scene, neon_share: f32, light_grid: bool) -> Arc<Scene
 	}
 	let mut tail = Key::default();
 	tail.materials(&scene.materials);
-	let local_keys = stamping.finish();
+	let (local_keys, untrusted_hashes) = stamping.finish();
 	tail.floats(&[neon_share]);
 	tail.number(light_grid as u64);
 	// a ViewportFrame's MeshParts draw their vertex alpha (TEX_VERTEX_ALPHA)
@@ -1047,7 +1057,7 @@ pub(super) fn key(scene: &Scene, neon_share: f32, light_grid: bool) -> Arc<Scene
 	}
 	whole.extend_from_slice(&hash_bytes(&tail.0).to_le_bytes());
 	let hash = hash_bytes(&whole);
-	Arc::new(SceneKey { parts, tail: tail.0, hash, local_keys })
+	Arc::new(SceneKey { parts, tail: tail.0, hash, local_keys, untrusted_hashes })
 }
 
 /// Scenes this many parts or more keep their parts' keys for later scenes (a clip's frames; a small

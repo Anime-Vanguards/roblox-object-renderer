@@ -1,6 +1,6 @@
 # Assets, caches, and disk use
 
-This page explains how `ror` resolves and downloads Roblox assets, caches GPU textures, shares files across checkouts, and prevents disk usage from growing unbounded.
+This page explains how `ror` resolves and downloads Roblox assets, caches GPU textures, shares files across checkouts, and prevents disk usage from growing unbounded. For how local files on disk are stamped and invalidated across memory, disk, and shared caches, see [local-files.md](local-files.md).
 
 Relevant code lives in `crates/ror-assets` (content URIs, HTTP downloads, disk cache, content store, Roblox install detection, cookies, Roblox Studio's signed-in account, broker auth, and Open Cloud API keys), `crates/ror-image`, and `crates/ror/src/render/texels.rs` (GPU texture preparation).
 

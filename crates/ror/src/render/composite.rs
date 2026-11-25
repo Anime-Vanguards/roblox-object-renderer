@@ -35,17 +35,26 @@ pub(super) fn has_local_file(uri: &str) -> bool {
 /// Cache key for a composite URI: unchanged when all layers are remote assets, or with each local
 /// template layer's file stamp folded in so a replaced local clothing image invalidates the cache.
 pub(super) fn stamped_key(uri: &str) -> String {
+	stamped_key_checked(uri).0
+}
+
+/// Like [`stamped_key`], also returning how many local clothing layers required a full-file hash
+/// because their volume provided no trusted OS change token.
+pub(super) fn stamped_key_checked(uri: &str) -> (String, usize) {
 	let Some(mut composite) = from_key(uri) else {
-		return uri.to_string();
+		return (uri.to_string(), 0);
 	};
 	let mut stamped = false;
+	let mut untrusted = 0usize;
 	for layer in [&mut composite.pants, &mut composite.shirt, &mut composite.graphic].into_iter().flatten() {
 		if super::names_local_file(&layer.image) {
-			layer.image = super::content_key(&layer.image);
+			let (keyed, is_untrusted) = super::content_key_checked(&layer.image);
+			layer.image = keyed;
+			untrusted += usize::from(is_untrusted);
 			stamped = true;
 		}
 	}
-	if stamped { key(&composite) } else { uri.to_string() }
+	(if stamped { key(&composite) } else { uri.to_string() }, untrusted)
 }
 
 /// Computes the expected stamped composite key from a scene key's recorded local-file stamps.
