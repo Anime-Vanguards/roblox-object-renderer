@@ -132,9 +132,10 @@ struct Filler {
 impl Filler {
 	fn new(part: &Part, fill: Fill) -> Self {
 		let rotation = part.cframe.matrix3;
-		// a SpecialMesh sphere is the mesh's box: the part's size times Scale, moved by Offset
+		// a SpecialMesh sphere is the mesh's box: the part's size times abs(Scale), moved by Offset
+		// (Roblox applies abs(Scale) to primitive SpecialMeshes, matching render::mod)
 		let (size, center) = match &part.geometry {
-			Geometry::Special { mesh_type: mesh_type::SPHERE, scale, offset, .. } => (part.size * *scale, part.cframe.translation + rotation * Vec3A::from(*offset)),
+			Geometry::Special { mesh_type: mesh_type::SPHERE, scale, offset, .. } => (part.size * scale.abs(), part.cframe.translation + rotation * Vec3A::from(*offset)),
 			_ => (part.size, part.cframe.translation),
 		};
 		let half = Vec3A::from(size * 0.5);
@@ -253,7 +254,7 @@ fn encode(part: &Part, fill: Fill, key: &mut Vec<u8>) {
 	floats(key, &part.size.to_array());
 	floats(key, &part.cframe.to_cols_array());
 	if let Geometry::Special { mesh_type: mesh_type::SPHERE, scale, offset, .. } = &part.geometry {
-		floats(key, &scale.to_array());
+		floats(key, &scale.abs().to_array());
 		floats(key, &offset.to_array());
 	}
 }
@@ -881,5 +882,32 @@ mod tests {
 		let start = std::time::Instant::now();
 		let grid = build(&scene).unwrap();
 		eprintln!("{} parts: {:?} voxels in {:.1} ms", scene.parts.len(), grid.dims, start.elapsed().as_secs_f64() * 1000.0);
+	}
+
+	/// A negatively scaled Sphere `SpecialMesh` uses `abs(Scale)` in Roblox, so its light-grid
+	/// occlusion and cache key must match the positive-scale sphere (not collapse to zero).
+	#[test]
+	fn mirrored_sphere_special_mesh_fills_light_grid_like_positive_scale() {
+		let make = |scale: Vec3| {
+			let mut sphere = block(Vec3::new(-4.0, 2.0, -4.0), Vec3::new(4.0, 10.0, 4.0));
+			sphere.geometry = Geometry::Special { mesh_type: mesh_type::SPHERE, mesh: None, scale, offset: Vec3::ZERO };
+			Scene {
+				parts: vec![Arc::new(block(Vec3::new(-24.0, -2.0, -24.0), Vec3::new(24.0, 0.0, 24.0))), Arc::new(sphere)],
+				..Default::default()
+			}
+		};
+		let pos = make(Vec3::new(1.0, 1.0, 1.0));
+		let pos_grid = build(&pos).expect("positive sphere grid");
+		let pos_key = key(&pos);
+		let empty = Scene { parts: vec![pos.parts[0].clone()], ..Default::default() };
+		let empty_grid = build(&empty).expect("floor-only grid");
+		assert_ne!(pos_grid.values, empty_grid.values, "positive sphere must darken the light grid");
+
+		for scale in [Vec3::new(-1.0, 1.0, 1.0), Vec3::new(1.0, -1.0, 1.0), Vec3::new(-1.0, -1.0, -1.0)] {
+			let neg = make(scale);
+			let neg_grid = build(&neg).expect("mirrored sphere grid");
+			assert_eq!(key(&neg), pos_key, "mirrored sphere {scale:?} must share light-grid key");
+			assert_eq!((neg_grid.origin, neg_grid.dims, &neg_grid.values), (pos_grid.origin, pos_grid.dims, &pos_grid.values), "mirrored sphere {scale:?} must fill light grid identically to positive scale");
+		}
 	}
 }

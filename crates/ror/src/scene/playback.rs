@@ -1416,7 +1416,7 @@ pub struct Resolved<'a> {
 	/// What the tracks move, found at the first moment's state (every moment starts from the file's:
 	/// [`Undo::restore`]), so later moments need not walk the document again, and `moving` as that walk
 	/// left it (what a moment's history then reads, as when each moment walked)
-	movers: std::sync::OnceLock<(Vec<Mover>, std::collections::HashMap<Ref, Option<usize>>)>,
+	movers: std::sync::OnceLock<Movers>,
 	timelines: std::collections::HashMap<Ref, Timeline>,
 	frames: Vec<f32>,
 	/// Every property set, switched or tweened.
@@ -1444,6 +1444,18 @@ pub struct Resolved<'a> {
 	/// Each emitter's viewer-masked timeline (with precomputed [`ScaleCurve`]s) over the grid
 	/// ([`Resolved::watched_timeline`]), worked out once per grid.
 	views: parking_lot::Mutex<std::collections::HashMap<(Ref, u64), std::sync::Arc<Timeline>>>,
+	#[cfg(test)]
+	trail_full_scans: std::sync::atomic::AtomicUsize,
+	#[cfg(test)]
+	trail_frames_scanned: std::sync::atomic::AtomicUsize,
+}
+
+struct Movers {
+	list: Vec<Mover>,
+	at_rest: std::collections::HashMap<Ref, Option<usize>>,
+	/// Exact time-invariant `tracks[index].rest.inverse() * part_rest` for moving parts carried by
+	/// an ancestor track (`tracks[index].referent != part`), captured once on the rest document.
+	part_in_track: std::collections::HashMap<Ref, (usize, Affine3A)>,
 }
 
 /// An instance a track moves ([`Resolved::apply_state`]): a part (its CFrame), a model (its pivot) or a
@@ -1484,22 +1496,50 @@ struct RateScan {
 	capped: bool,
 }
 
+/// How one endpoint of a Trail is anchored over time so [`TrailScan`] keys on exact, time-invariant
+/// transform bits when the attachment rides a moving track (reusing cached points on every frame
+/// without `pose(time)^-1` drift or rescans from `t = 0`).
+#[derive(Clone, Copy)]
+enum TrailAnchor {
+	/// Attachment rides `tracks[track]` at a fixed local transform `local` relative to `pose(t)`.
+	Tracked { track: usize, local: Affine3A },
+	/// Fallback when a property channel or complex ancestry overrides the tracked frame.
+	Dynamic { track: usize, inv: Affine3A, cframe: Affine3A },
+	/// Attachment does not belong to any moving track.
+	Static { cframe: Affine3A },
+}
+
+impl TrailAnchor {
+	fn sample(&self, tracks: &[Track], t: f32) -> Affine3A {
+		match *self {
+			Self::Tracked { track, local } => tracks[track].pose(t) * local,
+			Self::Dynamic { track, inv, cframe } => (tracks[track].pose(t) * inv) * cframe,
+			Self::Static { cframe } => cframe,
+		}
+	}
+
+	fn bits_eq(&self, other: &Self) -> bool {
+		match (self, other) {
+			(Self::Tracked { track: t1, local: l1 }, Self::Tracked { track: t2, local: l2 }) => t1 == t2 && affine_bits_eq(l1, l2),
+			(Self::Dynamic { track: t1, inv: i1, cframe: c1 }, Self::Dynamic { track: t2, inv: i2, cframe: c2 }) => t1 == t2 && affine_bits_eq(i1, i2) && affine_bits_eq(c1, c2),
+			(Self::Static { cframe: c1 }, Self::Static { cframe: c2 }) => affine_bits_eq(c1, c2),
+			_ => false,
+		}
+	}
+}
+
 /// A trail's grid-frame ribbon history through `self.frames[..index]`, before appending any
 /// between-frame head or trimming expired / over-length tail points. Reused only when every
-/// transform bit (`inv0`, `inv1`, `cframe0`, `cframe1`) matches identically so `MinLength`
-/// decisions never drift with frame order, density, or thread scheduling.
+/// [`TrailAnchor`] bit matches identically so `MinLength` decisions never drift with frame order,
+/// density, or thread scheduling while hitting the cache on every moving-part frame.
 #[derive(Clone)]
 struct TrailScan {
 	time: f32,
 	index: usize,
 	attachment0: Ref,
 	attachment1: Ref,
-	track0: Option<usize>,
-	track1: Option<usize>,
-	inv0: Option<Affine3A>,
-	inv1: Option<Affine3A>,
-	cframe0: Affine3A,
-	cframe1: Affine3A,
+	anchor0: TrailAnchor,
+	anchor1: TrailAnchor,
 	min_length: f32,
 	previous: f32,
 	fresh: bool,
@@ -1522,14 +1562,6 @@ fn affine_bits_eq(a: &Affine3A, b: &Affine3A) -> bool {
 		&& a.matrix3.x_axis.to_array().map(f32::to_bits) == b.matrix3.x_axis.to_array().map(f32::to_bits)
 		&& a.matrix3.y_axis.to_array().map(f32::to_bits) == b.matrix3.y_axis.to_array().map(f32::to_bits)
 		&& a.matrix3.z_axis.to_array().map(f32::to_bits) == b.matrix3.z_axis.to_array().map(f32::to_bits)
-}
-
-fn opt_affine_bits_eq(a: &Option<Affine3A>, b: &Option<Affine3A>) -> bool {
-	match (a, b) {
-		(Some(a), Some(b)) => affine_bits_eq(a, b),
-		(None, None) => true,
-		_ => false,
-	}
 }
 
 /// One continuous emitter still enabled past the playback's last event (never disabled or moved
@@ -2307,6 +2339,10 @@ impl Playback {
 			trails: Default::default(),
 			beams: Default::default(),
 			views: Default::default(),
+			#[cfg(test)]
+			trail_full_scans: Default::default(),
+			#[cfg(test)]
+			trail_frames_scanned: Default::default(),
 		})
 	}
 
@@ -2378,12 +2414,18 @@ impl Resolved<'_> {
 			if !self.playback.actions.is_empty() || !self.playback.tweens.is_empty() {
 				return false;
 			}
-			self.grid = frame_times(self.playback.frames.as_deref(), latest, self.playback.prewarm);
+			let new_grid = frame_times(self.playback.frames.as_deref(), latest, self.playback.prewarm);
+			let extends_prefix = new_grid.len() >= self.grid.len() && self.grid.iter().zip(&new_grid).all(|(a, b)| a.to_bits() == b.to_bits());
+			self.grid = new_grid;
 			self.latest = latest;
-			self.scans.get_mut().clear();
 			self.views.get_mut().clear();
-			self.trails.get_mut().clear();
-			self.beams.get_mut().clear();
+			if !extends_prefix || !self.playback.viewer.is_empty() {
+				self.scans.get_mut().clear();
+			}
+			if !extends_prefix {
+				self.trails.get_mut().clear();
+				self.beams.get_mut().clear();
+			}
 		}
 		self.time = time;
 		let end = self.grid.partition_point(|&frame| frame <= time + 1e-4);
@@ -2502,22 +2544,30 @@ impl Resolved<'_> {
 		let mut pivots: Vec<(Ref, Affine3A)> = Vec::new();
 		if !self.tracks.is_empty() {
 			let mut first = false;
-			let (movers, at_rest) = self.movers.get_or_init(|| {
+			let Movers { list: movers, at_rest, .. } = self.movers.get_or_init(|| {
 				first = true;
-				let mut movers = Vec::new();
+				let mut list = Vec::new();
+				let mut part_in_track = std::collections::HashMap::new();
 				for instance in document.dom.descendants() {
 					let referent = instance.referent();
 					if props::is_a(instance, "BasePart") {
-						movers.extend(self.track_of(document, referent).map(|index| Mover::Part(referent, index)));
+						if let Some(index) = self.track_of(document, referent) {
+							list.push(Mover::Part(referent, index));
+							if self.tracks[index].referent != referent
+								&& let Some(rest) = props::cframe(instance, "CFrame")
+							{
+								part_in_track.insert(referent, (index, self.tracks[index].rest.inverse() * rest));
+							}
+						}
 					} else if props::is_a(instance, "Model") {
-						movers.extend(self.track_of(document, referent).map(|index| Mover::Model(referent, index)));
+						list.extend(self.track_of(document, referent).map(|index| Mover::Model(referent, index)));
 					} else if props::is_a(instance, "Attachment")
 						&& let Some(&index) = self.track_by_ref.get(&referent)
 					{
-						movers.push(Mover::Attachment(referent, index));
+						list.push(Mover::Attachment(referent, index));
 					}
 				}
-				(movers, self.moving.read().clone())
+				Movers { list, at_rest: self.moving.read().clone(), part_in_track }
 			});
 			// (a moment moved to with `at` starts from what the walk left, as the walk itself did)
 			if !first {
@@ -2666,6 +2716,49 @@ impl Resolved<'_> {
 		let _ = self.apply_history_timed(document, scene);
 	}
 
+	/// Exact anchor for one Trail attachment at `time`: when the attachment rides a moving track
+	/// without an overriding `CFrame` property channel, computes its time-invariant local transform
+	/// relative to `tracks[index].pose(t)` directly from `document` (and `movers.part_in_track` for
+	/// parts inside moving models) so [`TrailScan`] matches exact bits and hits the cache every frame.
+	fn trail_anchor(&self, document: &Document, attachment: Ref, cframe: Affine3A, track: Option<usize>, time: f32) -> TrailAnchor {
+		let Some(index) = track else {
+			return TrailAnchor::Static { cframe };
+		};
+		let track_ref = self.tracks[index].referent;
+		if self.channel(track_ref, "CFrame").is_none() {
+			let mut cur = attachment;
+			let mut local = Affine3A::IDENTITY;
+			while let Some(instance) = document.dom.get_by_ref(cur) {
+				if cur == track_ref {
+					// Only `BasePart` and `Attachment` tracks share `tracks[index].pose(t)` as the
+					// parent frame (`beams::world_cframe`); a `Model` track uses `PrimaryPart` or
+					// parts-box center rather than `WorldPivotData`.
+					if props::is_a(instance, "BasePart") || props::is_a(instance, "Attachment") {
+						return TrailAnchor::Tracked { track: index, local };
+					}
+					break;
+				}
+				if props::is_a(instance, "Attachment") {
+					local = props::cframe(instance, "CFrame").unwrap_or(Affine3A::IDENTITY) * local;
+					cur = instance.parent();
+					continue;
+				}
+				if props::is_a(instance, "BasePart") {
+					if self.channel(cur, "CFrame").is_none()
+						&& let Some(movers) = self.movers.get()
+						&& let Some(&(part_track, part_offset)) = movers.part_in_track.get(&cur)
+						&& part_track == index
+					{
+						return TrailAnchor::Tracked { track: index, local: part_offset * local };
+					}
+					break;
+				}
+				break;
+			}
+		}
+		TrailAnchor::Dynamic { track: index, inv: self.tracks[index].pose(time).inverse(), cframe }
+	}
+
 	/// [`Resolved::apply_history`], returning particle stepping time and evaluated emission substeps
 	/// for per-frame reporting.
 	pub fn apply_history_timed(&self, document: &Document, scene: &mut Scene) -> HistoryStats {
@@ -2680,17 +2773,11 @@ impl Resolved<'_> {
 			let timeline = self.timelines.get(&trail.referent).unwrap_or(&empty_timeline);
 			let track0 = self.track_of(document, trail.attachment0);
 			let track1 = self.track_of(document, trail.attachment1);
-			let inv0 = track0.map(|index| self.tracks[index].pose(time).inverse());
-			let inv1 = track1.map(|index| self.tracks[index].pose(time).inverse());
+			let anchor0 = self.trail_anchor(document, trail.attachment0, trail.cframe0, track0, time);
+			let anchor1 = self.trail_anchor(document, trail.attachment1, trail.cframe1, track1, time);
 			let sample = |t: f32| -> TrailPoint {
-				let cframe0 = match (track0, inv0) {
-					(Some(index), Some(inv)) => (self.tracks[index].pose(t) * inv) * trail.cframe0,
-					_ => trail.cframe0,
-				};
-				let cframe1 = match (track1, inv1) {
-					(Some(index), Some(inv)) => (self.tracks[index].pose(t) * inv) * trail.cframe1,
-					_ => trail.cframe1,
-				};
+				let cframe0 = anchor0.sample(&self.tracks, t);
+				let cframe1 = anchor1.sample(&self.tracks, t);
 				TrailPoint {
 					time: t,
 					position0: Vec3::from(cframe0.translation),
@@ -2708,21 +2795,23 @@ impl Resolved<'_> {
 							&& scan.index <= self.frames.len()
 							&& scan.attachment0 == trail.attachment0
 							&& scan.attachment1 == trail.attachment1
-							&& scan.track0 == track0
-							&& scan.track1 == track1
 							&& scan.min_length.to_bits() == trail.min_length.to_bits()
-							&& opt_affine_bits_eq(&scan.inv0, &inv0)
-							&& opt_affine_bits_eq(&scan.inv1, &inv1)
-							&& affine_bits_eq(&scan.cframe0, &trail.cframe0)
-							&& affine_bits_eq(&scan.cframe1, &trail.cframe1) =>
+							&& scan.anchor0.bits_eq(&anchor0)
+							&& scan.anchor1.bits_eq(&anchor1) =>
 					{
 						(scan.points.clone(), scan.previous, scan.fresh, scan.index)
 					}
 					_ => (Vec::new(), f32::NEG_INFINITY, true, 0usize),
 				}
 			};
+			#[cfg(test)]
+			if first == 0 {
+				self.trail_full_scans.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+			}
 			let mut idx = first;
 			while idx < self.frames.len() {
+				#[cfg(test)]
+				self.trail_frames_scanned.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 				let frame = self.frames[idx];
 				// Clear() drops what the trail left so far
 				if timeline.cleared_between(previous, frame) {
@@ -2767,12 +2856,8 @@ impl Resolved<'_> {
 					index: self.frames.len(),
 					attachment0: trail.attachment0,
 					attachment1: trail.attachment1,
-					track0,
-					track1,
-					inv0,
-					inv1,
-					cframe0: trail.cframe0,
-					cframe1: trail.cframe1,
+					anchor0,
+					anchor1,
 					min_length: trail.min_length,
 					previous,
 					fresh,
@@ -4732,7 +4817,8 @@ mod tests {
 		assert!(s_alone.trails[0].points.len() >= 5, "trail should have multiple active points");
 		let png_alone = encode_scene_png(&s_alone, "alone");
 
-		// 2. Dense 60 fps sequential stepping via `at()`
+		// 2. Dense 60 fps sequential stepping via `at()` — must hit the TrailScan cache on every
+		//    subsequent frame (1 full scan from 0 on frame 0, O(N) total grid frames scanned, not O(N^2)).
 		let mut doc_dense = doc_base.copy();
 		let mut r_dense = playback.resolve_at(&doc_dense, 0.0).unwrap();
 		let mut s_dense = Scene::default();
@@ -4747,6 +4833,10 @@ mod tests {
 				s_dense = s;
 			}
 		}
+		let full_scans = r_dense.trail_full_scans.load(std::sync::atomic::Ordering::Relaxed);
+		let frames_scanned = r_dense.trail_frames_scanned.load(std::sync::atomic::Ordering::Relaxed);
+		assert_eq!(full_scans, 1, "moving trail at 60 fps must hit TrailScan cache on every frame after frame 0 (saw {full_scans} full rescans)");
+		assert_eq!(frames_scanned, 46, "moving trail over 46 60-Hz frames must scan each grid frame once (O(N), not O(N^2)); scanned {frames_scanned}");
 		assert_eq!(s_dense.trails[0].points.len(), s_alone.trails[0].points.len());
 		let png_dense = encode_scene_png(&s_dense, "dense");
 
@@ -4830,31 +4920,42 @@ mod tests {
 		let doc = model.into_document();
 		let base_scene = crate::scene::extract::extract(&doc);
 		assert!(base_scene.particles.len() >= 2, "Fire must expand into flame + secondary systems");
-		let reaches: Vec<f32> = base_scene.particles.iter().map(|e| {
-			let (a, b, c) = reach_terms(e);
-			e.size.length() * 0.5 + a + b + c
-		}).collect();
-		let r_min = reaches.iter().copied().fold(f32::INFINITY, f32::min);
-		let r_max = reaches.iter().copied().fold(0.0f32, f32::max);
-		// Position viewer so the smaller-reach system sits just outside the frustum while the
-		// larger-reach system overlaps it (or right on the boundary).
+		let reaches: Vec<(u64, f32)> = base_scene
+			.particles
+			.iter()
+			.map(|e| {
+				let (a, b, c) = reach_terms(e);
+				(e.seed, e.size.length() * 0.5 + a + b + c)
+			})
+			.collect();
+		let r_min = reaches.iter().map(|&(_, r)| r).fold(f32::INFINITY, f32::min);
+		let r_max = reaches.iter().map(|&(_, r)| r).fold(0.0f32, f32::max);
+		assert!(r_max > r_min + 0.5, "Fire sub-systems must have distinct reach radii: {reaches:?}");
+		// Position viewer strictly outside the smaller-reach system's frustum boundary and strictly
+		// inside the larger-reach system's frustum boundary, accounting for the side plane's normal
+		// factor `sqrt(1 + half_width^2)` used by `ViewerKey::sees`.
 		let mid_r = (r_min + r_max) * 0.5;
 		let z = 10.0f32;
-		let half_y = z * (35.0f32.to_radians()).tan();
-		let cam_x = half_y * (16.0 / 9.0) + mid_r;
+		let aspect = 16.0 / 9.0;
+		let half_width = (35.0f32.to_radians()).tan() * aspect;
+		let cam_x = half_width * z + mid_r * (1.0 + half_width * half_width).sqrt();
+		let viewer_key = ViewerKey {
+			at: 0.0,
+			cframe: [cam_x, 0.0, z, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+			fov: 70.0,
+			aspect,
+		};
+		assert!(!viewer_key.sees(Vec3::ZERO, r_min), "smaller-reach Fire system (r={r_min}) must be outside frustum");
+		assert!(viewer_key.sees(Vec3::ZERO, r_max), "larger-reach Fire system (r={r_max}) must overlap frustum");
 		let playback = Playback {
 			time: 0.8,
-			viewer: vec![ViewerKey {
-				at: 0.0,
-				cframe: [cam_x, 0.0, z, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-				fov: 70.0,
-				aspect: 16.0 / 9.0,
-			}],
+			viewer: vec![viewer_key],
 			..Default::default()
 		};
 
 		// Forward order vs reversed emitter order on separate fresh resolutions must yield the
-		// exact same births per emitter seed.
+		// exact same births per emitter seed, AND the two systems' masks must actually differ
+		// (the smaller-reach system is culled to 0 births while the larger-reach system emits).
 		let eval = |reverse: bool| -> Vec<(u64, Option<Vec<super::Birth>>)> {
 			let resolved = playback.resolve(&doc).unwrap();
 			let mut scene = crate::scene::extract::extract(&doc);
@@ -4869,6 +4970,8 @@ mod tests {
 		let forward = eval(false);
 		let reversed = eval(true);
 		assert_eq!(forward, reversed, "legacy Fire viewer mask must not depend on which sub-system evaluates first");
+		let counts: Vec<usize> = forward.iter().map(|(_, b)| b.as_ref().map_or(0, Vec::len)).collect();
+		assert!(counts.contains(&0) && counts.iter().any(|&n| n > 0), "Fire sub-systems must have different frustum masks (one culled, one emitting), got birth counts {counts:?}");
 
 		// Parallel evaluation on a shared Resolved across many runs must also match bit-for-bit.
 		let resolved = playback.resolve(&doc).unwrap();
