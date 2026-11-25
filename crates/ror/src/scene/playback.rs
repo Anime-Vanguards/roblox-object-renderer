@@ -496,22 +496,21 @@ impl Track {
 		if t <= first.0 {
 			return first.1;
 		}
-		for pair in self.keys.windows(2) {
-			let ((t0, a, ..), (t1, b, easing, direction)) = (&pair[0], &pair[1]);
-			if t <= *t1 {
-				// a key held (a recording leaves out the frames a part stood still in) stays put: a lerp of
-				// a key with itself lands a last bit off it at some moments, and the rotation rebuilt from
-				// its quaternion a little off the key's own (rock unions held still for a second shaded a
-				// few hundred pixels 1-6 levels differently from frame to frame, an edge pixel 171)
-				if a == b {
-					return *a;
-				}
-				let alpha = if t1 - t0 > 1e-6 { ease((t - t0) / (t1 - t0), easing.as_deref(), direction.as_deref()) } else { 1.0 };
-				let position = Vec3::from(a.translation).lerp(Vec3::from(b.translation), alpha);
-				return Affine3A::from_rotation_translation(rotation(a).slerp(rotation(b), alpha), position);
-			}
+		let index = self.keys.partition_point(|key| key.0 < t);
+		if index >= self.keys.len() {
+			return self.keys[self.keys.len() - 1].1;
 		}
-		self.keys[self.keys.len() - 1].1
+		let ((t0, a, ..), (t1, b, easing, direction)) = (&self.keys[index - 1], &self.keys[index]);
+		// a key held (a recording leaves out the frames a part stood still in) stays put: a lerp of
+		// a key with itself lands a last bit off it at some moments, and the rotation rebuilt from
+		// its quaternion a little off the key's own (rock unions held still for a second shaded a
+		// few hundred pixels 1-6 levels differently from frame to frame, an edge pixel 171)
+		if a == b {
+			return *a;
+		}
+		let alpha = if t1 - t0 > 1e-6 { ease((t - t0) / (t1 - t0), easing.as_deref(), direction.as_deref()) } else { 1.0 };
+		let position = Vec3::from(a.translation).lerp(Vec3::from(b.translation), alpha);
+		Affine3A::from_rotation_translation(rotation(a).slerp(rotation(b), alpha), position)
 	}
 
 	/// What the motion does to everything under the target at `t` (its pose over its rest).
@@ -564,20 +563,18 @@ fn frame_times(frames: Option<&[f32]>, end: f32, prewarm: f32) -> Vec<f32> {
 }
 
 /// The time an event happens: the first frame at or after it (events between frames wait for the
-/// next one, as a script's do).
+/// next one, as a script's do). `frames` is sorted in ascending time order.
 fn quantize(frames: &[f32], time: f32) -> f32 {
-	frames.iter().copied().find(|&frame| frame >= time - 1e-5).unwrap_or(time)
+	let index = frames.partition_point(|&frame| frame < time - 1e-5);
+	frames.get(index).copied().unwrap_or(time)
 }
 
 /// When a TimeScale set at `time` starts to count: the frame before the one it is set in, whose
 /// step it already governs (particle-emission emit-times, timescale-change: frozen particles are a
 /// frame younger than the frame they were frozen in).
 fn quantize_step(frames: &[f32], time: f32) -> f32 {
-	match frames.iter().position(|&frame| frame >= time - 1e-5) {
-		Some(index) if index > 0 => frames[index - 1],
-		Some(index) => frames[index],
-		None => time,
-	}
+	let index = frames.partition_point(|&frame| frame < time - 1e-5);
+	if index < frames.len() { frames[index.saturating_sub(1)] } else { time }
 }
 
 /// A JSON value as the Variant of the type `existing` has (the property's current value or default):
@@ -695,6 +692,7 @@ fn takes(existing: &Variant) -> String {
 
 /// A keyframe tween's value at `time`: its first key's before it, its last key's after it, eased
 /// between; keys relative to the property's value in the file (`initial`) taken from it.
+#[cfg(test)]
 fn tween_at(tween: &Tween, time: f32, initial: Option<&serde_json::Value>) -> Option<serde_json::Value> {
 	let mut keys: Vec<&TweenKey> = tween.keys.iter().collect();
 	keys.sort_by(|a, b| a.at.total_cmp(&b.at));
@@ -840,6 +838,16 @@ struct Channel<'a> {
 	initial: Option<serde_json::Value>,
 	events: Vec<(f32, Event<'a>)>,
 	keyframes: Option<&'a Tween>,
+	/// Pre-sorted and pre-resolved keyframe entries (populated in [`Channel::finalize`]).
+	sorted_keyframes: Vec<(f32, serde_json::Value, Option<&'a str>, Option<&'a str>)>,
+	/// Precomputed state immediately after each event in `events` (populated in [`Channel::finalize`]),
+	/// so [`Channel::at`] runs in O(log E) with bit-for-bit identical results.
+	states: Vec<(f32, ChannelState<'a>)>,
+}
+
+enum ChannelState<'a> {
+	Value(Option<serde_json::Value>),
+	Tween { start: f32, from: serde_json::Value, tween: &'a Tween },
 }
 
 enum Event<'a> {
@@ -849,19 +857,27 @@ enum Event<'a> {
 	Tween(&'a Tween),
 }
 
-impl Channel<'_> {
-	/// The property at `t`; None while nothing has changed it.
-	fn at(&self, t: f32) -> Option<serde_json::Value> {
+impl<'a> Channel<'a> {
+	fn finalize(&mut self) {
 		let initial = self.initial.as_ref();
 		if let Some(tween) = self.keyframes {
-			return tween_at(tween, t, initial);
+			let mut keys: Vec<&TweenKey> = tween.keys.iter().collect();
+			keys.sort_by(|a, b| a.at.total_cmp(&b.at));
+			self.sorted_keyframes = keys
+				.into_iter()
+				.map(|key| {
+					let value = resolved_value(&key.value, initial, initial).unwrap_or_else(|| key.value.clone());
+					(key.at, value, key.easing.as_deref(), key.direction.as_deref())
+				})
+				.collect();
+			return;
 		}
+		self.events.sort_by(|a, b| a.0.total_cmp(&b.0));
 		let mut value: Option<serde_json::Value> = None;
-		let mut running: Option<(f32, serde_json::Value, &Tween)> = None;
+		let mut running: Option<(f32, serde_json::Value, &'a Tween)> = None;
+		self.states.clear();
+		self.states.reserve(self.events.len());
 		for (time, event) in &self.events {
-			if *time > t + 1e-6 {
-				break;
-			}
 			let now = match &running {
 				Some((start, from, tween)) => Some(tweened(tween, *start, from, *time, initial)),
 				None => value.clone().or_else(|| self.initial.clone()),
@@ -879,11 +895,72 @@ impl Channel<'_> {
 					None => value = tween.to.as_ref().and_then(|to| resolved_value(to, None, initial)),
 				},
 			}
+			let state = match &running {
+				Some((start, from, tween)) => ChannelState::Tween { start: *start, from: from.clone(), tween },
+				None => ChannelState::Value(value.clone()),
+			};
+			self.states.push((*time, state));
 		}
-		match running {
-			Some((start, from, tween)) => Some(tweened(tween, start, &from, t, initial)),
-			None => value,
+	}
+
+	/// The property at `t`; None while nothing has changed it.
+	fn at(&self, t: f32) -> Option<serde_json::Value> {
+		if self.keyframes.is_some() {
+			let first = self.sorted_keyframes.first()?;
+			if t <= first.0 {
+				return Some(first.1.clone());
+			}
+			let index = self.sorted_keyframes.partition_point(|key| key.0 < t);
+			if index >= self.sorted_keyframes.len() {
+				return Some(self.sorted_keyframes[self.sorted_keyframes.len() - 1].1.clone());
+			}
+			let (t0, v0, _, _) = &self.sorted_keyframes[index - 1];
+			let (t1, v1, easing, direction) = &self.sorted_keyframes[index];
+			let span = t1 - t0;
+			let alpha = if span > 1e-6 { ease((t - t0) / span, *easing, *direction) } else { 1.0 };
+			return Some(lerp_value(v0, v1, alpha));
 		}
+		let index = self.states.partition_point(|(time, _)| *time <= t + 1e-6);
+		if index == 0 {
+			return None;
+		}
+		match &self.states[index - 1].1 {
+			ChannelState::Value(value) => value.clone(),
+			ChannelState::Tween { start, from, tween } => Some(tweened(tween, *start, from, t, self.initial.as_ref())),
+		}
+	}
+
+	/// Reads a 3-number vector property at `t` without cloning `serde_json::Value` on the common
+	/// non-tweened path.
+	fn at_vec3(&self, t: f32) -> Option<Vec3> {
+		let to_vec3 = |value: &serde_json::Value| -> Option<Vec3> {
+			let values = value.as_array().filter(|values| values.len() == 3)?;
+			Some(Vec3::new(values[0].as_f64().unwrap_or_default() as f32, values[1].as_f64().unwrap_or_default() as f32, values[2].as_f64().unwrap_or_default() as f32))
+		};
+		if self.keyframes.is_none() {
+			let index = self.states.partition_point(|(time, _)| *time <= t + 1e-6);
+			if index == 0 {
+				return None;
+			}
+			if let ChannelState::Value(value) = &self.states[index - 1].1 {
+				return value.as_ref().and_then(to_vec3);
+			}
+		}
+		self.at(t).as_ref().and_then(to_vec3)
+	}
+
+	/// Reads a scalar property at `t` without cloning `serde_json::Value` on the common non-tweened path.
+	fn at_f32(&self, t: f32) -> Option<f32> {
+		if self.keyframes.is_none() {
+			let index = self.states.partition_point(|(time, _)| *time <= t + 1e-6);
+			if index == 0 {
+				return None;
+			}
+			if let ChannelState::Value(value) = &self.states[index - 1].1 {
+				return value.as_ref().and_then(|v| v.as_f64()).map(|v| v as f32);
+			}
+		}
+		self.at(t).and_then(|v| v.as_f64()).map(|v| v as f32)
 	}
 }
 
@@ -1029,6 +1106,58 @@ impl Burst {
 	}
 }
 
+/// Precomputed piecewise-linear integral of a sorted `(time, scale)` step function from `start`.
+/// Produces bit-for-bit identical `f32` results to [`Timeline::integral`] in O(log N) time.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ScaleCurve {
+	valid: bool,
+	/// True when every active scale is non-negative (so the integral is non-decreasing in time).
+	monotonic: bool,
+	start: f32,
+	initial_scale: f32,
+	/// Active knots strictly after `start`: `(time, scale_after, cumulative_integral_at_time)`.
+	knots: Vec<(f32, f32, f32)>,
+}
+
+impl ScaleCurve {
+	fn from_scales(scales: &[(f32, f32)], start: f32) -> Self {
+		let mut initial_scale = scales.first().map(|(_, scale)| *scale).unwrap_or(1.0);
+		let mut monotonic = initial_scale >= 0.0;
+		let mut knots = Vec::new();
+		let mut total = 0.0f32;
+		let mut previous = start;
+		let mut scale = initial_scale;
+		for &(time, next) in scales {
+			if time <= start {
+				scale = next;
+				initial_scale = next;
+				monotonic = next >= 0.0;
+				continue;
+			}
+			total += (time - previous) * scale;
+			knots.push((time, next, total));
+			previous = time;
+			scale = next;
+			monotonic &= next >= 0.0;
+		}
+		Self { valid: true, monotonic, start, initial_scale, knots }
+	}
+
+	fn valid_for(&self, start: f32) -> bool {
+		self.valid && self.start.to_bits() == start.to_bits()
+	}
+
+	fn at(&self, t: f32) -> f32 {
+		let index = self.knots.partition_point(|&(time, _, _)| time < t);
+		if index == 0 {
+			(t - self.start).max(0.0) * self.initial_scale
+		} else {
+			let (previous, scale, total) = self.knots[index - 1];
+			total + (t - previous).max(0.0) * scale
+		}
+	}
+}
+
 /// What happens to one emitter or trail over the playback.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Timeline {
@@ -1040,20 +1169,37 @@ struct Timeline {
 	spawn_scale: Vec<(f32, f32)>,
 	emits: Vec<Burst>,
 	clears: Vec<f32>,
+	time_curve: ScaleCurve,
+	spawn_curve: ScaleCurve,
 }
 
 impl Timeline {
-	fn sorted(mut self) -> Self {
+	fn sorted(mut self, start: f32) -> Self {
 		self.enabled.sort_by(|a, b| a.0.total_cmp(&b.0));
 		self.time_scale.sort_by(|a, b| a.0.total_cmp(&b.0));
 		self.spawn_scale.sort_by(|a, b| a.0.total_cmp(&b.0));
 		self.emits.sort_by(|a, b| a.at.total_cmp(&b.at));
 		self.clears.sort_by(f32::total_cmp);
+		self.time_curve = ScaleCurve::from_scales(&self.time_scale, start);
+		self.spawn_curve = ScaleCurve::from_scales(&self.spawn_scale, start);
+		self
+	}
+
+	fn with_curves(mut self, start: f32) -> Self {
+		self.time_curve = ScaleCurve::from_scales(&self.time_scale, start);
+		self.spawn_curve = ScaleCurve::from_scales(&self.spawn_scale, start);
 		self
 	}
 
 	fn enabled_at(&self, t: f32) -> bool {
-		self.enabled.iter().take_while(|(time, _)| *time <= t + 1e-6).last().is_some_and(|(_, enabled)| *enabled)
+		let index = self.enabled.partition_point(|(time, _)| *time <= t + 1e-6);
+		index > 0 && self.enabled[index - 1].1
+	}
+
+	/// Earliest enable event `(time, true)` strictly after `t + 1e-6`, if any.
+	fn next_enabled_after(&self, t: f32) -> Option<f32> {
+		let index = self.enabled.partition_point(|(time, _)| *time <= t + 1e-6);
+		self.enabled[index..].iter().find(|(_, on)| *on).map(|&(time, _)| time)
 	}
 
 	/// Forced switches ([`Action::force`], in time order) win: from the first on only they switch it,
@@ -1064,24 +1210,44 @@ impl Timeline {
 		};
 		self.enabled.retain(|(time, _)| *time < first - 1e-6);
 		self.enabled.extend_from_slice(switches);
-		let off = |t: f32| switches.iter().take_while(|(time, _)| *time <= t + 1e-6).last().is_some_and(|(_, on)| !on);
+		let off = |t: f32| {
+			let index = switches.partition_point(|(time, _)| *time <= t + 1e-6);
+			index > 0 && !switches[index - 1].1
+		};
 		self.emits.retain(|burst| !off(burst.at));
 	}
 
 	fn last_clear(&self, t: f32) -> Option<f32> {
-		self.clears.iter().copied().take_while(|time| *time <= t + 1e-6).last()
+		let index = self.clears.partition_point(|&time| time <= t + 1e-6);
+		(index > 0).then(|| self.clears[index - 1])
+	}
+
+	fn cleared_between(&self, previous: f32, frame: f32) -> bool {
+		if self.clears.is_empty() {
+			return false;
+		}
+		let index = self.clears.partition_point(|&clear| clear <= previous);
+		self.clears.get(index).is_some_and(|&clear| clear <= frame + 1e-6)
 	}
 
 	/// Particle time at `t`: the integral of TimeScale from the start (TimeScale slows ageing and
 	/// emission alike: notes/render.md "Particles").
 	fn particle_time(&self, start: f32, t: f32) -> f32 {
-		Self::integral(&self.time_scale, start, t)
+		if self.time_curve.valid_for(start) {
+			self.time_curve.at(t)
+		} else {
+			Self::integral(&self.time_scale, start, t)
+		}
 	}
 
 	/// The spawning clock at `t`: as particle time, but a TimeScale set in a frame counts from the
 	/// frame's next step.
 	fn spawn_time(&self, start: f32, t: f32) -> f32 {
-		Self::integral(&self.spawn_scale, start, t)
+		if self.spawn_curve.valid_for(start) {
+			self.spawn_curve.at(t)
+		} else {
+			Self::integral(&self.spawn_scale, start, t)
+		}
 	}
 
 	fn integral(scales: &[(f32, f32)], start: f32, t: f32) -> f32 {
@@ -1104,17 +1270,16 @@ impl Timeline {
 	}
 }
 
-/// How far an emitter's particles can reach from where it emits: half its part's diagonal, its
-/// largest particle's corner and the farthest one flies in its life (the view decides whether Studio
-/// updates it: [`ViewerKey`]).
-fn reach(emitter: &super::particles::ParticleEmitter, size: Vec3) -> f32 {
+/// Emitter-constant terms of [`reach`], hoisted outside per-frame loops while preserving exact
+/// floating-point evaluation order (`size.length() * 0.5 + a + b + c`).
+fn reach_terms(emitter: &super::particles::ParticleEmitter) -> (f32, f32, f32) {
 	let life = emitter.lifetime.0.max(emitter.lifetime.1).max(0.0);
 	let speed = emitter.speed.0.abs().max(emitter.speed.1.abs());
 	let flight = if emitter.drag > 0.0 { (speed / (emitter.drag * std::f32::consts::LN_2)).min(speed * life) } else { speed * life };
 	let pull = 0.5 * emitter.acceleration.length() * life * life;
 	let largest = emitter.size_keys.iter().map(|&(_, value, envelope)| value + envelope.abs()).fold(0.0f32, f32::max);
 	let stretch = 1.0 + emitter.squash.iter().map(|&(_, value, envelope)| value.abs() + envelope.abs()).fold(0.0f32, f32::max);
-	size.length() * 0.5 + largest * stretch * std::f32::consts::SQRT_2 + flight + pull
+	(largest * stretch * std::f32::consts::SQRT_2, flight, pull)
 }
 
 /// Two step functions of time multiplied (each as [`Timeline::integral`] reads one: a value from its
@@ -1220,6 +1385,13 @@ impl Undo {
 	}
 }
 
+/// Per-frame timing and substep counts from [`Resolved::apply_history_timed`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HistoryStats {
+	pub particle_ms: f64,
+	pub particle_substeps: u64,
+}
+
 /// A playback ready to apply to one document: targets resolved, events at their frames. Only the
 /// moment drawn and the frames up to it depend on the time: [`Resolved::at`] moves it to another
 /// moment of the same document (a clip's frames), which resolving again gave exactly (a barrage
@@ -1233,6 +1405,8 @@ pub struct Resolved<'a> {
 	/// The last time `grid` covers: ten seconds past the last event, or the moment drawn after that
 	latest: f32,
 	tracks: Vec<Track>,
+	/// First index in `tracks` for each track target referent, for O(1) lookup.
+	track_by_ref: std::collections::HashMap<Ref, usize>,
 	/// Per instance, the nearest moving target at or above it (index into `tracks`).
 	moving: parking_lot::RwLock<std::collections::HashMap<Ref, Option<usize>>>,
 	/// What the tracks move, found at the first moment's state (every moment starts from the file's:
@@ -1243,19 +1417,29 @@ pub struct Resolved<'a> {
 	frames: Vec<f32>,
 	/// Every property set, switched or tweened.
 	channels: Vec<Channel<'a>>,
+	/// Index in `channels` by `(referent, property)` for O(1) lookup.
+	channel_by_key: std::collections::HashMap<(Ref, &'a str), usize>,
 	/// Every instance parented elsewhere: (time, parent; none out of the world), in time order.
 	parents: Vec<(Ref, Vec<(f32, Ref)>)>,
+	/// Index in `parents` by moved referent for O(1) lookup.
+	parent_by_ref: std::collections::HashMap<Ref, usize>,
 	/// Every instance reference set (a beam given its attachments after it appeared): (instance,
 	/// property, (time, the instance it names; none for null) in time order).
 	refs: Vec<(Ref, &'a str, Vec<(f32, Ref)>)>,
 	/// The forced switches of every instance they reach ([`Action::force`]): (time, on), in time order.
 	forced: std::collections::HashMap<Ref, Vec<(f32, bool)>>,
-	/// Each Rate emitter's scan as it stood before the first frame whose births could still live at
-	/// the moment drawn ([`Resolved::apply_history`]), for a later moment to go on from
-	scans: parking_lot::Mutex<std::collections::HashMap<Ref, RateScan>>,
-	/// Each emitter's view by the playback's viewer over the grid ([`Resolved::watched`]): from each
-	/// time on, 1 while that camera could draw it, else 0
-	views: parking_lot::Mutex<std::collections::HashMap<Ref, std::sync::Arc<Vec<(f32, f32)>>>>,
+	/// Each Rate emitter's monotonic accumulator and live-birth ring through the last grid frame
+	/// drawn ([`Resolved::apply_history_timed`]), keyed by `(referent, seed)` so multi-system
+	/// legacy effects never collide.
+	scans: parking_lot::Mutex<std::collections::HashMap<(Ref, u64), RateScan>>,
+	/// Each Trail's incremental grid scan up to the last frame drawn, so later moments append new
+	/// grid points instead of replaying from `t = 0`.
+	trails: parking_lot::Mutex<std::collections::HashMap<Ref, TrailScan>>,
+	/// Each Beam's incremental grid scroll offset up to the last frame drawn.
+	beams: parking_lot::Mutex<std::collections::HashMap<Ref, BeamScan>>,
+	/// Each emitter's viewer-masked timeline (with precomputed [`ScaleCurve`]s) over the grid
+	/// ([`Resolved::watched_timeline`]), worked out once per grid.
+	views: parking_lot::Mutex<std::collections::HashMap<(Ref, u64), std::sync::Arc<Timeline>>>,
 }
 
 /// An instance a track moves ([`Resolved::apply_state`]): a part (its CFrame), a model (its pivot) or a
@@ -1267,11 +1451,21 @@ enum Mover {
 	Attachment(Ref, usize),
 }
 
-/// An emitter's Rate accumulator before frame `index` of the grid, made at the moment `time` for this
-/// `rate` and longest lifetime. Every frame before it had births already gone at that moment, so at any
-/// later one too (particle time only grows): a later moment scans on from here and makes the births it
-/// would from the start. A clip from 10 s replayed its emitters' 600 frames before each frame drawn.
+/// One birth recorded by [`RateScan`] so forward steps materialize still-living particles without
+/// re-scanning already-processed grid frames.
 #[derive(Clone, Copy)]
+struct RateBirth {
+	frame: f32,
+	pt: f32,
+	cur_s: f32,
+	stream: u64,
+}
+
+/// An emitter's Rate accumulator after frame `index - 1` of the grid, made at the moment `time` for
+/// this `rate` and longest lifetime. With non-negative `TimeScale`, births already expired at `time`
+/// stay expired at every later moment, so forward steps drop expired entries from `live` and advance
+/// only across newly-reached grid frames `index..frames.len()`.
+#[derive(Clone)]
 struct RateScan {
 	time: f32,
 	rate: f32,
@@ -1282,6 +1476,45 @@ struct RateScan {
 	on: bool,
 	previous: Option<f32>,
 	stream: u64,
+	live: std::collections::VecDeque<RateBirth>,
+	capped: bool,
+}
+
+/// A trail's grid-frame ribbon history through `self.frames[..index]`, before appending any
+/// between-frame head or trimming expired / over-length tail points.
+#[derive(Clone)]
+struct TrailScan {
+	time: f32,
+	index: usize,
+	attachment0: Ref,
+	attachment1: Ref,
+	track0: Option<usize>,
+	track1: Option<usize>,
+	base0: Affine3A,
+	base1: Affine3A,
+	min_length: f32,
+	previous: f32,
+	fresh: bool,
+	points: Vec<TrailPoint>,
+}
+
+/// A beam's accumulated `TextureSpeed` scroll through `self.frames[..index]` (excluding the
+/// fractional trailing step to `self.time`).
+#[derive(Clone, Copy)]
+struct BeamScan {
+	time: f32,
+	index: usize,
+	speed: f32,
+	offset: f64,
+	previous: Option<f32>,
+}
+
+fn affine_near(a: &Affine3A, b: &Affine3A) -> bool {
+	let eps = 1e-4;
+	a.translation.abs_diff_eq(b.translation, eps)
+		&& a.matrix3.x_axis.abs_diff_eq(b.matrix3.x_axis, eps)
+		&& a.matrix3.y_axis.abs_diff_eq(b.matrix3.y_axis, eps)
+		&& a.matrix3.z_axis.abs_diff_eq(b.matrix3.z_axis, eps)
 }
 
 /// One continuous emitter still enabled past the playback's last event (never disabled or moved
@@ -1938,7 +2171,8 @@ impl Playback {
 				timeline.force(switches);
 			}
 		}
-		let timelines = timelines.into_iter().map(|(referent, timeline)| (referent, timeline.sorted())).collect();
+		let start = -self.prewarm;
+		let timelines = timelines.into_iter().map(|(referent, timeline)| (referent, timeline.sorted(start))).collect();
 		// every property set, switched or tweened, and every instance parented elsewhere, their events
 		// in time order (an action's before a tween's at the same time)
 		let mut channels: Vec<Channel<'a>> = Vec::new();
@@ -1950,12 +2184,14 @@ impl Playback {
 			let property = names.map_or(property, |names| names.content);
 			*known.entry((referent, property)).or_insert_with(|| {
 				let initial = document.dom.get_by_ref(referent).and_then(|instance| authored(instance, property));
-				channels.push(Channel { referent, property, alias: names.map(|names| names.legacy), initial, events: Vec::new(), keyframes: None });
+				channels.push(Channel { referent, property, alias: names.map(|names| names.legacy), initial, events: Vec::new(), keyframes: None, sorted_keyframes: Vec::new(), states: Vec::new() });
 				channels.len() - 1
 			})
 		};
 		let mut parents: Vec<(Ref, Vec<(f32, Ref)>)> = Vec::new();
+		let mut parent_by_ref: std::collections::HashMap<Ref, usize> = std::collections::HashMap::new();
 		let mut refs: Vec<(Ref, &'a str, Vec<(f32, Ref)>)> = Vec::new();
+		let mut ref_by_key: std::collections::HashMap<(Ref, &'a str), usize> = std::collections::HashMap::new();
 		for action in &self.actions {
 			let at = quantize(&grid, action.at);
 			let targets = paths.get(&action.target)?;
@@ -1971,10 +2207,11 @@ impl Playback {
 							serde_json::Value::String(path) => paths.get(path)?.first().copied().with_context(|| format!("playback: {}.{name}: no instance {path:?}", path_of(document, referent)))?,
 							other => bail!("playback: {}.{name} is an instance reference: the path of the instance it names, or null for none, not {}", path_of(document, referent), shown(other)),
 						};
-						match refs.iter_mut().find(|(set, property, _)| *set == referent && *property == name.as_str()) {
-							Some((_, _, events)) => events.push((at, named)),
-							None => refs.push((referent, name.as_str(), vec![(at, named)])),
-						}
+						let idx = *ref_by_key.entry((referent, name.as_str())).or_insert_with(|| {
+							refs.push((referent, name.as_str(), Vec::new()));
+							refs.len() - 1
+						});
+						refs[idx].2.push((at, named));
 						continue;
 					}
 					let index = channel(&mut channels, referent, name);
@@ -1987,10 +2224,11 @@ impl Playback {
 					if parent.is_some() && descendants(document, referent).contains(&parent) {
 						bail!("playback: {} cannot go under {path:?}, which is in it", path_of(document, referent));
 					}
-					match parents.iter_mut().find(|(moved, _)| *moved == referent) {
-						Some((_, events)) => events.push((at, parent)),
-						None => parents.push((referent, vec![(at, parent)])),
-					}
+					let idx = *parent_by_ref.entry(referent).or_insert_with(|| {
+						parents.push((referent, Vec::new()));
+						parents.len() - 1
+					});
+					parents[idx].1.push((at, parent));
 				}
 			}
 			if let Some(enabled) = action.enabled {
@@ -2019,7 +2257,7 @@ impl Playback {
 			}
 		}
 		for channel in &mut channels {
-			channel.events.sort_by(|a, b| a.0.total_cmp(&b.0));
+			channel.finalize();
 		}
 		for (_, events) in &mut parents {
 			events.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -2027,8 +2265,34 @@ impl Playback {
 		for (_, _, events) in &mut refs {
 			events.sort_by(|a, b| a.0.total_cmp(&b.0));
 		}
-		let frames = grid.iter().copied().filter(|&frame| frame <= time + 1e-4).collect();
-		Ok(Resolved { playback: self, time, grid, latest, tracks, moving: Default::default(), movers: Default::default(), timelines, frames, channels, parents, refs, forced, scans: Default::default(), views: Default::default() })
+		let mut track_by_ref = std::collections::HashMap::with_capacity(tracks.len());
+		for (index, track) in tracks.iter().enumerate() {
+			track_by_ref.entry(track.referent).or_insert(index);
+		}
+		let end = grid.partition_point(|&frame| frame <= time + 1e-4);
+		let frames = grid[..end].to_vec();
+		Ok(Resolved {
+			playback: self,
+			time,
+			grid,
+			latest,
+			tracks,
+			track_by_ref,
+			moving: Default::default(),
+			movers: Default::default(),
+			timelines,
+			frames,
+			channels,
+			channel_by_key: known,
+			parents,
+			parent_by_ref,
+			refs,
+			forced,
+			scans: Default::default(),
+			trails: Default::default(),
+			beams: Default::default(),
+			views: Default::default(),
+		})
 	}
 
 	/// The forced switches ([`Action::force`]) of every switchable instance they reach: at or under
@@ -2084,6 +2348,11 @@ impl Playback {
 }
 
 impl Resolved<'_> {
+	/// The moment this resolved playback currently stands at.
+	pub fn time(&self) -> f32 {
+		self.time
+	}
+
 	/// Moves to the moment `time` of the same document, as resolving it there gives, when its frames
 	/// are those this one waits for (false: resolve again).
 	pub fn at(&mut self, time: f32) -> bool {
@@ -2096,10 +2365,15 @@ impl Resolved<'_> {
 			}
 			self.grid = frame_times(self.playback.frames.as_deref(), latest, self.playback.prewarm);
 			self.latest = latest;
+			self.scans.get_mut().clear();
 			self.views.get_mut().clear();
+			self.trails.get_mut().clear();
+			self.beams.get_mut().clear();
 		}
 		self.time = time;
-		self.frames = self.grid.iter().copied().filter(|&frame| frame <= time + 1e-4).collect();
+		let end = self.grid.partition_point(|&frame| frame <= time + 1e-4);
+		self.frames.clear();
+		self.frames.extend_from_slice(&self.grid[..end]);
 		// what moves each instance follows the parents of the moment drawn
 		self.moving.get_mut().clear();
 		true
@@ -2110,7 +2384,7 @@ impl Resolved<'_> {
 		if let Some(known) = self.moving.read().get(&referent) {
 			return *known;
 		}
-		let found = match self.tracks.iter().position(|track| track.referent == referent) {
+		let found = match self.track_by_ref.get(&referent).copied() {
 			Some(index) => Some(index),
 			None => {
 				let parent = document.dom.get_by_ref(referent).map(|instance| instance.parent()).filter(|parent| parent.is_some());
@@ -2121,30 +2395,66 @@ impl Resolved<'_> {
 		found
 	}
 
-	/// An emitter's view by the playback's viewer ([`Playback::viewer`]), none without one: from each
-	/// frame of the grid's previous one on, 1 where the viewer's camera at that frame could draw the
-	/// emitter's particles (a ball about where it emits as far as they reach), else 0. Worked out once
-	/// per grid.
-	fn watched(&self, referent: Ref, emitter: &super::particles::ParticleEmitter, frame_at: &dyn Fn(f32) -> Affine3A, size_at: &dyn Fn(f32) -> Vec3) -> Option<std::sync::Arc<Vec<(f32, f32)>>> {
+	/// An emitter's viewer-masked timeline over the grid ([`Playback::viewer`]), none without a
+	/// viewer: from each frame of the grid's previous one on, 1 where the viewer's camera at that
+	/// frame could draw the emitter's particles (a ball about where it emits as far as they reach),
+	/// else 0, masked into `time_scale` and `spawn_scale` with precomputed [`ScaleCurve`]s. Worked
+	/// out once per grid.
+	fn watched_timeline(&self, referent: Ref, base: &Timeline, emitter: &super::particles::ParticleEmitter, track: Option<usize>, parent_now: Affine3A, inv: Option<Affine3A>, size_channel: Option<&Channel<'_>>) -> Option<std::sync::Arc<Timeline>> {
 		let viewer = &self.playback.viewer;
 		if viewer.is_empty() {
 			return None;
 		}
-		if let Some(view) = self.views.lock().get(&referent) {
-			return Some(view.clone());
+		let view_key = (referent, emitter.seed);
+		if let Some(cached) = self.views.lock().get(&view_key) {
+			return Some(cached.clone());
 		}
+		let (reach_a, reach_b, reach_c) = reach_terms(emitter);
 		let mut view: Vec<(f32, f32)> = Vec::new();
+		let mut viewer_idx = 0usize;
+		let static_emitter = track.is_none() && size_channel.is_none();
+		let static_center = Vec3::from(parent_now.translation);
+		let static_radius = emitter.size.length() * 0.5 + reach_a + reach_b + reach_c;
+		let mut last_viewer_idx = usize::MAX;
+		let mut last_seen = 0.0f32;
 		for (index, &frame) in self.grid.iter().enumerate() {
-			let key = &viewer[viewer.partition_point(|key| key.at <= frame + 1e-4).saturating_sub(1)];
-			let seen = if key.sees(Vec3::from(frame_at(frame).translation), reach(emitter, size_at(frame))) { 1.0 } else { 0.0 };
+			while viewer_idx + 1 < viewer.len() && viewer[viewer_idx + 1].at <= frame + 1e-4 {
+				viewer_idx += 1;
+			}
+			let seen = if static_emitter {
+				if viewer_idx != last_viewer_idx {
+					last_viewer_idx = viewer_idx;
+					last_seen = if viewer[viewer_idx].sees(static_center, static_radius) { 1.0 } else { 0.0 };
+				}
+				last_seen
+			} else {
+				let center = match (track, inv) {
+					(Some(track_idx), Some(inv)) => Vec3::from(((self.tracks[track_idx].pose(frame) * inv) * parent_now).translation),
+					_ => static_center,
+				};
+				let size = size_channel.and_then(|channel| channel.at_vec3(frame)).unwrap_or(emitter.size);
+				let radius = size.length() * 0.5 + reach_a + reach_b + reach_c;
+				if viewer[viewer_idx].sees(center, radius) { 1.0 } else { 0.0 }
+			};
 			let from = if index == 0 { f32::NEG_INFINITY } else { self.grid[index - 1] };
 			if view.last().is_none_or(|&(_, last)| last != seen) {
 				view.push((from, seen));
 			}
 		}
-		let view = std::sync::Arc::new(view);
-		self.views.lock().insert(referent, view.clone());
-		Some(view)
+		let masked_timeline = std::sync::Arc::new(
+			Timeline {
+				enabled: base.enabled.clone(),
+				time_scale: masked(&base.time_scale, &view),
+				spawn_scale: masked(&base.spawn_scale, &view),
+				emits: base.emits.clone(),
+				clears: base.clears.clone(),
+				time_curve: ScaleCurve::default(),
+				spawn_curve: ScaleCurve::default(),
+			}
+			.with_curves(-self.playback.prewarm),
+		);
+		self.views.lock().insert(view_key, masked_timeline.clone());
+		Some(masked_timeline)
 	}
 
 	/// An instance's world CFrame at `t`, from `now`, its world CFrame at the moment drawn: moved as its
@@ -2186,8 +2496,10 @@ impl Resolved<'_> {
 						movers.extend(self.track_of(document, referent).map(|index| Mover::Part(referent, index)));
 					} else if props::is_a(instance, "Model") {
 						movers.extend(self.track_of(document, referent).map(|index| Mover::Model(referent, index)));
-					} else if props::is_a(instance, "Attachment") && self.tracks.iter().any(|track| track.referent == referent) {
-						movers.push(Mover::Attachment(referent, self.track_of(document, referent).unwrap_or_default()));
+					} else if props::is_a(instance, "Attachment")
+						&& let Some(&index) = self.track_by_ref.get(&referent)
+					{
+						movers.push(Mover::Attachment(referent, index));
 					}
 				}
 				(movers, self.moving.read().clone())
@@ -2222,10 +2534,13 @@ impl Resolved<'_> {
 						// read from there (beams::parent_frame: a part's CFrame, a model's PrimaryPart or its
 						// parts' centre, the world's above a Folder), so it stands where its track puts it
 						let parent = self
-							.parents
-							.iter()
-							.find(|(moved, _)| *moved == referent)
-							.and_then(|(_, events)| events.iter().take_while(|(at, _)| *at <= time + 1e-6).last().map(|&(_, parent)| parent))
+							.parent_by_ref
+							.get(&referent)
+							.and_then(|&pidx| {
+								let events = &self.parents[pidx].1;
+								let pos = events.partition_point(|(at, _)| *at <= time + 1e-6);
+								(pos > 0).then(|| events[pos - 1].1)
+							})
 							.unwrap_or_else(|| document.dom.get_by_ref(referent).map(|instance| instance.parent()).unwrap_or_else(Ref::none));
 						let parent_now = match (super::beams::parent_frame(document, parent), self.track_of(document, parent)) {
 							(Some(rest), Some(moving)) => self.tracks[moving].delta(time) * rest,
@@ -2264,20 +2579,23 @@ impl Resolved<'_> {
 		}
 		// and every instance under the parent it has by then (a post effect in the Lighting)
 		for (referent, events) in &self.parents {
-			if let Some(&(_, parent)) = events.iter().take_while(|(at, _)| *at <= time + 1e-6).last() {
-				undo.reparent(document, *referent, parent);
+			let pos = events.partition_point(|(at, _)| *at <= time + 1e-6);
+			if pos > 0 {
+				undo.reparent(document, *referent, events[pos - 1].1);
 			}
 		}
 		// every instance reference as its sets leave it (a beam's attachments)
 		for (referent, property, events) in &self.refs {
-			if let Some(&(_, named)) = events.iter().take_while(|(at, _)| *at <= time + 1e-6).last() {
-				undo.set(document, *referent, property, Variant::Ref(named));
+			let pos = events.partition_point(|(at, _)| *at <= time + 1e-6);
+			if pos > 0 {
+				undo.set(document, *referent, property, Variant::Ref(events[pos - 1].1));
 			}
 		}
 		// forced switches over whatever switched, set or tweened Enabled
 		for (referent, switches) in &self.forced {
-			if let Some(&(_, on)) = switches.iter().take_while(|(at, _)| *at <= time + 1e-6).last() {
-				undo.set(document, *referent, "Enabled", Variant::Bool(on));
+			let pos = switches.partition_point(|(at, _)| *at <= time + 1e-6);
+			if pos > 0 {
+				undo.set(document, *referent, "Enabled", Variant::Bool(switches[pos - 1].1));
 			}
 		}
 		Ok(undo)
@@ -2302,7 +2620,7 @@ impl Resolved<'_> {
 
 	/// The channel of one property of one instance, if anything changes it.
 	fn channel(&self, referent: Ref, property: &str) -> Option<&Channel<'_>> {
-		self.channels.iter().find(|channel| channel.referent == referent && channel.property == property)
+		self.channel_by_key.get(&(referent, property)).map(|&index| &self.channels[index])
 	}
 
 	/// Whether all it changes over time is the Lighting, what is in it, the Terrain's Clouds, and the
@@ -2330,29 +2648,67 @@ impl Resolved<'_> {
 	/// and where it emitted them). `document` is the model at the moment drawn (after `apply_state`),
 	/// the scene extracted from it.
 	pub fn apply_history(&self, document: &Document, scene: &mut Scene) {
+		let _ = self.apply_history_timed(document, scene);
+	}
+
+	/// [`Resolved::apply_history`], returning particle stepping time and evaluated emission substeps
+	/// for per-frame reporting.
+	pub fn apply_history_timed(&self, document: &Document, scene: &mut Scene) -> HistoryStats {
 		let time = self.time;
+		let empty_timeline = Timeline::default();
 		// the model is placed at the start, its lights with it
 		for light in &mut scene.lights {
 			light.placed = true;
 		}
+		let next_frame = self.grid.get(self.grid.partition_point(|&frame| frame <= time + 1e-6)).copied();
 		for trail in &mut scene.trails {
-			let timeline = self.timelines.get(&trail.referent).cloned().unwrap_or_default();
+			let timeline = self.timelines.get(&trail.referent).unwrap_or(&empty_timeline);
+			let track0 = self.track_of(document, trail.attachment0);
+			let track1 = self.track_of(document, trail.attachment1);
+			let inv0 = track0.map(|index| self.tracks[index].pose(time).inverse());
+			let inv1 = track1.map(|index| self.tracks[index].pose(time).inverse());
+			let base0 = inv0.map_or(trail.cframe0, |inv| inv * trail.cframe0);
+			let base1 = inv1.map_or(trail.cframe1, |inv| inv * trail.cframe1);
 			let sample = |t: f32| -> TrailPoint {
+				let cframe0 = match (track0, inv0) {
+					(Some(index), Some(inv)) => (self.tracks[index].pose(t) * inv) * trail.cframe0,
+					_ => trail.cframe0,
+				};
+				let cframe1 = match (track1, inv1) {
+					(Some(index), Some(inv)) => (self.tracks[index].pose(t) * inv) * trail.cframe1,
+					_ => trail.cframe1,
+				};
 				TrailPoint {
 					time: t,
-					position0: Vec3::from(self.world_at(document, trail.attachment0, trail.cframe0, t).translation),
-					position1: Vec3::from(self.world_at(document, trail.attachment1, trail.cframe1, t).translation),
+					position0: Vec3::from(cframe0.translation),
+					position1: Vec3::from(cframe1.translation),
 					starts_strip: false,
 				}
 			};
 			let middle = |point: &TrailPoint| (point.position0 + point.position1) * 0.5;
-			let mut points: Vec<TrailPoint> = Vec::new();
-			let mut previous = f32::NEG_INFINITY;
-			// the next point starts a strip of its own (after the trail was disabled: trail-shape gap)
-			let mut fresh = true;
-			for &frame in &self.frames {
+			let min_length = trail.min_length.max(1e-4);
+			let (mut points, mut previous, mut fresh, first) = {
+				let scans = self.trails.lock();
+				match scans.get(&trail.referent) {
+					Some(scan)
+						if scan.time <= time
+							&& scan.index <= self.frames.len()
+							&& scan.attachment0 == trail.attachment0
+							&& scan.attachment1 == trail.attachment1
+							&& scan.track0 == track0
+							&& scan.track1 == track1
+							&& scan.min_length.to_bits() == trail.min_length.to_bits()
+							&& affine_near(&scan.base0, &base0)
+							&& affine_near(&scan.base1, &base1) =>
+					{
+						(scan.points.clone(), scan.previous, scan.fresh, scan.index)
+					}
+					_ => (Vec::new(), f32::NEG_INFINITY, true, 0usize),
+				}
+			};
+			for &frame in &self.frames[first..] {
 				// Clear() drops what the trail left so far
-				if timeline.clears.iter().any(|&clear| clear > previous && clear <= frame + 1e-6) {
+				if timeline.cleared_between(previous, frame) {
 					points.clear();
 				}
 				previous = frame;
@@ -2365,7 +2721,7 @@ impl Resolved<'_> {
 				// trail-shape minlength: the circle's corners match)
 				if !fresh
 					&& let Some(last) = points.last()
-					&& middle(&point).distance(middle(last)) < trail.min_length.max(1e-4)
+					&& middle(&point).distance(middle(last)) < min_length
 				{
 					continue;
 				}
@@ -2373,13 +2729,27 @@ impl Resolved<'_> {
 				fresh = false;
 				points.push(point);
 			}
+			self.trails.lock().insert(
+				trail.referent,
+				TrailScan {
+					time,
+					index: self.frames.len(),
+					attachment0: trail.attachment0,
+					attachment1: trail.attachment1,
+					track0,
+					track1,
+					base0,
+					base1,
+					min_length: trail.min_length,
+					previous,
+					fresh,
+					points: points.clone(),
+				},
+			);
 			// the head follows the attachments while enabled, unless the very next grid frame disables or
 			// clears the trail (a pooled part parked offscreen on its disable frame must not pull the head
 			// partway to the park position at moments just before that frame)
-			let next_frame = self.grid.iter().copied().find(|&frame| frame > time + 1e-6);
-			let stopping = next_frame.is_some_and(|next| {
-				!timeline.enabled_at(next) || timeline.clears.iter().any(|&clear| clear > previous && clear <= next + 1e-6)
-			});
+			let stopping = next_frame.is_some_and(|next| !timeline.enabled_at(next) || timeline.cleared_between(previous, next));
 			if timeline.enabled_at(time)
 				&& !stopping
 				&& let Some(last) = points.last()
@@ -2393,11 +2763,17 @@ impl Resolved<'_> {
 			// points older than Lifetime are gone
 			let lifetime = trail.lifetime.max(0.0);
 			let mut dropped = 0.0;
-			while points.len() > 1 && time - points[0].time > lifetime {
-				let gone = points.remove(0);
-				if !points[0].starts_strip {
-					dropped += middle(&gone).distance(middle(&points[0]));
+			let mut drop_count = 0usize;
+			while points.len() - drop_count > 1 && time - points[drop_count].time > lifetime {
+				let gone = &points[drop_count];
+				let next = &points[drop_count + 1];
+				if !next.starts_strip {
+					dropped += middle(gone).distance(middle(next));
 				}
+				drop_count += 1;
+			}
+			if drop_count > 0 {
+				points.drain(..drop_count);
 				points[0].starts_strip = true;
 			}
 			if points.len() == 1 && time - points[0].time > lifetime {
@@ -2426,11 +2802,13 @@ impl Resolved<'_> {
 			trail.dropped_length = dropped;
 		}
 		// each emitter's particles on every core: what one emits depends on no other
+		let particle_start = std::time::Instant::now();
+		let particle_substeps = std::sync::atomic::AtomicU64::new(0);
 		let play = |emitter: &mut super::particles::ParticleEmitter| {
 			let Some(referent) = emitter.referent else {
 				return;
 			};
-			let timeline = self.timelines.get(&referent).cloned().unwrap_or_default();
+			let base_timeline = self.timelines.get(&referent).unwrap_or(&empty_timeline);
 			// a legacy effect's system follows its mount (an Explosion's stays where it went off)
 			let parent = emitter.mount.unwrap_or_else(|| document.dom.get_by_ref(referent).map(|instance| instance.parent()).unwrap_or_else(Ref::none));
 			// an emitter outside a part or an attachment stays at the world's origin whatever moves
@@ -2446,25 +2824,22 @@ impl Resolved<'_> {
 				frame
 			};
 			let track = if fixed { None } else { self.track_of(document, parent) };
-			let frame_at = |t: f32| self.moved(track, parent_now, t);
+			let inv = track.map(|index| self.tracks[index].pose(time).inverse());
+			let frame_at = |t: f32| match (track, inv) {
+				(Some(index), Some(inv)) => (self.tracks[index].pose(t) * inv) * parent_now,
+				_ => parent_now,
+			};
 			// LockedToPart particles stay behind once physics moves the part (Motion::physics_from)
 			let physics = track.and_then(|index| self.tracks[index].physics_from).filter(|&from| emitter.locked_to_part && time > from);
 			let follow_of = |born: f32| physics.map(|from| frame_at(born.max(from)));
 			// a part emitter spawns over the part's size at the time (an attack run: a burst at 0 from
 			// parts tweened from 0.001 to 20 studs leaves from their centre); a legacy effect's own size
 			let size_channel = if emitter.mount.is_none() { self.channel(parent, "Size") } else { None };
-			let size_at = |t: f32| -> Vec3 {
-				match size_channel.and_then(|channel| channel.at(t)) {
-					Some(serde_json::Value::Array(values)) if values.len() == 3 => Vec3::new(values[0].as_f64().unwrap_or_default() as f32, values[1].as_f64().unwrap_or_default() as f32, values[2].as_f64().unwrap_or_default() as f32),
-					_ => emitter.size,
-				}
-			};
+			let size_at = |t: f32| -> Vec3 { size_channel.and_then(|channel| channel.at_vec3(t)).unwrap_or(emitter.size) };
 			let velocity_at = |t: f32| (Vec3::from(frame_at(t + 1.0 / 120.0).translation) - Vec3::from(frame_at(t - 1.0 / 120.0).translation)) * 60.0;
 			// out of the viewer's view the emitter's clock stands still: it neither emits nor ages
-			let timeline = match self.watched(referent, emitter, &frame_at, &size_at) {
-				Some(view) => Timeline { time_scale: masked(&timeline.time_scale, &view), spawn_scale: masked(&timeline.spawn_scale, &view), ..timeline },
-				None => timeline,
-			};
+			let watched_tl = self.watched_timeline(referent, base_timeline, emitter, track, parent_now, inv, size_channel);
+			let timeline = watched_tl.as_deref().unwrap_or(base_timeline);
 			let start = -self.playback.prewarm;
 			let now = timeline.particle_time(start, time);
 			let spawn_now = timeline.spawn_time(start, time);
@@ -2502,45 +2877,96 @@ impl Resolved<'_> {
 			// own step is not recorded, so emitters enabled in it (from the file, or by an action at 0)
 			// start without one: Studio's there fit head starts of 8, 0 and 21 ms in the three captures
 			if emitter.rate > 0.0 {
-				let (mut accumulated, mut deferred, mut on, mut previous, mut stream) = (0.0f32, 0.0f32, false, None, 0u64);
 				// births already dead at the moment drawn take no room under the cap: counted from 0, Rate
 				// 400 filled it with particles long gone by 10.2 s and the emitter stopped (map
 				// clips from 10 s: a map's Specks thinned to none, 4,718 particles to 1,464)
 				let longest = emitter.lifetime.0.max(emitter.lifetime.1);
-				// on from where an earlier moment's scan stood, when that holds for this one (RateScan)
-				let resume = self.scans.lock().get(&referent).copied().filter(|scan| scan.time <= time && scan.rate.to_bits() == emitter.rate.to_bits() && scan.longest.to_bits() == longest.to_bits() && scan.index <= self.frames.len());
-				let first = match resume {
-					Some(scan) => {
-						(accumulated, deferred, on, previous, stream) = (scan.accumulated, scan.deferred, scan.on, scan.previous, scan.stream);
-						scan.index
-					}
-					None => 0,
+				let monotonic = timeline.time_curve.valid_for(start) && timeline.time_curve.monotonic;
+				let scan_key = (referent, emitter.seed);
+				// Advance strictly forward from the previous moment's live-birth ring when valid,
+				// so already-scanned grid frames are never replayed.
+				let resume = if monotonic {
+					self.scans.lock().remove(&scan_key).filter(|scan| {
+						!scan.capped
+							&& scan.time <= time
+							&& scan.rate.to_bits() == emitter.rate.to_bits()
+							&& scan.longest.to_bits() == longest.to_bits()
+							&& scan.index <= self.frames.len()
+					})
+				} else {
+					None
 				};
-				let mut saved = None;
-				for (index, &frame) in self.frames.iter().enumerate().skip(first) {
-					if saved.is_none() && now - timeline.particle_time(start, frame) <= longest {
-						saved = Some(RateScan { time, rate: emitter.rate, longest, index, accumulated, deferred, on, previous, stream });
-					}
+				let (mut accumulated, mut deferred, mut on, mut previous, mut stream, mut live, mut index) = match resume {
+					Some(scan) => (scan.accumulated, scan.deferred, scan.on, scan.previous, scan.stream, scan.live, scan.index),
+					None => (0.0f32, 0.0f32, false, None, 0u64, std::collections::VecDeque::new(), 0usize),
+				};
+				while live.front().is_some_and(|birth| birth.frame < cleared || (now - birth.pt).max(0.0) > longest) {
+					live.pop_front();
+				}
+				let mut capped = false;
+				let mut previous_spawn = previous.map(|prev| timeline.spawn_time(start, prev));
+				let mut substeps = 0u64;
+				let frame_count = self.frames.len();
+				while index < frame_count {
+					let frame = self.frames[index];
 					let enabled = timeline.enabled_at(frame);
-					if on && let Some(previous) = previous {
-						let step = timeline.spawn_time(start, frame) - timeline.spawn_time(start, previous);
-						let counted = step * (EMISSION_STEP / (frame - previous).max(1e-6)).min(1.0);
+					// Contiguous disabled span: neither `on` nor `enabled` produces births or mutates
+					// accumulator state; jump straight to the next enable event while keeping the exact
+					// `previous` frame needed for its `deferred` head start.
+					if !on && !enabled {
+						match timeline.next_enabled_after(frame) {
+							Some(next_on) => {
+								let next_idx = self.frames.partition_point(|&f| f < next_on - 1e-6).max(index + 1);
+								if next_idx >= frame_count {
+									previous = Some(self.frames[frame_count - 1]);
+									break;
+								}
+								previous = Some(self.frames[next_idx - 1]);
+								previous_spawn = None;
+								index = next_idx;
+								continue;
+							}
+							None => {
+								previous = Some(self.frames[frame_count - 1]);
+								break;
+							}
+						}
+					}
+					substeps += 1;
+					let mut frame_spawn = None;
+					if on && let Some(prev) = previous {
+						let prev_s = previous_spawn.unwrap_or_else(|| timeline.spawn_time(start, prev));
+						let cur_s = timeline.spawn_time(start, frame);
+						frame_spawn = Some(cur_s);
+						let step = cur_s - prev_s;
+						let counted = step * (EMISSION_STEP / (frame - prev).max(1e-6)).min(1.0);
 						accumulated += emitter.rate * (deferred + counted);
 						deferred = step - counted;
-						while accumulated >= 1.0 {
-							accumulated -= 1.0;
-							stream += 1;
-							let age = (now - timeline.particle_time(start, frame)).max(0.0);
-							if frame >= cleared && age <= longest && births.len() < 4096 {
-								births.push(Birth {
-									age,
-									lived: (spawn_now - timeline.spawn_time(start, frame)).max(0.0),
-									cframe: frame_at(frame),
-									velocity: velocity_at(frame),
-									stream,
-									size: size_at(frame),
-									follow: follow_of(frame),
-								});
+						if accumulated >= 1.0 {
+							let pt = timeline.particle_time(start, frame);
+							let age = (now - pt).max(0.0);
+							while accumulated >= 1.0 {
+								accumulated -= 1.0;
+								stream += 1;
+								if frame >= cleared && age <= longest {
+									if monotonic && !capped {
+										if live.len() < 8192 {
+											live.push_back(RateBirth { frame, pt, cur_s, stream });
+										} else {
+											capped = true;
+										}
+									} else if !monotonic && births.len() < 4096 {
+										births.push(Birth {
+											age,
+											lived: (spawn_now - cur_s).max(0.0),
+											cframe: frame_at(frame),
+											velocity: velocity_at(frame),
+											stream,
+											size: size_at(frame),
+											follow: follow_of(frame),
+										});
+									}
+								}
 							}
 						}
 					}
@@ -2548,18 +2974,42 @@ impl Resolved<'_> {
 						accumulated = 0.0;
 						// the enabling frame's own excess over 1/60 s, counted with the next frame
 						deferred = match previous {
-							Some(previous) => {
-								let step = timeline.spawn_time(start, frame) - timeline.spawn_time(start, previous);
-								step - step * (EMISSION_STEP / (frame - previous).max(1e-6)).min(1.0)
+							Some(prev) => {
+								let prev_s = previous_spawn.unwrap_or_else(|| timeline.spawn_time(start, prev));
+								let cur_s = frame_spawn.unwrap_or_else(|| timeline.spawn_time(start, frame));
+								frame_spawn = Some(cur_s);
+								let step = cur_s - prev_s;
+								step - step * (EMISSION_STEP / (frame - prev).max(1e-6)).min(1.0)
 							}
 							None => 0.0,
 						};
 					}
 					on = enabled;
 					previous = Some(frame);
+					previous_spawn = frame_spawn;
+					index += 1;
 				}
-				let saved = saved.unwrap_or(RateScan { time, rate: emitter.rate, longest, index: self.frames.len(), accumulated, deferred, on, previous, stream });
-				self.scans.lock().insert(referent, saved);
+				if monotonic {
+					for birth in &live {
+						if births.len() >= 4096 {
+							break;
+						}
+						let age = (now - birth.pt).max(0.0);
+						births.push(Birth {
+							age,
+							lived: (spawn_now - birth.cur_s).max(0.0),
+							cframe: frame_at(birth.frame),
+							velocity: velocity_at(birth.frame),
+							stream: birth.stream,
+							size: size_at(birth.frame),
+							follow: follow_of(birth.frame),
+						});
+					}
+					self.scans.lock().insert(scan_key, RateScan { time, rate: emitter.rate, longest, index: frame_count, accumulated, deferred, on, previous, stream, live, capped });
+				}
+				if substeps > 0 {
+					particle_substeps.fetch_add(substeps, std::sync::atomic::Ordering::Relaxed);
+				}
 			}
 			births.retain(|birth| birth.age >= 0.0);
 			emitter.cframe = parent_now;
@@ -2570,36 +3020,48 @@ impl Resolved<'_> {
 		} else {
 			scene.particles.iter_mut().for_each(play);
 		}
+		let particle_ms = particle_start.elapsed().as_secs_f64() * 1000.0;
 		// beams: TextureSpeed scrolls the texture frame by frame, each frame by its step times the speed
 		// set in that frame, from the frame the beam is enabled in; a disabled beam starts again at 0
 		// (beam-scroll: within 0.003 of a repeat in every mode, late, toggle and tween)
 		for beam in &mut scene.beams {
-			let timeline = self.timelines.get(&beam.referent).cloned().unwrap_or_default();
+			let timeline = self.timelines.get(&beam.referent).unwrap_or(&empty_timeline);
 			let speed_channel = self.channel(beam.referent, "TextureSpeed");
 			let speed = beam.texture_speed;
-			let speed_at = |t: f32| -> f32 {
-				match speed_channel.and_then(|channel| channel.at(t)) {
-					Some(serde_json::Value::Number(value)) => value.as_f64().unwrap_or_default() as f32,
-					_ => speed,
+			let speed_at = |t: f32| -> f32 { speed_channel.and_then(|channel| channel.at_f32(t)).unwrap_or(speed) };
+			let (mut offset, mut previous, first) = {
+				let scans = self.beams.lock();
+				match scans.get(&beam.referent).copied() {
+					Some(scan) if scan.time <= time && scan.index <= self.frames.len() && scan.speed.to_bits() == speed.to_bits() => (scan.offset, scan.previous, scan.index),
+					_ => (0.0f64, None, 0usize),
 				}
 			};
-			let mut offset = 0.0f64;
-			let mut previous: Option<f32> = None;
-			for &frame in self.frames.iter().chain(std::iter::once(&time)) {
+			for &frame in &self.frames[first..] {
 				if !timeline.enabled_at(frame) {
 					offset = 0.0;
 					previous = None;
 					continue;
 				}
-				if let Some(previous) = previous
-					&& frame > previous
+				if let Some(prev) = previous
+					&& frame > prev
 				{
-					offset += (speed_at(frame) * (frame - previous)) as f64;
+					offset += (speed_at(frame) * (frame - prev)) as f64;
 				}
 				previous = Some(frame);
 			}
-			beam.texture_offset = offset.rem_euclid(1.0) as f32;
+			self.beams.lock().insert(beam.referent, BeamScan { time, index: self.frames.len(), speed, offset, previous });
+			// Fractional trailing step from the last grid frame to `time` (not cached in BeamScan).
+			let mut final_offset = offset;
+			if !timeline.enabled_at(time) {
+				final_offset = 0.0;
+			} else if let Some(prev) = previous
+				&& time > prev
+			{
+				final_offset += (speed_at(time) * (time - prev)) as f64;
+			}
+			beam.texture_offset = final_offset.rem_euclid(1.0) as f32;
 		}
+		HistoryStats { particle_ms, particle_substeps: particle_substeps.load(std::sync::atomic::Ordering::Relaxed) }
 	}
 }
 
@@ -3921,5 +4383,116 @@ mod tests {
 		assert_eq!(quantize_step(&frames, 0.02), 0.016);
 		assert_eq!(frame_times(None, 0.05, 0.0).len(), 4);
 		assert_eq!(frame_times(None, 0.05, 0.05)[0], -3.0 / 60.0);
+	}
+
+	#[test]
+	fn fast_curve_channel_and_incremental_scans_match_fresh_resolution() {
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use rbx_dom_weak::InstanceBuilder;
+		use rbx_dom_weak::types::{CFrame, Matrix3, NumberRange, Vector3};
+
+		// 1) ScaleCurve::at is bit-for-bit identical to Timeline::integral across prewarm, knots, and duplicates.
+		let scales = vec![(-1.0, 0.5), (0.0, 1.0), (0.5, 0.25), (0.5, 2.0), (1.25, 0.0), (2.0, 1.5), (3.5, 0.75)];
+		for start in [0.0f32, -0.5, -1.5] {
+			let curve = ScaleCurve::from_scales(&scales, start);
+			for step in -40..=260 {
+				let t = step as f32 * 0.02;
+				assert_eq!(curve.at(t).to_bits(), Timeline::integral(&scales, start, t).to_bits(), "start={start} t={t}");
+			}
+		}
+
+		// 2) Pre-resolved keyframe and event channels match naive tween_at and fresh resolution.
+		let tween = Tween {
+			target: "Fx.Part".into(),
+			property: "Transparency".into(),
+			keys: vec![
+				TweenKey { at: 1.0, value: serde_json::json!(0.8), easing: Some("Quad".into()), direction: Some("Out".into()) },
+				TweenKey { at: 0.0, value: serde_json::json!(0.0), easing: None, direction: None },
+				TweenKey { at: 0.4, value: serde_json::json!(0.3), easing: Some("Linear".into()), direction: None },
+			],
+			..Default::default()
+		};
+		let mut key_channel = Channel { referent: Ref::none(), property: "Transparency", alias: None, initial: Some(serde_json::json!(0.0)), events: Vec::new(), keyframes: Some(&tween), sorted_keyframes: Vec::new(), states: Vec::new() };
+		key_channel.finalize();
+		for step in -2..=24 {
+			let t = step as f32 * 0.05;
+			assert_eq!(key_channel.at(t), tween_at(&tween, t, Some(&serde_json::json!(0.0))), "keyframe channel at t={t}");
+		}
+
+		// 3) Incremental RateScan (including disabled-span skipping), TrailScan, BeamScan, and watched_timeline
+		//    stepped across sparse moments match fresh single-moment resolution on every birth, trail point, and beam offset.
+		let mut model = ModelBuilder::new("Fx");
+		let part = model.part(&PartSpec { name: "Mover".into(), size: Vec3::splat(2.0), ..PartSpec::default() });
+		let a0 = model.child(part, InstanceBuilder::new("Attachment").with_name("A0").with_property("CFrame", CFrame::new(Vector3::new(0.0, 0.5, 0.0), Matrix3::identity())));
+		let a1 = model.child(part, InstanceBuilder::new("Attachment").with_name("A1").with_property("CFrame", CFrame::new(Vector3::new(0.0, -0.5, 0.0), Matrix3::identity())));
+		model.child(part, InstanceBuilder::new("ParticleEmitter").with_name("Stream").with_property("Enabled", false).with_property("Rate", 30.0f32).with_property("Lifetime", NumberRange::new(0.8, 0.8)));
+		model.child(part, InstanceBuilder::new("ParticleEmitter").with_name("Idle").with_property("Enabled", false).with_property("Rate", 40.0f32).with_property("Lifetime", NumberRange::new(1.0, 1.0)));
+		model.child(part, InstanceBuilder::new("Trail").with_name("Ribbon").with_property("Attachment0", Variant::Ref(a0)).with_property("Attachment1", Variant::Ref(a1)).with_property("Enabled", true).with_property("Lifetime", 0.6f32).with_property("MinLength", 0.1f32));
+		model.child(part, InstanceBuilder::new("Beam").with_name("Arc").with_property("Attachment0", Variant::Ref(a0)).with_property("Attachment1", Variant::Ref(a1)).with_property("Enabled", true).with_property("TextureSpeed", 1.5f32));
+		let mut doc_inc = model.into_document();
+		let mut doc_fresh = doc_inc.copy();
+
+		let keys: Vec<MotionKey> = (0..=240).map(|i| {
+			let t = i as f32 / 60.0;
+			MotionKey { at: t, cframe: vec![(t * 2.0).sin() * 6.0, 2.0, (t * 1.5).cos() * 4.0], ..Default::default() }
+		}).collect();
+		let playback = Playback {
+			actions: vec![
+				Action { at: 0.5, target: "Fx.Mover.Stream".into(), enabled: Some(true), ..Default::default() },
+				Action { at: 1.5, target: "Fx.Mover.Stream".into(), enabled: Some(false), ..Default::default() },
+				Action { at: 2.8, target: "Fx.Mover.Stream".into(), enabled: Some(true), ..Default::default() },
+				Action { at: 1.0, target: "Fx.Mover.Stream".into(), time_scale: Some(0.5), ..Default::default() },
+				Action { at: 2.0, target: "Fx.Mover.Stream".into(), time_scale: Some(1.0), ..Default::default() },
+				Action { at: 1.2, target: "Fx.Mover.Arc".into(), enabled: Some(false), ..Default::default() },
+				Action { at: 2.1, target: "Fx.Mover.Arc".into(), enabled: Some(true), ..Default::default() },
+				Action { at: 2.2, target: "Fx.Mover.Arc".into(), set: [("TextureSpeed".into(), serde_json::json!(2.75))].into_iter().collect(), ..Default::default() },
+				Action { at: 1.8, target: "Fx.Mover.Ribbon".into(), clear: true, ..Default::default() },
+			],
+			motion: vec![Motion { target: "Fx.Mover".into(), keys, ..Default::default() }],
+			viewer: vec![
+				ViewerKey { at: 0.0, cframe: [0.0, 4.0, 25.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], fov: 60.0, aspect: 16.0 / 9.0 },
+				ViewerKey { at: 1.0, cframe: [0.0, 4.0, 25.0, -1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0], fov: 60.0, aspect: 16.0 / 9.0 },
+				ViewerKey { at: 2.0, cframe: [0.0, 4.0, 25.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], fov: 60.0, aspect: 16.0 / 9.0 },
+			],
+			..Default::default()
+		};
+
+		let mut resolved = playback.resolve_at(&doc_inc, 0.0).unwrap();
+		let mut total_substeps = 0u64;
+		for &t in &[0.0f32, 0.4, 1.0, 1.65, 2.5, 3.3, 3.95] {
+			assert!(resolved.at(t));
+			let undo_inc = resolved.apply_state(&mut doc_inc).unwrap();
+			let mut scene_inc = crate::scene::extract::extract(&doc_inc);
+			let hstats = resolved.apply_history_timed(&doc_inc, &mut scene_inc);
+			total_substeps += hstats.particle_substeps;
+			undo_inc.restore(&mut doc_inc);
+
+			let fresh = playback.resolve_at(&doc_fresh, t).unwrap();
+			let undo_fresh = fresh.apply_state(&mut doc_fresh).unwrap();
+			let mut scene_fresh = crate::scene::extract::extract(&doc_fresh);
+			fresh.apply_history(&doc_fresh, &mut scene_fresh);
+			undo_fresh.restore(&mut doc_fresh);
+
+			assert_eq!(scene_inc.particles.len(), scene_fresh.particles.len(), "t={t}");
+			for (a, b) in scene_inc.particles.iter().zip(&scene_fresh.particles) {
+				assert_eq!(a.births, b.births, "emitter {} births mismatch at t={t}", a.path);
+			}
+			assert_eq!(scene_inc.beams.len(), scene_fresh.beams.len());
+			for (a, b) in scene_inc.beams.iter().zip(&scene_fresh.beams) {
+				assert_eq!(a.texture_offset.to_bits(), b.texture_offset.to_bits(), "beam {} offset mismatch at t={t}", a.path);
+			}
+			assert_eq!(scene_inc.trails.len(), scene_fresh.trails.len());
+			for (a, b) in scene_inc.trails.iter().zip(&scene_fresh.trails) {
+				assert_eq!(a.points.len(), b.points.len(), "trail {} point count mismatch at t={t}", a.path);
+				assert!((a.dropped_length - b.dropped_length).abs() < 1e-4, "trail dropped_length mismatch at t={t}");
+				for (pa, pb) in a.points.iter().zip(&b.points) {
+					assert_eq!(pa.time.to_bits(), pb.time.to_bits());
+					assert_eq!(pa.starts_strip, pb.starts_strip);
+					assert!(pa.position0.distance(pb.position0) < 1e-4 && pa.position1.distance(pb.position1) < 1e-4, "trail point mismatch at t={t}: {pa:?} vs {pb:?}");
+				}
+			}
+		}
+		// Idle emitter is never enabled -> 0 substeps; Stream skips [0, 0.5) and [1.5, 2.8) -> well below 2 * 240.
+		assert!(total_substeps > 0 && total_substeps < 200, "disabled spans must be fast-skipped (got {total_substeps} substeps)");
 	}
 }

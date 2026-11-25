@@ -290,11 +290,12 @@ pub struct Moment {
 	pub particles: usize,
 }
 
-/// How bright one encoded frame is (a summary's `frameStats`, one per frame): what a review reads a
-/// hit frame's peak from. Measured on the pixels the encoder takes, after the tone curve and every
-/// post effect: an MP4's BT.709 NV12 as the video decodes it (luma from each pixel's Y, in steps of
-/// 1/219; red, green and blue with its 2 x 2 block's chroma), any other format's RGBA, both over
-/// black where the background is transparent.
+/// How bright one encoded frame is and how long each stage of it took (a summary's `frameStats`,
+/// one per frame): what a review reads a hit frame's peak and per-frame bottlenecks from. Measured
+/// on the pixels the encoder takes, after the tone curve and every post effect: an MP4's BT.709
+/// NV12 as the video decodes it (luma from each pixel's Y, in steps of 1/219; red, green and blue
+/// with its 2 x 2 block's chroma), any other format's RGBA, both over black where the background is
+/// transparent.
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct FrameStats {
@@ -307,6 +308,37 @@ pub struct FrameStats {
 	pub bright: u64,
 	/// The mean Rec.709 luma, 0-1, to four places.
 	pub luma: f64,
+	/// CPU time advancing playback state, extracting the scene, and stepping trails/beams (ms).
+	pub playback_ms: f64,
+	/// CPU time stepping particle birth history and simulating live particles (ms).
+	pub particle_ms: f64,
+	/// Number of 60 Hz Rate emission substeps evaluated across emitters for this frame.
+	pub particle_substeps: u64,
+	/// Environment/key preparation plus `Renderer::prepare` time for this frame (ms).
+	pub prepare_ms: f64,
+	/// GPU command encoding and submission time for this frame (ms).
+	pub draw_ms: f64,
+	/// GPU readback wait time for this frame (ms).
+	pub readback_ms: f64,
+	/// True when frame reuse copied the previous frame's pixels without redrawing.
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub repeated: bool,
+}
+
+/// Per-frame timing carried from scene construction through drawing into [`FrameStats`].
+#[derive(Clone, Copy, Debug, Default)]
+struct FrameTiming {
+	playback_ms: f64,
+	particle_ms: f64,
+	particle_substeps: u64,
+	prepare_ms: f64,
+	draw_ms: f64,
+	readback_ms: f64,
+	repeated: bool,
+}
+
+fn three_places(value: f64) -> f64 {
+	(value * 1000.0).round() / 1000.0
 }
 
 /// A frame's pixels measured ([`FrameStats`] without its moment).
@@ -1042,13 +1074,25 @@ impl<'a> Builder<'a> {
 	/// there: a later moment of the same document resolves no target or event again
 	/// ([`scene::playback::Resolved::at`]).
 	fn scene_with<'s>(&'s self, time: f32, kept: Option<&Mutex<Vec<Kept<'s>>>>) -> Result<Scene> {
-		self.scene_checked(time, kept, scene_reuse())
+		Ok(self.scene_checked(time, kept, scene_reuse(), true)?.0)
+	}
+
+	/// [`Builder::scene_with`], also returning per-frame playback and particle stepping timings.
+	fn scene_timed<'s>(&'s self, time: f32, kept: Option<&Mutex<Vec<Kept<'s>>>>) -> Result<(Scene, FrameTiming)> {
+		self.scene_checked(time, kept, scene_reuse(), true)
+	}
+
+	/// Extracts only the document's state at `time` without stepping particle/trail/beam history
+	/// (used by [`follow_playback`] so checking `emitter.follow` never rewinds incremental scans).
+	fn scene_state_with<'s>(&'s self, time: f32, kept: Option<&Mutex<Vec<Kept<'s>>>>) -> Result<Scene> {
+		Ok(self.scene_checked(time, kept, scene_reuse(), false)?.0)
 	}
 
 	/// [`Builder::scene_with`] reusing the untouched roots' entries as `reuse` says (`Check`: and the
 	/// whole extraction compared with it, an error where they differ).
-	fn scene_checked<'s>(&'s self, time: f32, kept: Option<&Mutex<Vec<Kept<'s>>>>, reuse: SceneReuse) -> Result<Scene> {
-		let taken = kept.and_then(|kept| kept.lock().pop());
+	fn scene_checked<'s>(&'s self, time: f32, kept: Option<&Mutex<Vec<Kept<'s>>>>, reuse: SceneReuse, with_history: bool) -> Result<(Scene, FrameTiming)> {
+		let started = Instant::now();
+		let taken = kept.and_then(|kept| take_kept(kept, time));
 		let resolved_for = |document: &Document, earlier: Option<scene::playback::Resolved<'s>>| -> Result<scene::playback::Resolved<'s>> {
 			match earlier {
 				Some(mut resolved) => {
@@ -1064,11 +1108,18 @@ impl<'a> Builder<'a> {
 		if let Some(input) = &self.fixed {
 			let resolved = resolved_for(&input.document, taken.map(|kept| kept.resolved))?;
 			let mut scene = input.scene.clone();
-			resolved.apply_history(&input.document, &mut scene);
+			let history = if with_history { resolved.apply_history_timed(&input.document, &mut scene) } else { Default::default() };
 			if let Some(kept) = kept {
 				kept.lock().push(Kept { document: None, resolved, roots: None });
 			}
-			return Ok(scene);
+			let total_ms = started.elapsed().as_secs_f64() * 1000.0;
+			let timing = FrameTiming {
+				playback_ms: (total_ms - history.particle_ms).max(0.0),
+				particle_ms: history.particle_ms,
+				particle_substeps: history.particle_substeps,
+				..Default::default()
+			};
+			return Ok((scene, timing));
 		}
 		let (taken, earlier, mut roots) = match taken {
 			Some(Kept { document: Some(document), resolved, roots }) => (Some(document), Some(resolved), roots),
@@ -1109,7 +1160,7 @@ impl<'a> Builder<'a> {
 			}
 			None => scene::extract::extract(&document),
 		};
-		resolved.apply_history(&document, &mut scene);
+		let history = if with_history { resolved.apply_history_timed(&document, &mut scene) } else { Default::default() };
 		undo.restore(&mut document);
 		match kept {
 			Some(kept) => kept.lock().push(Kept { document: Some(document), resolved, roots }),
@@ -1118,7 +1169,14 @@ impl<'a> Builder<'a> {
 		if self.lit.is_none() {
 			self.finish(&mut scene)?;
 		}
-		Ok(scene)
+		let total_ms = started.elapsed().as_secs_f64() * 1000.0;
+		let timing = FrameTiming {
+			playback_ms: (total_ms - history.particle_ms).max(0.0),
+			particle_ms: history.particle_ms,
+			particle_substeps: history.particle_substeps,
+			..Default::default()
+		};
+		Ok((scene, timing))
 	}
 
 	/// Every scene of `times` in order, each with the sky's maps for its Lighting made, sent on as it
@@ -1127,13 +1185,15 @@ impl<'a> Builder<'a> {
 	/// with a document of its own makes later ones too ([`Ahead`]), up to one a core. A document per
 	/// thread from the start, sixteen frames side by side, held a clip's model (8-10 MB for a
 	/// cosmetic's) and its playback (5-6 MB) sixteen times, most of them idle while the GPU drew.
-	fn produce<'s>(&'s self, renderer: &Renderer, times: &[f32], kept: &Mutex<Vec<Kept<'s>>>, sender: SyncSender<Result<(Scene, PreparedSky)>>) {
+	fn produce<'s>(&'s self, renderer: &Renderer, times: &[f32], kept: &Mutex<Vec<Kept<'s>>>, sender: SyncSender<Result<(Scene, PreparedSky, FrameTiming)>>) {
 		// a fixed input's frames all have its parts: one preparation key for the clip
 		let parts = PartsKey::default();
 		let build = |index: usize| {
-			self.scene_with(times[index], Some(kept)).map(|scene| {
+			self.scene_timed(times[index], Some(kept)).map(|(scene, mut timing)| {
 				let sky = if self.fixed.is_some() { renderer.prepare_environment_sharing(&scene, &parts) } else { renderer.prepare_environment(&scene) };
-				(scene, sky)
+				timing.prepare_ms += sky.env_ms;
+				timing.particle_ms += sky.particle_sim_ms;
+				(scene, sky, timing)
 			})
 		};
 		let ahead = Ahead::new(times.len());
@@ -1145,15 +1205,17 @@ impl<'a> Builder<'a> {
 			for index in 0..times.len() {
 				let started = Instant::now();
 				let built = ahead.take(index, &build);
+				let remaining = times.len().saturating_sub(index + 1);
 				// slow second and third frames (the first reads the untouched roots once, and the second
 				// alone may still settle: an attack clip's took 12 ms, its others 2.4): helpers from now, as
 				// many as it takes for scenes to come about as fast as the draws take them, rather than
 				// one at a time each after the draws ran dry (a 5,053-part map sim's frames take ~25 ms to
-				// make, a helper's own document ~130 ms before its first)
+				// make, a helper's own document ~130 ms before its first). Skip for short/sparse clips
+				// where re-parsing and re-resolving on helper threads costs more than sequential stepping.
 				if index == 1 {
 					second = started.elapsed().as_secs_f64() * 1000.0;
 				}
-				if index == 2 && helpers == 0 {
+				if index == 2 && helpers == 0 && remaining >= EARLY_HELPERS_MIN_REMAINING {
 					let ms = second.min(started.elapsed().as_secs_f64() * 1000.0);
 					let (free, others) = (crate::available_memory(), PRODUCING.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(1));
 					let roomy = others == 0 && free.is_some_and(|free| free > EARLY_HELPERS_FREE);
@@ -1185,6 +1247,7 @@ impl<'a> Builder<'a> {
 				// the draws took every scene as it came, twice the queue's length in a row: the
 				// producer is what they wait for
 				if unblocked >= 2 * SCENES_AHEAD
+					&& remaining > SCENES_AHEAD
 					&& helpers < most
 					&& let Some(slot) = HelperSlot::take(most)
 				{
@@ -1282,6 +1345,23 @@ struct Kept<'s> {
 	roots: Option<scene::extract::RootReuse>,
 }
 
+/// Picks the kept document/resolved entry closest behind `time` (largest `resolved.time() <= time`)
+/// so incremental emitter/trail/beam scans continue forward rather than rewinding to `t = 0`.
+fn take_kept<'s>(kept: &Mutex<Vec<Kept<'s>>>, time: f32) -> Option<Kept<'s>> {
+	let mut list = kept.lock();
+	if list.is_empty() {
+		return None;
+	}
+	let best = list
+		.iter()
+		.enumerate()
+		.filter(|(_, entry)| entry.resolved.time() <= time + 1e-6)
+		.max_by(|(_, a), (_, b)| a.resolved.time().total_cmp(&b.resolved.time()))
+		.or_else(|| list.iter().enumerate().min_by(|(_, a), (_, b)| a.resolved.time().total_cmp(&b.resolved.time())))
+		.map(|(index, _)| index)?;
+	Some(list.swap_remove(best))
+}
+
 /// Whether a clip's frames reuse the extraction of the roots its playback never changes
 /// (`ROR_SCENE_REUSE`: `off`, or `check`: compare every frame's scene with its whole extraction).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1332,12 +1412,12 @@ pub fn check_scene_reuse(job: &VideoJob, scenes: &SceneCache, times: &[f32]) -> 
 	let (mut whole_ms, mut reused_ms) = (0.0, 0.0);
 	for &time in times {
 		let started = Instant::now();
-		let _ = builder.scene_checked(time, Some(&held), SceneReuse::Off)?;
+		let _ = builder.scene_checked(time, Some(&held), SceneReuse::Off, true)?;
 		whole_ms += started.elapsed().as_secs_f64() * 1000.0;
 		let started = Instant::now();
-		let _ = builder.scene_checked(time, Some(&held), SceneReuse::On)?;
+		let _ = builder.scene_checked(time, Some(&held), SceneReuse::On, true)?;
 		reused_ms += started.elapsed().as_secs_f64() * 1000.0;
-		builder.scene_checked(time, Some(&held), SceneReuse::Check)?;
+		builder.scene_checked(time, Some(&held), SceneReuse::Check, true)?;
 	}
 	let kept = held.lock();
 	let (reused, roots) = kept.iter().find_map(|kept| kept.roots.as_ref().zip(kept.document.as_ref()).map(|(roots, document)| (roots.count(), document.roots.len()))).unwrap_or((0, 0));
@@ -1381,6 +1461,9 @@ const SCENES_AHEAD: usize = 4;
 const EARLY_HELPERS_FROM_MS: f64 = 8.0;
 const EARLY_HELPERS: usize = 4;
 const EARLY_HELPERS_FREE: u64 = 16 << 30;
+/// Minimum frames still left after frame 2 before spawning early helper threads (avoids re-parsing
+/// and re-resolving large playbacks on short sparse `--times` sheets).
+const EARLY_HELPERS_MIN_REMAINING: usize = 16;
 
 /// Clips making scenes in this process now (the service's jobs side by side).
 static PRODUCING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1396,7 +1479,7 @@ struct HelperSlot;
 
 impl HelperSlot {
 	fn take(most: usize) -> Option<Self> {
-		HELPERS.fetch_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire, |helpers| (helpers < most).then_some(helpers + 1)).ok().map(|_| Self)
+		HELPERS.try_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire, |helpers| (helpers < most).then_some(helpers + 1)).ok().map(|_| Self)
 	}
 }
 
@@ -1427,7 +1510,7 @@ impl Drop for Producing {
 /// ([`Renderer::resolve_frame_guis`]: from the GPU cache, disk or one set of rur calls), so that an
 /// animated GUI costs a share of a few rur calls rather than one each frame, and no draw waits on
 /// rur with its GPU memory admitted. Frames go on in order, each with its camera's GUIs.
-fn find_guis(renderer: &Renderer, view: &ViewRequest, cameras: &[CameraSpec], receiver: Receiver<Result<(Scene, PreparedSky)>>, sender: SyncSender<Result<(Scene, PreparedSky, FrameGuis)>>) {
+fn find_guis(renderer: &Renderer, view: &ViewRequest, cameras: &[CameraSpec], receiver: Receiver<Result<(Scene, PreparedSky, FrameTiming)>>, sender: SyncSender<Result<(Scene, PreparedSky, FrameTiming, FrameGuis)>>) {
 	let mut index = 0;
 	while let Ok(first) = receiver.recv() {
 		let mut batch = vec![first];
@@ -1445,10 +1528,10 @@ fn find_guis(renderer: &Renderer, view: &ViewRequest, cameras: &[CameraSpec], re
 				request
 			})
 			.collect();
-		let frames: Vec<(&Scene, &ViewRequest)> = batch.iter().zip(&requests).filter_map(|(built, request)| built.as_ref().ok().map(|(scene, _)| (scene, request))).collect();
+		let frames: Vec<(&Scene, &ViewRequest)> = batch.iter().zip(&requests).filter_map(|(built, request)| built.as_ref().ok().map(|(scene, ..)| (scene, request))).collect();
 		let mut found = renderer.resolve_frame_guis(&frames).into_iter();
 		for built in batch {
-			let frame = built.map(|(scene, sky)| (scene, sky, found.next().unwrap_or_default()));
+			let frame = built.map(|(scene, sky, timing)| (scene, sky, timing, found.next().unwrap_or_default()));
 			if sender.send(frame).is_err() {
 				return;
 			}
@@ -1457,20 +1540,20 @@ fn find_guis(renderer: &Renderer, view: &ViewRequest, cameras: &[CameraSpec], re
 	}
 }
 
-/// A frame ready to draw: its scene, its sky's maps, its GUI textures on the GPU, any per-key GUI
-/// failures, and what went wrong finding them.
-type ReadyFrame = (Scene, PreparedSky, crate::render::guis::GuiTextures, HashMap<crate::render::guis::GuiKey, String>, Vec<String>);
+/// A frame ready to draw: its scene, its sky's maps, its build timings, its GUI textures on the GPU,
+/// any per-key GUI failures, and what went wrong finding them.
+type ReadyFrame = (Scene, PreparedSky, FrameTiming, crate::render::guis::GuiTextures, HashMap<crate::render::guis::GuiKey, String>, Vec<String>);
 
 /// The upload stage between the GUI stage and the draws: each frame's GUI images onto the GPU while
 /// the frames before it draw (7.7 ms a frame of 13 telegraphs in the draw loop before), a frame or
 /// two ahead, so that only the frames about to draw hold them in GPU memory.
-fn upload_guis(renderer: &Renderer, receiver: Receiver<Result<(Scene, PreparedSky, FrameGuis)>>, sender: SyncSender<Result<(ReadyFrame, f64)>>) {
+fn upload_guis(renderer: &Renderer, receiver: Receiver<Result<(Scene, PreparedSky, FrameTiming, FrameGuis)>>, sender: SyncSender<Result<(ReadyFrame, f64)>>) {
 	for found in receiver {
-		let ready = found.map(|(scene, sky, guis)| {
+		let ready = found.map(|(scene, sky, timing, guis)| {
 			let started = Instant::now();
 			let mut warnings = Vec::new();
 			let (textures, skipped) = renderer.upload_frame_guis_reported(guis, &mut warnings);
-			((scene, sky, textures, skipped, warnings), started.elapsed().as_secs_f64() * 1000.0)
+			((scene, sky, timing, textures, skipped, warnings), started.elapsed().as_secs_f64() * 1000.0)
 		});
 		if sender.send(ready).is_err() {
 			return;
@@ -1619,7 +1702,7 @@ fn cameras<'s>(renderer: &Renderer, builder: &'s Builder, times: &[f32], job: &V
 /// they were emitted as the camera moves on, as the game's are. None when no emitter rides on one.
 fn follow_playback<'s>(builder: &'s Builder, held: &Mutex<Vec<Kept<'s>>>, job: &VideoJob, cameras: &[CameraSpec], framed: Option<(Vec3, Vec3)>, times: &[f32]) -> Result<Option<Playback>> {
 	let Some(&first) = times.first() else { return Ok(None) };
-	let scene = builder.scene_with(first, Some(held))?;
+	let scene = builder.scene_state_with(first, Some(held))?;
 	let mut parts: Vec<(String, scene::follow::Follow)> = Vec::new();
 	for emitter in &scene.particles {
 		let Some(follow) = emitter.follow else { continue };
@@ -1856,6 +1939,8 @@ struct EncodedVideo {
 	thumbnails: Vec<(usize, Vec<u8>)>,
 	/// Each frame's, in order.
 	brightness: Vec<Brightness>,
+	/// Each frame's encoder-side GPU readback wait time (ms), in order.
+	readback_ms: Vec<f64>,
 	copies: Vec<CopyResult>,
 }
 
@@ -1978,6 +2063,7 @@ impl Encoder {
 		let mut profile = OutputProfile::default();
 		let mut kept = Vec::new();
 		let mut brightness = Vec::new();
+		let mut readback_ms = Vec::new();
 		let (tile_width, tile_height) = thumbnail_size(width, height);
 		let nv12 = self.takes_nv12();
 		// NVENC takes a frame in the time of a copy: its thread measures the frame itself, where x264's
@@ -1992,6 +2078,7 @@ impl Encoder {
 					// the same pixels, so the same brightness
 					let measured = *brightness.last().context("a repeated first frame")?;
 					brightness.push(measured);
+					readback_ms.push(0.0);
 					return held.as_ref().context("a repeated frame with none kept")?.with(|pixels| {
 						copies.write(pixels);
 						write(pixels, &mut profile)
@@ -2067,6 +2154,7 @@ impl Encoder {
 			};
 			drop(earlier);
 			profile.readback_ms += stats.readback_ms;
+			readback_ms.push(stats.readback_ms);
 			result
 		};
 		let name = match self {
@@ -2190,7 +2278,7 @@ impl Encoder {
 				name
 			}
 		};
-		Ok(EncodedVideo { name, profile, thumbnails: kept, brightness, copies: copies.finish() })
+		Ok(EncodedVideo { name, profile, thumbnails: kept, brightness, readback_ms, copies: copies.finish() })
 	}
 }
 
@@ -2479,14 +2567,15 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 		sent = true;
 	}
 	let mut particles_per_frame = vec![0usize; count];
+	let mut frame_timings = Vec::with_capacity(count);
 	let mut stats = VideoStats::default();
 	let mut gui_report = scene::guis::GuiReport::default();
 	let mut first_view = None;
 	let render_start = Instant::now();
 	let mut drawn_at = None;
-	let (EncodedVideo { name: encoded, profile: encoder_profile, thumbnails: kept, brightness, copies }, (motion, census, effects)) = std::thread::scope(|scope| -> Result<_> {
-		let (batch_sender, batch_receiver) = sync_channel::<Result<(Scene, PreparedSky)>>(if builder.guis { GUI_FRAMES } else { SCENES_AHEAD });
-		let (found_sender, found_receiver) = sync_channel::<Result<(Scene, PreparedSky, FrameGuis)>>(FOUND_FRAMES);
+	let (EncodedVideo { name: encoded, profile: encoder_profile, thumbnails: kept, brightness, readback_ms: encoder_readbacks, copies }, (motion, census, effects)) = std::thread::scope(|scope| -> Result<_> {
+		let (batch_sender, batch_receiver) = sync_channel::<Result<(Scene, PreparedSky, FrameTiming)>>(if builder.guis { GUI_FRAMES } else { SCENES_AHEAD });
+		let (found_sender, found_receiver) = sync_channel::<Result<(Scene, PreparedSky, FrameTiming, FrameGuis)>>(FOUND_FRAMES);
 		let (scene_sender, scene_receiver) = sync_channel::<Result<(ReadyFrame, f64)>>(2);
 		let (frame_sender, frame_receiver) = sync_channel::<OutputFrame<'_>>(2);
 		let (builder, held) = (&builder, &held);
@@ -2537,7 +2626,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 			let mut last: Option<(Scene, bool)> = None;
 			for (index, built) in scene_receiver.iter().enumerate() {
 				profile.scene_wait_ms += scene_start.elapsed().as_secs_f64() * 1000.0;
-				let ((scene, sky, guis, gui_skipped, gui_warnings), upload_ms) = built?;
+				let ((scene, sky, mut timing, guis, gui_skipped, gui_warnings), upload_ms) = built?;
 				profile.gui_upload_ms += upload_ms;
 				let mut request = view.clone();
 				request.camera = cameras[index].clone();
@@ -2559,6 +2648,11 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 				if repeats && reuse == FrameReuse::On {
 					drop((sky, guis, gui_skipped));
 					particles_per_frame[index] = particles_per_frame[index - 1];
+					timing.prepare_ms = 0.0;
+					timing.draw_ms = 0.0;
+					timing.readback_ms = 0.0;
+					timing.repeated = true;
+					frame_timings.push(timing);
 					for warning in &scene.warnings {
 						if !warnings.contains(warning) {
 							warnings.push(warning.clone());
@@ -2587,6 +2681,10 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 				profile.prepare_ms += frame_stats.prepare_ms;
 				profile.draw_ms += frame_stats.draw_ms;
 				profile.readback_ms += frame_stats.readback_ms;
+				timing.prepare_ms += frame_stats.prepare_ms;
+				timing.draw_ms = frame_stats.draw_ms;
+				timing.readback_ms = frame_stats.readback_ms;
+				frame_timings.push(timing);
 				particles_per_frame[index] = frame_stats.particles;
 				stats.untrusted_stamp_hashes = stats.untrusted_stamp_hashes.max(frame_stats.untrusted_stamp_hashes);
 				if frame_stats.particles > stats.particles_max {
@@ -2683,7 +2781,24 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 		.iter()
 		.zip(&times)
 		.enumerate()
-		.map(|(frame, (measured, &time))| FrameStats { time: four_places(f64::from(time)), frame, near_white: measured.near_white, bright: measured.bright, luma: four_places(measured.luma) })
+		.map(|(frame, (measured, &time))| {
+			let timing = frame_timings.get(frame).copied().unwrap_or_default();
+			let readback_ms = timing.readback_ms + encoder_readbacks.get(frame).copied().unwrap_or(0.0);
+			FrameStats {
+				time: four_places(f64::from(time)),
+				frame,
+				near_white: measured.near_white,
+				bright: measured.bright,
+				luma: four_places(measured.luma),
+				playback_ms: three_places(timing.playback_ms),
+				particle_ms: three_places(timing.particle_ms),
+				particle_substeps: timing.particle_substeps,
+				prepare_ms: three_places(timing.prepare_ms),
+				draw_ms: three_places(timing.draw_ms),
+				readback_ms: three_places(readback_ms),
+				repeated: timing.repeated,
+			}
+		})
 		.collect();
 	let lint = effects.lint(&builder.fades, &stats.missing);
 	let counts = effects.counts(&builder.roots);
@@ -3228,7 +3343,13 @@ mod tests {
 			let name = format!("frames/{frame:04}.png");
 			assert!(read("plain", &name) == read("first", &name), "{name}");
 		}
-		assert_eq!(serde_json::to_value(&plain.frame_stats).unwrap(), serde_json::to_value(&first.frame_stats).unwrap());
+		assert_eq!(plain.frame_stats.len(), first.frame_stats.len());
+		for (a, b) in plain.frame_stats.iter().zip(&first.frame_stats) {
+			assert_eq!((a.time, a.frame, a.near_white, a.bright, a.luma, a.particle_substeps, a.repeated), (b.time, b.frame, b.near_white, b.bright, b.luma, b.particle_substeps, b.repeated));
+			for ms in [a.playback_ms, a.particle_ms, a.prepare_ms, a.draw_ms, a.readback_ms, b.playback_ms, b.particle_ms, b.prepare_ms, b.draw_ms, b.readback_ms] {
+				assert!(ms.is_finite() && ms >= 0.0, "per-frame timing must be finite and non-negative: {a:?} / {b:?}");
+			}
+		}
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
 	}
@@ -3634,12 +3755,116 @@ mod tests {
 
 	#[test]
 	fn the_frames_line_names_the_peaks() {
-		let frame = |index: usize, near_white: u64, luma: f64| FrameStats { time: index as f64 / 30.0, frame: index, near_white, bright: near_white * 2, luma };
+		let frame = |index: usize, near_white: u64, luma: f64| FrameStats {
+			time: index as f64 / 30.0,
+			frame: index,
+			near_white,
+			bright: near_white * 2,
+			luma,
+			playback_ms: 0.0,
+			particle_ms: 0.0,
+			particle_substeps: 0,
+			prepare_ms: 0.0,
+			draw_ms: 0.0,
+			readback_ms: 0.0,
+			repeated: false,
+		};
 		let frames = vec![frame(0, 0, 0.2), frame(1, 50, 0.4), frame(2, 100, 0.35), frame(3, 0, 0.1)];
 		assert_eq!(frames_line(&frames, 1000).unwrap(), "frames: near white peaks at 0.07 s (frame 2, 10.00 % of pixels), mean luma peaks at 0.03 s (frame 1, 0.400, 10.00 % bright)");
 		let dark = vec![frame(0, 0, 0.2), frame(1, 0, 0.2)];
 		assert_eq!(frames_line(&dark, 1000).unwrap(), "frames: no near-white pixel in any frame, mean luma peaks at 0.00 s (frame 0, 0.200, 0.00 % bright)");
 		assert!(frames_line(&[], 1000).is_none());
+	}
+
+	#[test]
+	fn sparse_times_matches_dense_pixels_and_records_per_frame_timings() {
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use rbx_dom_weak::{InstanceBuilder, types::NumberRange};
+		let state = std::env::temp_dir().join(format!("ror-sparse-frame-stats-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&state);
+		std::fs::create_dir_all(&state).unwrap();
+		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+
+		let mut model = ModelBuilder::new("Fx");
+		let part = model.part(&PartSpec { name: "Mover".into(), ..Default::default() });
+		model.child(part, InstanceBuilder::new("ParticleEmitter").with_name("Stream").with_property("Enabled", false).with_property("Rate", 30.0f32).with_property("Lifetime", NumberRange::new(0.6, 0.6)));
+		let input = state.join("fx.rbxm");
+		std::fs::write(&input, model.to_rbxm().unwrap()).unwrap();
+
+		let playback = crate::scene::Playback {
+			actions: vec![
+				crate::scene::playback::Action { at: 0.2, target: "Fx.Mover.Stream".into(), enabled: Some(true), ..Default::default() },
+				crate::scene::playback::Action { at: 0.8, target: "Fx.Mover.Stream".into(), enabled: Some(false), ..Default::default() },
+			],
+			motion: vec![crate::scene::playback::Motion {
+				target: "Fx.Mover".into(),
+				keys: vec![
+					crate::scene::playback::MotionKey { at: 0.0, cframe: vec![-2.0, 0.0, 0.0], ..Default::default() },
+					crate::scene::playback::MotionKey { at: 1.0, cframe: vec![2.0, 0.0, 0.0], ..Default::default() },
+				],
+				..Default::default()
+			}],
+			..Default::default()
+		};
+		let fixed_cam = CameraSpec::LookAt { eye: [0.0, 4.0, 12.0], target: [0.0, 0.0, 0.0], fov: 60.0 };
+		let make_job = |out: &str, times: Option<Vec<f32>>| VideoJob {
+			input: input.display().to_string(),
+			select: None,
+			out: Some(state.join(out)),
+			view: ViewRequest { width: 96, height: 64, camera: fixed_cam.clone(), msaa: 1, bloom: false, ..Default::default() },
+			name: default_name(),
+			playback: Some(playback.clone()),
+			playback_file: None,
+			playback_overlay: None,
+			start: 0.0,
+			duration: 1.0,
+			fps: 10.0,
+			speed: 1.0,
+			times,
+			orbit: 0.0,
+			format: VideoFormat::Png,
+			sheet: 0,
+			materials_from: None,
+			lighting_from: None,
+			map: None,
+			frame: None,
+			focus: None,
+			ffmpeg: None,
+			camera_track: None,
+			keep_default_camera: false,
+			sheet_first: false,
+			copies: Vec::new(),
+			relative_to: None,
+			nvenc: None,
+		};
+
+		let scenes = SceneCache::default();
+		let _dense = run(&renderer, &scenes, &make_job("dense", None), None).unwrap();
+		let _sparse = run(&renderer, &scenes, &make_job("sparse", Some(vec![0.0, 0.5, 0.9])), None).unwrap();
+
+		// Sparse --times frames must be byte-for-byte identical to the matching dense frames.
+		for (sparse_i, dense_i) in [(0usize, 0usize), (1, 5), (2, 9)] {
+			let a = std::fs::read(state.join("sparse").join(format!("frames/{sparse_i:04}.png"))).unwrap();
+			let b = std::fs::read(state.join("dense").join(format!("frames/{dense_i:04}.png"))).unwrap();
+			assert_eq!(a, b, "sparse frame {sparse_i} must match dense frame {dense_i}");
+		}
+
+		// summary.json must contain per-frame timing breakdown fields.
+		let summary: serde_json::Value = serde_json::from_slice(&std::fs::read(state.join("sparse/summary.json")).unwrap()).unwrap();
+		let stats = summary["frameStats"].as_array().unwrap();
+		assert_eq!(stats.len(), 3);
+		for entry in stats {
+			for key in ["playbackMs", "particleMs", "particleSubsteps", "prepareMs", "drawMs", "readbackMs"] {
+				assert!(entry.get(key).is_some(), "frameStats missing {key}: {entry}");
+			}
+		}
+		assert_eq!(stats[0]["particleSubsteps"].as_u64().unwrap(), 0, "emitter disabled at t=0 -> 0 substeps");
+		assert!(stats[1]["particleSubsteps"].as_u64().unwrap() > 0, "emitter active between t=0.2 and t=0.5 -> >0 substeps");
+
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
 	}
 
 	#[test]

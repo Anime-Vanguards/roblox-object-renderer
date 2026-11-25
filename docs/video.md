@@ -80,7 +80,7 @@ Built-in VFX review lints (`crates/ror/src/lint.rs`, summarized to stderr and li
 
 | Field | What it reports |
 |---|---|
-| `frameStats` | Per-frame `{time, frame, nearWhite, bright, luma}`: fraction of pixels with R/G/B >= 230, Rec.709 luma >= 0.8, and mean luma (`0–1`). |
+| `frameStats` | Per-frame `{time, frame, nearWhite, bright, luma, playbackMs, particleMs, particleSubsteps, prepareMs, drawMs, readbackMs}` (plus `repeated: true` when reused): brightness metrics alongside per-frame playback/extraction, particle stepping/simulation (and evaluated 60 Hz Rate substeps), prepare, draw, and readback times. |
 | `weightless` | Active emitters flying faster than 8 studs/s with neither `Drag` nor `Acceleration`. |
 | `lint.fades` | Purely linear opacity fades (`sequence` keypoints on a line or linear `tween` keys). |
 | `lint.restraint` | Sibling emitters under one parent sharing duplicate textures (`duplicateTextures`) or mixing incompatible `LightEmission` ranges (`mixedBlends`, spread > 1 or mixed signs). |

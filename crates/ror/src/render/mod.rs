@@ -1206,6 +1206,10 @@ pub struct PreparedSky {
 	particles: Option<Vec<Vec<particles::Particle>>>,
 	/// Local skybox faces hashed in full because their volume provided no trusted OS stamp.
 	untrusted_hashes: usize,
+	/// CPU time building environment maps and the scene preparation key.
+	pub(crate) env_ms: f64,
+	/// CPU time running [`particles::simulate_all`] for this frame.
+	pub(crate) particle_sim_ms: f64,
 }
 
 /// The effects' textures and bind groups a frame drew with ([`Renderer::effect_bindings`]): the
@@ -2305,6 +2309,7 @@ impl Renderer {
 	/// [`Renderer::render_with`]: a clip's frames whose Lighting changes have theirs made on every core
 	/// ahead of the draws (held here, whatever the cache lets go of meanwhile).
 	pub fn prepare_environment(&self, scene: &Scene) -> PreparedSky {
+		let env_start = Instant::now();
 		let mut missing = Vec::new();
 		let mut untrusted_hashes = 0usize;
 		let maps = self.environment(scene, &mut missing, &mut untrusted_hashes);
@@ -2312,18 +2317,27 @@ impl Renderer {
 		// 3,710 parts encode 1.5 MB, 0.6-0.8 ms of each frame): unless the render draws a copy of the
 		// scene instead (submit_views)
 		let key = (scene.environment.viewport.is_none() || !scene.has_more_than_parts()).then(|| scene_key(scene)).flatten().map(|key| self.shared_key(key));
-		PreparedSky { maps, missing, key, particles: Some(particles::simulate_all(scene)), untrusted_hashes }
+		let env_ms = env_start.elapsed().as_secs_f64() * 1000.0;
+		let particle_start = Instant::now();
+		let particles = particles::simulate_all(scene);
+		let particle_sim_ms = particle_start.elapsed().as_secs_f64() * 1000.0;
+		PreparedSky { maps, missing, key, particles: Some(particles), untrusted_hashes, env_ms, particle_sim_ms }
 	}
 
 	/// [`Renderer::prepare_environment`] for a clip's frames whose parts are all the same (a playback that
 	/// changes nothing): their preparation key made by the first, shared by the rest (a map's
 	/// 3,710 parts encoded 1.5 MB a frame, 12 % of a busy service's samples under eight clips).
 	pub fn prepare_environment_sharing(&self, scene: &Scene, parts: &PartsKey) -> PreparedSky {
+		let env_start = Instant::now();
 		let mut missing = Vec::new();
 		let mut untrusted_hashes = 0usize;
 		let maps = self.environment(scene, &mut missing, &mut untrusted_hashes);
 		let key = if scene.environment.viewport.is_none() || !scene.has_more_than_parts() { parts.0.get_or_init(|| scene_key(scene).map(|key| self.shared_key(key))).clone() } else { None };
-		PreparedSky { maps, missing, key, particles: Some(particles::simulate_all(scene)), untrusted_hashes }
+		let env_ms = env_start.elapsed().as_secs_f64() * 1000.0;
+		let particle_start = Instant::now();
+		let particles = particles::simulate_all(scene);
+		let particle_sim_ms = particle_start.elapsed().as_secs_f64() * 1000.0;
+		PreparedSky { maps, missing, key, particles: Some(particles), untrusted_hashes, env_ms, particle_sim_ms }
 	}
 
 	/// `key`, or an equal one an earlier frame made still holds: a clip's frames of an unchanging
@@ -3396,7 +3410,7 @@ impl Renderer {
 		self.memory_checkpoint("prepare");
 		let neon_share = scene.environment.viewport.as_ref().map_or(1.0, |_| environment::viewport_neon());
 		let (sky, key, ahead) = match sky {
-			Some(PreparedSky { maps, missing, key, particles, untrusted_hashes }) => (Some((maps, missing, untrusted_hashes)), key, particles),
+			Some(PreparedSky { maps, missing, key, particles, untrusted_hashes, .. }) => (Some((maps, missing, untrusted_hashes)), key, particles),
 			None => (None, None, None),
 		};
 		let key = key.or_else(|| scene_key(scene));
