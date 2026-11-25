@@ -1,0 +1,132 @@
+{
+	"version": 1,
+	"about": "Resource budgets (measure.mjs): per platform and workload, the median figures of a few runs of main and their spread (largest run / smallest). The win32-x64 figures are the software adapter's (a GPU-less CI runner draws on it); a run on a GPU differs in memory. A workload's tolerances override metrics.mjs's defaults.",
+	"tolerances": {},
+	"platforms": {
+		"win32-x64": {
+			"render-cold": {
+				"recorded": {
+					"commit": "821acde28f3e7443e9fc148bbf82eeff9dad6f75",
+					"date": "2026-11-25T21:39:45.870Z",
+					"where": "a local machine, 4 of 24 CPUs",
+					"runs": 3,
+					"adapter": "the software adapter, as on a GPU-less runner"
+				},
+				"metrics": {
+					"ioWriteBytes": 41283105,
+					"diskGrowth": 40422413,
+					"filesLeft": 0,
+					"filesCreated": 13,
+					"peakWorkingSetMax": 471998464,
+					"peakWorkingSetSum": 533946368,
+					"peakPrivateSum": 719994880,
+					"pageFaults": 547512,
+					"processes": 9,
+					"leftRunning": 0,
+					"ioReadBytes": 44286927,
+					"peakDiskGrowth": 40422420,
+					"peakHandlesMax": 729,
+					"peakProcesses": 5,
+					"wallMs": 52987,
+					"cpuMs": 122374,
+					"cpuKernelMs": 18921
+				},
+				"spread": {
+					"ioWriteBytes": 1.059,
+					"diskGrowth": 1,
+					"filesLeft": 1,
+					"filesCreated": 1,
+					"peakWorkingSetMax": 1.05,
+					"peakWorkingSetSum": 1.065,
+					"peakPrivateSum": 1.008,
+					"pageFaults": 1.042,
+					"processes": 1,
+					"leftRunning": 1,
+					"ioReadBytes": 1.074,
+					"peakDiskGrowth": 1,
+					"peakHandlesMax": 1.014,
+					"peakProcesses": 1.667,
+					"wallMs": 1.371,
+					"cpuMs": 1.089,
+					"cpuKernelMs": 1.363
+				}
+			},
+			"render-warm": {
+				"recorded": {
+					"commit": "821acde28f3e7443e9fc148bbf82eeff9dad6f75",
+					"date": "2026-11-25T21:39:45.870Z",
+					"where": "a local machine, 4 of 24 CPUs",
+					"runs": 3,
+					"adapter": "the software adapter, as on a GPU-less runner"
+				},
+				"metrics": {
+					"ioWriteBytes": 8609289,
+					"diskGrowth": 7762889,
+					"filesLeft": 0,
+					"filesCreated": 27,
+					"peakWorkingSetMax": 532750336,
+					"peakWorkingSetSum": 654270464,
+					"peakPrivateSum": 849596416,
+					"pageFaults": 578735,
+					"processes": 13,
+					"leftRunning": 0,
+					"ioReadBytes": 10205892,
+					"peakDiskGrowth": 7762919,
+					"peakHandlesMax": 967,
+					"peakProcesses": 8,
+					"wallMs": 48289,
+					"cpuMs": 131890,
+					"cpuKernelMs": 21312
+				},
+				"spread": {
+					"ioWriteBytes": 1,
+					"diskGrowth": 1,
+					"filesLeft": 1,
+					"filesCreated": 1,
+					"peakWorkingSetMax": 1.022,
+					"peakWorkingSetSum": 1.012,
+					"peakPrivateSum": 1.017,
+					"pageFaults": 1.011,
+					"processes": 1,
+					"leftRunning": 1,
+					"ioReadBytes": 1.002,
+					"peakDiskGrowth": 1,
+					"peakHandlesMax": 1.008,
+					"peakProcesses": 1,
+					"wallMs": 1.07,
+					"cpuMs": 1.13,
+					"cpuKernelMs": 1.032
+				}
+			},
+			"service-crowd": {
+				"recorded": {
+					"commit": "821acde28f3e7443e9fc148bbf82eeff9dad6f75",
+					"date": "2026-11-25T21:43:26.256Z",
+					"where": "a local machine, 4 of 24 CPUs",
+					"runs": 1,
+					"adapter": "the software adapter, as on a GPU-less runner"
+				},
+				"metrics": {
+					"ioWriteBytes": 9291166,
+					"diskGrowth": 8444766,
+					"filesLeft": 0,
+					"filesCreated": 73,
+					"peakWorkingSetMax": 563863552,
+					"peakWorkingSetSum": 827731968,
+					"peakPrivateSum": 1229934592,
+					"pageFaults": 649744,
+					"processes": 29,
+					"leftRunning": 0,
+					"ioReadBytes": 10216238,
+					"peakDiskGrowth": 8444766,
+					"peakHandlesMax": 3088,
+					"peakProcesses": 26,
+					"wallMs": 48813,
+					"cpuMs": 138843,
+					"cpuKernelMs": 22375
+				},
+				"spread": {}
+			}
+		}
+	}
+}
