@@ -206,7 +206,8 @@ impl Renderer {
 	}
 
 	fn posed_mesh(&self, uri: &str, skeleton: &Skeleton, part: &Part, bind: &Arc<GpuMesh>, local: &Affine3A, live: Option<usize>) -> Result<Option<Arc<GpuMesh>>> {
-		let source = self.skins.sources.get_or_load_for(&uri.to_string(), self.assets.is_offline_view(), || self.skin_source(uri))?;
+		let stamped = super::content_key(uri);
+		let source = self.skins.sources.get_or_load_for(&stamped, self.assets.is_offline_view(), || self.skin_source(uri))?;
 		let Some(mesh_scale) = MeshScale::of(local).filter(|_| !source.bones.is_empty()) else {
 			return Ok(None);
 		};
@@ -220,9 +221,9 @@ impl Renderer {
 			hash_values(&mut hash, matrix.to_cols_array());
 		}
 		if let Some(index) = live {
-			return Ok(Some(self.live_mesh(uri, index, hash, &source, &matrices, mesh_scale, bind)));
+			return Ok(Some(self.live_mesh(&stamped, index, hash, &source, &matrices, mesh_scale, bind)));
 		}
-		let key = format!("{uri}#{hash:016x}");
+		let key = format!("{stamped}#{hash:016x}");
 		let pose = || {
 			let start = std::time::Instant::now();
 			let vertices = skin(&source, &matrices, mesh_scale);

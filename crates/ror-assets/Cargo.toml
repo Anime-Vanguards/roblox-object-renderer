@@ -17,9 +17,11 @@ serde_json.workspace = true
 ureq = { version = "3.4", default-features = false, features = ["rustls", "gzip"] }
 # CDN bodies sometimes arrive gzip-compressed without a Content-Encoding header
 flate2 = "1.1"
+# Local file content hashing for recent rewrites (already in the workspace)
+blake3 = "1.8"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_System_Registry"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_Storage_FileSystem", "Win32_System_Registry"] }
 
 [dev-dependencies]
 # asset_ids example: content references inside .rbxm / .rbxmx models, alone or in .rbx archives

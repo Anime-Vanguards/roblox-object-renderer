@@ -829,7 +829,7 @@ mod surface_tests {
 		let age = |file: &std::path::Path| {
 			let meta = std::fs::metadata(file).unwrap();
 			let since = |time: Option<std::time::SystemTime>| time.and_then(|time| time.elapsed().ok()).unwrap_or_default();
-			since(meta.modified().ok()).min(since(file_change_time(file, &meta)))
+			since(meta.modified().ok()).min(since(ror_assets::FileStamp::change_time(file, &meta)))
 		};
 		while age(&seen).min(age(&unseen)) < std::time::Duration::from_millis(2100) {
 			std::thread::sleep(std::time::Duration::from_millis(100));
@@ -837,7 +837,7 @@ mod surface_tests {
 		assert_eq!(content_key(&uri(&seen)), fresh, "the file's key changed as it aged");
 		let meta = std::fs::metadata(&unseen).unwrap();
 		let stamp = |time: Option<std::time::SystemTime>| time.and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |time| time.as_nanos());
-		assert_eq!(content_key(&uri(&unseen)), format!("{}@5:{}:{}", uri(&unseen), stamp(meta.modified().ok()), stamp(file_change_time(&unseen, &meta))));
+		assert_eq!(content_key(&uri(&unseen)), format!("{}@5:{}:{}", uri(&unseen), stamp(meta.modified().ok()), stamp(ror_assets::FileStamp::change_time(&unseen, &meta))));
 		let _ = std::fs::remove_dir_all(&dir);
 	}
 
@@ -866,8 +866,8 @@ mod surface_tests {
 		paint(8, [0, 255, 0, 255]);
 		let meta_second = std::fs::metadata(&file).unwrap();
 		let mtime_second = meta_second.modified().unwrap();
-		let change_second = file_change_time(&file, &meta_second);
-		let stamped_second = content_key_for_stamp(&uri, &file, meta_second.len(), Some(mtime_second), change_second);
+		let change_second = ror_assets::FileStamp::change_time(&file, &meta_second);
+		let stamped_second = ror_assets::FileStamp::from_parts(&file, meta_second.len(), Some(mtime_second), change_second).stamp_uri(&uri);
 		// `first` is still held, as the geometry prepared with it holds it
 		let second = renderer.material_bind_group(&key, &mut missing);
 		assert!(missing.is_empty(), "{missing:?}");
@@ -883,7 +883,7 @@ mod surface_tests {
 		assert_eq!(meta_third.modified().unwrap(), mtime_second, "test setup needs identical mtime");
 		assert_ne!(
 			stamped_second,
-			content_key_for_stamp(&uri, &file, meta_third.len(), Some(mtime_second), change_second),
+			ror_assets::FileStamp::from_parts(&file, meta_third.len(), Some(mtime_second), change_second).stamp_uri(&uri),
 			"same-tick recent rewrite with identical len/mtime/change_time must hash contents"
 		);
 		let third = renderer.material_bind_group(&key, &mut missing);
@@ -2478,7 +2478,7 @@ impl Renderer {
 	fn load_union(&self, asset: Option<&str>, data: Option<&Arc<Vec<u8>>>) -> Result<Arc<GpuMesh>> {
 		let key = match (data, asset) {
 			(Some(data), _) => format!("union-data:{:016x}", fnv1a(data)),
-			(None, Some(asset)) => format!("union:{asset}"),
+			(None, Some(asset)) => format!("union:{}", content_key(asset)),
 			(None, None) => return Err(anyhow!("union without mesh data or AssetId")),
 		};
 		self.meshes.get_or_load_for(&key, self.assets.is_offline_view(), || {
@@ -2511,7 +2511,7 @@ impl Renderer {
 
 	/// A texture pack (SurfaceAppearance / MaterialVariant TexturePack, a built-in material's pack).
 	fn texture_pack(&self, uri: &str) -> Result<Arc<TexturePack>> {
-		self.packs.get_or_load_for(&uri.to_string(), self.assets.is_offline_view(), || {
+		self.packs.get_or_load_for(&content_key(uri), self.assets.is_offline_view(), || {
 			let fetched = self.assets.fetch(uri).map_err(|error| anyhow!("{error}"))?;
 			texture_pack::parse(&fetched.bytes).with_context(|| format!("{uri}: texture pack"))
 		})
@@ -2609,7 +2609,8 @@ impl Renderer {
 		// light too (light-night-sky2)
 		let tint = environment::sky_tint(lighting.clock_time, lighting.environment_diffuse_scale);
 		let tint_key = tint.map(|tint| format!("{tint:.4?}"));
-		let sky_key = format!("{:?}|{:?}", sky.skybox, sky.skybox_orientation);
+		let skybox: [String; 6] = std::array::from_fn(|index| content_key(&sky.skybox[index]));
+		let sky_key = format!("{skybox:?}|{:?}", sky.skybox_orientation);
 		let key = format!("{sky_key}|{atmosphere_key:?}|{tint_key:?}");
 		if let Some(maps) = self.environments.get(&key) {
 			return maps;
@@ -5857,105 +5858,6 @@ pub(crate) fn names_local_file(uri: &str) -> bool {
 	matches!(ror_assets::ContentId::parse(path), Ok(ror_assets::ContentId::File(_)))
 }
 
-/// The inode/metadata change time of `path` (NTFS `FILE_BASIC_INFO.ChangeTime` on Windows, `ctime`
-/// on Unix), which advances on rewrites and time-preserving copies even when `mtime` is restored to
-/// an older timestamp.
-#[cfg(windows)]
-fn file_change_time(path: &std::path::Path, _meta: &std::fs::Metadata) -> Option<std::time::SystemTime> {
-	use std::os::windows::ffi::OsStrExt;
-	use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-	use windows_sys::Win32::Storage::FileSystem::{
-		CreateFileW, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileBasicInfo, GetFileInformationByHandleEx, OPEN_EXISTING,
-	};
-	let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-	// SAFETY: `wide` is null-terminated UTF-16; `handle` is closed before returning.
-	unsafe {
-		let handle = CreateFileW(
-			wide.as_ptr(),
-			FILE_READ_ATTRIBUTES,
-			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-			std::ptr::null(),
-			OPEN_EXISTING,
-			FILE_FLAG_BACKUP_SEMANTICS,
-			std::ptr::null_mut(),
-		);
-		if handle == INVALID_HANDLE_VALUE {
-			return None;
-		}
-		let mut info: FILE_BASIC_INFO = std::mem::zeroed();
-		let ok = GetFileInformationByHandleEx(handle, FileBasicInfo, (&raw mut info).cast(), std::mem::size_of::<FILE_BASIC_INFO>() as u32);
-		CloseHandle(handle);
-		if ok == 0 || info.ChangeTime <= 0 {
-			return None;
-		}
-		// Windows FILETIME: 100 ns ticks since 1601-01-01; Unix epoch is 116_444_736_000_000_000 ticks later.
-		const EPOCH_DIFF: u64 = 116_444_736_000_000_000;
-		let ticks = (info.ChangeTime as u64).checked_sub(EPOCH_DIFF)?;
-		Some(std::time::UNIX_EPOCH + std::time::Duration::new(ticks / 10_000_000, ((ticks % 10_000_000) * 100) as u32))
-	}
-}
-
-#[cfg(unix)]
-fn file_change_time(_path: &std::path::Path, meta: &std::fs::Metadata) -> Option<std::time::SystemTime> {
-	use std::os::unix::fs::MetadataExt;
-	let secs = u64::try_from(meta.ctime()).ok()?;
-	let nanos = u32::try_from(meta.ctime_nsec()).ok()?;
-	Some(std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos))
-}
-
-#[cfg(not(any(windows, unix)))]
-fn file_change_time(_path: &std::path::Path, _meta: &std::fs::Metadata) -> Option<std::time::SystemTime> {
-	None
-}
-
-fn content_key_for_stamp(uri: &str, file: &std::path::Path, len: u64, modified_time: Option<std::time::SystemTime>, change_time: Option<std::time::SystemTime>) -> String {
-	let unix_nanos = |time: Option<std::time::SystemTime>| time.and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |time| time.as_nanos());
-	let modified = unix_nanos(modified_time);
-	let changed = unix_nanos(change_time);
-	// Windows file timestamps can quantise to ~15.6 ms ticks: an in-place rewrite at the same byte
-	// length right after a render can keep `(len, mtime, change_time)`. Including `change_time` also
-	// catches time-preserving copies whose restored `mtime` is older than 2 s, and hashing files
-	// whose `mtime` or `change_time` is within 2 s closes same-tick collisions without reading old
-	// unchanged files.
-	let is_recent = |time: Option<std::time::SystemTime>| time.is_some_and(|time| time.elapsed().map_or(true, |age| age < std::time::Duration::from_secs(2)));
-	let recent = modified_time.is_none() || is_recent(modified_time) || is_recent(change_time);
-	let stamped = format!("{uri}@{len}:{modified}:{changed}");
-	if len > 64 << 20 {
-		return stamped;
-	}
-	// The hash a file's key took while it was recent stays in its key once it is old, so an unchanged file
-	// keeps one key as it ages: its scene's kept preparation and its material are found again. A scene drawn
-	// from a file written just before was prepared again when drawn 2 s later (on CI's software adapter,
-	// its first render alone took 9.5 s). Once old, the file is read once more (a rewrite in the last tick
-	// it was read in keeps its stamp) and then no more; a file first seen old is never read.
-	let hashes = FILE_HASHES.get_or_init(Default::default);
-	let stamp = (file.to_path_buf(), len, modified, changed);
-	if !recent {
-		match hashes.lock().get(&stamp) {
-			None => return stamped,
-			Some((hash, true)) => return format!("{stamped}:{hash}"),
-			Some((_, false)) => {}
-		}
-	}
-	let Ok(bytes) = std::fs::read(file) else {
-		return stamped;
-	};
-	let hash = blake3::hash(&bytes).to_hex()[..16].to_string();
-	let mut hashes = hashes.lock();
-	if hashes.len() >= FILE_HASHES_KEPT {
-		hashes.clear();
-	}
-	hashes.insert(stamp, (hash.clone(), !recent));
-	format!("{stamped}:{hash}")
-}
-
-/// The hashes local files' keys took ([`content_key_for_stamp`]), by path and stamp (length, mtime and
-/// change time in nanoseconds): the hash, and whether it was read once the file was old (settled).
-type FileHashes = Mutex<HashMap<(std::path::PathBuf, u64, u128, u128), (String, bool)>>;
-static FILE_HASHES: std::sync::OnceLock<FileHashes> = std::sync::OnceLock::new();
-/// The most files [`FILE_HASHES`] holds; past it, it starts again (each file's key may change once).
-const FILE_HASHES_KEPT: usize = 4096;
-
 pub(crate) fn content_key(uri: &str) -> String {
 	let path = uri.split_once('#').map_or(uri, |(path, _)| path);
 	// a URI with a scheme other than file: (rbxassetid://, a transcode's or a composite's key) names no
@@ -5969,9 +5871,9 @@ pub(crate) fn content_key(uri: &str) -> String {
 		return uri.to_string();
 	}
 	match ror_assets::ContentId::parse(path) {
-		Ok(ror_assets::ContentId::File(file)) => match std::fs::metadata(&file) {
-			Ok(meta) => content_key_for_stamp(uri, &file, meta.len(), meta.modified().ok(), file_change_time(&file, &meta)),
-			Err(_) => uri.to_string(),
+		Ok(ror_assets::ContentId::File(file)) => match ror_assets::FileStamp::of(&file) {
+			Some(stamp) => stamp.stamp_uri(uri),
+			None => uri.to_string(),
 		},
 		_ => uri.to_string(),
 	}

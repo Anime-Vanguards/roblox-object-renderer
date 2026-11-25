@@ -43,6 +43,7 @@ mod cookie;
 mod http;
 mod ratelimit;
 mod sniff;
+mod stamp;
 pub mod store;
 mod studio;
 mod studiocookie;
@@ -61,11 +62,12 @@ use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 
 pub use sniff::sniff_kind;
+pub use stamp::FileStamp;
 pub use transcode::Transcode;
 pub use uri::{ContentId, Thumbnail, ThumbnailKind};
 pub use warm::{BATCH, Download, WarmReport};
 
-use cache::{DiskCache, FileStamp, MemoryCache, Meta, Refusal};
+use cache::{DiskCache, MemoryCache, Meta, Refusal};
 use http::{Client, Credential, Endpoints, Reply};
 
 #[derive(Clone, Debug)]

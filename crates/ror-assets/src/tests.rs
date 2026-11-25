@@ -1643,3 +1643,69 @@ fn with_offline_shares_caches_and_isolates_inflight_misses() {
 	// Once cached by the online fetch, offline now finds it.
 	assert_eq!(offline.fetch("rbxassetid://777").unwrap().bytes, PNG);
 }
+
+#[test]
+fn local_file_replaced_with_same_size_and_mtime_invalidates_memory_cache() {
+	let state = temp_state("local-replaced-same-mtime");
+	let dir = state.join("files");
+	std::fs::create_dir_all(&dir).unwrap();
+	let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+	let set_mtime = |path: &std::path::Path, time: std::time::SystemTime| {
+		std::fs::File::options().write(true).open(path).unwrap().set_modified(time).unwrap();
+	};
+	let ways = ["write_mtime_back", "rename_over", "copy_preserving_mtime"];
+	let targets: Vec<_> = ways
+		.iter()
+		.map(|way| {
+			let target = dir.join(format!("{way}.bin"));
+			let src = dir.join(format!("{way}.src"));
+			std::fs::write(&target, b"version-alpha-01").unwrap();
+			set_mtime(&target, old);
+			std::fs::write(&src, b"version-bravo-02").unwrap();
+			set_mtime(&src, old);
+			(way, target, src)
+		})
+		.collect();
+	// Age past any recent-write window so change time alone must distinguish same-size, same-mtime replacements.
+	std::thread::sleep(Duration::from_millis(2200));
+
+	let store = Assets::new(AssetConfig { offline: true, ..AssetConfig::new(&state) });
+	let file_uri = |path: &std::path::Path| format!("file:///{}", path.display().to_string().replace('\\', "/"));
+	let mut before_meta = Vec::new();
+	for (way, target, _) in &targets {
+		let fetched = store.fetch(&file_uri(target)).unwrap();
+		assert_eq!(fetched.bytes.as_slice(), b"version-alpha-01", "{way}: initial read");
+		let meta = std::fs::metadata(target).unwrap();
+		before_meta.push((meta.len(), meta.modified().unwrap()));
+	}
+
+	for (way, target, src) in &targets {
+		match **way {
+			"write_mtime_back" => {
+				std::fs::write(target, b"version-bravo-02").unwrap();
+				set_mtime(target, old);
+			}
+			"rename_over" => {
+				std::fs::rename(src, target).unwrap();
+			}
+			"copy_preserving_mtime" => {
+				std::fs::copy(src, target).unwrap();
+				set_mtime(target, old);
+			}
+			_ => unreachable!(),
+		}
+	}
+	std::thread::sleep(Duration::from_millis(2200));
+
+	let mut failures = Vec::new();
+	for ((way, target, _), (len_before, mtime_before)) in targets.iter().zip(&before_meta) {
+		let meta = std::fs::metadata(target).unwrap();
+		assert_eq!((meta.len(), meta.modified().unwrap()), (*len_before, *mtime_before), "{way}: test setup needs same len and mtime");
+		let fetched = store.fetch(&file_uri(target)).unwrap();
+		if fetched.bytes.as_slice() != b"version-bravo-02" {
+			failures.push(format!("{way}: stale cached bytes {:?}", String::from_utf8_lossy(&fetched.bytes)));
+		}
+	}
+	let _ = std::fs::remove_dir_all(&state);
+	assert!(failures.is_empty(), "stale Assets::fetch hits ({}):\n{}", failures.len(), failures.join("\n"));
+}

@@ -4,12 +4,13 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use glam::Vec3;
 use parking_lot::Mutex;
 use rayon::prelude::*;
+use ror_assets::FileStamp;
 use serde::{Deserialize, Serialize};
 
 use crate::lint::{Motion, Weightless};
@@ -236,9 +237,9 @@ struct PlaceSettings {
 pub struct SceneCache {
 	/// By file, selection, the folder its relative local paths are read from and whether it keeps the
 	/// invisible parts (the collisions-only view's: [`scene::load::Document::keep_invisible`])
-	entries: Mutex<HashMap<(PathBuf, Option<String>, Option<PathBuf>, bool), (SystemTime, u64, Arc<Scene>)>>,
-	places: Mutex<HashMap<PathBuf, (SystemTime, u64, Arc<PlaceSettings>)>>,
-	maps: Mutex<HashMap<PathBuf, (SystemTime, u64, Arc<scene::load::Document>)>>,
+	entries: Mutex<HashMap<(PathBuf, Option<String>, Option<PathBuf>, bool), (FileStamp, Arc<Scene>)>>,
+	places: Mutex<HashMap<PathBuf, (FileStamp, Arc<PlaceSettings>)>>,
+	maps: Mutex<HashMap<PathBuf, (FileStamp, Arc<scene::load::Document>)>>,
 	/// Videos' inputs ([`crate::video::FixedInput`]) by [`SceneCache::video_key`], the last used last
 	videos: Mutex<Vec<(String, Arc<crate::video::FixedInput>)>>,
 	/// The file being loaded into each cache, so jobs missing the same one at once load it once
@@ -304,13 +305,12 @@ impl SceneCache {
 	}
 
 	/// What a video's input as it stands depends on: its file, the map drawn around it and the places
-	/// lending MaterialService and Lighting (each with its modification time and size), what it
-	/// selects and where its relative local paths are read from. `None` when the input is not a file
-	/// (an asset).
+	/// lending MaterialService and Lighting (each stamped by [`FileStamp`]), what it selects and
+	/// where its relative local paths are read from. `None` when the input is not a file (an asset).
 	pub(crate) fn video_key(&self, input: &str, select: Option<&str>, map: Option<&MapSetting>, (materials, lighting): (Option<&str>, Option<&str>), relative_to: Option<&Path>) -> Option<String> {
 		let stamp = |path: &str| -> Option<String> {
-			let metadata = std::fs::metadata(path).ok().filter(|metadata| metadata.is_file())?;
-			Some(format!("{path:?} {:?} {}", metadata.modified().ok(), metadata.len()))
+			let stamp = FileStamp::of_file(Path::new(path))?;
+			Some(format!("{path:?} {}", stamp.key_suffix()))
 		};
 		let mut key = format!("{} select {select:?} relative to {relative_to:?}", stamp(input)?);
 		if let Some(map) = map {
@@ -362,11 +362,8 @@ impl SceneCache {
 	/// A map file's document, parsed once while the file is unchanged (a game map is tens of
 	/// thousands of instances).
 	fn map_document(&self, path: &Path) -> Result<Arc<scene::load::Document>> {
-		let metadata = std::fs::metadata(path).with_context(|| format!("--map: reading {}", path.display()))?;
-		let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-		let cached = || {
-			self.maps.lock().get(path).filter(|(time, size, _)| *time == modified && *size == metadata.len()).map(|(_, _, document)| document.clone())
-		};
+		let stamp = FileStamp::try_of(path).with_context(|| format!("--map: reading {}", path.display()))?;
+		let cached = || self.maps.lock().get(path).filter(|(kept, _)| *kept == stamp).map(|(_, document)| document.clone());
 		if let Some(document) = cached() {
 			return Ok(document);
 		}
@@ -376,7 +373,7 @@ impl SceneCache {
 			if maps.len() > 4 {
 				maps.clear();
 			}
-			maps.insert(path.to_path_buf(), (modified, metadata.len(), document.clone()));
+			maps.insert(path.to_path_buf(), (stamp, document.clone()));
 			Ok(document)
 		})
 	}
@@ -401,9 +398,8 @@ impl SceneCache {
 	}
 
 	fn place(&self, path: &Path) -> Result<Arc<PlaceSettings>> {
-		let metadata = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
-		let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-		let cached = || self.places.lock().get(path).filter(|(time, size, _)| *time == modified && *size == metadata.len()).map(|(_, _, place)| place.clone());
+		let stamp = FileStamp::try_of(path).with_context(|| format!("reading {}", path.display()))?;
+		let cached = || self.places.lock().get(path).filter(|(kept, _)| *kept == stamp).map(|(_, place)| place.clone());
 		if let Some(place) = cached() {
 			return Ok(place);
 		}
@@ -414,7 +410,7 @@ impl SceneCache {
 			if places.len() > 16 {
 				places.clear();
 			}
-			places.insert(path.to_path_buf(), (modified, metadata.len(), place.clone()));
+			places.insert(path.to_path_buf(), (stamp, place.clone()));
 			Ok(place)
 		})
 	}
@@ -458,16 +454,15 @@ impl SceneCache {
 	}
 
 	fn load(&self, path: &Path, select: Option<&str>, relative_to: Option<&Path>, keep_invisible: bool) -> Result<(Arc<Scene>, bool)> {
-		let metadata = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
-		let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+		let stamp = FileStamp::try_of(path).with_context(|| format!("reading {}", path.display()))?;
 		let key = (path.to_path_buf(), select.map(str::to_string), relative_to.map(Path::to_path_buf), keep_invisible);
-		let cached = || self.entries.lock().get(&key).filter(|(time, size, _)| *time == modified && *size == metadata.len()).map(|(_, _, scene)| (scene.clone(), true));
+		let cached = || self.entries.lock().get(&key).filter(|(kept, _)| *kept == stamp).map(|(_, scene)| (scene.clone(), true));
 		if let Some(hit) = cached() {
 			return Ok(hit);
 		}
 		self.loading.once("scenes", path, cached, || {
 			// the parse and the extraction within the machine's free memory, as one load
-			let _budget = crate::budget::reserve(metadata.len());
+			let _budget = crate::budget::reserve(stamp.len());
 			let mut document = scene::load::read_file(path)?;
 			document.keep_invisible = keep_invisible;
 			if let Some(select) = select {
@@ -482,7 +477,7 @@ impl SceneCache {
 			if entries.len() > 256 {
 				entries.clear();
 			}
-			entries.insert(key.clone(), (modified, metadata.len(), scene.clone()));
+			entries.insert(key.clone(), (stamp, scene.clone()));
 			Ok((scene, false))
 		})
 	}
@@ -953,6 +948,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use std::time::SystemTime;
 
 	/// A job's relative local paths are read from the folder it names (its caller's working directory,
 	/// which the CLI sends to a service running in its state dir), whatever the process's own: a
@@ -1152,5 +1148,210 @@ mod tests {
 		assert!(front.shown * 3 > front.whole && front.shown * 3 < front.whole * 2, "the wall hides about half of it from the front: {front:?}");
 		assert!(run(&renderer, &SceneCache::default(), &job("Model.Nothing")).is_err(), "an instance with no part is an error");
 		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	/// A model file, map file, lending place (`materials_from` / `lighting_from`) or video fixed input
+	/// replaced at the same byte length with its modified time put back (write + set_modified, rename
+	/// over, time-preserving copy) must never be served from `SceneCache` as the old file, even past
+	/// the 2 s recent window.
+	#[test]
+	fn replaced_model_map_place_and_video_key_never_reuse_stale_cache() {
+		let state = std::env::temp_dir().join(format!("ror-replaced-inputs-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&state);
+		std::fs::create_dir_all(&state).unwrap();
+		let old = SystemTime::now() - std::time::Duration::from_secs(3600);
+		let set_mtime = |path: &Path| {
+			std::fs::File::options().write(true).open(path).unwrap().set_modified(old).unwrap();
+		};
+		let model_xml = |width: u32| -> Vec<u8> {
+			format!(
+				r#"<roblox version="4"><Item class="Part" referent="P1"><Properties><string name="Name">Board</string><bool name="Anchored">true</bool><Vector3 name="size"><X>{width}</X><Y>8</Y><Z>1</Z></Vector3><CoordinateFrame name="CFrame"><X>0</X><Y>0</Y><Z>0</Z><R00>1</R00><R01>0</R01><R02>0</R02><R10>0</R10><R11>1</R11><R12>0</R12><R20>0</R20><R21>0</R21><R22>1</R22></CoordinateFrame></Properties></Item></roblox>"#
+			)
+			.into_bytes()
+		};
+		let map_xml = |tag: char, width: u32| -> Vec<u8> {
+			format!(
+				r#"<roblox version="4"><Item class="Part" referent="M1"><Properties><string name="Name">Map{tag}</string><bool name="Anchored">true</bool><Vector3 name="size"><X>{width}</X><Y>2</Y><Z>2</Z></Vector3><CoordinateFrame name="CFrame"><X>0</X><Y>-4</Y><Z>0</Z><R00>1</R00><R01>0</R01><R02>0</R02><R10>0</R10><R11>1</R11><R12>0</R12><R20>0</R20><R21>0</R21><R22>1</R22></CoordinateFrame></Properties></Item></roblox>"#
+			)
+			.into_bytes()
+		};
+		let materials_xml = |studs: u32| -> Vec<u8> {
+			format!(
+				r#"<roblox version="4"><Item class="MaterialService" referent="MS1"><Properties><string name="Name">MaterialService</string></Properties><Item class="MaterialVariant" referent="MV1"><Properties><string name="Name">Mat</string><float name="StudsPerTile">{studs}</float></Properties></Item></Item></roblox>"#
+			)
+			.into_bytes()
+		};
+		let lighting_xml = |brightness: u32| -> Vec<u8> {
+			format!(
+				r#"<roblox version="4"><Item class="Lighting" referent="L1"><Properties><string name="Name">Lighting</string><float name="Brightness">{brightness}</float></Properties></Item></roblox>"#
+			)
+			.into_bytes()
+		};
+		let pairs: [(&str, Vec<u8>, Vec<u8>); 4] = [
+			("model.rbxmx", model_xml(2), model_xml(9)),
+			("map.rbxmx", map_xml('A', 2), map_xml('B', 9)),
+			("materials.rbxlx", materials_xml(2), materials_xml(9)),
+			("lighting.rbxlx", lighting_xml(1), lighting_xml(9)),
+		];
+		for (name, a, b) in &pairs {
+			assert_eq!(a.len(), b.len(), "{name}: replacement fixture must have identical byte length");
+		}
+		let ways = ["write_mtime_back", "rename_over", "copy_preserving_mtime"];
+		let anchor = state.join("anchor.rbxmx");
+		std::fs::write(&anchor, model_xml(2)).unwrap();
+		set_mtime(&anchor);
+		for way in ways {
+			let dir = state.join(way);
+			std::fs::create_dir_all(&dir).unwrap();
+			for (name, a, b) in &pairs {
+				let target = dir.join(name);
+				let src = dir.join(format!("{name}.src"));
+				std::fs::write(&target, a).unwrap();
+				set_mtime(&target);
+				std::fs::write(&src, b).unwrap();
+				set_mtime(&src);
+			}
+		}
+		// Age past the 2 s recent window so change time must distinguish same-size, same-mtime files.
+		std::thread::sleep(std::time::Duration::from_millis(2200));
+
+		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(state.join("cache")) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let scenes = SceneCache::default();
+		let render_model = |model: &Path, out: PathBuf| -> Vec<u8> {
+			let job = Job {
+				input: model.display().to_string(),
+				select: None,
+				out: Some(out),
+				views: vec![NamedView {
+					name: "front".into(),
+					view: ViewRequest { width: 96, height: 96, background: Background::Color([0.0, 0.0, 0.0]), ..Default::default() },
+				}],
+				no_png: false,
+				compact_png: false,
+				materials_from: None,
+				lighting_from: None,
+				playback: None,
+				frame: Some([[-8.0, -8.0, -1.0], [8.0, 8.0, 1.0]]),
+				focus: None,
+				collision: None,
+				map: None,
+				cost: None,
+				relative_to: None,
+				alone: None,
+			};
+			let result = run(&renderer, &scenes, &job).unwrap();
+			std::fs::read(result.views[0].file.as_ref().unwrap()).unwrap()
+		};
+
+		let anchor_s = anchor.display().to_string();
+		let mut before = Vec::new();
+		for way in ways {
+			let dir = state.join(way);
+			let model = dir.join("model.rbxmx");
+			let map = dir.join("map.rbxmx");
+			let materials = dir.join("materials.rbxlx");
+			let lighting = dir.join("lighting.rbxlx");
+			let (loaded, cached) = scenes.load(&model, None, None, false).unwrap();
+			assert!(!cached && (loaded.parts[0].size.x - 2.0).abs() < 1e-4, "{way}: initial model");
+			let png_a = render_model(&model, dir.join("out_a"));
+			let mut doc = crate::scene::build::ModelBuilder::new("Model").into_document();
+			scenes.add_map(&mut doc, &MapSetting { file: map.display().to_string(), origin: None }).unwrap();
+			assert!(scene::extract::extract(&doc).parts.iter().any(|part| part.path.ends_with("MapA")), "{way}: initial map");
+			let mut lent_scene = Scene::default();
+			let mat_s = materials.display().to_string();
+			let light_s = lighting.display().to_string();
+			scenes.lend(&mut lent_scene, Some(&mat_s), Some(&light_s)).unwrap();
+			assert!((lent_scene.materials.variants[0].studs_per_tile - 2.0).abs() < 1e-4, "{way}: initial materials");
+			assert!((lent_scene.environment.brightness - 1.0).abs() < 1e-4, "{way}: initial lighting");
+			let vkey_model = scenes.video_key(&model.display().to_string(), None, None, (None, None), None).unwrap();
+			let vkey_map = scenes.video_key(&anchor_s, None, Some(&MapSetting { file: map.display().to_string(), origin: None }), (None, None), None).unwrap();
+			let vkey_mat = scenes.video_key(&anchor_s, None, None, (Some(&mat_s), None), None).unwrap();
+			let vkey_light = scenes.video_key(&anchor_s, None, None, (None, Some(&light_s)), None).unwrap();
+			let metas: Vec<_> = pairs
+				.iter()
+				.map(|(name, _, _)| {
+					let meta = std::fs::metadata(dir.join(name)).unwrap();
+					(meta.len(), meta.modified().unwrap())
+				})
+				.collect();
+			before.push((way, png_a, vkey_model, vkey_map, vkey_mat, vkey_light, metas));
+		}
+
+		// Replace every input using its method, keeping exact byte length and old modified time.
+		for way in ways {
+			let dir = state.join(way);
+			for (name, _, b) in &pairs {
+				let target = dir.join(name);
+				let src = dir.join(format!("{name}.src"));
+				match way {
+					"write_mtime_back" => {
+						std::fs::write(&target, b).unwrap();
+						set_mtime(&target);
+					}
+					"rename_over" => {
+						std::fs::rename(&src, &target).unwrap();
+					}
+					"copy_preserving_mtime" => {
+						std::fs::copy(&src, &target).unwrap();
+						set_mtime(&target);
+					}
+					_ => unreachable!(),
+				}
+			}
+		}
+		std::thread::sleep(std::time::Duration::from_millis(2200));
+
+		let mut failures = Vec::new();
+		for (way, png_a, vkey_model, vkey_map, vkey_mat, vkey_light, metas) in before {
+			let dir = state.join(way);
+			for ((name, _, _), (len_before, mtime_before)) in pairs.iter().zip(&metas) {
+				let meta = std::fs::metadata(dir.join(name)).unwrap();
+				assert_eq!((meta.len(), meta.modified().unwrap()), (*len_before, *mtime_before), "{way}/{name}: test setup needs same len and mtime");
+			}
+			let model = dir.join("model.rbxmx");
+			let map = dir.join("map.rbxmx");
+			let materials = dir.join("materials.rbxlx");
+			let lighting = dir.join("lighting.rbxlx");
+			let (loaded, cached) = scenes.load(&model, None, None, false).unwrap();
+			if cached || (loaded.parts[0].size.x - 9.0).abs() >= 1e-4 {
+				failures.push(format!("{way}: model SceneCache::load stale (cached={cached}, width={})", loaded.parts[0].size.x));
+			}
+			let png_b = render_model(&model, dir.join("out_b"));
+			if png_a == png_b {
+				failures.push(format!("{way}: model job::run drew stale PNG"));
+			}
+			let mut doc = crate::scene::build::ModelBuilder::new("Model").into_document();
+			scenes.add_map(&mut doc, &MapSetting { file: map.display().to_string(), origin: None }).unwrap();
+			if !scene::extract::extract(&doc).parts.iter().any(|part| part.path.ends_with("MapB")) {
+				failures.push(format!("{way}: map SceneCache::map_document stale"));
+			}
+			let mut lent_scene = Scene::default();
+			let mat_s = materials.display().to_string();
+			let light_s = lighting.display().to_string();
+			scenes.lend(&mut lent_scene, Some(&mat_s), Some(&light_s)).unwrap();
+			if (lent_scene.materials.variants[0].studs_per_tile - 9.0).abs() >= 1e-4 {
+				failures.push(format!("{way}: materials_from SceneCache::place stale"));
+			}
+			if (lent_scene.environment.brightness - 9.0).abs() >= 1e-4 {
+				failures.push(format!("{way}: lighting_from SceneCache::place stale"));
+			}
+			if vkey_model == scenes.video_key(&model.display().to_string(), None, None, (None, None), None).unwrap() {
+				failures.push(format!("{way}: video_key missed replaced model"));
+			}
+			if vkey_map == scenes.video_key(&anchor_s, None, Some(&MapSetting { file: map.display().to_string(), origin: None }), (None, None), None).unwrap() {
+				failures.push(format!("{way}: video_key missed replaced map"));
+			}
+			if vkey_mat == scenes.video_key(&anchor_s, None, None, (Some(&mat_s), None), None).unwrap() {
+				failures.push(format!("{way}: video_key missed replaced materials_from"));
+			}
+			if vkey_light == scenes.video_key(&anchor_s, None, None, (None, Some(&light_s)), None).unwrap() {
+				failures.push(format!("{way}: video_key missed replaced lighting_from"));
+			}
+		}
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+		assert!(failures.is_empty(), "stale cache hits after same-size same-mtime replacement ({}):\n{}", failures.len(), failures.join("\n"));
 	}
 }

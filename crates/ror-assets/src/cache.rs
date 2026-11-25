@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Fetched, RefusalReason};
+use crate::{Fetched, FileStamp, RefusalReason};
 
 /// FNV-1a, 128 bits, as 32 hex digits.
 pub(crate) fn hash_key(key: &str) -> String {
@@ -286,20 +286,6 @@ fn place(temp: &Path, path: &Path) -> std::io::Result<()> {
 	Err(last_error.unwrap_or_else(|| std::io::Error::other("rename failed")))
 }
 
-/// Identity of a local file's contents, to notice edits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct FileStamp {
-	pub len: u64,
-	pub modified: Option<SystemTime>,
-}
-
-impl FileStamp {
-	pub(crate) fn of(path: &Path) -> Option<FileStamp> {
-		let meta = std::fs::metadata(path).ok()?;
-		Some(FileStamp { len: meta.len(), modified: meta.modified().ok() })
-	}
-}
-
 struct Entry {
 	value: Arc<Fetched>,
 	stamp: Option<FileStamp>,
@@ -405,10 +391,10 @@ mod tests {
 	#[test]
 	fn stamps_invalidate() {
 		let mut cache = MemoryCache::new(100);
-		let stamp = FileStamp { len: 3, modified: None };
+		let stamp = FileStamp::from_parts(Path::new(""), 3, None, None);
 		cache.insert("f", fetched(3), Some(stamp));
 		assert!(cache.get("f", Some(stamp)).is_some());
-		assert!(cache.get("f", Some(FileStamp { len: 4, modified: None })).is_none());
+		assert!(cache.get("f", Some(FileStamp::from_parts(Path::new(""), 4, None, None))).is_none());
 	}
 
 	#[test]
