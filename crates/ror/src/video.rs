@@ -272,8 +272,13 @@ fn effective_camera_track(job: &VideoJob) -> Option<Vec<CameraKey>> {
 /// merged in), watched through its camera track when it has one (Studio updates only the emitters
 /// that camera could draw: [`scene::playback::ViewerKey`]).
 fn watched(job: &VideoJob) -> Result<Playback> {
+	let track = effective_camera_track(job);
+	watched_with(job, track.as_deref())
+}
+
+fn watched_with(job: &VideoJob, track: Option<&[CameraKey]>) -> Result<Playback> {
 	let mut playback = Playback::resolve_source(job.playback.as_ref(), job.playback_file.as_deref(), job.playback_overlay.as_ref(), None)?.unwrap_or_default();
-	if let Some(track) = effective_camera_track(job).filter(|_| playback.viewer.is_empty()) {
+	if let Some(track) = track.filter(|track| !track.is_empty() && playback.viewer.is_empty()) {
 		let aspect = job.view.width.max(1) as f32 / job.view.height.max(1) as f32;
 		let mut keys: Vec<scene::playback::ViewerKey> = track.iter().map(|key| scene::playback::ViewerKey { at: key.at, cframe: key.cframe, fov: key.fov, aspect }).collect();
 		keys.sort_by(|a, b| a.at.total_cmp(&b.at));
@@ -297,12 +302,12 @@ pub struct Moment {
 	pub particles: usize,
 }
 
-/// How bright one encoded frame is and how long each stage of it took (a summary's `frameStats`,
-/// one per frame): what a review reads a hit frame's peak and per-frame bottlenecks from. Measured
-/// on the pixels the encoder takes, after the tone curve and every post effect: an MP4's BT.709
-/// NV12 as the video decodes it (luma from each pixel's Y, in steps of 1/219; red, green and blue
-/// with its 2 x 2 block's chroma), any other format's RGBA, both over black where the background is
-/// transparent.
+/// How bright one encoded frame is (a summary's `frameStats`, one per frame), plus per-frame
+/// timing breakdowns when `ROR_PROFILE` is set so default `summary.json` stays deterministic across
+/// runs. Measured on the pixels the encoder takes, after the tone curve and every post effect: an
+/// MP4's BT.709 NV12 as the video decodes it (luma from each pixel's Y, in steps of 1/219; red,
+/// green and blue with its 2 x 2 block's chroma), any other format's RGBA, both over black where
+/// the background is transparent.
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct FrameStats {
@@ -315,19 +320,25 @@ pub struct FrameStats {
 	pub bright: u64,
 	/// The mean Rec.709 luma, 0-1, to four places.
 	pub luma: f64,
-	/// CPU time advancing playback state, extracting the scene, and stepping trails/beams (ms).
-	pub playback_ms: f64,
-	/// CPU time stepping particle birth history and simulating live particles (ms).
-	pub particle_ms: f64,
-	/// Number of 60 Hz Rate emission substeps evaluated across emitters for this frame.
-	pub particle_substeps: u64,
-	/// Environment/key preparation plus `Renderer::prepare` time for this frame (ms).
-	pub prepare_ms: f64,
-	/// GPU command encoding and submission time for this frame (ms).
-	pub draw_ms: f64,
-	/// GPU readback wait time for this frame (ms).
-	pub readback_ms: f64,
-	/// True when frame reuse copied the previous frame's pixels without redrawing.
+	/// CPU time advancing playback state, extracting the scene, and stepping trails/beams (ms; `ROR_PROFILE`).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub playback_ms: Option<f64>,
+	/// CPU time stepping particle birth history and simulating live particles (ms; `ROR_PROFILE`).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub particle_ms: Option<f64>,
+	/// Number of 60 Hz Rate emission substeps evaluated across emitters for this frame (`ROR_PROFILE`).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub particle_substeps: Option<u64>,
+	/// Environment/key preparation plus `Renderer::prepare` time for this frame (ms; `ROR_PROFILE`).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub prepare_ms: Option<f64>,
+	/// GPU command encoding and submission time for this frame (ms; `ROR_PROFILE`).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub draw_ms: Option<f64>,
+	/// GPU readback wait time for this frame (ms; `ROR_PROFILE`).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub readback_ms: Option<f64>,
+	/// True when frame reuse copied the previous frame's pixels without redrawing (`ROR_PROFILE`).
 	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
 	pub repeated: bool,
 }
@@ -346,6 +357,31 @@ struct FrameTiming {
 
 fn three_places(value: f64) -> f64 {
 	(value * 1000.0).round() / 1000.0
+}
+
+fn build_frame_stats(brightness: &[Brightness], times: &[f32], frame_timings: &[FrameTiming], encoder_readbacks: &[f64], profile: bool) -> Vec<FrameStats> {
+	brightness
+		.iter()
+		.enumerate()
+		.map(|(frame, b)| {
+			let timing = frame_timings.get(frame).copied().unwrap_or_default();
+			let readback_ms = timing.readback_ms + encoder_readbacks.get(frame).copied().unwrap_or(0.0);
+			FrameStats {
+				time: four_places(f64::from(times[frame])),
+				frame,
+				near_white: b.near_white,
+				bright: b.bright,
+				luma: four_places(b.luma),
+				playback_ms: profile.then(|| three_places(timing.playback_ms)),
+				particle_ms: profile.then(|| three_places(timing.particle_ms)),
+				particle_substeps: profile.then_some(timing.particle_substeps),
+				prepare_ms: profile.then(|| three_places(timing.prepare_ms)),
+				draw_ms: profile.then(|| three_places(timing.draw_ms)),
+				readback_ms: profile.then(|| three_places(readback_ms)),
+				repeated: profile && timing.repeated,
+			}
+		})
+		.collect()
 }
 
 /// A frame's pixels measured ([`FrameStats`] without its moment).
@@ -950,10 +986,16 @@ impl<'a> Builder<'a> {
 	/// The builder of `job`'s frames, its input's bytes from `read` unless `scenes` kept its
 	/// [`FixedInput`].
 	fn new(read: impl FnOnce() -> Result<Vec<u8>>, job: &'a VideoJob, scenes: &'a SceneCache) -> Result<Self> {
+		Self::with_playback(read, job, watched(job)?, scenes)
+	}
+
+	/// [`Builder::new`] with an already-resolved `playback`, avoiding cloning large inline
+	/// `job.playback` payloads when overriding the camera track or camera-follow motion.
+	fn with_playback(read: impl FnOnce() -> Result<Vec<u8>>, job: &'a VideoJob, playback: Playback, scenes: &'a SceneCache) -> Result<Self> {
 		let mut builder = Builder {
 			bytes: Vec::new(),
 			select: job.select.as_deref(),
-			playback: watched(job)?,
+			playback,
 			scenes,
 			relative_to: job.relative_to.as_deref(),
 			map: job.map.as_ref(),
@@ -1659,9 +1701,9 @@ type Framing = (Vec<CameraSpec>, Option<(Vec3, Vec3)>);
 /// Each frame's camera: a camera track's key at its moment; else an orbit fitted once to the box every
 /// sampled moment draws (or the box or instance given), the same distance all round when it turns;
 /// any other camera as given. Also the box framed.
-fn cameras<'s>(renderer: &Renderer, builder: &'s Builder, times: &[f32], job: &VideoJob, held: &Mutex<Vec<Kept<'s>>>) -> Result<Framing> {
-	if let Some(track) = effective_camera_track(job) {
-		return Ok((times.iter().map(|&time| track_camera(&track, time)).collect(), None));
+fn cameras<'s>(renderer: &Renderer, builder: &'s Builder, times: &[f32], job: &VideoJob, track: Option<&[CameraKey]>, held: &Mutex<Vec<Kept<'s>>>) -> Result<Framing> {
+	if let Some(track) = track.filter(|track| !track.is_empty()) {
+		return Ok((times.iter().map(|&time| track_camera(track, time)).collect(), None));
 	}
 	let (width, height) = (job.view.width.max(1), job.view.height.max(1));
 	let CameraSpec::Orbit { yaw, pitch, distance, padding, target, fov } = job.view.camera else {
@@ -2401,14 +2443,14 @@ pub fn run_with(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 	let key = format!("video {} {:?} {}x{}x{} {:?}", job.input, job.playback_file, view.width, view.height, view.supersample, job.format);
 	let input_bytes = crate::budget::file_bytes([Some(std::path::Path::new(&job.input)), job.playback_file.as_deref(), job.map.as_ref().map(|map| std::path::Path::new(&map.file))].into_iter().flatten());
 	let mut admitted = crate::job::admit(renderer, scenes, &format!("video of {}", job.input), key, crate::budget::clip_need(pixels, input_bytes))?;
-	let result = run_admitted(renderer, scenes, job, gpu, early);
+	let result = run_admitted(renderer, scenes, job, gpu, early, std::env::var_os("ROR_PROFILE").is_some());
 	if result.is_ok() {
 		admitted.finished();
 	}
 	result
 }
 
-fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: Option<&GpuGate>, early: Option<&mut dyn FnMut(&VideoResult)>) -> Result<VideoResult> {
+fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: Option<&GpuGate>, early: Option<&mut dyn FnMut(&VideoResult)>, profile_frames: bool) -> Result<VideoResult> {
 	let started = Instant::now();
 	let mut timings = VideoTimings::default();
 	let mut profile = OutputProfile::default();
@@ -2477,18 +2519,15 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 		CopyRuns::none()
 	};
 
-	let normalized_job;
-	let job = if let Some(track) = job.camera_track.as_ref().filter(|track| !track.is_empty()) {
+	let camera_track = job.camera_track.as_ref().filter(|track| !track.is_empty()).map(|track| {
 		let (keys, skipped) = normalize_camera_track(track.clone(), job.keep_default_camera);
 		if skipped {
 			crate::say("note: skipped leading engine-default camera key at t=0 (pass --keep-default-camera / keepDefaultCamera: true to keep it)");
 		}
-		normalized_job = VideoJob { camera_track: Some(keys), ..job.clone() };
-		&normalized_job
-	} else {
-		job
-	};
-	let builder = Builder::new(|| input_bytes(renderer, &job.input), job, scenes)?;
+		keys
+	});
+	let playback = watched_with(job, camera_track.as_deref())?;
+	let builder = Builder::with_playback(|| input_bytes(renderer, &job.input), job, playback, scenes)?;
 	// the document the clip's moments are made on, with its playback resolved, from the framing on
 	let held = Mutex::new(Vec::new());
 	timings.load_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -2502,20 +2541,16 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 			builder.warm(&renderer.assets);
 			start.elapsed().as_secs_f64() * 1000.0
 		});
-		let framing = cameras(renderer, &builder, &times, job, &held);
+		let framing = cameras(renderer, &builder, &times, job, camera_track.as_deref(), &held);
 		(framing, warming.join().unwrap_or(0.0))
 	});
 	let (cameras, framed) = framing?;
 	timings.framing_ms = framing_start.elapsed().as_secs_f64() * 1000.0;
 	timings.warm_ms = warm_ms;
 	// parts the game keeps under the camera move with this clip's camera: the frames are made from a
-	// playback that keys their motion (`follow_playback`)
-	let followed_job;
+	// playback that keys their motion (`follow_playback`), without cloning `job.playback` again.
 	let followed = match follow_playback(&builder, &held, job, &cameras, framed, &times)? {
-		Some(playback) => {
-			followed_job = VideoJob { playback: Some(playback), playback_overlay: None, ..job.clone() };
-			Some(Builder::new(|| input_bytes(renderer, &job.input), &followed_job, scenes)?)
-		}
+		Some(playback) => Some(Builder::with_playback(|| input_bytes(renderer, &job.input), job, playback, scenes)?),
 		None => None,
 	};
 	let followed_held = Mutex::new(Vec::new());
@@ -2527,13 +2562,15 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 	let encoder = encoder.take();
 
 	let sheet_frames = spread(count, job.sheet);
+	let mut warned_rur = std::collections::HashSet::new();
 	let mut sent = false;
 	if job.sheet_first
 		&& !sheet_frames.is_empty()
 		&& let Some(early) = early
 	{
 		let ahead = Instant::now();
-		let first = sheet_first(renderer, &builder, &held, &times, &cameras, &view, &sheet_frames, gpu)?;
+		let first = sheet_first(renderer, builder, held, &times, &cameras, &view, &sheet_frames, gpu)?;
+		crate::render::guis::warn_invalid_rur_once(&mut warned_rur, &first.guis);
 		let mut early_stats = VideoStats { particles_max: 0, ..Default::default() };
 		(early_stats.parts, early_stats.emitters, early_stats.beams, early_stats.trails) = first.census.counts();
 		for (&index, &particles) in sheet_frames.iter().zip(&first.particles) {
@@ -2699,6 +2736,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 				// what the clip keeps from frame to frame while the camera holds still (render::ClipKept)
 				let keep = cameras.get(index + 1).is_some_and(|next| same_camera(next, &cameras[index]));
 				let (mut images, frame_stats) = renderer.submit_frame(&scene, std::slice::from_ref(&request), sky, readback, (guis, gui_skipped), gpu, Some((&clip_kept, keep)))?;
+				crate::render::guis::warn_invalid_rur_once(&mut warned_rur, &frame_stats.gui_report);
 				gui_report.merge(&frame_stats.gui_report);
 				profile.gpu_wait_ms += frame_stats.gpu_wait_ms;
 				let pending = images.pop().context("the render gave no image")?;
@@ -2802,29 +2840,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 		Some(file)
 	};
 	timings.sheet_ms = sheet_start.elapsed().as_secs_f64() * 1000.0;
-	let frame_stats: Vec<FrameStats> = brightness
-		.iter()
-		.zip(&times)
-		.enumerate()
-		.map(|(frame, (measured, &time))| {
-			let timing = frame_timings.get(frame).copied().unwrap_or_default();
-			let readback_ms = timing.readback_ms + encoder_readbacks.get(frame).copied().unwrap_or(0.0);
-			FrameStats {
-				time: four_places(f64::from(time)),
-				frame,
-				near_white: measured.near_white,
-				bright: measured.bright,
-				luma: four_places(measured.luma),
-				playback_ms: three_places(timing.playback_ms),
-				particle_ms: three_places(timing.particle_ms),
-				particle_substeps: timing.particle_substeps,
-				prepare_ms: three_places(timing.prepare_ms),
-				draw_ms: three_places(timing.draw_ms),
-				readback_ms: three_places(readback_ms),
-				repeated: timing.repeated,
-			}
-		})
-		.collect();
+	let frame_stats = build_frame_stats(&brightness, &times, &frame_timings, &encoder_readbacks, profile_frames);
 	let lint = effects.lint(&builder.fades, &stats.missing);
 	let counts = effects.counts(&builder.roots);
 	let mut lines: Vec<String> = frames_line(&frame_stats, view.width as u64 * view.height as u64).into_iter().chain(counts.line()).collect();
@@ -3368,13 +3384,7 @@ mod tests {
 			let name = format!("frames/{frame:04}.png");
 			assert!(read("plain", &name) == read("first", &name), "{name}");
 		}
-		assert_eq!(plain.frame_stats.len(), first.frame_stats.len());
-		for (a, b) in plain.frame_stats.iter().zip(&first.frame_stats) {
-			assert_eq!((a.time, a.frame, a.near_white, a.bright, a.luma, a.particle_substeps, a.repeated), (b.time, b.frame, b.near_white, b.bright, b.luma, b.particle_substeps, b.repeated));
-			for ms in [a.playback_ms, a.particle_ms, a.prepare_ms, a.draw_ms, a.readback_ms, b.playback_ms, b.particle_ms, b.prepare_ms, b.draw_ms, b.readback_ms] {
-				assert!(ms.is_finite() && ms >= 0.0, "per-frame timing must be finite and non-negative: {a:?} / {b:?}");
-			}
-		}
+		assert_eq!(plain.frame_stats, first.frame_stats);
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
 	}
@@ -3847,12 +3857,12 @@ mod tests {
 			near_white,
 			bright: near_white * 2,
 			luma,
-			playback_ms: 0.0,
-			particle_ms: 0.0,
-			particle_substeps: 0,
-			prepare_ms: 0.0,
-			draw_ms: 0.0,
-			readback_ms: 0.0,
+			playback_ms: None,
+			particle_ms: None,
+			particle_substeps: None,
+			prepare_ms: None,
+			draw_ms: None,
+			readback_ms: None,
 			repeated: false,
 		};
 		let frames = vec![frame(0, 0, 0.2), frame(1, 50, 0.4), frame(2, 100, 0.35), frame(3, 0, 0.1)];
@@ -3927,27 +3937,41 @@ mod tests {
 		};
 
 		let scenes = SceneCache::default();
-		let _dense = run(&renderer, &scenes, &make_job("dense", None), None).unwrap();
-		let _sparse = run(&renderer, &scenes, &make_job("sparse", Some(vec![0.0, 0.5, 0.9])), None).unwrap();
+		let _dense = run_admitted(&renderer, &scenes, &make_job("dense", None), None, None, false).unwrap();
+		let _sparse_a = run_admitted(&renderer, &scenes, &make_job("sparse-a", Some(vec![0.0, 0.5, 0.9])), None, None, false).unwrap();
+		let _sparse_b = run_admitted(&renderer, &scenes, &make_job("sparse-b", Some(vec![0.0, 0.5, 0.9])), None, None, false).unwrap();
+		let _profiled = run_admitted(&renderer, &scenes, &make_job("profiled", Some(vec![0.0, 0.5, 0.9])), None, None, true).unwrap();
 
 		// Sparse --times frames must be byte-for-byte identical to the matching dense frames.
 		for (sparse_i, dense_i) in [(0usize, 0usize), (1, 5), (2, 9)] {
-			let a = std::fs::read(state.join("sparse").join(format!("frames/{sparse_i:04}.png"))).unwrap();
+			let a = std::fs::read(state.join("sparse-a").join(format!("frames/{sparse_i:04}.png"))).unwrap();
 			let b = std::fs::read(state.join("dense").join(format!("frames/{dense_i:04}.png"))).unwrap();
 			assert_eq!(a, b, "sparse frame {sparse_i} must match dense frame {dense_i}");
 		}
 
-		// summary.json must contain per-frame timing breakdown fields.
-		let summary: serde_json::Value = serde_json::from_slice(&std::fs::read(state.join("sparse/summary.json")).unwrap()).unwrap();
-		let stats = summary["frameStats"].as_array().unwrap();
-		assert_eq!(stats.len(), 3);
-		for entry in stats {
-			for key in ["playbackMs", "particleMs", "particleSubsteps", "prepareMs", "drawMs", "readbackMs"] {
-				assert!(entry.get(key).is_some(), "frameStats missing {key}: {entry}");
+		// Default summary.json omits noisy per-frame timing keys so frameStats is deterministic across runs.
+		let summary_a: serde_json::Value = serde_json::from_slice(&std::fs::read(state.join("sparse-a/summary.json")).unwrap()).unwrap();
+		let summary_b: serde_json::Value = serde_json::from_slice(&std::fs::read(state.join("sparse-b/summary.json")).unwrap()).unwrap();
+		assert_eq!(summary_a["frameStats"], summary_b["frameStats"], "default frameStats must be deterministic across runs");
+		let default_stats = summary_a["frameStats"].as_array().unwrap();
+		assert_eq!(default_stats.len(), 3);
+		for entry in default_stats {
+			for key in ["playbackMs", "particleMs", "particleSubsteps", "prepareMs", "drawMs", "readbackMs", "repeated"] {
+				assert!(entry.get(key).is_none(), "default frameStats should omit {key}: {entry}");
 			}
 		}
-		assert_eq!(stats[0]["particleSubsteps"].as_u64().unwrap(), 0, "emitter disabled at t=0 -> 0 substeps");
-		assert!(stats[1]["particleSubsteps"].as_u64().unwrap() > 0, "emitter active between t=0.2 and t=0.5 -> >0 substeps");
+
+		// With profiling enabled (ROR_PROFILE), summary.json records the full per-frame timing breakdown.
+		let summary_prof: serde_json::Value = serde_json::from_slice(&std::fs::read(state.join("profiled/summary.json")).unwrap()).unwrap();
+		let prof_stats = summary_prof["frameStats"].as_array().unwrap();
+		assert_eq!(prof_stats.len(), 3);
+		for entry in prof_stats {
+			for key in ["playbackMs", "particleMs", "particleSubsteps", "prepareMs", "drawMs", "readbackMs"] {
+				assert!(entry.get(key).is_some(), "profiled frameStats missing {key}: {entry}");
+			}
+		}
+		assert_eq!(prof_stats[0]["particleSubsteps"].as_u64().unwrap(), 0, "emitter disabled at t=0 -> 0 substeps");
+		assert!(prof_stats[1]["particleSubsteps"].as_u64().unwrap() > 0, "emitter active between t=0.2 and t=0.5 -> >0 substeps");
 
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);

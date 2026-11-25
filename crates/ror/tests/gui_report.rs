@@ -196,5 +196,23 @@ fn summary_records_drawn_and_skipped_guis_and_finds_rur_via_rur_home() {
 	assert_eq!(reason_of(&summary, "Stray").as_deref(), Some("ScreenGui outside PlayerGui"));
 	assert_eq!(reason_of(&summary, "Board.BackSide").as_deref(), Some("facing away from camera"));
 
+	// 4. With an invalid ROR_RUR path on a multi-frame video: Board.Visible is skipped with the
+	//    ROR_RUR reason and stderr emits the warning exactly once across all frames (no per-frame spam).
+	let stale_rur = root.join("does-not-exist-rur");
+	let out_stale = root.join("out-stale-rur-video");
+	let output = base_cmd(None, false)
+		.env("ROR_RUR", &stale_rur)
+		.args(["video", model.to_str().unwrap(), "--camera", camera, "--duration", "0.5", "--fps", "10", "--format", "png", "--size", "64x64", "--msaa", "1", "--no-bloom", "--no-service", "--offline", "--out", out_stale.to_str().unwrap()])
+		.output()
+		.unwrap();
+	assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+	let stderr = String::from_utf8_lossy(&output.stderr);
+	let warning_count = stderr.matches("ROR_RUR points at").count();
+	assert_eq!(warning_count, 1, "invalid ROR_RUR must warn once across a multi-frame clip, got {warning_count} in:\n{stderr}");
+	let summary: serde_json::Value = serde_json::from_slice(&std::fs::read(out_stale.join("summary.json")).unwrap()).unwrap();
+	assert_eq!(summary["frames"].as_u64(), Some(5));
+	assert_eq!(summary["guis"]["drawn"], serde_json::json!([]));
+	assert!(reason_of(&summary, "Board.Visible").as_deref().is_some_and(|r| r.contains("ROR_RUR points at")), "{summary}");
+
 	let _ = std::fs::remove_dir_all(&root);
 }

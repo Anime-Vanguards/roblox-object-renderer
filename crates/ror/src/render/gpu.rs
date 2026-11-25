@@ -30,9 +30,6 @@ pub struct Gpu {
 	cache_file: Option<PathBuf>,
 	/// The size of what was last written (written again only when it grew).
 	cache_written: Mutex<usize>,
-	/// The driver refused the cache this process started from: the content store's copy is written
-	/// again whatever its size.
-	store_stale: std::sync::atomic::AtomicBool,
 	/// Bytes written through the queue since its last submission ([`Gpu::uploaded`])
 	pending_uploads: std::sync::atomic::AtomicU64,
 	/// The submissions made through [`Gpu::submit`] and which the GPU has done, and the one thread that
@@ -569,9 +566,17 @@ impl Gpu {
 		{
 			let name = format!("pipelines/{key}");
 			let state = crate::output::state_dir();
-			let file = state.join(&name);
-			// a state dir without one starts from the content store's (what another build or checkout
-			// made on this machine: the driver checks it is its own)
+			let state_file = state.join(&name);
+			// Keep one canonical pipeline cache file: in the shared content store when enabled (and
+			// no state-local override already exists), else in the state dir, so cold/growth saves
+			// write the cache once rather than twice.
+			let file = if state_file.is_file() {
+				state_file
+			} else if let Some(store) = crate::output::store_dir() {
+				store.join(&name)
+			} else {
+				state_file
+			};
 			let data = crate::output::read_state_file(&state, &name).filter(|data| data.len() <= MAX_PIPELINE_CACHE);
 			read_len = data.as_ref().map_or(0, Vec::len);
 			// SAFETY: the data is what `get_data` wrote for an adapter with the same key (the file name);
@@ -581,14 +586,13 @@ impl Gpu {
 		} else {
 			(None, None)
 		};
-		// what the file holds, unless the driver refused it (a driver update's pipelineCacheUUID: it starts
-		// from an empty cache, and the file is written again once this process's pipelines are in it; kept
-		// as written, a stale file that no later process outgrew made every process compile every
-		// pipeline, ~0.6 s, as a driver given a cache of the application's own keeps none of its own)
-		let file_len = cache_file.as_ref().and_then(|file| std::fs::metadata(file).ok()).map_or(0, |metadata| metadata.len() as usize);
+		// What the file holds, unless the driver refused it (a driver update's pipelineCacheUUID
+		// resets the cache to a tiny empty header, well under half the file). A driver that accepts
+		// the cache may repack/align it slightly differently between runs without compiling any new
+		// pipelines, so treat `loaded >= read_len / 2` as accepted to avoid rewriting on warm runs.
 		let loaded = pipeline_cache.as_ref().and_then(|cache| cache.get_data()).map_or(0, |data| data.len());
-		let written = if loaded >= file_len { file_len } else { 0 };
-		let store_stale = std::sync::atomic::AtomicBool::new(loaded < read_len);
+		let accepted = read_len > 0 && loaded >= read_len / 2;
+		let written = if accepted { loaded.max(read_len) } else { 0 };
 		let timeline = if adapter_info.backend == wgpu::Backend::Vulkan { Timeline::new(&adapter, &device) } else { None };
 		let tracker = Arc::new(Tracker {
 			state: Mutex::new(Track::default()),
@@ -609,7 +613,6 @@ impl Gpu {
 			pipeline_cache,
 			cache_file,
 			cache_written: Mutex::new(written),
-			store_stale,
 			pending_uploads: std::sync::atomic::AtomicU64::new(0),
 			tracker,
 			poller: Mutex::new(None),
@@ -821,8 +824,8 @@ impl Gpu {
 		}
 	}
 
-	/// Writes the pipeline cache to disk when it holds more than the file (after the renderer made its
-	/// pipelines, and after any made later).
+	/// Writes the pipeline cache to disk once when it holds meaningfully more than the file (after
+	/// the renderer made its pipelines, and after any lazy pipeline added later).
 	pub fn save_pipeline_cache(&self) {
 		let (Some(cache), Some(file)) = (&self.pipeline_cache, &self.cache_file) else {
 			return;
@@ -831,7 +834,7 @@ impl Gpu {
 			return;
 		};
 		let mut written = self.cache_written.lock();
-		if data.len() <= *written || data.len() > MAX_PIPELINE_CACHE {
+		if data.len() > MAX_PIPELINE_CACHE || (*written > 0 && data.len() <= *written + 1024) {
 			return;
 		}
 		if let Some(parent) = file.parent() {
@@ -839,15 +842,16 @@ impl Gpu {
 		}
 		if crate::output::write_atomic(file, &data).is_ok() {
 			*written = data.len();
-		}
-		// the content store keeps the largest a process made (and one the driver took over one it refused)
-		if let Some(store) = crate::output::store_dir()
-			&& let Some(name) = file.file_name()
-		{
-			let kept = store.join("pipelines").join(name);
-			let stale = self.store_stale.load(std::sync::atomic::Ordering::Relaxed);
-			if (stale || std::fs::metadata(&kept).map_or(0, |metadata| metadata.len() as usize) < data.len()) && crate::output::write_atomic(&kept, &data).is_ok() {
-				self.store_stale.store(false, std::sync::atomic::Ordering::Relaxed);
+		} else if let Some(name) = file.file_name() {
+			// Fall back to the state dir if the shared store is unwritable.
+			let fallback = crate::output::state_dir().join("pipelines").join(name);
+			if fallback != *file {
+				if let Some(parent) = fallback.parent() {
+					let _ = std::fs::create_dir_all(parent);
+				}
+				if crate::output::write_atomic(&fallback, &data).is_ok() {
+					*written = data.len();
+				}
 			}
 		}
 	}

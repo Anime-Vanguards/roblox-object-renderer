@@ -1364,7 +1364,9 @@ pub struct RendererInner {
 	/// Skinned meshes posed by their Bones (skinning.rs)
 	skins: skinning::Skins,
 	beams: beams::BeamPipelines,
-	ids: ids::IdPipelines,
+	/// Per-part id and Highlight mask pipelines, built lazily the first time a scene draws
+	/// Highlights, `--ids`, or `--layers` so plain renders neither compile nor cache them.
+	ids: std::sync::OnceLock<ids::IdPipelines>,
 	particles: particles::ParticlePipelines,
 	/// Image-space post effects (post.rs)
 	post: post::PostPipelines,
@@ -1863,13 +1865,12 @@ impl Renderer {
 			(Pipelines::new(device, cache), post.join().expect("the post pipelines' thread"))
 		});
 		let frame_layout = &pipelines.frame_layout;
-		let (beams, ids, particles, guis) = std::thread::scope(|scope| {
+		let (beams, particles, guis) = std::thread::scope(|scope| {
 			let beams = scope.spawn(|| beams::BeamPipelines::new(device, frame_layout, cache));
-			let ids = scope.spawn(|| ids::IdPipelines::new(device, frame_layout, cache));
 			let particles = scope.spawn(|| particles::ParticlePipelines::new(device, frame_layout, cache));
 			let guis = guis::GuiPipelines::new(device, frame_layout, cache);
 			let made = "the effects' pipelines' threads";
-			(beams.join().expect(made), ids.join().expect(made), particles.join().expect(made), guis)
+			(beams.join().expect(made), particles.join().expect(made), guis)
 		});
 		let white = GpuTexture::solid(&gpu, "white", [255, 255, 255, 255], TextureUse::Color);
 		let normal = GpuTexture::solid(&gpu, "flat normal", [128, 128, 255, 255], TextureUse::Data);
@@ -2080,7 +2081,7 @@ impl Renderer {
 				materials: Mutex::new(HashMap::new()),
 				skins: skinning::Skins::default(),
 				beams,
-				ids,
+				ids: std::sync::OnceLock::new(),
 				particles,
 				post,
 				guis,
@@ -2101,6 +2102,16 @@ impl Renderer {
 				recent_keys: Mutex::default(),
 				residency_from: std::sync::atomic::AtomicU64::new(residency::FEEDBACK_FROM),
 			}),
+		})
+	}
+
+	/// Builds (once) the per-part id and Highlight mask pipelines on first use so renders with no
+	/// Highlights, `--ids`, or `--layers` never compile or cache them.
+	fn id_pipelines(&self) -> &ids::IdPipelines {
+		self.ids.get_or_init(|| {
+			let pipelines = ids::IdPipelines::new(&self.gpu.device, &self.pipelines.frame_layout, self.gpu.pipeline_cache.as_ref());
+			self.gpu.save_pipeline_cache();
+			pipelines
 		})
 	}
 
@@ -2506,9 +2517,19 @@ impl Renderer {
 			HashMap::new()
 		} else {
 			// What was resolved ahead (a video frame's), plus any missing keys retried at draw time
-			// (restoring recovery for GUIs that failed transiently during prefetch while avoiding
-			// duplicate warnings; persistent failures stay cached in `self.gui_failures`).
-			let rest: Vec<&guis::GuiDraw> = gui_draws.iter().copied().filter(|draw| draw.keys().any(|key| !ready.contains_key(&key))).collect();
+			// (restoring recovery for GUIs that failed transiently during prefetch while never
+			// retrying permanent environment causes like missing/invalid `rur` and avoiding duplicate
+			// warnings; persistent `rur` call failures stay cached in `self.gui_failures`).
+			let rest: Vec<&guis::GuiDraw> = gui_draws
+				.iter()
+				.copied()
+				.filter(|draw| {
+					draw.keys().any(|key| {
+						!ready.contains_key(&key)
+							&& !gui_failures.get(&key).is_some_and(|reason| guis::is_unrecoverable_gui_skip(reason))
+					})
+				})
+				.collect();
 			if !rest.is_empty() {
 				let mut retry_warnings = Vec::new();
 				let mut retry_failures = HashMap::new();
@@ -3513,7 +3534,11 @@ impl Renderer {
 			Some(viewport) => environment::viewport_light(viewport),
 			None => environment::direct_light(scene.environment.clock_time, scene.environment.geographic_latitude, scene.environment.environment_diffuse_scale),
 		};
-		let highlights = highlights::PreparedHighlights::new(lease.device(), &self.ids, &scene.highlights, &geometry.part_draws, geometry.instance_count);
+		let highlights = if scene.highlights.is_empty() {
+			None
+		} else {
+			highlights::PreparedHighlights::new(lease.device(), self.id_pipelines(), &scene.highlights, &geometry.part_draws, geometry.instance_count)
+		};
 		Ok(Prepared { geometry, casters: None, immutable: !scene.live, lights, environment, sun_shadows: scene.environment.global_shadows && scene.environment.sun_shadow_maps && direct.strength.max_element() > 0.0, bounds, sun_direction: direct.direction, sun_strength: direct.strength, beam_textures, trail_textures, highlights, particles })
 	}
 
@@ -5660,7 +5685,7 @@ impl Renderer {
 		// ViewRequest::texture: the image stays on the GPU, without what is composited after a readback
 		let keep = request.texture;
 		let gui_layer = if keep { None } else { self.encode_gui_overlays(&mut encoder, prepared, view_guis, &camera, width, height, &profile) };
-		let highlight_mask = if keep { None } else { prepared.highlights.as_ref().map(|prepared_highlights| highlights::encode_mask(device, &mut encoder, &self.ids, prepared_highlights, &frame_group, &prepared.draws, width, height, &profile)) };
+		let highlight_mask = if keep { None } else { prepared.highlights.as_ref().map(|prepared_highlights| highlights::encode_mask(device, &mut encoder, self.id_pipelines(), prepared_highlights, &frame_group, &prepared.draws, width, height, &profile)) };
 		let part_ids = (request.ids && !keep).then(|| {
 			let mut ids = vec![0u32; prepared.instance_count.max(1)];
 			for (part, draw) in prepared.part_draws.iter().enumerate() {
@@ -5668,8 +5693,9 @@ impl Renderer {
 					ids[*instance as usize] = part as u32 + 1;
 				}
 			}
-			let group = self.ids.bind_group(device, &ids);
-			ids::encode_part_ids(device, &mut encoder, &self.ids, &group, &frame_group, &prepared.draws, width, height, &profile)
+			let id_pipelines = self.id_pipelines();
+			let group = id_pipelines.bind_group(device, &ids);
+			ids::encode_part_ids(device, &mut encoder, id_pipelines, &group, &frame_group, &prepared.draws, width, height, &profile)
 		});
 		let layers = (request.layers && !keep).then(|| {
 			let mut owners = vec![0u32; prepared.instance_count.max(1)];
@@ -5683,12 +5709,13 @@ impl Renderer {
 					*owner = draw.decal_order.0 + 1;
 				}
 			}
+			let id_pipelines = self.id_pipelines();
 			let pipelines = self.layers.get_or_init(|| {
 				let pipelines = ids::LayerPipelines::new(device, &self.pipelines.frame_layout, self.gpu.pipeline_cache.as_ref());
 				self.gpu.save_pipeline_cache();
 				pipelines
 			});
-			ids::encode_layers(device, &mut encoder, &self.ids, pipelines, &owners, prepared.part_draws.len(), &frame_group, &prepared.draws, width, height, &profile)
+			ids::encode_layers(device, &mut encoder, id_pipelines, pipelines, &owners, prepared.part_draws.len(), &frame_group, &prepared.draws, width, height, &profile)
 		});
 		let bytes_per_row = (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
 		let readback_size = bytes_per_row as u64 * height as u64;
@@ -8070,6 +8097,32 @@ mod blend_order_tests {
 				.collect();
 			assert_eq!(drawn, over, "{effects}, part {height} studs tall, eye {eye:?} looking at {target:?}: the rows drawn over the face (read {read:?})");
 		}
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	#[test]
+	fn id_pipelines_build_lazily_on_first_id_or_highlight_render() {
+		let state = std::env::temp_dir().join(format!("ror-lazy-ids-test-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&state);
+		std::fs::create_dir_all(&state).unwrap();
+		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		assert!(renderer.ids.get().is_none(), "IdPipelines should not compile before first use");
+
+		let mut model = ModelBuilder::new("Box");
+		model.part(&PartSpec { name: "Block".into(), ..Default::default() });
+		let scene = crate::scene::extract::extract(&model.into_document());
+		let plain = ViewRequest { width: 64, height: 64, msaa: 1, bloom: false, ..Default::default() };
+		let _ = renderer.render(&scene, std::slice::from_ref(&plain)).unwrap();
+		assert!(renderer.ids.get().is_none(), "plain render without Highlights, --ids, or --layers must leave IdPipelines uncompiled");
+
+		let with_ids = ViewRequest { ids: true, ..plain };
+		let (images, _) = renderer.render(&scene, std::slice::from_ref(&with_ids)).unwrap();
+		assert!(images[0].ids.is_some());
+		assert!(renderer.ids.get().is_some(), "--ids render must lazily initialize IdPipelines");
+
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
 	}

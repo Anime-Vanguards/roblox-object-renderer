@@ -80,7 +80,7 @@ Built-in VFX review lints (`crates/ror/src/lint.rs`, summarized to stderr and li
 
 | Field | What it reports |
 |---|---|
-| `frameStats` | Per-frame `{time, frame, nearWhite, bright, luma, playbackMs, particleMs, particleSubsteps, prepareMs, drawMs, readbackMs}` (plus `repeated: true` when reused): brightness metrics alongside per-frame playback/extraction, particle stepping/simulation (and evaluated 60 Hz Rate substeps), prepare, draw, and readback times. |
+| `frameStats` | Per-frame `{time, frame, nearWhite, bright, luma}` brightness metrics (deterministic across runs). Set `ROR_PROFILE=1` to also include per-frame `{playbackMs, particleMs, particleSubsteps, prepareMs, drawMs, readbackMs}` (and `repeated: true` when reused). |
 | `weightless` | Active emitters flying faster than 8 studs/s with neither `Drag` nor `Acceleration`. |
 | `lint.fades` | Purely linear opacity fades (`sequence` keypoints on a line or linear `tween` keys). |
 | `lint.restraint` | Sibling emitters under one parent sharing duplicate textures (`duplicateTextures`) or mixing incompatible `LightEmission` ranges (`mixedBlends`, spread > 1 or mixed signs). |

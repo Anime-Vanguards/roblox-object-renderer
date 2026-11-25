@@ -905,6 +905,8 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 	} else {
 		render_in_groups(renderer, &scene, &requests, gpu)?
 	};
+	let mut warned_rur = std::collections::HashSet::new();
+	crate::render::guis::warn_invalid_rur_once(&mut warned_rur, &stats.gui_report);
 	stats.untrusted_stamp_hashes += input_untrusted;
 	let alone = match &job.alone {
 		Some(path) if images.iter().any(|image| image.ids.is_some()) => alone(renderer, &scene, path, &requests, &images, gpu)?,

@@ -57,6 +57,25 @@ const UNBUILT: &str = "unbuilt";
 /// How long a GUI whose content could not be drawn is not tried again.
 const FAILURE_TTL: Duration = Duration::from_secs(60);
 
+pub(crate) const RUR_NOT_FOUND_PREFIX: &str = "rur not found";
+pub(crate) const ROR_RUR_INVALID_PREFIX: &str = "ROR_RUR points at ";
+
+/// Whether a GUI skip reason is a permanent configuration/environment cause (missing `rur` or an
+/// explicitly invalid `ROR_RUR`) that cannot recover on a draw-time retry within the same run.
+pub(crate) fn is_unrecoverable_gui_skip(reason: &str) -> bool {
+	reason.starts_with(RUR_NOT_FOUND_PREFIX) || reason.starts_with(ROR_RUR_INVALID_PREFIX)
+}
+
+/// Emits a `crate::say` warning at most once per run per distinct invalid-`ROR_RUR` cause found in
+/// `report.skipped` (avoiding per-frame warning spam in multi-frame clips).
+pub(crate) fn warn_invalid_rur_once(warned: &mut std::collections::HashSet<String>, report: &crate::scene::guis::GuiReport) {
+	for skip in &report.skipped {
+		if skip.reason.starts_with(ROR_RUR_INVALID_PREFIX) && warned.insert(skip.reason.clone()) {
+			crate::say(&format!("warning: {}", skip.reason));
+		}
+	}
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 struct GuiVertex {
@@ -1038,8 +1057,7 @@ impl Renderer {
 				return (textures, images);
 			}
 			Err(problem) => {
-				crate::say(&format!("warning: {problem}"));
-				warnings.push(format!("{} GUIs not drawn: {problem}", missing.len()));
+				warnings.push(format!("GUIs not drawn: {problem}"));
 				for (_, key, ..) in &missing {
 					skipped.insert(*key, problem.clone());
 				}
@@ -2201,6 +2219,47 @@ mod tests {
 		assert_eq!(stats.guis, 1, "GUI must be drawn after draw-time retry recovers it");
 		assert_eq!(stats.gui_report.drawn.len(), 1, "recovered GUI must appear in gui_report.drawn: {:?}", stats.gui_report);
 		assert!(stats.gui_report.skipped.is_empty(), "recovered GUI must not remain in gui_report.skipped: {:?}", stats.gui_report);
+
+		// Permanent/unrecoverable causes (missing rur or stale ROR_RUR) must NOT be retried at
+		// draw time even if the key is missing from `ready`.
+		for cause in [
+			"rur not found (set ROR_RUR or RUR_HOME)",
+			"ROR_RUR points at /no/such/rur, which is not a rur checkout (expected cli/rur.mjs)",
+		] {
+			assert!(is_unrecoverable_gui_skip(cause));
+			let unrecoverable = (GuiTextures::new(), HashMap::from([(key, cause.to_string())]));
+			let (_pending, stats) = renderer
+				.submit_views(&scene, std::slice::from_ref(&view), None, None, Some(unrecoverable), None, None)
+				.expect("render skipping unrecoverable GUI retry");
+			assert_eq!(stats.guis, 0, "unrecoverable cause {cause:?} must not retry at draw time");
+			assert!(stats.gui_report.drawn.is_empty());
+			assert_eq!(stats.gui_report.skipped.len(), 1);
+			assert_eq!(stats.gui_report.skipped[0].reason, cause);
+		}
+
+		// `warn_invalid_rur_once` emits one warning per distinct invalid-ROR_RUR cause across many frames.
+		struct NoteSink(parking_lot::Mutex<Vec<String>>);
+		impl crate::Caller for NoteSink {
+			fn hear(&self, text: &str) {
+				self.0.lock().push(text.to_string());
+			}
+			fn gone(&self) -> bool {
+				false
+			}
+			fn setting(&self, _name: &str) -> Option<String> {
+				None
+			}
+		}
+		let sink = std::rc::Rc::new(NoteSink(parking_lot::Mutex::new(Vec::new())));
+		let mut report = crate::scene::guis::GuiReport::default();
+		report.record_skipped("Board.Sign", "ROR_RUR points at /stale/rur, which is not a rur checkout (expected cli/rur.mjs)");
+		let mut warned = std::collections::HashSet::new();
+		crate::for_caller(sink.clone(), || {
+			for _ in 0..10 {
+				warn_invalid_rur_once(&mut warned, &report);
+			}
+		});
+		assert_eq!(sink.0.lock().len(), 1, "invalid ROR_RUR must warn once per run per cause, got: {:?}", *sink.0.lock());
 
 		let _ = std::fs::remove_dir_all(&dir);
 	}
