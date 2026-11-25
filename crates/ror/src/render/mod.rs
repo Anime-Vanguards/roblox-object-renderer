@@ -824,8 +824,9 @@ mod surface_tests {
 		std::fs::write(&seen, b"paint").unwrap();
 		std::fs::write(&unseen, b"paint").unwrap();
 		let fresh = content_key(&uri(&seen));
-		// length, mtime, change time and the hash of a file read while recent
-		assert_eq!(fresh.rsplit_once('@').unwrap().1.split(':').count(), 4, "{fresh}");
+		let fresh_stamp = ror_assets::FileStamp::of(&seen).unwrap();
+		assert!(fresh_stamp.is_content_hashed(), "fresh file should be content-hashed: {fresh}");
+		assert_eq!(fresh, fresh_stamp.stamp_uri(&uri(&seen)));
 		let age = |file: &std::path::Path| {
 			let meta = std::fs::metadata(file).unwrap();
 			let since = |time: Option<std::time::SystemTime>| time.and_then(|time| time.elapsed().ok()).unwrap_or_default();
@@ -835,9 +836,15 @@ mod surface_tests {
 			std::thread::sleep(std::time::Duration::from_millis(100));
 		}
 		assert_eq!(content_key(&uri(&seen)), fresh, "the file's key changed as it aged");
-		let meta = std::fs::metadata(&unseen).unwrap();
-		let stamp = |time: Option<std::time::SystemTime>| time.and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |time| time.as_nanos());
-		assert_eq!(content_key(&uri(&unseen)), format!("{}@5:{}:{}", uri(&unseen), stamp(meta.modified().ok()), stamp(ror_assets::FileStamp::change_time(&unseen, &meta))));
+		// Rewriting the same bytes keeps the exact same content key (zero reload on no-op rebuilds).
+		std::fs::write(&seen, b"paint").unwrap();
+		assert_eq!(content_key(&uri(&seen)), fresh, "identical-byte rewrite changed content key");
+		let unseen_stamp = ror_assets::FileStamp::of(&unseen).unwrap();
+		let unseen_os = ror_assets::FileStamp::os_stamp(&unseen).unwrap();
+		if unseen_os.trusted {
+			assert!(!unseen_stamp.is_content_hashed(), "file first seen old on a trusted filesystem should not be hashed");
+		}
+		assert_eq!(content_key(&uri(&unseen)), unseen_stamp.stamp_uri(&uri(&unseen)));
 		let _ = std::fs::remove_dir_all(&dir);
 	}
 
