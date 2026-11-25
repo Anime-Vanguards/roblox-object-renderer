@@ -62,6 +62,25 @@ fn process_dead(_info: &ServiceInfo) -> bool {
 	false
 }
 
+/// Removes `path` only if it still names the same service record (`pid`, `started`, `build`),
+/// closing the race where a newly started service replaces the record between read and unlink.
+fn prune_if_same(path: &Path, expected: &ServiceInfo) -> bool {
+	let Some(current) = read_info(path) else {
+		return false;
+	};
+	if current.pid == expected.pid && current.started == expected.started && current.build == expected.build {
+		std::fs::remove_file(path).is_ok()
+	} else {
+		false
+	}
+}
+
+/// Whether `build` currently has a live, ready (non-shutting-down) service recorded in `state_dir`.
+pub(super) fn is_live_ready(state_dir: &Path, build: &str) -> bool {
+	let record = build_info_path(state_dir, build);
+	read_info(&record).is_some_and(|info| !process_dead(&info) && ready(&info, build))
+}
+
 /// Every recorded service of the state dir whose process is still alive (or cannot be proved dead);
 /// records of exited processes are removed so `status` and `stop` never stall probing dead ports.
 fn recorded(state_dir: &Path) -> Vec<ServiceInfo> {
@@ -75,8 +94,11 @@ fn recorded(state_dir: &Path) -> Vec<ServiceInfo> {
 			let path = entry.path();
 			let info = read_info(&path)?;
 			if process_dead(&info) {
-				let _ = std::fs::remove_file(&path);
-				return None;
+				if prune_if_same(&path, &info) {
+					return None;
+				}
+				let fresh = read_info(&path)?;
+				return (!process_dead(&fresh)).then_some(fresh);
 			}
 			Some(info)
 		})
@@ -122,7 +144,13 @@ pub fn ensure(state_dir: &Path, _offline: bool) -> Result<u16> {
 	let record = build_info_path(state_dir, &build);
 	if let Some(info) = read_info(&record) {
 		if process_dead(&info) {
-			let _ = std::fs::remove_file(&record);
+			if !prune_if_same(&record, &info)
+				&& let Some(fresh) = read_info(&record)
+				&& !process_dead(&fresh)
+				&& ready(&fresh, &build)
+			{
+				return Ok(fresh.port);
+			}
 		} else if ready(&info, &build) {
 			return Ok(info.port);
 		}
@@ -503,6 +531,33 @@ mod tests {
 		assert!(!dir.join("dead-offline.json").exists());
 		assert!(!dir.join("reused-pid.json").exists());
 		assert!(dir.join("live.json").exists());
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	#[test]
+	fn prune_if_same_preserves_record_replaced_by_newer_service() {
+		let state = std::env::temp_dir().join(format!("ror-prune-race-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&state);
+		let dir = services_dir(&state);
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("0.1.0-1-1.json");
+		let stale = ServiceInfo { port: 10001, pid: 999996, build: "0.1.0-1-1".into(), started: 100, source: None };
+		std::fs::write(&path, serde_json::to_string(&stale).unwrap()).unwrap();
+		// A freshly started service replaces the record at the same path before the stale reader unlinks.
+		let fresh = ServiceInfo { port: 10002, pid: std::process::id(), build: "0.1.0-1-1".into(), started: 200, source: None };
+		std::fs::write(&path, serde_json::to_string(&fresh).unwrap()).unwrap();
+		assert!(!prune_if_same(&path, &stale), "must not delete a record replaced by a newer service");
+		assert_eq!(read_info(&path).map(|info| (info.pid, info.port)), Some((fresh.pid, fresh.port)));
+		// Same PID with a newer `started` timestamp is also a different service instance.
+		let newer_start = ServiceInfo { started: 201, ..fresh.clone() };
+		std::fs::write(&path, serde_json::to_string(&newer_start).unwrap()).unwrap();
+		assert!(!prune_if_same(&path, &fresh), "must not delete a record with a newer started timestamp");
+		assert!(path.exists());
+		// When the record still matches the stale snapshot, pruning removes it.
+		let unchanged = dir.join("0.1.0-1-2.json");
+		std::fs::write(&unchanged, serde_json::to_string(&stale).unwrap()).unwrap();
+		assert!(prune_if_same(&unchanged, &stale), "matching stale record should be pruned");
+		assert!(!unchanged.exists());
 		let _ = std::fs::remove_dir_all(&state);
 	}
 }

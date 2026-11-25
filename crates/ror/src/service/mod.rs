@@ -88,6 +88,31 @@ pub fn build_of(id: &str) -> &str {
 	id.split('+').next().unwrap_or(id)
 }
 
+/// If `build` carries a legacy `+offline` tag (e.g. spawned as a successor by a pre-unification
+/// `--offline` service after a rebuild), returns the unified service build id without that tag.
+fn unified_build_for_legacy_offline(build: &str) -> Option<String> {
+	let mut parts = build.split('+');
+	let base = parts.next()?;
+	let mut had_offline = false;
+	let mut kept = vec![base];
+	for part in parts {
+		if part == "offline" {
+			had_offline = true;
+		} else {
+			kept.push(part);
+		}
+	}
+	had_offline.then(|| kept.join("+"))
+}
+
+/// Whether `build` is a legacy `+offline` service whose unified service is already live and ready.
+fn legacy_offline_superseded(state_dir: &Path, build: &str) -> bool {
+	let Some(unified) = unified_build_for_legacy_offline(build) else {
+		return false;
+	};
+	client::is_live_ready(state_dir, &unified)
+}
+
 fn id_of(build: &str, _offline: bool, environment: impl Iterator<Item = (String, String)>) -> String {
 	let mut id = build.to_string();
 	let mut settings: Vec<(String, String)> = environment.filter(|(name, _)| changes_output(name)).collect();
@@ -415,7 +440,11 @@ pub fn serve(options: ServeOptions) -> Result<()> {
 	if let Some(source) = options.source.clone() {
 		successor(state.clone(), source, options.state_dir.clone());
 	}
-	let info_files = [build_info_path(&options.state_dir, &info.build), info_path(&options.state_dir)];
+	let mut info_files = vec![build_info_path(&options.state_dir, &info.build)];
+	// Avoid clobbering `service.json` when a legacy `+offline` successor is already superseded by a live unified service.
+	if !legacy_offline_superseded(&options.state_dir, &info.build) {
+		info_files.push(info_path(&options.state_dir));
+	}
 	std::fs::create_dir_all(services_dir(&options.state_dir))?;
 	for file in &info_files {
 		output::write_atomic(file, serde_json::to_string_pretty(&info)?.as_bytes())?;
@@ -476,6 +505,15 @@ pub fn serve(options: ServeOptions) -> Result<()> {
 				// idle means no jobs (a status poller must not keep it up); a recent request still holds it for the job it precedes
 				let quiet = state.last_activity.lock().elapsed();
 				let running = state.running.load(Ordering::SeqCst);
+				// A legacy `+offline` successor spawned by an older service retires once the unified service is live.
+				if running == 0
+					&& !state.shutting_down.load(Ordering::SeqCst)
+					&& state.started.elapsed() >= Duration::from_secs(2)
+					&& legacy_offline_superseded(&state.state_dir, &state.build)
+				{
+					eprintln!("ror: unified service for {} is already up; retiring legacy offline service", build_of(&state.build));
+					state.shutting_down.store(true, Ordering::SeqCst);
+				}
 				// handed over: a client that asked this one's health a moment before still sends its job here
 				let leaving = state.shutting_down.load(Ordering::SeqCst) && (!state.handed_over.load(Ordering::SeqCst) || quiet > HANDOVER_GRACE);
 				if running == 0 && (leaving || (since_job > idle && quiet > REQUEST_GRACE)) {
@@ -975,5 +1013,84 @@ mod tests {
 			assert!(Instant::now() < deadline, "the client's end was never seen");
 			std::thread::sleep(Duration::from_millis(20));
 		}
+	}
+
+	/// A service started with `--offline` keeps every request offline even without `X-ROR-Offline: 1`,
+	/// exercising `request_offline`'s `state.offline ||` branch through `counted`.
+	#[test]
+	fn service_started_offline_keeps_requests_offline_without_header() {
+		let dir = std::env::temp_dir().join(format!("ror-service-offline-flag-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		let adapter = GpuAdapter::find().expect("a GPU (or software adapter)");
+		let adapter_info = adapter.adapter.get_info();
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: false, ..ror_assets::AssetConfig::new(&dir) });
+		let state = Arc::new_cyclic(|me| State {
+			me: me.clone(),
+			adapter,
+			adapter_info,
+			assets,
+			awake: RwLock::new(None),
+			waking: Mutex::new(()),
+			wakes: AtomicU64::new(0),
+			wake_ms: AtomicU64::new(0),
+			last_wake: Mutex::new(Instant::now()),
+			scenes: SceneCache::default(),
+			gpu: crate::budget::GpuGate::default(),
+			started: Instant::now(),
+			last_activity: Mutex::new(Instant::now()),
+			last_job: Mutex::new(Instant::now()),
+			running: AtomicU64::new(0),
+			done: AtomicU64::new(0),
+			failed: AtomicU64::new(0),
+			shutting_down: AtomicBool::new(false),
+			build: "test-offline-build".into(),
+			warming: AtomicBool::new(false),
+			state_dir: dir.clone(),
+			offline: true,
+			source: None,
+			idle: Duration::from_secs(60),
+			handed_over: AtomicBool::new(false),
+		});
+		let plain_request = http::Request { method: "POST".into(), path: "/render".into(), headers: vec![("x-ror".into(), "1".into())], body: Vec::new() };
+		let offline = request_offline(&state, &plain_request);
+		assert!(offline, "service started with offline=true must treat requests without X-ROR-Offline as offline");
+		let (status, body) = counted(&state, offline, |renderer| Ok(serde_json::json!({ "offline": renderer.assets.offline() })));
+		assert_eq!(status, 200);
+		assert_eq!(body["offline"], true, "counted must dispatch to the offline renderer when state.offline is true");
+		drop(state);
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	/// A legacy `+offline` successor detects when the unified service for its build is live and ready,
+	/// and does not mistake a shutting-down or unified service as superseded.
+	#[test]
+	fn legacy_offline_successor_detects_live_unified_service() {
+		assert_eq!(unified_build_for_legacy_offline("0.1.0-1-2+offline").as_deref(), Some("0.1.0-1-2"));
+		assert_eq!(unified_build_for_legacy_offline("0.1.0-1-2+deadbeef+offline").as_deref(), Some("0.1.0-1-2+deadbeef"));
+		assert_eq!(unified_build_for_legacy_offline("0.1.0-1-2"), None);
+
+		let state_dir = std::env::temp_dir().join(format!("ror-legacy-offline-retire-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&state_dir);
+		std::fs::create_dir_all(services_dir(&state_dir)).unwrap();
+
+		let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+		let port = listener.local_addr().unwrap().port();
+		let server = std::thread::spawn(move || {
+			for body in [br#"{"ok":true,"shuttingDown":false}"#.as_slice(), br#"{"ok":true,"shuttingDown":true}"#.as_slice()] {
+				let (stream, _) = listener.accept().unwrap();
+				let _ = http::read_request(&stream);
+				let _ = http::write_response(&stream, 200, "application/json", body);
+			}
+		});
+		let info = ServiceInfo { port, pid: std::process::id(), build: "0.1.0-1-2".into(), started: unix_now(), source: None };
+		std::fs::write(build_info_path(&state_dir, &info.build), serde_json::to_string(&info).unwrap()).unwrap();
+
+		assert!(legacy_offline_superseded(&state_dir, "0.1.0-1-2+offline"), "live unified service must supersede legacy +offline");
+		assert!(!legacy_offline_superseded(&state_dir, "0.1.0-1-2"), "unified service must never supersede itself");
+		assert!(!legacy_offline_superseded(&state_dir, "0.1.0-1-2+offline"), "shutting-down unified service must not supersede legacy +offline");
+
+		server.join().unwrap();
+		let _ = std::fs::remove_dir_all(&state_dir);
 	}
 }
