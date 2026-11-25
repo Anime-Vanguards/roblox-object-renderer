@@ -1017,7 +1017,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 				}
 				Ok(document)
 			};
-			let reload: Option<&dyn Fn() -> Result<scene::load::Document>> = (job.playback.is_none() && job.map.is_none()).then_some(&reload as _);
+			let reload: Option<&dyn Fn() -> Result<scene::load::Document>> = (playback.is_none() && job.map.is_none()).then_some(&reload as _);
 			Some(crate::cost::run(renderer, &scene, document, options, &job.views, &shots, &out, gpu, reload, &job.input, lent)?)
 		}
 		_ => None,
@@ -1501,6 +1501,69 @@ mod tests {
 		assert!((after.parts[0].size.x - 2.0).abs() < 1e-4, "returning to A must load A, not cached B");
 		let (hit, cached_hit) = scenes.load(&model, None, None, false).unwrap();
 		assert!(cached_hit && (hit.parts[0].size.x - 2.0).abs() < 1e-4, "settled A should cache normally");
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	/// `ror cost --playback <file> --edits <edits>` must recognize `playback_file` as a playback
+	/// (not reload the bare model file without playback for `--edits` trials).
+	#[test]
+	fn cost_edits_refuses_playback_file_just_like_inline_playback() {
+		let state = std::env::temp_dir().join(format!("ror-cost-playback-file-edits-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&state);
+		std::fs::create_dir_all(&state).unwrap();
+		let mut model = crate::scene::build::ModelBuilder::new("Model");
+		model.part(&crate::scene::build::PartSpec { name: "Box".into(), size: glam::Vec3::splat(4.0), ..Default::default() });
+		let rbxm = state.join("model.rbxm");
+		std::fs::write(&rbxm, model.to_rbxm().unwrap()).unwrap();
+		let playback_path = state.join("playback.json");
+		std::fs::write(&playback_path, r#"{"time":0.5,"actions":[{"at":0.25,"target":"Model.Box","set":{"Transparency":0.5}}]}"#).unwrap();
+
+		let gpu = std::sync::Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let scenes = SceneCache::default();
+		let mut cost = crate::cost::CostOptions {
+			attribute: true,
+			no_images: true,
+			edits: Some(crate::cost::edits::EditsFile {
+				edits: vec![crate::cost::edits::Edit::Hide { targets: vec!["Model.Box".into()], classes: Vec::new() }],
+				..Default::default()
+			}),
+			..Default::default()
+		};
+		let job = Job {
+			input: rbxm.display().to_string(),
+			select: None,
+			out: Some(state.join("out")),
+			views: vec![NamedView {
+				name: "front".into(),
+				view: ViewRequest {
+					width: 32,
+					height: 32,
+					msaa: 1,
+					bloom: false,
+					camera: CameraSpec::LookAt { eye: [0.0, 0.0, 12.0], target: [0.0; 3], fov: 50.0 },
+					..Default::default()
+				},
+			}],
+			no_png: true,
+			compact_png: false,
+			materials_from: None,
+			lighting_from: None,
+			map: None,
+			playback: None,
+			playback_file: Some(playback_path),
+			playback_overlay: None,
+			playback_time: None,
+			alone: None,
+			collision: None,
+			cost: Some(std::mem::take(&mut cost)),
+			relative_to: None,
+			focus: None,
+			frame: None,
+		};
+		let err = run(&renderer, &scenes, &job).expect_err("--edits with playbackFile must not silently reload bare file without playback");
+		assert!(err.to_string().contains("not a playback"), "unexpected error: {err:#}");
 		let _ = std::fs::remove_dir_all(&state);
 	}
 }

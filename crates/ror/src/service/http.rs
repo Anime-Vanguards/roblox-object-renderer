@@ -30,8 +30,9 @@ const BODY_CHUNK: usize = 1 << 20;
 /// How reading an HTTP request can fail.
 #[derive(Debug)]
 pub enum ReadError {
-	/// `Content-Length` exceeded the configured body limit.
-	TooLarge { length: usize, limit: usize },
+	/// `Content-Length` exceeded the configured body limit. `unread` is the number of body bytes
+	/// not yet read from the socket (after what `BufReader` already pulled in while parsing headers).
+	TooLarge { length: usize, limit: usize, unread: usize },
 	/// Malformed HTTP, timeout, or I/O failure.
 	Other(anyhow::Error),
 }
@@ -50,7 +51,7 @@ impl From<std::io::Error> for ReadError {
 
 pub fn read_request(stream: &TcpStream) -> Result<Request> {
 	read_request_with_limit(stream, MAX_BODY).map_err(|error| match error {
-		ReadError::TooLarge { length, limit } => anyhow!("request body is {length} bytes, over the {limit}-byte limit"),
+		ReadError::TooLarge { length, limit, .. } => anyhow!("request body is {length} bytes, over the {limit}-byte limit"),
 		ReadError::Other(error) => error,
 	})
 }
@@ -87,7 +88,8 @@ pub fn read_request_with_limit(stream: &TcpStream, limit: usize) -> std::result:
 		None => 0,
 	};
 	if length > limit {
-		return Err(ReadError::TooLarge { length, limit });
+		let unread = length.saturating_sub(reader.buffer().len());
+		return Err(ReadError::TooLarge { length, limit, unread });
 	}
 	// Stream the body in chunks so large payloads never pre-allocate gigabytes before bytes arrive.
 	let mut body = Vec::with_capacity(length.min(BODY_CHUNK));
@@ -123,19 +125,36 @@ pub fn write_response(mut stream: &TcpStream, status: u16, content_type: &str, b
 	Ok(())
 }
 
-/// Writes an HTTP response and closes the connection cleanly so Windows does not send a TCP RST
-/// (`os error 10053`) that drops the error body while the client still has unread bytes in flight.
+/// Writes an HTTP response and drains the client's unread bytes before closing so Windows does not
+/// send a TCP RST (`os error 10053`) that drops the error body while a synchronous client is still
+/// writing a large request body. When `expected_unread` is `Some(n)`, stops draining as soon as all
+/// `n` remaining body bytes arrive (or the client closes), bounded by a 10 s safety cap.
 pub fn write_response_and_close(stream: &TcpStream, status: u16, content_type: &str, body: &[u8]) -> Result<()> {
+	write_response_and_drain(stream, status, content_type, body, None)
+}
+
+pub fn write_response_and_drain(stream: &TcpStream, status: u16, content_type: &str, body: &[u8], expected_unread: Option<usize>) -> Result<()> {
 	let written = write_response(stream, status, content_type, body);
 	let _ = stream.shutdown(Shutdown::Write);
-	let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
-	let deadline = Instant::now() + Duration::from_millis(250);
-	let mut sink = [0u8; 8192];
+	let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+	let deadline = Instant::now() + if expected_unread.is_some() { Duration::from_secs(10) } else { Duration::from_millis(250) };
+	let mut sink = vec![0u8; 64 * 1024];
 	let mut reader = stream;
+	let mut remaining = expected_unread;
 	while Instant::now() < deadline {
-		match reader.read(&mut sink) {
-			Ok(0) | Err(_) => break,
-			Ok(_) => {}
+		if remaining == Some(0) {
+			break;
+		}
+		let want = remaining.map_or(sink.len(), |left| left.min(sink.len()));
+		match reader.read(&mut sink[..want]) {
+			Ok(0) => break,
+			Ok(n) => {
+				if let Some(left) = &mut remaining {
+					*left = left.saturating_sub(n);
+				}
+			}
+			Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+			Err(_) => break,
 		}
 	}
 	written

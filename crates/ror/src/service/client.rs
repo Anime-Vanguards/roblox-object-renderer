@@ -475,11 +475,21 @@ fn job_header(offline: bool) -> String {
 	header
 }
 
+fn check_body_size(len: usize, limit: usize) -> Result<()> {
+	if len > limit {
+		return Err(refused(format!(
+			"request body is {len} bytes, over the {limit}-byte service limit (pass large playbacks via playbackFile instead of inline)"
+		)));
+	}
+	Ok(())
+}
+
 /// Sends a job; every way it fails says why. The service may have exited between the health check and
 /// the request, or crashed on it: a request not sent, or one whose connection closed unanswered, is sent
 /// again once. One sent and unanswered within `timeout` is not: its job may still run there (a job sent
 /// twice was drawn twice, once for nobody).
 fn post(state_dir: &Path, route: &str, body: &[u8], offline: bool, timeout: Duration) -> Result<serde_json::Value> {
+	check_body_size(body.len(), http::MAX_BODY)?;
 	let log = state_dir.join("serve.log");
 	let header = job_header(offline);
 	let mut attempt = 0;
@@ -515,9 +525,14 @@ fn post_once(port: u16, route: &str, header: &str, body: &[u8], timeout: Duratio
 					Some(error) => error.to_string(),
 					None => format!("the render service answered {status} without saying why: {value} (its log: {})", log.display()),
 				};
-				// HTTP 400 comes from the job itself failing validation or asset lookup; any other
-				// non-200 status (403, 404, 413, 500, 503, ...) means the service refused or broke.
-				return if status == 400 { PostAttempt::JobError(anyhow!("{message}")) } else { PostAttempt::Refused(format!("HTTP {status}: {message}")) };
+				// Only real service refusals (payload too large, throttled, unavailable) trigger
+				// in-process fallback. HTTP 400 job failures, 500 panics/internal errors, and other
+				// non-refusal statuses surface directly with the service's message.
+				return match status {
+					413 | 429 | 503 => PostAttempt::Refused(format!("HTTP {status}: {message}")),
+					400 => PostAttempt::JobError(anyhow!("{message}")),
+					_ => PostAttempt::JobError(anyhow!("render service HTTP {status}: {message}")),
+				};
 			}
 			PostAttempt::Ok(value)
 		}
@@ -608,17 +623,19 @@ mod tests {
 		let _ = std::fs::remove_dir_all(&state);
 	}
 
-	/// Service refusals (403, 413, 500, 503, non-JSON) classify as `Refused` so the CLI falls back
-	/// to in-process rendering, while HTTP 400 job errors stay `JobError`.
+	/// Only real refusals (413, 429, 503, non-JSON) classify as `Refused` for in-process fallback;
+	/// HTTP 500 panics/internal errors, 400 job failures, and 403/404 surface directly as `JobError`.
 	#[test]
 	fn service_refusal_is_distinguished_from_job_error() {
 		let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
 		let port = listener.local_addr().unwrap().port();
 		let server = std::thread::spawn(move || {
-			let replies: [(u16, &[u8]); 4] = [
-				(500, br#"{"error":"request body rejected"}"#),
-				(413, br#"{"error":"payload too large"}"#),
+			let replies: [(u16, &[u8]); 6] = [
+				(500, br#"{"error":"the render panicked"}"#),
+				(403, br#"{"error":"forbidden"}"#),
 				(400, br#"{"error":"no such file"}"#),
+				(413, br#"{"error":"payload too large"}"#),
+				(429, br#"{"error":"busy"}"#),
 				(503, b"not json"),
 			];
 			for (status, body) in replies {
@@ -629,10 +646,18 @@ mod tests {
 		});
 		let log = PathBuf::from("serve.log");
 		let header = "X-ROR: 1";
-		assert!(matches!(post_once(port, "/render", header, b"{}", Duration::from_secs(5), &log), PostAttempt::Refused(msg) if msg.contains("HTTP 500") && msg.contains("request body rejected")));
-		assert!(matches!(post_once(port, "/render", header, b"{}", Duration::from_secs(5), &log), PostAttempt::Refused(msg) if msg.contains("HTTP 413")));
+		assert!(matches!(post_once(port, "/render", header, b"{}", Duration::from_secs(5), &log), PostAttempt::JobError(err) if !is_refused(&err) && err.to_string().contains("HTTP 500") && err.to_string().contains("the render panicked")));
+		assert!(matches!(post_once(port, "/render", header, b"{}", Duration::from_secs(5), &log), PostAttempt::JobError(err) if !is_refused(&err) && err.to_string().contains("HTTP 403")));
 		assert!(matches!(post_once(port, "/render", header, b"{}", Duration::from_secs(5), &log), PostAttempt::JobError(err) if !is_refused(&err) && err.to_string().contains("no such file")));
+		assert!(matches!(post_once(port, "/render", header, b"{}", Duration::from_secs(5), &log), PostAttempt::Refused(msg) if msg.contains("HTTP 413")));
+		assert!(matches!(post_once(port, "/render", header, b"{}", Duration::from_secs(5), &log), PostAttempt::Refused(msg) if msg.contains("HTTP 429")));
 		assert!(matches!(post_once(port, "/render", header, b"{}", Duration::from_secs(5), &log), PostAttempt::Refused(msg) if msg.contains("not JSON")));
 		server.join().unwrap();
+
+		// Pre-flight body size check refuses over-limit bodies before opening a socket.
+		assert!(check_body_size(1024, 1024).is_ok());
+		let err = check_body_size(http::MAX_BODY + 1, http::MAX_BODY).unwrap_err();
+		assert!(is_refused(&err), "over-limit pre-flight must classify as refused: {err:#}");
+		assert!(err.to_string().contains("playbackFile"), "pre-flight error should name playbackFile: {err:#}");
 	}
 }
