@@ -811,6 +811,42 @@ mod surface_tests {
 		assert_eq!(content_key(&transcode::image_key("rbxassetid://123")), transcode::image_key("rbxassetid://123"));
 	}
 
+	/// A character composite whose clothing template is a local file gets a stamped cache key (both
+	/// in `content_key` and in prepared geometry keys) so replacing that local template redraws it.
+	#[test]
+	fn a_rewritten_local_clothing_template_changes_composite_key() {
+		let file = std::env::temp_dir().join(format!("ror-composite-stamp-{}.png", std::process::id()));
+		let old_mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+		std::fs::write(&file, b"shirt-a").unwrap();
+		std::fs::File::options().write(true).open(&file).unwrap().set_modified(old_mtime).unwrap();
+		let uri = format!("file:///{}", file.display().to_string().replace('\\', "/"));
+		let local_comp = crate::scene::character::Composite {
+			layout: crate::scene::character::Layout::R6,
+			colors: vec![[1.0, 1.0, 1.0]; 5],
+			pants: None,
+			shirt: Some(crate::scene::character::Layer { image: uri.clone(), tint: [1.0, 1.0, 1.0] }),
+			graphic: None,
+		};
+		let local_key = composite::key(&local_comp);
+		assert!(names_local_file(&local_key));
+		let before = content_key(&local_key);
+		std::fs::write(&file, b"shirt-b").unwrap();
+		std::fs::File::options().write(true).open(&file).unwrap().set_modified(old_mtime).unwrap();
+		assert_ne!(before, content_key(&local_key), "replaced local clothing template must invalidate composite key");
+		let _ = std::fs::remove_file(&file);
+
+		let remote_comp = crate::scene::character::Composite {
+			layout: crate::scene::character::Layout::R6,
+			colors: vec![[1.0, 1.0, 1.0]; 5],
+			pants: None,
+			shirt: Some(crate::scene::character::Layer { image: "rbxassetid://123".into(), tint: [1.0, 1.0, 1.0] }),
+			graphic: None,
+		};
+		let remote_key = composite::key(&remote_comp);
+		assert!(!names_local_file(&remote_key));
+		assert_eq!(content_key(&remote_key), remote_key);
+	}
+
 	/// An unchanged local file keeps its key once its times pass the 2 s it is read and hashed in: a scene
 	/// drawn from a file written just before was prepared again when drawn after that. A file first seen
 	/// old is keyed by its stamp alone, unread.
@@ -5861,6 +5897,9 @@ fn tune_spec() -> Option<(f32, f32, f32)> {
 /// between jobs; ror-assets re-reads such a file by the same stamp). Other URIs as they are.
 /// Whether `uri` names a local file ([`content_key`] stamps its key with the file's).
 pub(crate) fn names_local_file(uri: &str) -> bool {
+	if uri.starts_with(composite::KEY_PREFIX) {
+		return composite::has_local_file(uri);
+	}
 	let path = uri.split_once('#').map_or(uri, |(path, _)| path);
 	if let Some((scheme, _)) = path.split_once(':')
 		&& scheme.len() > 1
@@ -5873,6 +5912,9 @@ pub(crate) fn names_local_file(uri: &str) -> bool {
 }
 
 pub(crate) fn content_key(uri: &str) -> String {
+	if uri.starts_with(composite::KEY_PREFIX) {
+		return composite::stamped_key(uri);
+	}
 	let path = uri.split_once('#').map_or(uri, |(path, _)| path);
 	// a URI with a scheme other than file: (rbxassetid://, a transcode's or a composite's key) names no
 	// local file, and parsing a key no scheme matches looks for one on disk: 36,500 file probes in the

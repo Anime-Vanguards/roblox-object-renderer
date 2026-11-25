@@ -627,7 +627,7 @@ impl Key {
 			for layer in [pants, shirt, graphic] {
 				key.optional(layer.as_ref(), |key, layer| {
 					let crate::scene::character::Layer { image, tint } = layer;
-					key.text(image);
+					key.content(image);
 					key.floats(tint);
 				});
 			}

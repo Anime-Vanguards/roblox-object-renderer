@@ -24,6 +24,30 @@ fn from_key(key: &str) -> Option<Composite> {
 	serde_json::from_str(key.strip_prefix(KEY_PREFIX)?).ok()
 }
 
+/// Whether any clothing template layer in a composite URI names a local file.
+pub(super) fn has_local_file(uri: &str) -> bool {
+	let Some(composite) = from_key(uri) else {
+		return false;
+	};
+	[&composite.pants, &composite.shirt, &composite.graphic].into_iter().flatten().any(|layer| super::names_local_file(&layer.image))
+}
+
+/// Cache key for a composite URI: unchanged when all layers are remote assets, or with each local
+/// template layer's file stamp folded in so a replaced local clothing image invalidates the cache.
+pub(super) fn stamped_key(uri: &str) -> String {
+	let Some(mut composite) = from_key(uri) else {
+		return uri.to_string();
+	};
+	let mut stamped = false;
+	for layer in [&mut composite.pants, &mut composite.shirt, &mut composite.graphic].into_iter().flatten() {
+		if super::names_local_file(&layer.image) {
+			layer.image = super::content_key(&layer.image);
+			stamped = true;
+		}
+	}
+	if stamped { key(&composite) } else { uri.to_string() }
+}
+
 /// A compositing mesh: positions in target pixels (y up), uv in its source image.
 struct Sheet {
 	positions: Vec<[f32; 2]>,
