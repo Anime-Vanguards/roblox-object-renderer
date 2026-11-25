@@ -22,10 +22,6 @@
 //! Draws within the GPU memory free ([`GpuGate`]): a draw (a still's group of views, a clip's frame)
 //! starts once the GPU has free what its targets add, beside what the draws starting before it may still
 //! take and a headroom, instead of the four draws at once the service allowed whatever the memory.
-//!
-//! Beside a game ([`crate::gaming`]) the floor counts the game's working set as taken, and every draw,
-//! one alone too, waits for the GPU's memory to have the headroom left: past full, Windows makes room by
-//! moving the game's own textures out, and every frame that samples one waits for it.
 
 use parking_lot::{Condvar, Mutex};
 use std::cell::Cell;
@@ -54,27 +50,16 @@ thread_local! {
 }
 
 /// Memory kept free for everything else: the floor a job waits for before it starts ([`crate::memory_floor`],
-/// `ROR_MEMORY_FLOOR_GB` as the job's caller sets it, [`crate::setting`]; 0 when that is off). While a game
-/// runs ([`crate::gaming`]), the default floor less the game's working set, and at least [`GAMING_FLOOR`]:
-/// the floor is room for programs to start and grow, and the game took its share when it loaded. With the
-/// game proxy's 10 GB held, 13.6-16.2 GB free and the floor of 7.4 GB, videos and sims asked for 4.2 GB
-/// each beside two running and gave up after 60 s: 28 and 31 of two heavy mixes' 78 jobs (2026-11-02).
+/// `ROR_MEMORY_FLOOR_GB` as the job's caller sets it, [`crate::setting`]; 0 when that is off,
+/// [`crate::DEFAULT_MEMORY_FLOOR`] = 4 GB by default). One mode-independent rule so a large foreground
+/// application never raises the bar or forces extra give-ups.
 pub fn floor() -> u64 {
 	let Some(total) = crate::total_memory() else {
 		return 0;
 	};
 	let setting = crate::setting("ROR_MEMORY_FLOOR_GB");
-	let Some(floor) = crate::memory_floor(total, setting.as_deref()) else {
-		return 0;
-	};
-	match crate::gaming::now().and_then(|gaming| gaming.working_set) {
-		Some(game) if setting.is_none() => floor.saturating_sub(game).max(GAMING_FLOOR.min(floor)),
-		_ => floor,
-	}
+	crate::memory_floor(total, setting.as_deref()).unwrap_or(0)
 }
-
-/// The least floor beside a game: its next level's loading and the file cache it streams through.
-pub const GAMING_FLOOR: u64 = 4 << 30;
 
 /// A reservation, given back when dropped, on the thread that took it.
 pub struct LoadGuard {
@@ -343,9 +328,8 @@ pub fn admit(what: &str, key: Option<String>, heuristic: Need, relieve: &dyn Fn(
 	let (started, limit) = (Instant::now(), crate::memory_wait());
 	let (mut told, mut relieved_at) = (false, None::<Instant>);
 	let mut jobs = JOBS.lock();
+	let floor = floor();
 	loop {
-		// read each round: a game starting or ending moves it (floor)
-		let floor = floor();
 		let now = Need::now();
 		if jobs.running == 0 {
 			if told {
@@ -540,27 +524,15 @@ impl Drop for GpuAdmission {
 }
 
 impl GpuGate {
-	/// Waits until a draw into `sets` fits ([`GpuGate`]) and admits it. Beside a game ([`crate::gaming`]) a
-	/// draw alone waits for the headroom too, and gives up after [`crate::memory_wait`] saying why: past
-	/// full, Windows makes room by moving the game's textures out (a game proxy's 7 GB set beside many
-	/// renders and Studios: 4.0 of its 7 GB resident at times, the System process's paging 50 % of a GPU
-	/// engine, 25 fps, 2026-11-02).
+	/// Waits until a draw into `sets` fits beside other draws ([`GpuGate`]) and admits it. A draw
+	/// alone or adding nothing starts immediately without waiting.
 	pub fn admit(&self, sets: &[TargetSet], free: &dyn Fn() -> Option<GpuFree>, relieve: &dyn Fn(u64) -> u64) -> anyhow::Result<GpuAdmission> {
-		self.admit_beside(sets, free, relieve, &crate::gaming::now)
-	}
-
-	/// [`GpuGate::admit`] with the game running given by `game` (each time it looks again).
-	pub fn admit_beside(&self, sets: &[TargetSet], free: &dyn Fn() -> Option<GpuFree>, relieve: &dyn Fn(u64) -> u64, game: &dyn Fn() -> Option<crate::gaming::Gaming>) -> anyhow::Result<GpuAdmission> {
 		let started = Instant::now();
-		let (mut relieved_at, mut waiting, mut told) = (None::<Instant>, false, false);
+		let (mut relieved_at, mut waiting) = (None::<Instant>, false);
 		let mut state = self.inner.state.lock();
 		loop {
 			let adds = state.adds(sets);
-			if adds == 0 {
-				break;
-			}
-			let gaming = game();
-			if state.draws == 0 && gaming.is_none() {
+			if adds == 0 || state.draws == 0 {
 				break;
 			}
 			let Some(GpuFree { free, total }) = free() else {
@@ -577,41 +549,6 @@ impl GpuGate {
 				let freed = relieve(short);
 				state = self.inner.state.lock();
 				if freed > 0 {
-					continue;
-				}
-			}
-			if let Some(gaming) = &gaming {
-				let reserved = state.reserved;
-				let why = || {
-					let game = match (&gaming.image, gaming.gpu) {
-						(Some(image), Some(gpu)) => format!("{image} holds {}, ", crate::gigabytes_text(gpu)),
-						_ => String::new(),
-					};
-					format!(
-						"it adds {} of GPU memory and {} of that is not to be had: {}{} of {} free, {} kept free beside the game, {} the draws starting with it take",
-						crate::gigabytes_text(adds),
-						crate::gigabytes_text(short),
-						game,
-						crate::gigabytes_text(free),
-						crate::gigabytes_text(total),
-						crate::gigabytes_text(headroom),
-						crate::gigabytes_text(reserved)
-					)
-				};
-				// not on the caller going: a clip's frames after its early sheet draw with the caller gone
-				let (waited, limit) = (started.elapsed(), crate::memory_wait());
-				if waited >= limit {
-					if waiting {
-						state.waiting -= 1;
-					}
-					anyhow::bail!("a draw gave up after waiting {:.0} s for GPU memory while a game runs: {}. ROR_MEMORY_WAIT=<seconds> sets the wait", waited.as_secs_f64(), why());
-				}
-				if !told {
-					told = true;
-					let line = format!("a draw waits for GPU memory while a game runs: {}. It starts when memory frees, and gives up after {:.0} s", why(), limit.as_secs_f64());
-					drop(state);
-					crate::say(&line);
-					state = self.inner.state.lock();
 					continue;
 				}
 			}
@@ -638,10 +575,6 @@ impl GpuGate {
 				None => state.sets.push((set.key, 1)),
 			}
 			keys.push(set.key);
-		}
-		if told {
-			drop(state);
-			crate::say(&format!("the draw starts after {:.1} s waiting for GPU memory", waited.as_secs_f64()));
 		}
 		Ok(GpuAdmission { inner: self.inner.clone(), reserved, keys, waited })
 	}
@@ -842,9 +775,8 @@ mod tests {
 		TargetSet { key: (width, width, 4), bytes, kept }
 	}
 
-	/// [`GpuGate::admit`] with no game running, whatever this machine runs while the tests do.
 	fn draw(gate: &GpuGate, sets: &[TargetSet], free: &dyn Fn() -> Option<GpuFree>, relieve: &dyn Fn(u64) -> u64) -> GpuAdmission {
-		gate.admit_beside(sets, free, relieve, &|| None).unwrap()
+		gate.admit(sets, free, relieve).unwrap()
 	}
 
 	#[test]
@@ -894,7 +826,10 @@ mod tests {
 				admitted.store(true, std::sync::atomic::Ordering::SeqCst);
 				assert!(second.waited >= Duration::from_millis(200), "{:?}", second.waited);
 			});
-			std::thread::sleep(Duration::from_millis(300));
+			while gate.status()["waiting"] == 0 {
+				std::thread::sleep(Duration::from_millis(10));
+			}
+			std::thread::sleep(Duration::from_millis(250));
 			assert!(!admitted.load(std::sync::atomic::Ordering::SeqCst), "started beside a draw it does not fit beside");
 			assert_eq!(gate.status()["waiting"], 1);
 			assert_eq!(relieved.load(std::sync::atomic::Ordering::SeqCst), 1, "waited without relieving first");
@@ -906,6 +841,9 @@ mod tests {
 		let first = draw(&gate, &[set(1024, GB, false)], &free, &relieve);
 		std::thread::scope(|scope| {
 			let waiter = scope.spawn(|| draw(&gate, &[set(4096, GB, false)], &free, &relieve).waited);
+			while gate.status()["waiting"] == 0 {
+				std::thread::sleep(Duration::from_millis(10));
+			}
 			std::thread::sleep(Duration::from_millis(150));
 			free_bytes.store(8 * GB, std::sync::atomic::Ordering::SeqCst);
 			assert!(waiter.join().unwrap() >= Duration::from_millis(100));
@@ -916,64 +854,50 @@ mod tests {
 	#[test]
 	fn a_draw_alone_starts_whatever_the_memory() {
 		let gate = GpuGate::default();
-		let admission = draw(&gate, &[set(8192, 12 * GB, false)], &|| Some(GpuFree { free: GB, total: 16 * GB }), &|_| 0);
+		let caller = std::rc::Rc::new(Listening { heard: Mutex::new(Vec::new()), wait: "0.2", gone: false });
+		let relieved = std::sync::atomic::AtomicUsize::new(0);
+		let admission = crate::for_caller(caller.clone(), || {
+			gate.admit(
+				&[set(8192, 12 * GB, false)],
+				&|| Some(GpuFree { free: GB, total: 16 * GB }),
+				&|_| {
+					relieved.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+					0
+				},
+			)
+		})
+		.expect("solo draw must always start");
 		assert!(admission.waited < Duration::from_millis(40));
+		assert_eq!(relieved.load(std::sync::atomic::Ordering::SeqCst), 0, "solo draw must not relieve or stall");
+		assert!(caller.heard.lock().is_empty(), "solo draw must not warn about waiting");
+		assert_eq!(gate.status()["waited"], 0);
+		drop(admission);
 		// and with no memory known (no Vulkan budget, no adapter counter), every draw starts
 		let unknown = draw(&gate, &[set(4096, 12 * GB, false)], &|| None, &|_| 0);
 		assert!(unknown.waited < Duration::from_millis(40));
 	}
 
-	fn a_game() -> Option<crate::gaming::Gaming> {
-		Some(crate::gaming::Gaming { image: Some("game.exe".into()), working_set: Some(9 * GB), private: Some(11 * GB), gpu: Some(7 * GB) })
-	}
-
 	#[test]
-	fn beside_a_game_a_draw_alone_waits_for_the_headroom_and_starts_when_memory_frees() {
-		let gate = GpuGate::default();
-		let free_bytes = std::sync::atomic::AtomicU64::new(GB);
-		let free = || Some(GpuFree { free: free_bytes.load(std::sync::atomic::Ordering::SeqCst), total: 16 * GB });
-		let relieved = std::sync::atomic::AtomicUsize::new(0);
-		let relieve = |_| {
-			relieved.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-			0
-		};
-		std::thread::scope(|scope| {
-			// 0.5 GB + 1.6 GB headroom > 1 GB free: it has the renderer's caches relieved, then waits
-			let waiter = scope.spawn(|| gate.admit_beside(&[set(1024, GB / 2, false)], &free, &relieve, &a_game).map(|admission| admission.waited));
-			std::thread::sleep(Duration::from_millis(200));
-			assert_eq!(gate.status()["waiting"], 1, "a draw alone started beside a game without the memory");
-			assert!(relieved.load(std::sync::atomic::Ordering::SeqCst) >= 1, "waited without relieving first");
-			free_bytes.store(4 * GB, std::sync::atomic::Ordering::SeqCst);
-			assert!(waiter.join().unwrap().unwrap() >= Duration::from_millis(150));
-		});
-		// a set kept from an earlier draw adds nothing and starts at once
-		let kept = gate.admit_beside(&[set(2048, GB, true)], &|| Some(GpuFree { free: 0, total: 16 * GB }), &relieve, &a_game).unwrap();
-		assert!(kept.waited < Duration::from_millis(40));
-	}
-
-	#[test]
-	fn beside_a_game_a_draw_that_never_fits_gives_up_after_the_wait_saying_why() {
-		let gate = GpuGate::default();
-		let caller = std::rc::Rc::new(Listening { heard: Mutex::new(Vec::new()), wait: "0.4", gone: false });
-		let started = Instant::now();
-		let result = crate::for_caller(caller.clone(), || gate.admit_beside(&[set(3840, 2 * GB, false)], &|| Some(GpuFree { free: GB, total: 16 * GB }), &|_| 0, &a_game));
-		let error = format!("{:#}", result.err().expect("admitted"));
-		assert!(started.elapsed() >= Duration::from_millis(400) && started.elapsed() < Duration::from_secs(10));
-		assert!(error.starts_with("a draw gave up after waiting 0 s for GPU memory while a game runs: ") && error.contains("game.exe holds 7.0 GB"), "{error}");
-		let heard = caller.heard.lock().clone();
-		assert!(heard.len() == 1 && heard[0].starts_with("a draw waits for GPU memory while a game runs: "), "{heard:?}");
-		assert_eq!(gate.status()["waiting"], 0);
-		assert_eq!(gate.status()["drawing"], 0);
-	}
-
-	#[test]
-	fn beside_a_game_a_draw_whose_caller_has_gone_still_waits_for_the_memory() {
-		// a clip's frames after its early sheet draw for a caller that has gone: they wait, they do not fail
-		let gate = GpuGate::default();
-		let caller = std::rc::Rc::new(Listening { heard: Mutex::new(Vec::new()), wait: "0.4", gone: true });
-		let started = Instant::now();
-		let result = crate::for_caller(caller, || gate.admit_beside(&[set(3840, 2 * GB, false)], &|| Some(GpuFree { free: GB, total: 16 * GB }), &|_| 0, &a_game));
-		assert!(result.is_err() && started.elapsed() >= Duration::from_millis(400), "gave up after {:?}", started.elapsed());
+	fn floor_uses_flat_4gb_default_and_honors_caller_setting() {
+		struct FloorSetting(Option<&'static str>);
+		impl crate::Caller for FloorSetting {
+			fn hear(&self, _text: &str) {}
+			fn gone(&self) -> bool {
+				false
+			}
+			fn setting(&self, name: &str) -> Option<String> {
+				(name == "ROR_MEMORY_FLOOR_GB").then(|| self.0.map(str::to_string)).flatten()
+			}
+		}
+		let expected_default = if crate::total_memory().is_some() { crate::DEFAULT_MEMORY_FLOOR } else { 0 };
+		if std::env::var_os("ROR_MEMORY_FLOOR_GB").is_none() {
+			assert_eq!(floor(), expected_default);
+		}
+		if crate::total_memory().is_some() {
+			assert_eq!(crate::for_caller(std::rc::Rc::new(FloorSetting(Some("2.5"))), floor), (2.5 * GB as f64) as u64);
+			assert_eq!(crate::for_caller(std::rc::Rc::new(FloorSetting(Some("0"))), floor), 0);
+			assert_eq!(crate::for_caller(std::rc::Rc::new(FloorSetting(Some("invalid"))), floor), crate::DEFAULT_MEMORY_FLOOR);
+		}
 	}
 
 	#[test]

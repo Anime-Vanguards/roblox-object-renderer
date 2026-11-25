@@ -325,7 +325,7 @@ const LONG_NAP: Duration = Duration::from_micros(250);
 const UPLOAD_FLUSH_BYTES: u64 = 64 << 20;
 
 /// Device-local GPU memory in bytes ([`Gpu::vram`]).
-#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Vram {
 	pub usage: u64,
 	pub budget: u64,
@@ -480,20 +480,10 @@ async fn find_adapter() -> Result<(wgpu::Instance, wgpu::Adapter)> {
 }
 
 /// Whether the device's queue asks for a low priority among every program's GPU work
-/// (VK_KHR_global_priority): `ROR_GPU_PRIORITY=low`, or `gaming` for while a game runs
-/// ([`crate::gaming`]); medium, the driver's default, otherwise. NVIDIA's driver puts a low queue in
-/// Windows' lower hardware-queue band (band 0 against 1, DxgKrnl's ChangeHwContextPriority), but beside
-/// the game proxy with a ror clip every 5 s it did not keep the proxy's frames shorter (2026-11-02, two
-/// runs each, others' GPU work in both: GPU-frame p99 22.4 and 14.7 ms low, 13.9 and 16.4 medium), and
-/// a monitor's idle GPU priority for background work, the same band, had stretched them (21.5-22.0 against
-/// 15.4-15.7 ms). The priority is fixed for a device's life: a service makes its device again on its
-/// next wake.
+/// (VK_KHR_global_priority): `ROR_GPU_PRIORITY=low`; medium, the driver's default, otherwise. The
+/// priority is fixed for a device's life: a service makes its device again on its next wake.
 pub fn wants_low_priority() -> bool {
-	match std::env::var("ROR_GPU_PRIORITY").ok().as_deref().map(str::trim) {
-		Some("low") => true,
-		Some("gaming") => crate::gaming::active(),
-		_ => false,
-	}
+	matches!(std::env::var("ROR_GPU_PRIORITY").ok().as_deref().map(str::trim), Some("low"))
 }
 
 /// A device whose queue has the low global priority ([`wants_low_priority`]), where Vulkan's driver

@@ -276,14 +276,6 @@ fn quiet_release() -> Duration {
 	quiet("ROR_QUIET_RELEASE", 10.0)
 }
 
-/// [`quiet_release`] while a game runs ([`crate::gaming`]): the next job wakes a dormant copy in
-/// 0.12-0.25 s, and the GPU memory a service holds between jobs (1.1-3.2 GB beside a game proxy,
-/// 2026-11-02) is the game's.
-const GAMING_QUIET_RELEASE: Duration = Duration::from_secs(2);
-
-/// How often a busy service checks the GPU's headroom while a game runs ([`Renderer::fit_vram`]).
-const GAMING_FIT_EVERY: Duration = Duration::from_secs(1);
-
 fn quiet(name: &str, default: f64) -> Duration {
 	Duration::from_secs_f64(std::env::var(name).ok().and_then(|value| value.parse::<f64>().ok()).unwrap_or(default))
 }
@@ -438,24 +430,12 @@ pub fn serve(options: ServeOptions) -> Result<()> {
 			let mut kept_rur = Instant::now();
 			// the job end whose leftovers were collected
 			let mut collected = None;
-			let quiet_release_set = quiet_release();
-			let (mut relieved, mut fitted) = (None, None::<Instant>);
+			let quiet_release = quiet_release();
+			let mut relieved = None;
 			loop {
 				std::thread::sleep(Duration::from_millis(250));
 				let last_job = *state.last_job.lock();
 				let since_job = last_job.elapsed();
-				// beside a game, the GPU memory a quiet service holds goes sooner (GAMING_QUIET_RELEASE)
-				let gaming = crate::gaming::active();
-				let quiet_release = if gaming { quiet_release_set.min(GAMING_QUIET_RELEASE) } else { quiet_release_set };
-				if gaming
-					&& state.running.load(Ordering::SeqCst) > 0
-					&& fitted.is_none_or(|at| at.elapsed() >= GAMING_FIT_EVERY)
-					&& let Some(awake) = state.awake_now()
-				{
-					// the draws' headroom beside a game, while jobs run (what renders keep for later goes first)
-					fitted = Some(Instant::now());
-					awake.renderer.fit_vram();
-				}
 				if state.running.load(Ordering::SeqCst) == 0 {
 					if let Some(done) = state.go_dormant(quiet_release) {
 						eprintln!("ror: {:.0} s without jobs: {done}", quiet_release.as_secs_f64());

@@ -18,7 +18,7 @@ ror render Model.rbxm --no-service   # Bypass the service for one invocation
 ## Process lifecycle
 
 - **Safe rebuilds:** Each service runs from a copy of the binary under `<state dir>/bin`, so recompiling `ror` never fails on a locked executable. When the source binary changes, the service spawns a successor from the new build and exits cleanly once the successor is ready (`ROR_SERVICE_SUCCESSOR=0` disables auto-handoff). Distinct builds sharing a state directory run side-by-side services; online and `--offline` callers of the same build share one service (`X-ROR-Offline: 1` forbids network access per request), and records of exited service processes are pruned automatically.
-- **Dormant mode & idle exit:** After `ROR_QUIET_RELEASE` seconds without jobs (default `10`, capped at `2` while a game is running), the service releases its GPU device and caches by handing off to a lightweight dormant process (~30 MB RSS holding only the GPU adapter; `ROR_SERVICE_HANDOVER=0` keeps it in-process). Waking on the next job takes 0.12–0.25 s. After `ROR_SERVICE_IDLE` seconds of inactivity (default `600`), it exits completely.
+- **Dormant mode & idle exit:** After `ROR_QUIET_RELEASE` seconds without jobs (default `10`), the service releases its GPU device and caches by handing off to a lightweight dormant process (~30 MB RSS holding only the GPU adapter; `ROR_SERVICE_HANDOVER=0` keeps it in-process). Waking on the next job takes 0.12–0.25 s. After `ROR_SERVICE_IDLE` seconds of inactivity (default `600`), it exits completely.
 - **Startup & Vulkan tuning:** Starts in under a second and prefers a discrete Vulkan GPU. On Windows it caches the selected driver in `<state dir>/gpu.json` (`ROR_VULKAN_FILTER=0` disables) and disables implicit Vulkan layers (overlays/capture hooks) unless `VK_LOADER_LAYERS_DISABLE` is set or `ROR_VULKAN_LAYERS=1`. Pipelines cache under `<state dir>/pipelines` (`ROR_PIPELINE_CACHE=0` disables).
 - **GPU clock warmup (`ror service warm` / `POST /warm`):** Runs a short GPU burst (at most 0.5 s, canceled immediately when a real job arrives) to wake an idle GPU out of low-power clocks before a clip starts.
 - **Working directory:** The service runs inside `<state dir>`, not the caller's working directory. Clients send absolute paths plus `relativeTo` for resolving relative asset links inside input files.
@@ -36,14 +36,14 @@ Idle assets remain resident on the GPU up to per-cache budgets (LRU eviction whe
 | Skyboxes | 64 MB | `ROR_SKY_CACHE_MB` |
 | Lighting environments | 64 MB | `ROR_ENVIRONMENT_CACHE_MB` |
 
-On Vulkan with `VK_EXT_memory_budget`, the service checks VRAM before each job and trims idle caches back toward 70% if usage passes 85% (reported under `caches.vram` in `/health`). While a game is detected running, it also trims during jobs whenever free VRAM drops below 10%. Direct3D 12 and Metal skip VRAM budget checks. (On Windows, GPU allocations also count against system commit.)
+Before each job, the service checks both adapter-wide free VRAM (when available on Windows) and Vulkan's `VK_EXT_memory_budget` (reported under `caches.vram` in `/health`), trimming idle caches if adapter-wide free VRAM drops below 10% or process usage passes 85% of budget (down to 70%). This never blocks a job or changes rendered output. (On Windows, GPU allocations also count against system commit.)
 
 ## Memory admission and concurrency limits
 
 To prevent concurrent callers from exhausting RAM or VRAM, the service gates job admission (`crate::budget::admit`). System and process memory accounting is implemented on **Windows only**; Linux and macOS run without memory floors, queues, or caps.
 
 On Windows:
-1. **Free-memory floor:** The first job starts only when free system RAM exceeds `ROR_MEMORY_FLOOR_GB` (default: `max(4 GB, 12% of RAM)`; `0` disables). If unavailable, it waits up to `ROR_MEMORY_WAIT` seconds (default `60`) before failing with a clear breakdown of memory needed vs. available.
+1. **Free-memory floor:** The first job starts only when free system RAM exceeds `ROR_MEMORY_FLOOR_GB` (default: `4 GB`; `0` disables). If unavailable, it waits up to `ROR_MEMORY_WAIT` seconds (default `60`) before failing with a clear breakdown of memory needed vs. available.
 2. **Concurrent job sizing:** Additional jobs start only when free RAM covers the floor, in-flight file parses, active job headroom, and the incoming job's estimate (either measured from a prior solo run or estimated via `budget::clip_need` / `budget::still_need`), while keeping the service under 85% of its commit cap.
 3. **Cache relief & queuing:** If memory is tight, idle caches are purged first; if still short, the job queues until an active job finishes (notifying the caller once) or times out after `ROR_MEMORY_WAIT` seconds. Active services also re-check and trim caches every 3 s while below the floor.
 4. **Hard process cap:** Each `ror` process (plus its `ffmpeg` and `rur` children) runs inside a Windows Job Object capping committed memory at `ROR_MAX_MEMORY_GB` (default: `max(6 GB, 40% of RAM)`; `0` disables) to fail cleanly on OOM instead of thrashing the OS.
@@ -52,8 +52,7 @@ Additional guardrails:
 - `ROR_MEMORY_FLOOR_GB` and `ROR_MEMORY_WAIT` are forwarded from the invoking CLI command.
 - Parsing `.rbxm`/`.rbxl` peaks around ~80x file size, so file loads reserve 100x file size and deduplicate concurrent loads of the same file.
 - Thread pools use half of logical cores, capped at 8 threads per pool (override with `RAYON_NUM_THREADS`).
-- Set `ROR_GAMING_STATUS` to a JSON status file (`crate::gaming`) to make `ror` yield VRAM and drop idle timers while a game is running.
-- On Vulkan (`VK_EXT_memory_budget`) or Windows adapter counters, service draws wait for free VRAM when needed (failing after `ROR_MEMORY_WAIT` if a game is active). Set `ROR_GPU_PRIORITY=low` to request low global Vulkan queue priority where supported.
+- On Vulkan (`VK_EXT_memory_budget`) or Windows adapter counters, concurrent service draws wait for free VRAM when needed (a solo draw always starts without waiting). Set `ROR_GPU_PRIORITY=low` to request low global Vulkan queue priority where supported.
 
 
 ## HTTP API

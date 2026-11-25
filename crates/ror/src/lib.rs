@@ -17,7 +17,6 @@
 pub mod budget;
 pub mod clean;
 pub mod cost;
-pub mod gaming;
 pub mod inspect;
 pub mod job;
 pub mod lint;
@@ -149,19 +148,21 @@ mod child_environment_tests {
 
 #[cfg(test)]
 mod memory_guard_tests {
-	use super::{memory_cap, memory_floor};
+	use super::{DEFAULT_MEMORY_FLOOR, memory_cap, memory_floor};
 	const GIB: u64 = 1 << 30;
 
 	#[test]
 	fn floor_and_cap_follow_the_machine_and_the_settings() {
-		// a 64 GB machine: 12 % and 40 %; a 16 GB one: the minimums
-		assert_eq!(memory_floor(62 * GIB, None), Some((62.0 * 0.12 * GIB as f64) as u64));
-		assert_eq!(memory_cap(62 * GIB, None), Some((62.0 * 0.4 * GIB as f64) as u64));
+		// floor defaults to a flat 4 GB in every mode (no stricter beside a game); cap is 40 % with a 6 GB minimum
+		assert_eq!(memory_floor(62 * GIB, None), Some(DEFAULT_MEMORY_FLOOR));
+		assert_eq!(memory_floor(128 * GIB, None), Some(DEFAULT_MEMORY_FLOOR));
 		assert_eq!(memory_floor(16 * GIB, None), Some(4 * GIB));
+		assert_eq!(memory_cap(62 * GIB, None), Some((62.0 * 0.4 * GIB as f64) as u64));
 		assert_eq!(memory_cap(8 * GIB, None), Some(6 * GIB));
 		// settings in gigabytes, 0 turning each off, anything else ignored
 		assert_eq!(memory_floor(62 * GIB, Some("2.5")), Some((2.5 * GIB as f64) as u64));
 		assert_eq!(memory_floor(62 * GIB, Some("0")), None);
+		assert_eq!(memory_floor(62 * GIB, Some("lots")), Some(DEFAULT_MEMORY_FLOOR));
 		assert_eq!(memory_cap(62 * GIB, Some(" 10 ")), Some(10 * GIB));
 		assert_eq!(memory_cap(62 * GIB, Some("0")), None);
 		assert_eq!(memory_cap(62 * GIB, Some("lots")), Some((62.0 * 0.4 * GIB as f64) as u64));
@@ -234,10 +235,14 @@ fn gigabytes(setting: Option<&str>) -> Option<Option<u64>> {
 	Some(if value > 0.0 { Some((value * GB) as u64) } else { None })
 }
 
-/// How much memory must be free before a job starts: `ROR_MEMORY_FLOOR_GB` (0: no floor), else 12 %
-/// of the machine's memory and at least 4 GB.
-pub fn memory_floor(total: u64, setting: Option<&str>) -> Option<u64> {
-	gigabytes(setting).unwrap_or_else(|| Some(((total as f64 * 0.12) as u64).max(4 << 30)))
+/// Default physical memory kept free for other programs before a job starts (4 GB): one rule in
+/// every mode, never stricter beside a large foreground application than the earlier relaxed floor.
+pub const DEFAULT_MEMORY_FLOOR: u64 = 4 << 30;
+
+/// How much memory must be free before a job starts: `ROR_MEMORY_FLOOR_GB` (0: no floor), else
+/// [`DEFAULT_MEMORY_FLOOR`] (4 GB).
+pub fn memory_floor(_total: u64, setting: Option<&str>) -> Option<u64> {
+	gigabytes(setting).unwrap_or(Some(DEFAULT_MEMORY_FLOOR))
 }
 
 /// The most memory one ror process may commit: `ROR_MAX_MEMORY_GB` (0: no cap), else 40 % of the
@@ -324,7 +329,6 @@ pub fn wait_for_memory(what: &str, need: u64, since: std::time::Instant) -> anyh
 	let (Some(total), Some(_)) = (total_memory(), available_memory()) else {
 		return Ok(());
 	};
-	// beside a game, the floor less what the game holds (budget::floor)
 	let floor = budget::floor();
 	if floor == 0 {
 		return Ok(());

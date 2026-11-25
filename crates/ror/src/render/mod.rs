@@ -2091,31 +2091,36 @@ impl Renderer {
 		)
 	}
 
-	/// Keeps this process within the GPU memory the system gives it ([`gpu::Gpu::vram`]: a budget that
-	/// shrinks as other programs, a game, take more). Past 85 % of it, what renders keep for later goes
-	/// until 70 % is in use: the targets and buffers kept between renders, preparations and shadow maps,
-	/// then the least recently used GUI images, textures, meshes and sky maps. Over the budget, the
-	/// system pages GPU memory out and every frame waits on it. Returns the memory before.
+	/// Keeps this process within both the adapter's measured free GPU memory ([`gpu::Gpu::free_memory`],
+	/// every program counted) and this process's budget ([`gpu::Gpu::vram`]): in every mode, when
+	/// adapter-wide free memory drops below [`crate::budget::GPU_HEADROOM_PERCENT`] (10 %) or process
+	/// usage passes 85 % of its budget (down to 70 %), what renders keep for later goes — unheld targets
+	/// and buffers, preparations, shadow maps, posed skins, then least recently used GUI images,
+	/// textures, meshes and sky maps. Only idle caches are released: no draw waits and no picture
+	/// changes. Returns this process's budget reading before relief, if available.
 	pub fn fit_vram(&self) -> Option<gpu::Vram> {
-		let vram = self.gpu.vram()?;
-		// beside a game the budget says too little (Windows' stays near the whole GPU whatever others hold):
-		// what the adapter has free with every program counted keeps crate::budget's headroom
-		if crate::gaming::active()
-			&& let Some(free) = self.gpu.free_memory()
-		{
+		self.fit_vram_with(self.gpu.vram(), self.gpu.free_memory())
+	}
+
+	pub(crate) fn fit_vram_with(&self, vram: Option<gpu::Vram>, free: Option<crate::budget::GpuFree>) -> Option<gpu::Vram> {
+		let adapter_short = free.map_or(0, |free| {
 			let headroom = free.total / 100 * crate::budget::GPU_HEADROOM_PERCENT;
-			if free.free < headroom {
-				let freed = self.relieve(headroom - free.free);
-				eprintln!("ror: {} MB of the GPU free beside a game, under the {} MB kept free: let go of {} MB kept for later renders", free.free >> 20, headroom >> 20, freed >> 20);
+			headroom.saturating_sub(free.free)
+		});
+		let budget_short = vram.map_or(0, |vram| if vram.usage > vram.budget / 100 * 85 { vram.usage.saturating_sub(vram.budget / 100 * 70) } else { 0 });
+		let goal = adapter_short.max(budget_short);
+		if goal > 0 {
+			let freed = self.relieve(goal);
+			if adapter_short >= budget_short
+				&& let Some(free) = free
+			{
+				let headroom = free.total / 100 * crate::budget::GPU_HEADROOM_PERCENT;
+				eprintln!("ror: {} MB of the GPU free, under the {} MB headroom: let go of {} MB kept for later renders", free.free >> 20, headroom >> 20, freed >> 20);
+			} else if let Some(vram) = vram {
+				eprintln!("ror: GPU memory {} MB in use of a {} MB budget: let go of {} MB kept for later renders", vram.usage >> 20, vram.budget >> 20, freed >> 20);
 			}
-			return Some(vram);
 		}
-		if vram.usage <= vram.budget / 100 * 85 {
-			return Some(vram);
-		}
-		let freed = self.relieve(vram.usage.saturating_sub(vram.budget / 100 * 70));
-		eprintln!("ror: GPU memory {} MB in use of a {} MB budget: let go of {} MB kept for later renders", vram.usage >> 20, vram.budget >> 20, freed >> 20);
-		Some(vram)
+		vram
 	}
 
 	/// Lets go of what renders keep for later ones until `goal` bytes are freed, while renders draw (none
@@ -2296,9 +2301,8 @@ impl Renderer {
 
 	#[allow(clippy::too_many_arguments)]
 	fn submit_views(&self, scene: &Scene, views: &[ViewRequest], sky: Option<PreparedSky>, video: Option<VideoReadback>, guis: Option<guis::GuiTextures>, gate: Option<&crate::budget::GpuGate>, kept: Option<(&ClipKept, bool)>) -> Result<(Vec<PendingView<'_>>, RenderStats)> {
-		// within the GPU's free memory, until its views are submitted (what they took shows in its use then);
-		// beside a game, short of it, what no render holds goes too (textures and meshes read again later)
-		let relieve = |goal| if crate::gaming::active() { self.relieve(goal) } else { self.release_unheld_targets() };
+		// within the GPU's free memory, until its views are submitted (what they took shows in its use then)
+		let relieve = |_| self.release_unheld_targets();
 		let admission = gate.map(|gate| gate.admit(&self.target_sets(views), &|| self.gpu.free_memory(), &relieve)).transpose()?;
 		let ao = kept.map(|(kept, keep)| ao::HistoryUse { history: &kept.ao, keep });
 		let residency = kept.map(|(kept, keep)| (&kept.residency, keep));
@@ -7214,6 +7218,59 @@ mod camera_reuse_tests {
 		let store_tex_count = std::fs::read_dir(&store_tex_dir).map(|entries| entries.flatten().filter(|e| e.path().extension().is_some_and(|ext| ext == "tex")).count()).unwrap_or(0);
 		assert_eq!(store_tex_count, 0, "offline transcode fallback must not publish a .tex file to the shared store");
 		drop((fallback_tex, offline, online));
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	/// `fit_vram_with` relieves idle caches whenever measured adapter-wide free VRAM falls below
+	/// `GPU_HEADROOM_PERCENT` (even when this process's Vulkan budget still looks ample or is absent),
+	/// keeps caches under healthy headroom, and never changes rendered pixels or blocks a solo draw.
+	#[test]
+	fn fit_vram_relieves_idle_caches_on_adapter_free_headroom_and_preserves_pixels() {
+		const GIB: u64 = 1 << 30;
+		let state = std::env::temp_dir().join(format!("ror-fit-vram-headroom-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&state);
+		let renderer = warmed(&state);
+		let scene = scene();
+		let request = view([14.0, 9.0, -16.0]);
+		let gate = crate::budget::GpuGate::default();
+		let (before, _) = renderer.render_gated(&scene, std::slice::from_ref(&request), Some(&gate)).unwrap();
+		let prep_before = renderer.preparations.stats().0;
+		let reuse_before = renderer.reuse.stats().0;
+		assert!(prep_before > 0 && reuse_before > 0, "render must populate idle caches (prep={prep_before}, reuse={reuse_before})");
+
+		let ample_vram = Some(super::gpu::Vram { usage: GIB, budget: 16 * GIB });
+		let healthy_free = Some(crate::budget::GpuFree { free: 10 * GIB, total: 16 * GIB });
+		let low_free = Some(crate::budget::GpuFree { free: 512 << 20, total: 16 * GIB });
+
+		// Healthy adapter headroom and ample budget keep idle caches warm.
+		assert_eq!(renderer.fit_vram_with(ample_vram, healthy_free), ample_vram);
+		assert_eq!(renderer.preparations.stats().0, prep_before, "healthy headroom must not evict preparations");
+		assert_eq!(renderer.reuse.stats().0, reuse_before, "healthy headroom must not evict reused targets");
+
+		// Low adapter-wide free VRAM (< 10% headroom) relieves idle caches even while process budget usage is low.
+		assert_eq!(renderer.fit_vram_with(ample_vram, low_free), ample_vram);
+		assert_eq!(renderer.preparations.stats().0, 0, "low adapter free VRAM must relieve idle preparations");
+		assert_eq!(renderer.reuse.stats().0, 0, "low adapter free VRAM must relieve unheld targets");
+
+		// Next gated render draws byte-identical pixels without waiting and repopulates caches.
+		let (after, _) = renderer.render_gated(&scene, std::slice::from_ref(&request), Some(&gate)).unwrap();
+		assert_eq!(before[0].rgba, after[0].rgba, "cache relief must not change rendered pixels");
+		assert_eq!(gate.status()["waited"], 0, "solo draw must never wait after cache relief");
+		assert!(renderer.preparations.stats().0 > 0 && renderer.reuse.stats().0 > 0);
+
+		// Works even without VK_EXT_memory_budget (`vram == None`) when adapter counter shows low free VRAM.
+		assert_eq!(renderer.fit_vram_with(None, low_free), None);
+		assert_eq!(renderer.preparations.stats().0, 0, "adapter free relief must still run when vram budget is None");
+		assert_eq!(renderer.reuse.stats().0, 0);
+
+		// Process VRAM budget threshold (> 85% usage) still relieves when adapter counter is absent.
+		let _ = renderer.render_gated(&scene, std::slice::from_ref(&request), Some(&gate)).unwrap();
+		assert!(renderer.preparations.stats().0 > 0);
+		let high_vram = Some(super::gpu::Vram { usage: 15 * GIB, budget: 16 * GIB });
+		assert_eq!(renderer.fit_vram_with(high_vram, None), high_vram);
+		assert_eq!(renderer.preparations.stats().0, 0, "process budget over 85% must still relieve idle caches");
+
+		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
 	}
 }
