@@ -811,6 +811,36 @@ mod surface_tests {
 		assert_eq!(content_key(&transcode::image_key("rbxassetid://123")), transcode::image_key("rbxassetid://123"));
 	}
 
+	/// An unchanged local file keeps its key once its times pass the 2 s it is read and hashed in: a scene
+	/// drawn from a file written just before was prepared again when drawn after that. A file first seen
+	/// old is keyed by its stamp alone, unread.
+	#[test]
+	fn a_local_file_keeps_its_key_as_it_ages() {
+		let dir = std::env::temp_dir().join(format!("ror-aging-key-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		let uri = |file: &std::path::Path| format!("file:///{}", file.display().to_string().replace('\\', "/").replace(' ', "%20"));
+		let (seen, unseen) = (dir.join("seen.png"), dir.join("unseen.png"));
+		std::fs::write(&seen, b"paint").unwrap();
+		std::fs::write(&unseen, b"paint").unwrap();
+		let fresh = content_key(&uri(&seen));
+		// length, mtime, change time and the hash of a file read while recent
+		assert_eq!(fresh.rsplit_once('@').unwrap().1.split(':').count(), 4, "{fresh}");
+		let age = |file: &std::path::Path| {
+			let meta = std::fs::metadata(file).unwrap();
+			let since = |time: Option<std::time::SystemTime>| time.and_then(|time| time.elapsed().ok()).unwrap_or_default();
+			since(meta.modified().ok()).min(since(file_change_time(file, &meta)))
+		};
+		while age(&seen).min(age(&unseen)) < std::time::Duration::from_millis(2100) {
+			std::thread::sleep(std::time::Duration::from_millis(100));
+		}
+		assert_eq!(content_key(&uri(&seen)), fresh, "the file's key changed as it aged");
+		let meta = std::fs::metadata(&unseen).unwrap();
+		let stamp = |time: Option<std::time::SystemTime>| time.and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |time| time.as_nanos());
+		assert_eq!(content_key(&uri(&unseen)), format!("{}@5:{}:{}", uri(&unseen), stamp(meta.modified().ok()), stamp(file_change_time(&unseen, &meta))));
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
 	/// A local image rewritten under its path is drawn anew while geometry prepared with its first
 	/// version still holds that version's material: the service drew a repainted sheet's old paint for as
 	/// long as renders followed one another.
@@ -5896,16 +5926,42 @@ fn content_key_for_stamp(uri: &str, file: &std::path::Path, len: u64, modified_t
 	// unchanged files.
 	let is_recent = |time: Option<std::time::SystemTime>| time.is_some_and(|time| time.elapsed().map_or(true, |age| age < std::time::Duration::from_secs(2)));
 	let recent = modified_time.is_none() || is_recent(modified_time) || is_recent(change_time);
-	if recent
-		&& len <= 64 << 20
-		&& let Ok(bytes) = std::fs::read(file)
-	{
-		let hash = blake3::hash(&bytes);
-		format!("{uri}@{len}:{modified}:{changed}:{}", &hash.to_hex()[..16])
-	} else {
-		format!("{uri}@{len}:{modified}:{changed}")
+	let stamped = format!("{uri}@{len}:{modified}:{changed}");
+	if len > 64 << 20 {
+		return stamped;
 	}
+	// The hash a file's key took while it was recent stays in its key once it is old, so an unchanged file
+	// keeps one key as it ages: its scene's kept preparation and its material are found again. A scene drawn
+	// from a file written just before was prepared again when drawn 2 s later (on CI's software adapter,
+	// its first render alone took 9.5 s). Once old, the file is read once more (a rewrite in the last tick
+	// it was read in keeps its stamp) and then no more; a file first seen old is never read.
+	let hashes = FILE_HASHES.get_or_init(Default::default);
+	let stamp = (file.to_path_buf(), len, modified, changed);
+	if !recent {
+		match hashes.lock().get(&stamp) {
+			None => return stamped,
+			Some((hash, true)) => return format!("{stamped}:{hash}"),
+			Some((_, false)) => {}
+		}
+	}
+	let Ok(bytes) = std::fs::read(file) else {
+		return stamped;
+	};
+	let hash = blake3::hash(&bytes).to_hex()[..16].to_string();
+	let mut hashes = hashes.lock();
+	if hashes.len() >= FILE_HASHES_KEPT {
+		hashes.clear();
+	}
+	hashes.insert(stamp, (hash.clone(), !recent));
+	format!("{stamped}:{hash}")
 }
+
+/// The hashes local files' keys took ([`content_key_for_stamp`]), by path and stamp (length, mtime and
+/// change time in nanoseconds): the hash, and whether it was read once the file was old (settled).
+type FileHashes = Mutex<HashMap<(std::path::PathBuf, u64, u128, u128), (String, bool)>>;
+static FILE_HASHES: std::sync::OnceLock<FileHashes> = std::sync::OnceLock::new();
+/// The most files [`FILE_HASHES`] holds; past it, it starts again (each file's key may change once).
+const FILE_HASHES_KEPT: usize = 4096;
 
 pub(crate) fn content_key(uri: &str) -> String {
 	let path = uri.split_once('#').map_or(uri, |(path, _)| path);
