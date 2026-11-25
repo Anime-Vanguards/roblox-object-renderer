@@ -7137,6 +7137,68 @@ mod camera_reuse_tests {
 		let _ = std::fs::remove_dir_all(&state);
 	}
 
+	/// A clip frame prepared on an offline view that hit a silent fallback (uncached `TexturePack`
+	/// with a local `ColorMap`, leaving `stats.missing` empty) must NOT mark its parts reusable in
+	/// `ClipKept`, so subsequent frames re-prepare instead of carrying the silent fallback forward.
+	#[test]
+	fn silent_offline_pack_fallback_is_not_reusable_across_clip_frames() {
+		let state = std::env::temp_dir().join(format!("ror-silent-pack-clip-reusable-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&state);
+		std::fs::create_dir_all(&state).unwrap();
+		let gpu = Arc::new(super::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let config = ror_assets::AssetConfig { offline: false, store: None, studio_content: Some(state.join("no-studio")), ..ror_assets::AssetConfig::new(&state) };
+		let online_assets = ror_assets::Assets::new(config);
+		let online = Renderer::new(gpu, online_assets.clone()).expect("a renderer");
+		let offline = online.with_assets(online_assets.with_offline(true));
+		let png = state.join("albedo.png");
+		crate::output::write_png(&png, 4, 4, &[200, 100, 50, 255].repeat(16), true).unwrap();
+		let png_uri = format!("file:///{}", png.display().to_string().replace('\\', "/").replace(' ', "%20"));
+		let build_scene = |mover_x: f32| {
+			let mut model = ModelBuilder::new("SilentPackClip");
+			model.part(&PartSpec { name: "Block".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, 2.0, 0.0)), size: Vec3::splat(4.0), ..Default::default() });
+			model.part(&PartSpec { name: "Mover".into(), cframe: Affine3A::from_translation(Vec3::new(mover_x, 2.0, 0.0)), size: Vec3::splat(2.0), ..Default::default() });
+			let mut scene = crate::scene::extract::extract(&model.into_document());
+			Arc::make_mut(&mut scene.parts[0]).surface_appearance = Some(crate::scene::SurfaceAppearance {
+				color_map: Some(png_uri.clone()),
+				normal_map: None,
+				metalness_map: None,
+				roughness_map: None,
+				texture_pack: Some("rbxassetid://9090910".into()),
+				alpha_mode: 0,
+				color: Vec3::ONE,
+				emissive_mask: None,
+				emissive_strength: 0.0,
+				emissive_tint: Vec3::ONE,
+			});
+			scene
+		};
+		let request = view([8.0, 6.0, -14.0]);
+		let kept = super::ClipKept::new();
+		let scene0 = build_scene(0.0);
+		let sky0 = offline.prepare_environment(&scene0);
+		let (mut views0, mut stats0) = offline.submit_frame(&scene0, std::slice::from_ref(&request), sky0, None, Default::default(), None, Some((&kept, false))).unwrap();
+		views0.pop().unwrap().finish(&mut stats0).unwrap();
+		assert!(stats0.missing.iter().all(|m| !m.contains("9090910")), "pack fallback is silent: {:?}", stats0.missing);
+		let key0 = super::scene_key(&scene0).unwrap();
+		let flags = vec![0u8; scene0.parts.len()];
+		assert!(
+			!kept.geometry.last.lock().as_ref().expect("clip keeps last frame").same_part(0, &key0, &flags),
+			"silent offline fallback part must not be marked reusable in ClipKept"
+		);
+		// Frame 1 moves part 1 while part 0 stays identical: because part 0 was not marked reusable,
+		// all parts are prepared anew (`moving == false`), not patched from frame 0's fallback.
+		let scene1 = build_scene(5.0);
+		let sky1 = offline.prepare_environment(&scene1);
+		let (mut views1, mut stats1) = offline.submit_frame(&scene1, std::slice::from_ref(&request), sky1, None, Default::default(), None, Some((&kept, false))).unwrap();
+		views1.pop().unwrap().finish(&mut stats1).unwrap();
+		assert!(
+			!kept.geometry.last.lock().as_ref().expect("clip keeps last frame").moving,
+			"frame 1 reused silent-fallback part 0 from ClipKept instead of re-preparing it"
+		);
+		drop((offline, online));
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
 	/// An offline `Transcode::Image` fallback to a cached uploaded PNG must neither write a `.tex`
 	/// file under the transcode key to disk/store nor promote the fallback into the shared texture cache.
 	#[test]

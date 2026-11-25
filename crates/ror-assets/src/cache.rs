@@ -482,4 +482,36 @@ mod tests {
 		assert!(!bad_bin.exists() && !bad_json.exists(), "mismatched store entry should be removed");
 		let _ = std::fs::remove_dir_all(&root);
 	}
+
+	/// `DiskCache::publish` must link `.json` metadata into the content store before `.bin`, so a
+	/// concurrent reader can never observe an unindexed `.bin` when publishing `.json` has not
+	/// succeeded yet.
+	#[test]
+	fn publish_links_metadata_before_content() {
+		let root = std::env::temp_dir().join(format!("ror-assets-publish-order-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&root);
+		let store = root.join("store");
+		let disk = DiskCache::new(&root.join("state"), &[], Some(&store));
+		let key = "rbxassetid://234567";
+		let hash = hash_key(key);
+		let (store_bin, store_json) = files(&store.join("assets"), &hash);
+		// Block `store_json` with a directory so `link_atomic(&json, &store_json)` fails deterministically.
+		std::fs::create_dir_all(&store_json).unwrap();
+		let meta = Meta { uri: key.into(), fetched_at: 1, source_host: "test".into(), size: 7, kind: "bin".into() };
+		disk.write(key, b"payload", &meta).unwrap();
+		assert!(!store_bin.exists(), "publish linked .bin into the content store even though linking .json failed");
+		// Once `store_json` is unblocked, publishing links both metadata and content.
+		std::fs::remove_dir(&store_json).unwrap();
+		disk.publish(&hash);
+		assert!(store_json.is_file() && store_bin.is_file(), "publish should link both .json and .bin once unblocked");
+		// Without local metadata, `publish` must not expose `.bin` in the store.
+		let no_meta_key = "rbxassetid://234568";
+		let no_meta_hash = hash_key(no_meta_key);
+		let (own_bin, _) = files(&root.join("state").join("assets"), &no_meta_hash);
+		let (no_meta_store_bin, no_meta_store_json) = files(&store.join("assets"), &no_meta_hash);
+		write_atomic(&own_bin, b"orphan").unwrap();
+		disk.publish(&no_meta_hash);
+		assert!(!no_meta_store_bin.exists() && !no_meta_store_json.exists(), "publish without local .json must not link .bin");
+		let _ = std::fs::remove_dir_all(&root);
+	}
 }
