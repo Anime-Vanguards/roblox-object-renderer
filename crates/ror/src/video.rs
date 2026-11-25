@@ -586,6 +586,8 @@ pub struct VideoResult {
 	/// The first frame's camera, as `ror render --camera-from <out>` reads it.
 	pub views: Vec<ViewResult>,
 	pub stats: VideoStats,
+	/// Which GUIs were drawn and which were skipped (with reasons) across the clip.
+	pub guis: scene::guis::GuiReport,
 	/// The ParticleEmitters emitting in some frame whose particles fly weightless (crate::lint).
 	pub weightless: crate::lint::Weightless,
 	/// The other authoring lints over the clip (crate::lint::Lint): linear fades, restraint within a
@@ -1297,7 +1299,7 @@ pub fn check_scene_reuse(job: &VideoJob, scenes: &SceneCache, times: &[f32]) -> 
 /// documents (a producer's helpers each read the file again) name their instances by other referents
 /// and never compare equal: the frame is drawn.
 fn same_scene(a: &Scene, b: &Scene) -> bool {
-	let Scene { parts, lights, beams, highlights, kept_glass, particles, trails, guis, environment, materials, warnings: _, lineage, live, setting, play } = a;
+	let Scene { parts, lights, beams, highlights, kept_glass, particles, trails, guis, skipped_guis: _, environment, materials, warnings: _, lineage, live, setting, play } = a;
 	*live == b.live
 		&& *play == b.play
 		&& *setting == b.setting
@@ -1405,9 +1407,9 @@ fn find_guis(renderer: &Renderer, view: &ViewRequest, cameras: &[CameraSpec], re
 	}
 }
 
-/// A frame ready to draw: its scene, its sky's maps, its GUI textures on the GPU and what went wrong
-/// finding them.
-type ReadyFrame = (Scene, PreparedSky, crate::render::guis::GuiTextures, Vec<String>);
+/// A frame ready to draw: its scene, its sky's maps, its GUI textures on the GPU, any per-key GUI
+/// failures, and what went wrong finding them.
+type ReadyFrame = (Scene, PreparedSky, crate::render::guis::GuiTextures, HashMap<crate::render::guis::GuiKey, String>, Vec<String>);
 
 /// The upload stage between the GUI stage and the draws: each frame's GUI images onto the GPU while
 /// the frames before it draw (7.7 ms a frame of 13 telegraphs in the draw loop before), a frame or
@@ -1417,8 +1419,8 @@ fn upload_guis(renderer: &Renderer, receiver: Receiver<Result<(Scene, PreparedSk
 		let ready = found.map(|(scene, sky, guis)| {
 			let started = Instant::now();
 			let mut warnings = Vec::new();
-			let textures = renderer.upload_frame_guis(guis, &mut warnings);
-			((scene, sky, textures, warnings), started.elapsed().as_secs_f64() * 1000.0)
+			let (textures, skipped) = renderer.upload_frame_guis_reported(guis, &mut warnings);
+			((scene, sky, textures, skipped, warnings), started.elapsed().as_secs_f64() * 1000.0)
 		});
 		if sender.send(ready).is_err() {
 			return;
@@ -2414,6 +2416,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 			framed: framed.map(|(min, max)| [min.into(), max.into()]),
 			views: first.view.iter().map(|image| ViewResult { name: job.name.clone(), ..image.clone() }).collect(),
 			stats: early_stats,
+			guis: first.guis.clone(),
 			weightless: Default::default(),
 			lint: Default::default(),
 			counts: Default::default(),
@@ -2427,6 +2430,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 	}
 	let mut particles_per_frame = vec![0usize; count];
 	let mut stats = VideoStats::default();
+	let mut gui_report = scene::guis::GuiReport::default();
 	let mut first_view = None;
 	let render_start = Instant::now();
 	let mut drawn_at = None;
@@ -2483,7 +2487,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 			let mut last: Option<(Scene, bool)> = None;
 			for (index, built) in scene_receiver.iter().enumerate() {
 				profile.scene_wait_ms += scene_start.elapsed().as_secs_f64() * 1000.0;
-				let ((scene, sky, guis, gui_warnings), upload_ms) = built?;
+				let ((scene, sky, guis, gui_skipped, gui_warnings), upload_ms) = built?;
 				profile.gui_upload_ms += upload_ms;
 				let mut request = view.clone();
 				request.camera = cameras[index].clone();
@@ -2503,7 +2507,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 				}
 				profile.repeated += usize::from(repeats);
 				if repeats && reuse == FrameReuse::On {
-					drop((sky, guis));
+					drop((sky, guis, gui_skipped));
 					particles_per_frame[index] = particles_per_frame[index - 1];
 					for warning in &scene.warnings {
 						if !warnings.contains(warning) {
@@ -2525,7 +2529,8 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 				// wait: four slots held through eight clips' CPU work cost each ~1 s)
 				// what the clip keeps from frame to frame while the camera holds still (render::ClipKept)
 				let keep = cameras.get(index + 1).is_some_and(|next| same_camera(next, &cameras[index]));
-				let (mut images, frame_stats) = renderer.submit_frame(&scene, std::slice::from_ref(&request), sky, readback, guis, gpu, Some((&clip_kept, keep)))?;
+				let (mut images, frame_stats) = renderer.submit_frame(&scene, std::slice::from_ref(&request), sky, readback, (guis, gui_skipped), gpu, Some((&clip_kept, keep)))?;
+				gui_report.merge(&frame_stats.gui_report);
 				profile.gpu_wait_ms += frame_stats.gpu_wait_ms;
 				let pending = images.pop().context("the render gave no image")?;
 				let image = pending.image();
@@ -2663,6 +2668,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 		framed: framed.map(|(min, max)| [min.into(), max.into()]),
 		views: first_view.into_iter().collect(),
 		stats,
+		guis: gui_report,
 		weightless: motion.weightless(),
 		lint,
 		counts,
@@ -2687,6 +2693,7 @@ struct SheetFirst {
 	census: Census,
 	missing: Vec<String>,
 	warnings: Vec<String>,
+	guis: scene::guis::GuiReport,
 	/// The first frame's camera (the sheet's first moment is the clip's first frame)
 	view: Option<ViewResult>,
 }
@@ -2697,7 +2704,7 @@ struct SheetFirst {
 #[allow(clippy::too_many_arguments)]
 fn sheet_first<'s>(renderer: &Renderer, builder: &'s Builder, held: &Mutex<Vec<Kept<'s>>>, times: &[f32], cameras: &[CameraSpec], view: &ViewRequest, frames: &[usize], gpu: Option<&GpuGate>) -> Result<SheetFirst> {
 	let (tile_width, tile_height) = thumbnail_size(view.width, view.height);
-	let mut first = SheetFirst { thumbnails: Vec::new(), particles: Vec::new(), census: Census::default(), missing: Vec::new(), warnings: Vec::new(), view: None };
+	let mut first = SheetFirst { thumbnails: Vec::new(), particles: Vec::new(), census: Census::default(), missing: Vec::new(), warnings: Vec::new(), guis: Default::default(), view: None };
 	let parts = PartsKey::default();
 	let mut queue: std::collections::VecDeque<PendingView<'_>> = std::collections::VecDeque::new();
 	let take = |pending: PendingView<'_>, first: &mut SheetFirst| -> Result<()> {
@@ -2712,6 +2719,7 @@ fn sheet_first<'s>(renderer: &Renderer, builder: &'s Builder, held: &Mutex<Vec<K
 		let mut request = view.clone();
 		request.camera = cameras[index].clone();
 		let (mut images, frame_stats) = renderer.submit_frame(&scene, std::slice::from_ref(&request), sky, None, Default::default(), gpu, None)?;
+		first.guis.merge(&frame_stats.gui_report);
 		let pending = images.pop().context("the render gave no image")?;
 		if first.view.is_none() {
 			let image = pending.image();

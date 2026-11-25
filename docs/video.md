@@ -74,7 +74,7 @@ Select the MP4 encoder with `ROR_VIDEO_ENCODER=auto|x264|libx264|h264_nvenc`:
 
 ## What the summary measures
 
-`summary.json` records frame counts, timings, framed bounds, peak/per-sheet particle counts, active part/emitter/beam/trail counts, missing assets, warnings, and the first-frame camera. Set `ROR_VIDEO_PROFILE=1` to include detailed stage timings under `outputProfile`.
+`summary.json` records frame counts, timings, framed bounds, peak/per-sheet particle counts, active part/emitter/beam/trail counts, `guis` (`drawn` and `skipped` with reasons), missing assets, warnings, and the first-frame camera. Set `ROR_VIDEO_PROFILE=1` to include detailed stage timings under `outputProfile`.
 
 Built-in VFX review lints (`crates/ror/src/lint.rs`, summarized to stderr and listed in `lines`):
 

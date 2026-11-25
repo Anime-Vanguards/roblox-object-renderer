@@ -8,6 +8,54 @@ use std::sync::Arc;
 use glam::{Affine3A, Vec3};
 use rbx_dom_weak::types::{ContentType, Ref, Variant};
 use rbx_dom_weak::{Instance, InstanceBuilder, WeakDom};
+use serde::Serialize;
+
+/// A GUI skipped during extraction, view planning, or rendering, with the reason why.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkippedGui {
+	pub path: String,
+	pub reason: String,
+}
+
+/// Which GUIs a render or clip drew and which it skipped (recorded in `summary.json`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuiReport {
+	pub drawn: Vec<String>,
+	pub skipped: Vec<SkippedGui>,
+}
+
+impl GuiReport {
+	/// Marks `path` as drawn; removes any earlier skipped entry for the same path (a GUI drawn in
+	/// at least one view or frame is reported under `drawn`).
+	pub fn record_drawn(&mut self, path: impl Into<String>) {
+		let path = path.into();
+		self.skipped.retain(|entry| entry.path != path);
+		if !self.drawn.contains(&path) {
+			self.drawn.push(path);
+		}
+	}
+
+	/// Marks `path` as skipped with `reason`, unless it was already drawn or already recorded as skipped.
+	pub fn record_skipped(&mut self, path: impl Into<String>, reason: impl Into<String>) {
+		let path = path.into();
+		if self.drawn.contains(&path) || self.skipped.iter().any(|entry| entry.path == path) {
+			return;
+		}
+		self.skipped.push(SkippedGui { path, reason: reason.into() });
+	}
+
+	/// Merges another view's or frame's report into this one (`drawn` takes precedence over `skipped`).
+	pub fn merge(&mut self, other: &Self) {
+		for path in &other.drawn {
+			self.record_drawn(path.clone());
+		}
+		for entry in &other.skipped {
+			self.record_skipped(entry.path.clone(), entry.reason.clone());
+		}
+	}
+}
 
 use super::environment::ViewportLighting;
 use super::load::Document;
@@ -730,17 +778,19 @@ fn billboard_anchor(document: &Document, instance: &Instance) -> Option<(Vec3, V
 	None
 }
 
-/// A SurfaceGui or BillboardGui as drawn, or `None` when Studio draws nothing for it (disabled, or
-/// nothing to draw on).
-pub fn read(document: &Document, referent: Ref, instance: &Instance, warnings: &mut Vec<String>) -> Option<Gui> {
+/// A SurfaceGui, BillboardGui or ScreenGui as drawn, or `None` when Studio draws nothing for it
+/// (recording why in `skipped`).
+pub fn read(document: &Document, referent: Ref, instance: &Instance, warnings: &mut Vec<String>, skipped: &mut Vec<SkippedGui>) -> Option<Gui> {
+	let path = document.path_of(referent);
 	if !props::bool(instance, "Enabled", true) {
+		skipped.push(SkippedGui { path, reason: "disabled".into() });
 		return None;
 	}
-	let path = document.path_of(referent);
 	let kind = match instance.class.as_str() {
 		// only a PlayerGui's: a ScreenGui anywhere else (the Workspace, a model) draws nothing
 		"ScreenGui" => {
 			if !document.dom.get_by_ref(instance.parent()).is_some_and(|parent| parent.class == "PlayerGui") {
+				skipped.push(SkippedGui { path, reason: "ScreenGui outside PlayerGui".into() });
 				return None;
 			}
 			// IgnoreGuiInset is a view of ScreenInsets: off is CoreUISafeInsets (2), on DeviceSafeInsets (1)
@@ -752,12 +802,17 @@ pub fn read(document: &Document, referent: Ref, instance: &Instance, warnings: &
 			let part = document.dom.get_by_ref(target).filter(|part| props::is_a(part, "BasePart"));
 			let Some(part) = part else {
 				warnings.push(format!("{path}: SurfaceGui without a part to draw on (not drawn)"));
+				skipped.push(SkippedGui { path, reason: "no BasePart adornee".into() });
 				return None;
 			};
 			if !beams::drawn(document, target) {
+				skipped.push(SkippedGui { path, reason: "adornee not in world".into() });
 				return None;
 			}
-			let cframe = props::cframe(part, "CFrame")?;
+			let Some(cframe) = props::cframe(part, "CFrame") else {
+				skipped.push(SkippedGui { path, reason: "adornee has no CFrame".into() });
+				return None;
+			};
 			let size = props::vec3(part, "Size", Vec3::new(4.0, 1.0, 2.0));
 			let face = props::enum_value(instance, "Face", 5).min(5);
 			// FixedSize: CanvasSize; PixelsPerStud: the face's size in studs times PixelsPerStud
@@ -769,6 +824,7 @@ pub fn read(document: &Document, referent: Ref, instance: &Instance, warnings: &
 				props::vec2(instance, "CanvasSize", [800.0, 600.0])
 			};
 			if canvas[0] <= 0.0 || canvas[1] <= 0.0 {
+				skipped.push(SkippedGui { path, reason: "zero canvas size".into() });
 				return None;
 			}
 			GuiKind::Surface(SurfaceGui { cframe, size, face, canvas, z_offset: props::f32(instance, "ZOffset", 0.0) })
@@ -776,6 +832,7 @@ pub fn read(document: &Document, referent: Ref, instance: &Instance, warnings: &
 		_ => {
 			let Some((anchor, extents)) = billboard_anchor(document, instance) else {
 				warnings.push(format!("{path}: BillboardGui without a part or attachment to follow (not drawn)"));
+				skipped.push(SkippedGui { path, reason: "no part or attachment adornee".into() });
 				return None;
 			};
 			let size = props::udim2(instance, "Size").unwrap_or([0.0; 4]);
@@ -795,6 +852,7 @@ pub fn read(document: &Document, referent: Ref, instance: &Instance, warnings: &
 		Ok(result) => result,
 		Err(error) => {
 			warnings.push(format!("{path}: could not serialise the GUI (not drawn): {error}"));
+			skipped.push(SkippedGui { path, reason: format!("serialization failed: {error}") });
 			return None;
 		}
 	};
@@ -917,6 +975,8 @@ mod tests {
 		assert_eq!(screens.len(), 2, "{:?}", scene.guis.iter().map(|gui| &gui.path).collect::<Vec<_>>());
 		assert!(screens[0].0.ends_with("PlayerGui.Transition") && screens[0].1 == &super::ScreenGui { display_order: 3, inset: false });
 		assert!(screens[1].0.ends_with("PlayerGui.Hud") && screens[1].1 == &super::ScreenGui { display_order: 0, inset: true });
+		assert!(scene.skipped_guis.iter().any(|entry| entry.path.ends_with("PlayerGui.Off") && entry.reason == "disabled"), "{:?}", scene.skipped_guis);
+		assert!(scene.skipped_guis.iter().any(|entry| entry.path.ends_with("Stray") && entry.reason == "ScreenGui outside PlayerGui"), "{:?}", scene.skipped_guis);
 		assert!(scene.warnings.is_empty(), "{:?}", scene.warnings);
 		assert_eq!((super::top_bar_inset(true), super::top_bar_inset(false)), (58.0, 0.0));
 	}

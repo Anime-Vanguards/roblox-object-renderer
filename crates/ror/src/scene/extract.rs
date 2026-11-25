@@ -55,6 +55,7 @@ struct Piece {
 	particles: Vec<super::particles::ParticleEmitter>,
 	trails: Vec<super::trails::Trail>,
 	guis: Vec<super::guis::Gui>,
+	skipped_guis: Vec<super::guis::SkippedGui>,
 	variants: Vec<MaterialVariant>,
 	warnings: Vec<String>,
 	part_indices: Vec<(Ref, usize)>,
@@ -335,6 +336,7 @@ fn extract_with(document: &Document, roots: &[Ref], reuse: Option<(&mut RootReus
 			scene.particles.extend_from_slice(&piece.particles);
 			scene.trails.extend_from_slice(&piece.trails);
 			scene.guis.extend_from_slice(&piece.guis);
+			scene.skipped_guis.extend_from_slice(&piece.skipped_guis);
 			scene.materials.variants.extend_from_slice(&piece.variants);
 			scene.warnings.extend_from_slice(&piece.warnings);
 			continue;
@@ -344,7 +346,7 @@ fn extract_with(document: &Document, roots: &[Ref], reuse: Option<(&mut RootReus
 		};
 		// what a kept stretch's walk adds, with what the moment changed in it
 		let keep = matches!(units.get(index), Some(Unit::Tree { kept: true, .. }));
-		let before = (scene.parts.len(), scene.lights.len(), scene.beams.len(), scene.particles.len(), scene.trails.len(), scene.guis.len(), scene.materials.variants.len(), scene.warnings.len(), highlights.len(), any_highlights.len());
+		let before = (scene.parts.len(), scene.lights.len(), scene.beams.len(), scene.particles.len(), scene.trails.len(), scene.guis.len(), scene.skipped_guis.len(), scene.materials.variants.len(), scene.warnings.len(), highlights.len(), any_highlights.len());
 		let mut met: Vec<Ref> = Vec::new();
 		for &referent in &order[range] {
 			if keep {
@@ -361,12 +363,13 @@ fn extract_with(document: &Document, roots: &[Ref], reuse: Option<(&mut RootReus
 				particles: scene.particles[before.3..].to_vec(),
 				trails: scene.trails[before.4..].to_vec(),
 				guis: scene.guis[before.5..].to_vec(),
-				variants: scene.materials.variants[before.6..].to_vec(),
-				warnings: scene.warnings[before.7..].to_vec(),
+				skipped_guis: scene.skipped_guis[before.6..].to_vec(),
+				variants: scene.materials.variants[before.7..].to_vec(),
+				warnings: scene.warnings[before.8..].to_vec(),
 				part_indices: met.iter().filter_map(|referent| part_indices.get(referent).map(|&at| (*referent, at - base))).collect(),
 				invisible_glass: met.iter().filter_map(|referent| invisible_glass.get(referent).map(|part| (*referent, part.clone()))).collect(),
-				highlights: highlights[before.8..].to_vec(),
-				any_highlights: any_highlights[before.9..].to_vec(),
+				highlights: highlights[before.9..].to_vec(),
+				any_highlights: any_highlights[before.10..].to_vec(),
 			}));
 		}
 	}
@@ -401,7 +404,7 @@ fn walk_one(
 		// screen (render::guis)
 		if props::class_is_a(class, "LayerCollector") {
 			if matches!(class, "SurfaceGui" | "BillboardGui" | "ScreenGui")
-				&& let Some(gui) = super::guis::read(document, referent, instance, &mut scene.warnings)
+				&& let Some(gui) = super::guis::read(document, referent, instance, &mut scene.warnings, &mut scene.skipped_guis)
 			{
 				scene.guis.push(gui);
 			}

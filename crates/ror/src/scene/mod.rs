@@ -72,6 +72,8 @@ pub struct Scene {
 	pub trails: Vec<Trail>,
 	/// SurfaceGuis and BillboardGuis (their content drawn by rur).
 	pub guis: Vec<guis::Gui>,
+	/// GUIs present in the file that extraction skipped (disabled, missing adornee, etc.).
+	pub skipped_guis: Vec<guis::SkippedGui>,
 	pub environment: Environment,
 	/// MaterialService: the material generation and the MaterialVariants parts can use.
 	pub materials: Materials,
@@ -118,6 +120,7 @@ impl Scene {
 		self.highlights.clear();
 		self.kept_glass.clear();
 		self.guis.clear();
+		self.skipped_guis.clear();
 		self.particles.clear();
 		self.beams.clear();
 		self.trails.clear();

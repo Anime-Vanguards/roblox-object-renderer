@@ -4,8 +4,9 @@
 //! device pixels of the atlas, with the GUI's children in it. rur draws the atlas with a transparent
 //! background, and it is cut back into one image per GUI.
 //!
-//! rur is found through `ROR_RUR` (its checkout), else beside this checkout
-//! (`../roblox-ui-renderer`); Node through `ROR_NODE`, else `node` on the PATH. An atlas goes straight
+//! rur is found through `ROR_RUR`, then `RUR_HOME` (each a checkout directory or its `cli/rur.mjs`),
+//! then beside this checkout (`../roblox-ui-renderer`), then `rur` / `rur.mjs` on `PATH`; Node through
+//! `ROR_NODE`, else `node` on the PATH. An atlas goes straight
 //! to rur's render service (`rur-native serve`, the same engine arguments `rur render --model` sends
 //! it) once a `rur render` through Node has started that service and it answers as this checkout's,
 //! running the current engine build: Node's start-up and rur.mjs's checks cost 170-870 ms a call,
@@ -31,14 +32,71 @@ fn plain(path: &Path) -> PathBuf {
 	crate::output::plain_path(path)
 }
 
-/// The rur checkout to use, if there is one.
+/// Resolves a candidate checkout directory or `.../cli/rur.mjs` path to its rur checkout root.
+fn checkout_root(path: &Path) -> Option<PathBuf> {
+	let candidate = plain(path);
+	if candidate.join("cli").join("rur.mjs").is_file() {
+		return Some(candidate);
+	}
+	if candidate.is_file()
+		&& candidate.file_name().is_some_and(|name| name.eq_ignore_ascii_case("rur.mjs"))
+		&& candidate.parent().is_some_and(|parent| parent.file_name().is_some_and(|name| name.eq_ignore_ascii_case("cli")))
+	{
+		return candidate.parent().and_then(Path::parent).map(plain);
+	}
+	None
+}
+
+/// Checks whether an executable or script in a `PATH` folder lives inside (or symlinks into) a rur
+/// checkout.
+fn checkout_from_path_entry(dir: &Path) -> Option<PathBuf> {
+	let names: &[&str] = if cfg!(windows) { &["rur.mjs", "rur.cmd", "rur.bat", "rur.exe", "rur"] } else { &["rur", "rur.mjs"] };
+	for name in names {
+		let entry = dir.join(name);
+		if !entry.is_file() {
+			continue;
+		}
+		let resolved = std::fs::canonicalize(&entry).unwrap_or(entry);
+		if let Some(root) = checkout_root(&resolved) {
+			return Some(root);
+		}
+		for ancestor in resolved.ancestors().skip(1).take(3) {
+			if let Some(root) = checkout_root(ancestor) {
+				return Some(root);
+			}
+		}
+	}
+	None
+}
+
+fn locate_with(ror_rur: Option<std::ffi::OsString>, rur_home: Option<std::ffi::OsString>, checkout: Option<PathBuf>, path_env: Option<std::ffi::OsString>) -> Option<PathBuf> {
+	for value in [ror_rur, rur_home].into_iter().flatten() {
+		if value.is_empty() {
+			continue;
+		}
+		if let Some(root) = checkout_root(Path::new(&value)) {
+			return Some(root);
+		}
+	}
+	if let Some(sibling) = checkout.map(|dir| dir.join("..").join("roblox-ui-renderer"))
+		&& let Some(root) = checkout_root(&sibling)
+	{
+		return Some(root);
+	}
+	if let Some(paths) = path_env {
+		for dir in std::env::split_paths(&paths) {
+			if let Some(root) = checkout_from_path_entry(&dir) {
+				return Some(root);
+			}
+		}
+	}
+	None
+}
+
+/// The rur checkout to use, if there is one: `ROR_RUR`, then `RUR_HOME`, then a sibling
+/// `../roblox-ui-renderer` beside a `ror` checkout, then `rur` / `rur.mjs` on `PATH`.
 pub fn locate() -> Option<PathBuf> {
-	let candidate = match std::env::var_os("ROR_RUR") {
-		Some(path) if !path.is_empty() => PathBuf::from(path),
-		_ => crate::output::checkout_dir()?.join("..").join("roblox-ui-renderer"),
-	};
-	let candidate = plain(&candidate);
-	candidate.join("cli").join("rur.mjs").is_file().then_some(candidate)
+	locate_with(std::env::var_os("ROR_RUR"), std::env::var_os("RUR_HOME"), crate::output::checkout_dir(), std::env::var_os("PATH"))
 }
 
 /// rur's state dir as its CLI resolves it (cli/paths.mjs): RUR_STATE_DIR, RUR_CACHE_DIR, else the
@@ -950,5 +1008,42 @@ mod tests {
 		let index = first.0;
 		drop(first);
 		assert_eq!(Slot::take().0, index, "a free slot is taken again");
+	}
+
+	#[test]
+	fn locate_checks_ror_rur_rur_home_sibling_and_path_in_order() {
+		let root = std::env::temp_dir().join(format!("ror-rur-locate-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&root);
+		let make = |name: &str| {
+			let dir = root.join(name);
+			std::fs::create_dir_all(dir.join("cli")).unwrap();
+			std::fs::write(dir.join("cli").join("rur.mjs"), "").unwrap();
+			plain(&dir)
+		};
+		let env_ror = make("from-ror-rur");
+		let env_home = make("from-rur-home");
+		let parent = root.join("workspace");
+		let checkout = parent.join("roblox-object-renderer");
+		std::fs::create_dir_all(&checkout).unwrap();
+		let sibling = make("workspace/roblox-ui-renderer");
+		let on_path = make("from-path");
+		let path_env = std::env::join_paths([on_path.join("cli")]).unwrap();
+
+		// ROR_RUR wins over RUR_HOME, sibling, and PATH
+		assert_eq!(locate_with(Some(env_ror.as_os_str().to_os_string()), Some(env_home.as_os_str().to_os_string()), Some(checkout.clone()), Some(path_env.clone())), Some(env_ror.clone()));
+		// RUR_HOME works when ROR_RUR is unset (directory or direct cli/rur.mjs path)
+		assert_eq!(locate_with(None, Some(env_home.as_os_str().to_os_string()), Some(checkout.clone()), Some(path_env.clone())), Some(env_home.clone()));
+		assert_eq!(locate_with(None, Some(env_home.join("cli").join("rur.mjs").into_os_string()), None, None), Some(env_home.clone()));
+		// Invalid ROR_RUR falls through to RUR_HOME
+		assert_eq!(locate_with(Some(root.join("missing").into_os_string()), Some(env_home.as_os_str().to_os_string()), None, None), Some(env_home.clone()));
+		// Sibling beside checkout wins over PATH when env vars are unset
+		let found_sibling = locate_with(None, None, Some(checkout), Some(path_env.clone())).unwrap();
+		assert_eq!(found_sibling.canonicalize().unwrap(), sibling.canonicalize().unwrap());
+		// PATH resolves a rur checkout when env vars and sibling are absent
+		assert_eq!(locate_with(None, None, None, Some(path_env)).unwrap().canonicalize().unwrap(), on_path.canonicalize().unwrap());
+		// None when nothing provides rur
+		assert_eq!(locate_with(None, None, None, None), None);
+
+		let _ = std::fs::remove_dir_all(&root);
 	}
 }

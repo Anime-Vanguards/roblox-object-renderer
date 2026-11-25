@@ -252,6 +252,9 @@ pub struct RenderStats {
 	/// What the job should report: GUIs not drawn and why, rur's diagnostics.
 	#[serde(skip)]
 	pub warnings: Vec<String>,
+	/// Which GUIs drew and which were skipped (with reasons) across the views rendered.
+	#[serde(skip)]
+	pub gui_report: crate::scene::guis::GuiReport,
 	/// Texture residency (render::residency): its feedback passes' time and the whole step's, and the
 	/// material maps whose levels it read and the bytes they added.
 	#[serde(skip)]
@@ -2359,7 +2362,16 @@ impl Renderer {
 	/// `kept` is what the clip keeps between frames: its occlusion and its residency's (`keep`: the next
 	/// frame's camera is this one's).
 	#[allow(clippy::too_many_arguments)]
-	pub(crate) fn submit_frame(&self, scene: &Scene, views: &[ViewRequest], sky: PreparedSky, readback: Option<VideoReadback>, guis: guis::GuiTextures, gate: Option<&crate::budget::GpuGate>, kept: Option<(&ClipKept, bool)>) -> Result<(Vec<PendingView<'_>>, RenderStats)> {
+	pub(crate) fn submit_frame(
+		&self,
+		scene: &Scene,
+		views: &[ViewRequest],
+		sky: PreparedSky,
+		readback: Option<VideoReadback>,
+		guis: (guis::GuiTextures, HashMap<guis::GuiKey, String>),
+		gate: Option<&crate::budget::GpuGate>,
+		kept: Option<(&ClipKept, bool)>,
+	) -> Result<(Vec<PendingView<'_>>, RenderStats)> {
 		self.submit_views(scene, views, Some(sky), readback, Some(guis), gate, kept)
 	}
 
@@ -2410,7 +2422,16 @@ impl Renderer {
 	}
 
 	#[allow(clippy::too_many_arguments)]
-	fn submit_views(&self, scene: &Scene, views: &[ViewRequest], sky: Option<PreparedSky>, video: Option<VideoReadback>, guis: Option<guis::GuiTextures>, gate: Option<&crate::budget::GpuGate>, kept: Option<(&ClipKept, bool)>) -> Result<(Vec<PendingView<'_>>, RenderStats)> {
+	fn submit_views(
+		&self,
+		scene: &Scene,
+		views: &[ViewRequest],
+		sky: Option<PreparedSky>,
+		video: Option<VideoReadback>,
+		guis: Option<(guis::GuiTextures, HashMap<guis::GuiKey, String>)>,
+		gate: Option<&crate::budget::GpuGate>,
+		kept: Option<(&ClipKept, bool)>,
+	) -> Result<(Vec<PendingView<'_>>, RenderStats)> {
 		// within the GPU's free memory, until its views are submitted (what they took shows in its use then)
 		let relieve = |_| self.release_unheld_targets();
 		let admission = gate.map(|gate| gate.admit(&self.target_sets(views), &|| self.gpu.free_memory(), &relieve)).transpose()?;
@@ -2447,7 +2468,17 @@ impl Renderer {
 		stats.triangles = prepared.draws.iter().map(|draw| (draw.indices.len() / 3) as u64).sum();
 		// every view's GUIs first: one batch of textures for all of them
 		let gui_start = Instant::now();
-		let gui_plans: Vec<Vec<guis::GuiDraw>> = views.iter().map(|view| guis::plan(scene, &view.camera.place(prepared.bounds, view.width.max(1), view.height.max(1)), view)).collect();
+		for skip in &scene.skipped_guis {
+			stats.gui_report.record_skipped(skip.path.clone(), skip.reason.clone());
+		}
+		let mut gui_plans: Vec<Vec<guis::GuiDraw>> = Vec::with_capacity(views.len());
+		for view in views {
+			let (draws, skips) = guis::plan_with_skips(scene, &view.camera.place(prepared.bounds, view.width.max(1), view.height.max(1)), view);
+			for skip in skips {
+				stats.gui_report.record_skipped(skip.path, skip.reason);
+			}
+			gui_plans.push(draws);
+		}
 		let gui_draws: Vec<&guis::GuiDraw> = gui_plans.iter().flatten().collect();
 		if !gui_draws.is_empty() {
 			let mut untrusted_gui = std::collections::HashSet::new();
@@ -2456,14 +2487,14 @@ impl Renderer {
 			}
 			stats.untrusted_stamp_hashes += untrusted_gui.len();
 		}
+		let (mut ready, mut gui_failures) = guis.unwrap_or_default();
 		let gui_textures = if gui_draws.is_empty() {
 			HashMap::new()
 		} else {
 			// what was resolved ahead (a video frame's), the rest found now
-			let mut ready = guis.unwrap_or_default();
-			let rest: Vec<&guis::GuiDraw> = gui_draws.iter().copied().filter(|draw| draw.keys().any(|key| !ready.contains_key(&key))).collect();
+			let rest: Vec<&guis::GuiDraw> = gui_draws.iter().copied().filter(|draw| draw.keys().any(|key| !ready.contains_key(&key) && !gui_failures.contains_key(&key))).collect();
 			if !rest.is_empty() {
-				ready.extend(self.gui_textures(scene, &rest, &mut stats.warnings));
+				ready.extend(self.gui_textures_reported(scene, &rest, &mut stats.warnings, &mut gui_failures));
 			}
 			ready
 		};
@@ -2492,6 +2523,17 @@ impl Renderer {
 			// its own
 			let worlds = self.render_worlds(scene, gui_plan, view, prepared.bounds, &mut stats.warnings);
 			let view_guis = self.gui_geometry(scene, gui_plan, &gui_textures, &worlds, &view_lease);
+			for draw in gui_plan {
+				let Some(gui) = scene.guis.get(draw.gui) else {
+					continue;
+				};
+				if gui_textures.contains_key(&draw.key) {
+					stats.gui_report.record_drawn(gui.path.clone());
+				} else {
+					let reason = gui_failures.get(&draw.key).cloned().unwrap_or_else(|| "texture unavailable".into());
+					stats.gui_report.record_skipped(gui.path.clone(), reason);
+				}
+			}
 			stats.guis += view_guis.draws.len();
 			// Roblox's levels of detail from this view's camera: its own copy of the draws while it draws
 			let lod = view.lod.map(|lod| {

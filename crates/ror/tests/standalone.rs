@@ -21,7 +21,15 @@ fn defaults_command(binary: &Path, cwd: &Path, home: &Path, state: Option<&Path>
 	command.current_dir(cwd);
 	command.env("LOCALAPPDATA", home).env("HOME", home).env("XDG_CACHE_HOME", home);
 	command.env("ROR_STORE", "0").env("ROR_DEFAULTS_PROBE", home);
-	command.env_remove("ROR_STATE_DIR").env_remove("ROR_RUR").env_remove("ROR_REE");
+	command.env_remove("ROR_STATE_DIR").env_remove("ROR_RUR").env_remove("RUR_HOME").env_remove("ROR_REE");
+	if let Some(paths) = std::env::var_os("PATH") {
+		let filtered: Vec<PathBuf> = std::env::split_paths(&paths)
+			.filter(|dir| !["rur", "rur.mjs", "rur.cmd", "rur.bat", "rur.exe"].iter().any(|name| dir.join(name).is_file()))
+			.collect();
+		if let Ok(joined) = std::env::join_paths(filtered) {
+			command.env("PATH", joined);
+		}
+	}
 	if let Some(state) = state {
 		command.env("ROR_STATE_DIR", state);
 	}

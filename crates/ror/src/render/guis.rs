@@ -401,7 +401,7 @@ pub struct GuiFailures {
 /// A GUI as a view draws it.
 pub(super) struct GuiDraw {
 	/// The GUI's index in `Scene::guis`.
-	gui: usize,
+	pub(super) gui: usize,
 	pub(super) key: GuiKey,
 	/// Live local-file snapshots taken when `key` was built, verified before keeping rur's output.
 	local_snaps: Arc<[(PathBuf, Option<ror_assets::FileSnapshot>)]>,
@@ -506,11 +506,18 @@ fn drawn(scene: &Scene) -> bool {
 	!scene.guis.is_empty() && std::env::var_os("ROR_NO_GUIS").is_none()
 }
 
-/// Where the scene's GUIs draw in a view and which textures they need: SurfaceGuis on their part's
-/// face; BillboardGuis sized for this camera and image.
-pub(super) fn plan(scene: &Scene, camera: &Camera, request: &ViewRequest) -> Vec<GuiDraw> {
-	if !drawn(scene) {
-		return Vec::new();
+/// Where the scene's GUIs draw in a view and which textures they need, alongside any scene GUIs
+/// skipped for this view and why.
+pub(super) fn plan_with_skips(scene: &Scene, camera: &Camera, request: &ViewRequest) -> (Vec<GuiDraw>, Vec<crate::scene::guis::SkippedGui>) {
+	let mut skipped = Vec::new();
+	if scene.guis.is_empty() {
+		return (Vec::new(), skipped);
+	}
+	if std::env::var_os("ROR_NO_GUIS").is_some() {
+		for gui in &scene.guis {
+			skipped.push(crate::scene::guis::SkippedGui { path: gui.path.clone(), reason: "ROR_NO_GUIS set".into() });
+		}
+		return (Vec::new(), skipped);
 	}
 	let supersample = request.supersample.clamp(1, 4);
 	let (width, height) = (request.width.max(1), request.height.max(1));
@@ -526,9 +533,11 @@ pub(super) fn plan(scene: &Scene, camera: &Camera, request: &ViewRequest) -> Vec
 				let center = surface.point(0.5, 0.5);
 				// one-sided: nothing shows from behind its face
 				if (camera.eye - center).dot(normal) <= 0.0 {
+					skipped.push(crate::scene::guis::SkippedGui { path: gui.path.clone(), reason: "facing away from camera".into() });
 					continue;
 				}
 				if gui.max_distance > 0.0 && camera.eye.distance(center) > gui.max_distance {
+					skipped.push(crate::scene::guis::SkippedGui { path: gui.path.clone(), reason: "beyond MaxDistance".into() });
 					continue;
 				}
 				// with GlobalShadows Studio lights a SurfaceGui from its light-grid voxel, which its own
@@ -582,9 +591,11 @@ pub(super) fn plan(scene: &Scene, camera: &Camera, request: &ViewRequest) -> Vec
 				// sized by its view depth, not its distance (probes: 10 studs to the side reads as head-on)
 				let depth = -relative.dot(back);
 				if depth <= camera.near {
+					skipped.push(crate::scene::guis::SkippedGui { path: gui.path.clone(), reason: "behind near plane".into() });
 					continue;
 				}
 				if gui.max_distance > 0.0 && relative.length() > gui.max_distance {
+					skipped.push(crate::scene::guis::SkippedGui { path: gui.path.clone(), reason: "beyond MaxDistance".into() });
 					continue;
 				}
 				// whole device pixels: AbsoluteSize is round(1.5 · (studs · pixels per stud + offset)) / 1.5
@@ -593,6 +604,7 @@ pub(super) fn plan(scene: &Scene, camera: &Camera, request: &ViewRequest) -> Vec
 				let pixel_width = (x_scale * focal / depth + x_offset * gui_scale).round();
 				let pixel_height = (y_scale * focal / depth + y_offset * gui_scale).round();
 				if pixel_width < 1.0 || pixel_height < 1.0 {
+					skipped.push(crate::scene::guis::SkippedGui { path: gui.path.clone(), reason: "zero pixel size".into() });
 					continue;
 				}
 				// centred on the projected anchor, SizeOffset moving it right and up by fractions of its
@@ -633,6 +645,7 @@ pub(super) fn plan(scene: &Scene, camera: &Camera, request: &ViewRequest) -> Vec
 				let gui_scale = (request.gui_scale.filter(|scale| *scale > 0.0).unwrap_or(height as f32 / REFERENCE_HEIGHT) * 1024.0).floor().max(1.0) / 1024.0;
 				let top = if screen.inset { (crate::scene::guis::top_bar_inset(scene.play) * gui_scale).min(height as f32) } else { 0.0 };
 				if (height as f32 - top) < 1.0 {
+					skipped.push(crate::scene::guis::SkippedGui { path: gui.path.clone(), reason: "zero pixel size".into() });
 					continue;
 				}
 				let (content_hash, local_snaps) = crate::scene::guis::stamp_gui_hash(gui.base_content_hash, &gui.local_files);
@@ -666,7 +679,13 @@ pub(super) fn plan(scene: &Scene, camera: &Camera, request: &ViewRequest) -> Vec
 			}
 		}
 	}
-	draws
+	(draws, skipped)
+}
+
+/// Where the scene's GUIs draw in a view and which textures they need: SurfaceGuis on their part's
+/// face; BillboardGuis sized for this camera and image.
+pub(super) fn plan(scene: &Scene, camera: &Camera, request: &ViewRequest) -> Vec<GuiDraw> {
+	plan_with_skips(scene, camera, request).0
 }
 
 /// The GUI draws of a view, uploaded: each one's texture and vertex range.
@@ -919,6 +938,7 @@ pub type GuiTextures = HashMap<GuiKey, Arc<GuiTexture>>;
 pub struct FrameGuis {
 	textures: GuiTextures,
 	images: Vec<(GuiKey, Arc<GuiImage>, bool)>,
+	skipped: HashMap<GuiKey, String>,
 	pub warnings: Vec<String>,
 }
 
@@ -986,7 +1006,7 @@ impl Renderer {
 	/// as when every frame asked for its own: rur draws a GUI a little differently by what shares its
 	/// atlas (render::rur). The batches of all the frames are drawn RUR_WORKERS at a time, each written
 	/// to disk and mip-mapped as it arrives. Problems go into `warnings`.
-	fn resolve_guis(&self, frames: &[Members], warnings: &mut Vec<String>) -> (GuiTextures, HashMap<GuiKey, (Arc<GuiImage>, bool)>) {
+	fn resolve_guis(&self, frames: &[Members], warnings: &mut Vec<String>, skipped: &mut HashMap<GuiKey, String>) -> (GuiTextures, HashMap<GuiKey, (Arc<GuiImage>, bool)>) {
 		let mut textures = HashMap::new();
 		let mut images: HashMap<GuiKey, (Arc<GuiImage>, bool)> = HashMap::new();
 		let mut seen = std::collections::HashSet::new();
@@ -1009,7 +1029,10 @@ impl Renderer {
 			return (textures, images);
 		}
 		let Some(rur) = rur::locate() else {
-			warnings.push(format!("{} GUIs not drawn: rur not found (set ROR_RUR to a roblox-ui-renderer checkout, or put one beside this one)", missing.len()));
+			warnings.push(format!("{} GUIs not drawn: rur not found (set ROR_RUR or RUR_HOME to a roblox-ui-renderer checkout, put one beside this one, or put rur on PATH)", missing.len()));
+			for (_, key, ..) in &missing {
+				skipped.insert(*key, "rur not found (set ROR_RUR or RUR_HOME)".into());
+			}
 			return (textures, images);
 		};
 		let profile = std::env::var_os("ROR_PROFILE").is_some();
@@ -1054,6 +1077,7 @@ impl Renderer {
 			left.retain(|(_, key, gui, _, _)| match failures.get(key) {
 				Some((_, reason)) => {
 					warnings.push(format!("{}: not drawn ({reason})", gui.path));
+					skipped.insert(*key, format!("rur failed: {reason}"));
 					false
 				}
 				None => true,
@@ -1069,6 +1093,7 @@ impl Renderer {
 		let next = std::sync::atomic::AtomicUsize::new(0);
 		let finished: Mutex<Vec<(GuiKey, GuiImage, bool)>> = Mutex::new(Vec::new());
 		let problems: Mutex<Vec<String>> = Mutex::new(Vec::new());
+		let key_errors: Mutex<Vec<(GuiKey, String)>> = Mutex::new(Vec::new());
 		std::thread::scope(|scope| {
 			for _ in 0..RUR_WORKERS.min(calls) {
 				scope.spawn(|| {
@@ -1107,7 +1132,9 @@ impl Renderer {
 												Some((*key, image, stable, problem))
 											}
 											Err(error) => {
+												let reason = format!("texture encode failed: {error:#}");
 												problems.lock().push(format!("{}: encoding its GUI texture: {error:#}", gui.path));
+												key_errors.lock().push((*key, reason));
 												None
 											}
 										}
@@ -1124,9 +1151,11 @@ impl Renderer {
 								let reason = format!("{error:#}");
 								let mut failures = self.gui_failures.keys.lock();
 								let mut problems = problems.lock();
+								let mut errs = key_errors.lock();
 								let transient = self.assets.is_offline_view();
 								for (key, gui, _, snaps) in members {
 									problems.push(format!("{}: not drawn ({reason})", gui.path));
+									errs.push((*key, format!("rur failed: {reason}")));
 									if !transient && snaps_still_unchanged(snaps) {
 										failures.insert(*key, (Instant::now(), reason.clone()));
 									}
@@ -1138,6 +1167,9 @@ impl Renderer {
 			}
 		});
 		warnings.extend(problems.into_inner());
+		for (key, reason) in key_errors.into_inner() {
+			skipped.entry(key).or_insert(reason);
+		}
 		let finished = finished.into_inner();
 		let drawn = finished.len();
 		for (key, image, stable) in finished {
@@ -1153,7 +1185,7 @@ impl Renderer {
 	/// Uploads GUI images, decoded on every core, adding their textures to `textures`: into the GPU
 	/// cache those marked so (each once, however many renders ask for it), the rest for the render that
 	/// asks alone.
-	fn upload_guis(&self, images: Vec<(GuiKey, Arc<GuiImage>, bool)>, textures: &mut GuiTextures, warnings: &mut Vec<String>) {
+	fn upload_guis(&self, images: Vec<(GuiKey, Arc<GuiImage>, bool)>, textures: &mut GuiTextures, warnings: &mut Vec<String>, skipped: &mut HashMap<GuiKey, String>) {
 		let mut wanted = Vec::new();
 		for (key, image, cached) in images {
 			match self.gui_textures.get(&key).filter(|_| cached) {
@@ -1236,7 +1268,10 @@ impl Renderer {
 			let recycle = (!cached).then_some(&self.gui_uploads);
 			match unpacked.and_then(|()| self.staged_gui(&key, &image, &staging, offset, &mut encoder, recycle)) {
 				Ok(texture) => made.push((key, cached, texture)),
-				Err(error) => warnings.push(format!("GUI texture: {error:#}")),
+				Err(error) => {
+					warnings.push(format!("GUI texture: {error:#}"));
+					skipped.entry(key).or_insert_with(|| format!("texture upload failed: {error:#}"));
+				}
 			}
 		}
 		let copied = self.gpu.submit([encoder.finish()]);
@@ -1254,17 +1289,20 @@ impl Renderer {
 				Ok(texture) => {
 					textures.insert(key, texture);
 				}
-				Err(error) => warnings.push(format!("GUI texture: {error:#}")),
+				Err(error) => {
+					warnings.push(format!("GUI texture: {error:#}"));
+					skipped.entry(key).or_insert_with(|| format!("texture upload failed: {error:#}"));
+				}
 			}
 		}
 	}
 
 	/// The textures `draws` need: from memory, from disk, else drawn by rur. Problems go into
-	/// `warnings`.
-	pub(super) fn gui_textures(&self, scene: &Scene, draws: &[&GuiDraw], warnings: &mut Vec<String>) -> GuiTextures {
-		let (mut textures, images) = self.resolve_guis(&[wanted(scene, draws)], warnings);
+	/// `warnings`, and per-key failure reasons into `skipped`.
+	pub(super) fn gui_textures_reported(&self, scene: &Scene, draws: &[&GuiDraw], warnings: &mut Vec<String>, skipped: &mut HashMap<GuiKey, String>) -> GuiTextures {
+		let (mut textures, images) = self.resolve_guis(&[wanted(scene, draws)], warnings, skipped);
 		// a still's stable images are kept: the render after the service's prefetch finds them in the GPU cache
-		self.upload_guis(images.into_iter().map(|(key, (image, stable))| (key, image, stable)).collect(), &mut textures, warnings);
+		self.upload_guis(images.into_iter().map(|(key, (image, stable))| (key, image, stable)).collect(), &mut textures, warnings, skipped);
 		textures
 	}
 
@@ -1278,7 +1316,8 @@ impl Renderer {
 		let bounds = self.framing_bounds(scene);
 		let plans: Vec<Vec<GuiDraw>> = views.iter().map(|view| plan(scene, &view.camera.place(bounds, view.width.max(1), view.height.max(1)), view)).collect();
 		let draws: Vec<&GuiDraw> = plans.iter().flatten().collect();
-		self.gui_textures(scene, &draws, &mut warnings);
+		let mut skipped = HashMap::new();
+		self.gui_textures_reported(scene, &draws, &mut warnings, &mut skipped);
 		warnings
 	}
 
@@ -1304,7 +1343,8 @@ impl Renderer {
 			.collect();
 		let wanted: Vec<Members> = frames.iter().zip(&plans).map(|((scene, _), plan)| wanted(scene, &plan.iter().collect::<Vec<_>>())).collect();
 		let mut warnings = Vec::new();
-		let (textures, images) = if wanted.iter().all(Vec::is_empty) { Default::default() } else { self.resolve_guis(&wanted, &mut warnings) };
+		let mut skipped = HashMap::new();
+		let (textures, images) = if wanted.iter().all(Vec::is_empty) { Default::default() } else { self.resolve_guis(&wanted, &mut warnings, &mut skipped) };
 		// the GPU cache keeps an image other frames of these draw too; an animated GUI's image, a
 		// frame's own, leaves the GPU once its frame has drawn
 		let mut frames_drawing: HashMap<GuiKey, usize> = HashMap::new();
@@ -1325,6 +1365,8 @@ impl Renderer {
 						&& !frame.images.iter().any(|(kept, _, _)| *kept == key)
 					{
 						frame.images.push((key, image.clone(), *stable && frames_drawing.get(&key).is_some_and(|&frames| frames > 1)));
+					} else if let Some(reason) = skipped.get(&key) {
+						frame.skipped.entry(key).or_insert_with(|| reason.clone());
 					}
 				}
 				frame
@@ -1339,10 +1381,14 @@ impl Renderer {
 	/// A frame's GUI images uploaded (into the GPU cache, each once), with the textures it already had:
 	/// what its render draws with ([`Renderer::submit_video_with`]). Problems go into `warnings`.
 	pub fn upload_frame_guis(&self, guis: FrameGuis, warnings: &mut Vec<String>) -> GuiTextures {
-		let FrameGuis { mut textures, images, warnings: found } = guis;
+		self.upload_frame_guis_reported(guis, warnings).0
+	}
+
+	pub(crate) fn upload_frame_guis_reported(&self, guis: FrameGuis, warnings: &mut Vec<String>) -> (GuiTextures, HashMap<GuiKey, String>) {
+		let FrameGuis { mut textures, images, mut skipped, warnings: found } = guis;
 		warnings.extend(found);
-		self.upload_guis(images, &mut textures, warnings);
-		textures
+		self.upload_guis(images, &mut textures, warnings, &mut skipped);
+		(textures, skipped)
 	}
 
 	/// The worlds a view's GUIs show (scene::guis::Viewport), by the draw's index: a window's drawn by
@@ -1879,10 +1925,10 @@ mod tests {
 				let rgba: Vec<u8> = (0..rows).flat_map(|row| (0..columns).flat_map(move |_| if cover && row < rows / 2 { [255u8; 4] } else { [0u8; 4] })).collect();
 				images.push((draw.key, Arc::new(GuiImage::from_rgba(columns, rows, rgba).unwrap()), false));
 			}
-			let (mut textures, mut warnings) = (HashMap::new(), Vec::new());
-			renderer.upload_guis(images, &mut textures, &mut warnings);
+			let (mut textures, mut warnings, mut skipped) = (HashMap::new(), Vec::new(), HashMap::new());
+			renderer.upload_guis(images, &mut textures, &mut warnings, &mut skipped);
 			assert!(warnings.is_empty(), "{warnings:?}");
-			let (pending, mut stats) = renderer.submit_views(&scene, std::slice::from_ref(&request), None, None, Some(textures), None, None).unwrap();
+			let (pending, mut stats) = renderer.submit_views(&scene, std::slice::from_ref(&request), None, None, Some((textures, skipped)), None, None).unwrap();
 			let image = pending.into_iter().next().unwrap().finish(&mut stats).unwrap();
 			// (the world itself is empty: the screen is the background's blue)
 			assert!(stats.warnings.iter().all(|warning| warning.starts_with("nothing to frame")), "{:?}", stats.warnings);

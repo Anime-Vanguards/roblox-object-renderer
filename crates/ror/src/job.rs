@@ -169,6 +169,8 @@ pub struct JobResult {
 	pub lights: usize,
 	pub bounds: Option<[[f32; 3]; 2]>,
 	pub stats: RenderStats,
+	/// Which GUIs were drawn and which were skipped (with reasons).
+	pub guis: scene::guis::GuiReport,
 	/// The ParticleEmitters emitting at the moment drawn whose particles fly weightless (crate::lint).
 	pub weightless: Weightless,
 	/// With `cost`: what each view costs Roblox to draw (each view's costliest batches; cost.json
@@ -628,6 +630,7 @@ fn render_in_groups(renderer: &Renderer, scene: &Scene, requests: &[ViewRequest]
 						stats.warnings.push(warning);
 					}
 				}
+				stats.gui_report.merge(&more.gui_report);
 			}
 		}
 	}
@@ -780,6 +783,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 				lights: 0,
 				bounds: None,
 				stats: RenderStats::default(),
+				guis: Default::default(),
 				weightless: Motion::default().weightless(),
 				cost: Some(cost),
 				warnings: Vec::new(),
@@ -1028,6 +1032,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 		parts: scene.parts.len(),
 		lights: scene.lights.len(),
 		bounds: scene.bounds().map(|(min, max)| [min.into(), max.into()]),
+		guis: stats.gui_report.clone(),
 		stats,
 		weightless: motion.weightless(),
 		cost,
