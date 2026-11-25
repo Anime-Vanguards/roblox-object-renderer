@@ -7,7 +7,9 @@
 // yet, and "warm" means what the cold run left.
 //
 // On a CI runner there is no GPU: ror draws on the software adapter, and a service's first start compiles every
-// pipeline on the CPU (tens of seconds), so the suite starts a service only twice.
+// pipeline on the CPU (tens of seconds), so the suite starts a service only twice. A runner has no ffmpeg either, so
+// the workloads hide it (ror asks an ffmpeg it finds for its encoders: two more processes, and more data written) and
+// every machine runs the same processes.
 //
 // Options: --ror <exe> (default: target/release/ror beside this checkout, or ROR_BIN).
 
@@ -59,6 +61,17 @@ function crowd(ror, fixture, out, count, size) {
 	};
 }
 
+// The environment without ffmpeg: ror finds it through ROR_FFMPEG (not passed on), PATH, or winget's packages in
+// LOCALAPPDATA, so PATH loses every folder holding one and LOCALAPPDATA is an empty folder of the run's
+function withoutFfmpeg(context) {
+	const name = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
+	const key = Object.keys(context.env).find(variable => variable.toUpperCase() === "PATH") || "PATH";
+	const kept = (context.env[key] || "").split(path.delimiter).filter(dir => dir && !fs.existsSync(path.join(dir, name)));
+	const local = path.join(context.work, "no-ffmpeg");
+	fs.mkdirSync(local, { recursive: true });
+	return { [key]: kept.join(path.delimiter), ...(process.platform === "win32" ? { LOCALAPPDATA: local } : {}) };
+}
+
 function workload({ id, title, about, fresh, requires, steps, expect }) {
 	return {
 		id, title, about, requires,
@@ -74,7 +87,7 @@ function workload({ id, title, about, fresh, requires, steps, expect }) {
 			const plan = path.join(context.work, id, "plan.json");
 			fs.writeFileSync(plan, JSON.stringify({ steps: [...steps(ror, fixture, out), { argv: [ror, "service", "stop"], log: path.join(out, "stop.log") }] }));
 			// the service exits a moment after `ror service stop`
-			return { argv: [context.node, context.fanout, plan], env: { ROR_STATE_DIR: state, ROR_STORE: store }, folders: folders(context, id, out), out, lingerMs: 15000 };
+			return { argv: [context.node, context.fanout, plan], env: { ROR_STATE_DIR: state, ROR_STORE: store, ...withoutFfmpeg(context) }, folders: folders(context, id, out), out, lingerMs: 15000 };
 		},
 		// every still and clip it asked for is on disk
 		verify(prepared) {
