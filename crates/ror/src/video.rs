@@ -108,12 +108,16 @@ pub struct VideoJob {
 	#[serde(default = "default_name")]
 	pub name: String,
 	/// What happens when (docs/playback.md); each frame draws it at its own moment.
-	#[serde(default)]
+	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub playback: Option<Playback>,
-	/// The file the playback was read from, when it was one (the summary's `playback`: a recording's
-	/// other files beside it).
+	/// The file the playback is read from (loaded on the runner side when `playback` is `None`,
+	/// keeping large recordings off the HTTP request body; also recorded in `summary.json`).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub playback_file: Option<PathBuf>,
+	/// CLI overrides (`--emit`, `--enable`, `--disable`, `--set`, `--tween`, `--parent`, salt) merged
+	/// on top of `playback_file` (or `playback`).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub playback_overlay: Option<Playback>,
 	/// The first frame's moment, seconds after the playback's start.
 	#[serde(default)]
 	pub start: f32,
@@ -207,17 +211,18 @@ pub struct CameraKey {
 	pub fov: f32,
 }
 
-/// The job's playback, watched through its camera track when it has one (Studio updates only the
-/// emitters that camera could draw: [`scene::playback::ViewerKey`]).
-fn watched(job: &VideoJob) -> Playback {
-	let mut playback = job.playback.clone().unwrap_or_default();
+/// The job's playback (loaded from `playback_file` when not supplied inline, with any CLI overlay
+/// merged in), watched through its camera track when it has one (Studio updates only the emitters
+/// that camera could draw: [`scene::playback::ViewerKey`]).
+fn watched(job: &VideoJob) -> Result<Playback> {
+	let mut playback = Playback::resolve_source(job.playback.as_ref(), job.playback_file.as_deref(), job.playback_overlay.as_ref(), None)?.unwrap_or_default();
 	if let Some(track) = job.camera_track.as_deref().filter(|_| playback.viewer.is_empty()) {
 		let aspect = job.view.width.max(1) as f32 / job.view.height.max(1) as f32;
 		let mut keys: Vec<scene::playback::ViewerKey> = track.iter().map(|key| scene::playback::ViewerKey { at: key.at, cframe: key.cframe, fov: key.fov, aspect }).collect();
 		keys.sort_by(|a, b| a.at.total_cmp(&b.at));
 		playback.viewer = keys;
 	}
-	playback
+	Ok(playback)
 }
 
 /// The track's camera at a moment: the latest key at or before it, else the first.
@@ -857,7 +862,7 @@ impl<'a> Builder<'a> {
 		let mut builder = Builder {
 			bytes: Vec::new(),
 			select: job.select.as_deref(),
-			playback: watched(job),
+			playback: watched(job)?,
 			scenes,
 			relative_to: job.relative_to.as_deref(),
 			map: job.map.as_ref(),
@@ -1576,7 +1581,7 @@ fn follow_playback<'s>(builder: &'s Builder, held: &Mutex<Vec<Kept<'s>>>, job: &
 	}
 	let (width, height) = (job.view.width.max(1), job.view.height.max(1));
 	let placed: Vec<crate::render::camera::Camera> = cameras.iter().map(|spec| spec.place(framed, width, height)).collect();
-	let mut playback = watched(job);
+	let mut playback = builder.playback.clone();
 	for (path, follow) in parts {
 		// a playback that moves the part already says where it is
 		if playback.motion.iter().any(|motion| motion.target == path) {
@@ -2343,7 +2348,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 	let followed_job;
 	let followed = match follow_playback(&builder, &held, job, &cameras, framed, &times)? {
 		Some(playback) => {
-			followed_job = VideoJob { playback: Some(playback), ..job.clone() };
+			followed_job = VideoJob { playback: Some(playback), playback_overlay: None, ..job.clone() };
 			Some(Builder::new(|| input_bytes(renderer, &job.input), &followed_job, scenes)?)
 		}
 		None => None,
@@ -2907,6 +2912,7 @@ mod tests {
 			name: default_name(),
 			playback: Some(playback),
 			playback_file: None,
+			playback_overlay: None,
 			start: 0.0,
 			duration: 1.0,
 			fps: 10.0,
@@ -2973,6 +2979,7 @@ mod tests {
 			name: default_name(),
 			playback: Some(serde_json::from_value(playback).unwrap()),
 			playback_file: None,
+			playback_overlay: None,
 			start: 0.0,
 			duration: 1.0,
 			fps: 10.0,
@@ -3053,6 +3060,7 @@ mod tests {
 			name: default_name(),
 			playback: Some(playback),
 			playback_file: None,
+			playback_overlay: None,
 			start: 0.0,
 			duration: 1.0,
 			fps: 10.0,
@@ -3118,6 +3126,7 @@ mod tests {
 			name: default_name(),
 			playback: None,
 			playback_file: None,
+			playback_overlay: None,
 			start: 0.0,
 			duration: 1.0,
 			fps: 8.0,
@@ -3187,6 +3196,7 @@ mod tests {
 			name: default_name(),
 			playback: None,
 			playback_file: None,
+			playback_overlay: None,
 			start: 0.0,
 			duration: 1.0,
 			fps: 9.0,
@@ -3262,6 +3272,7 @@ mod tests {
 			name: default_name(),
 			playback: None,
 			playback_file: None,
+			playback_overlay: None,
 			start: 0.0,
 			duration: 1.0,
 			fps: 12.0,

@@ -861,26 +861,41 @@ struct TimelineArgs<'a> {
 	changes: Option<&'a ChangeArgs>,
 }
 
+/// The parsed timeline inputs from `--playback`, `--time`, `--emit`, `--enable`, `--disable`,
+/// `--set`, `--tween`, and `--parent`. When `--playback` names a file, it is kept as `file` (not
+/// read into memory on the client) and any CLI overrides go in `overlay` / `time` so large
+/// recordings never cross the render-service HTTP body inline.
+#[derive(Default)]
+struct PlaybackInput {
+	playback: Option<ror::scene::Playback>,
+	file: Option<PathBuf>,
+	overlay: Option<ror::scene::Playback>,
+	time: Option<f32>,
+}
+
 /// The playback of `--playback`, `--time`, `--emit`, `--enable`, `--disable`, `--set`, `--tween`
 /// and `--parent`, if any is given.
-fn playback_args(args: &TimelineArgs) -> Result<Option<ror::scene::Playback>> {
+fn playback_args(args: &TimelineArgs) -> Result<PlaybackInput> {
 	use ror::scene::playback::{Action, Emit, spec};
 	let changed = args.changes.is_some_and(|changes| !changes.set.is_empty() || !changes.tween.is_empty() || !changes.parent.is_empty());
 	// the command's own setting goes in its job: a running service's environment is not the caller's
 	let salt = std::env::var("ROR_PARTICLE_SALT").unwrap_or_default();
-	if args.playback.is_none() && args.time.is_none() && args.emit.is_empty() && args.enable.is_empty() && args.disable.is_empty() && !changed && salt.is_empty() {
-		return Ok(None);
+	let has_cli_overrides = !args.emit.is_empty() || !args.enable.is_empty() || !args.disable.is_empty() || changed || !salt.is_empty();
+	if args.playback.is_none() && args.time.is_none() && !has_cli_overrides {
+		return Ok(PlaybackInput::default());
 	}
-	let mut playback: ror::scene::Playback = match args.playback {
-		Some(text) if text.trim_start().starts_with('{') => serde_json::from_str(text).context("--playback JSON")?,
-		Some(path) => serde_json::from_str(&std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?).with_context(|| format!("--playback {path}"))?,
-		None => ror::scene::Playback::default(),
+	let (mut inline, file) = match args.playback {
+		Some(text) if text.trim_start().starts_with('{') => (Some(serde_json::from_str::<ror::scene::Playback>(text).context("--playback JSON")?), None),
+		Some(path) => {
+			let file = std::path::Path::new(path);
+			std::fs::metadata(file).with_context(|| format!("reading {path}"))?;
+			(None, Some(PathBuf::from(absolute(file))))
+		}
+		None => (Some(ror::scene::Playback::default()), None),
 	};
-	if let Some(time) = args.time {
-		playback.time = time;
-	}
+	let mut overlay = ror::scene::Playback::default();
 	if !salt.is_empty() {
-		playback.salt = salt;
+		overlay.salt = salt;
 	}
 	// <path>[=value][@seconds]; a quoted segment (["a=b@c"]) may hold either sign
 	let split = |spec: &str| -> Result<(String, Option<String>, f32)> {
@@ -919,27 +934,32 @@ fn playback_args(args: &TimelineArgs) -> Result<Option<ror::scene::Playback>> {
 			Some(mode) if ror::scene::playback::ByAttributes::parse(mode).is_ok() => Emit::Mode(mode.into()),
 			Some(count) => Emit::Count(count.parse().with_context(|| format!("--emit {spec}: a count, attributes, immediate, cutscene or delayed"))?),
 		};
-		playback.actions.push(Action { at, target, emit: Some(emit), ..Default::default() });
+		overlay.actions.push(Action { at, target, emit: Some(emit), ..Default::default() });
 	}
 	for (specs, enabled) in [(args.enable, true), (args.disable, false)] {
 		for spec in specs {
 			let (target, _, at) = split(spec)?;
 			// the command line's switches win over the playback's (bisecting a recording)
-			playback.actions.push(Action { at, target, enabled: Some(enabled), force: true, ..Default::default() });
+			overlay.actions.push(Action { at, target, enabled: Some(enabled), force: true, ..Default::default() });
 		}
 	}
 	if let Some(changes) = args.changes {
 		for text in &changes.set {
-			playback.actions.push(spec::set(text).with_context(|| format!("--set {text}"))?);
+			overlay.actions.push(spec::set(text).with_context(|| format!("--set {text}"))?);
 		}
 		for text in &changes.tween {
-			playback.tweens.push(spec::tween(text).with_context(|| format!("--tween {text}"))?);
+			overlay.tweens.push(spec::tween(text).with_context(|| format!("--tween {text}"))?);
 		}
 		for text in &changes.parent {
-			playback.actions.push(spec::parent(text).with_context(|| format!("--parent {text}"))?);
+			overlay.actions.push(spec::parent(text).with_context(|| format!("--parent {text}"))?);
 		}
 	}
-	Ok(Some(playback))
+	if let Some(playback) = &mut inline {
+		playback.merge_overlay(overlay, args.time);
+		Ok(PlaybackInput { playback: inline, file: None, overlay: None, time: None })
+	} else {
+		Ok(PlaybackInput { playback: None, file, overlay: has_cli_overrides.then_some(overlay), time: args.time })
+	}
 }
 
 fn parse_size(size: &str) -> Result<(u32, u32)> {
@@ -1080,7 +1100,10 @@ fn render(mut args: RenderArgs) -> Result<()> {
 		compact_png: false,
 		materials_from: args.materials_from.map(|path| absolute(&path)),
 		lighting_from: args.lighting_from.map(|path| absolute(&path)),
-		playback,
+		playback: playback.playback,
+		playback_file: playback.file,
+		playback_overlay: playback.overlay,
+		playback_time: playback.time,
 		frame: args.frame.as_deref().map(parse_box).transpose()?,
 		focus: args.focus.clone(),
 		collision: args
@@ -1093,7 +1116,7 @@ fn render(mut args: RenderArgs) -> Result<()> {
 		relative_to: std::env::current_dir().ok(),
 		alone: args.alone.filter(|_| args.ids),
 	};
-	let mut result = if args.no_service || std::env::var_os("ROR_NO_SERVICE").is_some() {
+	let run_in_process = || -> Result<serde_json::Value> {
 		ror::memory_checkpoint("start");
 		let gpu = Arc::new(Gpu::new()?);
 		ror::memory_checkpoint("GPU device");
@@ -1102,9 +1125,19 @@ fn render(mut args: RenderArgs) -> Result<()> {
 		let value = serde_json::to_value(job::run(&renderer, &SceneCache::default(), &job)?)?;
 		ror::memory_checkpoint("job done");
 		report_held(&renderer);
-		value
+		Ok(value)
+	};
+	let mut result = if args.no_service || std::env::var_os("ROR_NO_SERVICE").is_some() {
+		run_in_process()?
 	} else {
-		ror::service::client::render(&output::state_dir(), &job, args.offline)?
+		match ror::service::client::render(&output::state_dir(), &job, args.offline) {
+			Ok(value) => value,
+			Err(error) if ror::service::client::is_refused(&error) => {
+				eprintln!("ror: render service refused/failed ({error:#}); falling back to in-process rendering");
+				run_in_process()?
+			}
+			Err(error) => return Err(error),
+		}
 	};
 	if let Some(missing) = result.pointer("/stats/missing").and_then(|value| value.as_array()) {
 		for missing in missing {
@@ -1225,10 +1258,10 @@ fn video(mut args: VideoArgs) -> Result<()> {
 	// unless told what it emits (its Lighting's changes or a property's say nothing of that)
 	let emissions = args.playback.is_some() || !args.emit.is_empty() || !args.enable.is_empty() || !args.disable.is_empty();
 	if !emissions && !args.no_emit {
-		let effect = playback_args(&TimelineArgs { playback: None, time: None, emit: &["=attributes".to_string()], enable: &[], disable: &[], changes: None })?.unwrap_or_default();
-		match &mut playback {
+		let effect = playback_args(&TimelineArgs { playback: None, time: None, emit: &["=attributes".to_string()], enable: &[], disable: &[], changes: None })?.playback.unwrap_or_default();
+		match &mut playback.playback {
 			Some(playback) => playback.actions.extend(effect.actions),
-			None => playback = Some(effect),
+			None => playback.playback = Some(effect),
 		}
 	}
 	let format = match &args.format {
@@ -1242,8 +1275,9 @@ fn video(mut args: VideoArgs) -> Result<()> {
 		out: args.out,
 		view,
 		name,
-		playback,
-		playback_file: args.playback.as_deref().filter(|text| !text.trim_start().starts_with('{')).map(|path| absolute(std::path::Path::new(path)).into()),
+		playback: playback.playback,
+		playback_file: playback.file,
+		playback_overlay: playback.overlay,
 		start: args.start,
 		duration: args.duration,
 		fps: args.fps,
@@ -1271,14 +1305,24 @@ fn video(mut args: VideoArgs) -> Result<()> {
 		relative_to: std::env::current_dir().ok(),
 		nvenc: args.nvenc.as_deref().map(ror::nvenc::Rate::parse).transpose()?,
 	};
-	let mut result = if args.no_service || std::env::var_os("ROR_NO_SERVICE").is_some() {
+	let run_in_process = || -> Result<serde_json::Value> {
 		let gpu = Arc::new(Gpu::new()?);
 		let renderer = Renderer::new(gpu, assets(args.offline)?)?;
 		let value = serde_json::to_value(ror::video::run(&renderer, &SceneCache::default(), &job, None)?)?;
 		report_held(&renderer);
-		value
+		Ok(value)
+	};
+	let mut result = if args.no_service || std::env::var_os("ROR_NO_SERVICE").is_some() {
+		run_in_process()?
 	} else {
-		ror::service::client::video(&output::state_dir(), &job, args.offline)?
+		match ror::service::client::video(&output::state_dir(), &job, args.offline) {
+			Ok(value) => value,
+			Err(error) if ror::service::client::is_refused(&error) => {
+				eprintln!("ror: render service refused/failed ({error:#}); falling back to in-process rendering");
+				run_in_process()?
+			}
+			Err(error) => return Err(error),
+		}
 	};
 	if let Some(missing) = result.pointer("/stats/missing").and_then(|value| value.as_array()) {
 		for missing in missing {
@@ -1893,7 +1937,10 @@ fn cost(mut args: CostArgs) -> Result<()> {
 		compact_png: false,
 		materials_from: args.materials_from.as_deref().map(absolute),
 		lighting_from: args.lighting_from.as_deref().map(absolute),
-		playback,
+		playback: playback.playback,
+		playback_file: playback.file,
+		playback_overlay: playback.overlay,
+		playback_time: playback.time,
 		frame: None,
 		focus: args.focus.clone(),
 		collision: None,
@@ -1933,14 +1980,24 @@ fn cost(mut args: CostArgs) -> Result<()> {
 		relative_to: std::env::current_dir().ok(),
 		alone: None,
 	};
-	let result = if args.no_service || std::env::var_os("ROR_NO_SERVICE").is_some() {
+	let run_in_process = || -> Result<serde_json::Value> {
 		let gpu = Arc::new(Gpu::new()?);
 		let renderer = Renderer::new(gpu, assets(args.offline)?)?;
 		let value = serde_json::to_value(job::run(&renderer, &SceneCache::default(), &job)?)?;
 		report_held(&renderer);
-		value
+		Ok(value)
+	};
+	let result = if args.no_service || std::env::var_os("ROR_NO_SERVICE").is_some() {
+		run_in_process()?
 	} else {
-		ror::service::client::render(&output::state_dir(), &job, args.offline)?
+		match ror::service::client::render(&output::state_dir(), &job, args.offline) {
+			Ok(value) => value,
+			Err(error) if ror::service::client::is_refused(&error) => {
+				eprintln!("ror: render service refused/failed ({error:#}); falling back to in-process rendering");
+				run_in_process()?
+			}
+			Err(error) => return Err(error),
+		}
 	};
 	// the report taken out of the result, unless --check reads both (a grid's is ~240 MB as a Value)
 	let mut result = result;

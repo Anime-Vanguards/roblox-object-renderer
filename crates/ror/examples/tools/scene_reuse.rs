@@ -66,6 +66,7 @@ pub fn main() -> Result<()> {
 			name: "video".into(),
 			playback: Some(playback),
 			playback_file: None,
+			playback_overlay: None,
 			start: 0.0,
 			duration,
 			fps,

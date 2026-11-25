@@ -51,6 +51,17 @@ pub struct Job {
 	/// TimeScale, property sets and tweens, motion (scene::playback, docs/playback.md).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub playback: Option<scene::Playback>,
+	/// A playback JSON file read on the runner side instead of inlining it in `playback` (keeps large
+	/// recordings off the HTTP request body).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub playback_file: Option<PathBuf>,
+	/// CLI overrides (`--emit`, `--enable`, `--disable`, `--set`, `--tween`, `--parent`, salt) merged
+	/// on top of `playback_file` (or `playback`).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub playback_overlay: Option<scene::Playback>,
+	/// Explicit `--time` override applied on top of `playback_file` (preserves the file's `time` when `None`).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub playback_time: Option<f32>,
 	/// Orbit views frame this box (min, max) rather than what the model draws: one camera for every
 	/// moment of a timeline, or a region of a map.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -656,7 +667,7 @@ pub fn run_gated(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Optio
 	// within the memory the machine has free, beside the process's other jobs (crate::budget::admit)
 	let pixels: u64 = job.views.iter().map(|named| named.view.width as u64 * named.view.height as u64 * (named.view.supersample.max(1) as u64).pow(2)).sum();
 	let key = format!("render {} {:?} {pixels}", job.input, job.select);
-	let input_bytes = crate::budget::file_bytes([Some(Path::new(&job.input)), job.map.as_ref().map(|map| Path::new(&map.file))].into_iter().flatten());
+	let input_bytes = crate::budget::file_bytes([Some(Path::new(&job.input)), job.playback_file.as_deref(), job.map.as_ref().map(|map| Path::new(&map.file))].into_iter().flatten());
 	let mut admitted = admit(renderer, scenes, &format!("render of {}", job.input), key, crate::budget::still_need(pixels, input_bytes))?;
 	let result = run_admitted(renderer, scenes, job, gpu);
 	if result.is_ok() {
@@ -696,7 +707,8 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 	// the cost model reads the document the scene came from (its parts' referents point into it)
 	let mut cost_document = None;
 	let mut input_untrusted = 0usize;
-	let (scene, cached) = if job.playback.is_some() || job.map.is_some() || job.cost.is_some() {
+	let playback = scene::Playback::resolve_source(job.playback.as_ref(), job.playback_file.as_deref(), job.playback_overlay.as_ref(), job.playback_time)?;
+	let (scene, cached) = if playback.is_some() || job.map.is_some() || job.cost.is_some() {
 		// every such job has a document of its own: its parse and scene within the machine's free memory, as one load
 		let _budget = crate::budget::reserve(std::fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0));
 		let mut document = if path.is_file() {
@@ -722,7 +734,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 		if let Some(options) = &job.cost
 			&& let Some(tl) = &options.timeline
 		{
-			if let Some(playback) = &job.playback {
+			if let Some(playback) = &playback {
 				document.play = playback.play;
 				document.salt = playback.salt.clone();
 				lent_lighting = scenes.give_lighting(&mut document, playback, lighting_from)?;
@@ -748,7 +760,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 			let cost = crate::cost::timeline::run(
 				renderer,
 				&mut document,
-				job.playback.as_ref(),
+				playback.as_ref(),
 				options,
 				tl,
 				&job.views,
@@ -776,7 +788,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 			output::write_json_atomic(&out.join("summary.json"), &result, true)?;
 			return Ok(result);
 		}
-		match &job.playback {
+		match &playback {
 			Some(playback) => {
 				if job.cost.is_none() && scenes.frame_by_frame(path) {
 					crate::say(&format!("{FRAME_BY_FRAME} stills of {}'s playback in {} s: `ror video --times a,b,c --format png` draws moments from one load, about a third of the time each", path.display(), STILL_WINDOW.as_secs()));
@@ -1064,6 +1076,9 @@ mod tests {
 				materials_from: None,
 				lighting_from: None,
 				playback: None,
+				playback_file: None,
+				playback_overlay: None,
+				playback_time: None,
 				frame: None,
 				focus: None,
 				collision: None,
@@ -1167,6 +1182,9 @@ mod tests {
 				materials_from: None,
 				lighting_from: None,
 				playback: None,
+				playback_file: None,
+				playback_overlay: None,
+				playback_time: None,
 				frame: None,
 				focus: None,
 				collision,
@@ -1214,6 +1232,9 @@ mod tests {
 			materials_from: None,
 			lighting_from: None,
 			playback: None,
+			playback_file: None,
+			playback_overlay: None,
+			playback_time: None,
 			frame: None,
 			focus: None,
 			collision: None,
@@ -1314,6 +1335,9 @@ mod tests {
 				materials_from: None,
 				lighting_from: None,
 				playback: None,
+				playback_file: None,
+				playback_overlay: None,
+				playback_time: None,
 				frame: Some([[-8.0, -8.0, -1.0], [8.0, 8.0, 1.0]]),
 				focus: None,
 				collision: None,

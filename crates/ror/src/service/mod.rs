@@ -1,7 +1,10 @@
 //! The render service: one warm process per state dir that keeps the GPU device, pipelines,
 //! meshes, textures and parsed models loaded while jobs come, and runs many callers' render jobs at
-//! once. Quiet 10 s, it hands over to a dormant copy of itself, which holds the GPU's instance and
-//! adapter but no device, and makes the device again for the next job ([`State::go_dormant`]).
+//! once. Quiet `ROR_QUIET_RELEASE` s (default 10 s), it trims transient idle render targets and
+//! preparations in-process while keeping its GPU device and warm asset/scene caches hot; quiet
+//! `ROR_QUIET_DORMANT` s (default 120 s), it hands over to a dormant copy of itself, which holds
+//! the GPU's instance and adapter but no device, and makes the device again for the next job
+//! ([`State::go_dormant`]).
 //!
 //! `ror serve` listens on 127.0.0.1 (a port the OS assigns) and records it in
 //! `<state dir>/services/<build>.json` and, as the latest service, `<state dir>/service.json`;
@@ -294,15 +297,24 @@ impl State {
 /// After the last job ends: the allocator's free memory and the GPU's dropped resources go back to
 /// the system ([`crate::release_free_memory`]).
 const QUIET_COLLECT: Duration = Duration::from_secs(2);
-/// After the last job ends: the service goes dormant ([`State::sleep`]), its renderer and GPU device
-/// dropped with every cache on them; the next job makes them again on the kept adapter.
+/// After the last job ends: transient per-render caches (targets, preparations, shadow maps, GUI
+/// textures, posed skins, download bytes) are released in-process while the GPU device, warm
+/// textures/meshes/sky caches, and parsed scenes stay hot for the next command in the session.
 /// `ROR_QUIET_RELEASE` (seconds) sets it.
 fn quiet_release() -> Duration {
 	quiet("ROR_QUIET_RELEASE", 10.0)
 }
+/// After the last job ends: the service goes dormant ([`State::go_dormant`]), handing over to a
+/// lightweight copy with no GPU device or caches; the next job makes the device again on the kept
+/// adapter. Kept well above short interactive pauses so a multi-command session keeps warm caches.
+/// `ROR_QUIET_DORMANT` (seconds) sets it.
+fn quiet_dormant() -> Duration {
+	quiet("ROR_QUIET_DORMANT", 120.0)
+}
 
 fn quiet(name: &str, default: f64) -> Duration {
-	Duration::from_secs_f64(std::env::var(name).ok().and_then(|value| value.parse::<f64>().ok()).unwrap_or(default))
+	let seconds = std::env::var(name).ok().and_then(|value| value.parse::<f64>().ok()).unwrap_or(default);
+	Duration::from_secs_f64(seconds.max(0.0))
 }
 
 /// How long any request keeps an otherwise idle service from exiting.
@@ -457,17 +469,30 @@ pub fn serve(options: ServeOptions) -> Result<()> {
 		let idle = options.idle;
 		std::thread::spawn(move || {
 			let mut kept_rur = Instant::now();
-			// the job end whose leftovers were collected
+			// the job end whose leftovers were collected / transient caches released
 			let mut collected = None;
+			let mut released = None;
 			let quiet_release = quiet_release();
+			let quiet_dormant = quiet_dormant();
 			let mut relieved = None;
 			loop {
 				std::thread::sleep(Duration::from_millis(250));
 				let last_job = *state.last_job.lock();
 				let since_job = last_job.elapsed();
 				if state.running.load(Ordering::SeqCst) == 0 {
-					if let Some(done) = state.go_dormant(quiet_release) {
-						eprintln!("ror: {:.0} s without jobs: {done}", quiet_release.as_secs_f64());
+					if let Some(done) = state.go_dormant(quiet_dormant) {
+						eprintln!("ror: {:.0} s without jobs: {done}", quiet_dormant.as_secs_f64());
+					} else if since_job >= quiet_release
+						&& released != Some(last_job)
+						&& let Some(awake) = state.awake_now()
+					{
+						released = Some(last_job);
+						collected = Some(last_job);
+						// Release transient render targets, preparations, shadows, GUI frames and
+						// download buffers while keeping the GPU device and warm texture/mesh/scene
+						// caches hot across pauses within one session.
+						awake.renderer.release_idle();
+						crate::release_free_memory();
 					} else if since_job > QUIET_COLLECT
 						&& collected != Some(last_job)
 						&& let Some(awake) = state.awake_now()
@@ -498,7 +523,7 @@ pub fn serve(options: ServeOptions) -> Result<()> {
 				// keep-alive is a request, and rur-native held 409 MB for as long as ror lived
 				if kept_rur.elapsed() > RUR_KEEP_ALIVE {
 					kept_rur = Instant::now();
-					if state.running.load(Ordering::SeqCst) > 0 || since_job < quiet_release {
+					if state.running.load(Ordering::SeqCst) > 0 || since_job < quiet_dormant {
 						crate::render::rur::keep_alive();
 					}
 				}
@@ -540,8 +565,9 @@ pub fn serve(options: ServeOptions) -> Result<()> {
 		std::thread::spawn(move || {
 			let _ = stream.set_nodelay(true);
 			if let Err(error) = handle(&state, &stream) {
+				eprintln!("ror: refused request (500): {error:#}");
 				let body = serde_json::json!({"error": format!("{error:#}")}).to_string();
-				let _ = http::write_response(&stream, 500, "application/json", body.as_bytes());
+				let _ = http::write_response_and_close(&stream, 500, "application/json", body.as_bytes());
 			}
 		});
 	}
@@ -599,7 +625,8 @@ fn handle(state: &State, stream: &TcpStream) -> Result<()> {
 	*state.last_activity.lock() = Instant::now();
 	let local_host = request.header("host").is_some_and(|host| host.starts_with("127.0.0.1:") || host.starts_with("localhost:"));
 	if request.header("x-ror") != Some("1") || !local_host {
-		return http::write_response(stream, 403, "application/json", br#"{"error":"requests need the X-ROR: 1 header and a local Host"}"#);
+		eprintln!("ror: refused {} {} (403): requests need the X-ROR: 1 header and a local Host", request.method, request.path);
+		return http::write_response_and_close(stream, 403, "application/json", br#"{"error":"requests need the X-ROR: 1 header and a local Host"}"#);
 	}
 	match (request.method.as_str(), request.path.as_str()) {
 		("GET", "/health") => {
@@ -719,7 +746,10 @@ fn handle(state: &State, stream: &TcpStream) -> Result<()> {
 			state.shutting_down.store(true, Ordering::SeqCst);
 			http::write_response(stream, 200, "application/json", br#"{"ok":true}"#)
 		}
-		_ => http::write_response(stream, 404, "application/json", br#"{"error":"not found"}"#),
+		_ => {
+			eprintln!("ror: refused {} {} (404): not found", request.method, request.path);
+			http::write_response_and_close(stream, 404, "application/json", br#"{"error":"not found"}"#)
+		}
 	}
 }
 
@@ -806,10 +836,12 @@ fn counted(state: &State, offline: bool, run: impl FnOnce(&Renderer) -> Result<s
 		}
 		Ok(Err(error)) => {
 			state.failed.fetch_add(1, Ordering::SeqCst);
+			eprintln!("ror: job failed (400): {error:#}");
 			(400, serde_json::json!({"error": format!("{error:#}")}))
 		}
 		Err(_) => {
 			state.failed.fetch_add(1, Ordering::SeqCst);
+			eprintln!("ror: job failed (500): the render panicked");
 			(500, serde_json::json!({"error": "the render panicked"}))
 		}
 	}
@@ -1096,5 +1128,202 @@ mod tests {
 
 		server.join().unwrap();
 		let _ = std::fs::remove_dir_all(&state_dir);
+	}
+
+	/// Request bodies over the old 64 MiB limit stream cleanly through `http::read_request`, and
+	/// early server refusals deliver their HTTP error response cleanly without dropping the client
+	/// with a reset while body bytes are still in flight.
+	#[test]
+	fn large_bodies_stream_and_early_refusals_deliver_their_reason() {
+		let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+		let port = listener.local_addr().unwrap().port();
+		let large_len = (65 << 20) + 123;
+		let server = std::thread::spawn(move || {
+			let (stream, _) = listener.accept().unwrap();
+			let req = http::read_request(&stream).expect("65 MiB body must be accepted");
+			assert_eq!(req.body.len(), large_len);
+			assert_eq!(req.body[0], b'a');
+			assert_eq!(req.body[large_len - 1], b'z');
+			http::write_response(&stream, 200, "application/json", br#"{"ok":true}"#).unwrap();
+
+			// Second request: reject early with 413 without reading the body and close cleanly.
+			let (stream, _) = listener.accept().unwrap();
+			http::write_response_and_close(&stream, 413, "application/json", br#"{"error":"refused for test"}"#).unwrap();
+		});
+
+		let mut payload = vec![b'x'; large_len];
+		payload[0] = b'a';
+		payload[large_len - 1] = b'z';
+		let (status, body) = http::request_hearing(port, "POST", "/video", "X-ROR: 1", &payload, Duration::from_secs(30), &mut |_| {}).expect("65 MiB request must succeed");
+		assert_eq!(status, 200);
+		assert_eq!(body, br#"{"ok":true}"#);
+
+		let big_rejected = vec![b'y'; 4 << 20];
+		let (status, body) = http::request_hearing(port, "POST", "/video", "X-ROR: 1", &big_rejected, Duration::from_secs(10), &mut |_| {}).expect("client must read early refusal response");
+		assert_eq!(status, 413);
+		assert!(String::from_utf8_lossy(&body).contains("refused for test"), "{}", String::from_utf8_lossy(&body));
+		server.join().unwrap();
+	}
+
+	/// Jobs passing `playbackFile` (with optional `playbackOverlay` / `playbackTime`) send only a
+	/// small path payload over HTTP and load the playback file on the service side for both `/render`
+	/// and `/video`.
+	#[test]
+	fn service_loads_playback_file_by_path_for_render_and_video() {
+		let dir = std::env::temp_dir().join(format!("ror-service-playback-file-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		let mut model = crate::scene::build::ModelBuilder::new("Scene");
+		model.part(&crate::scene::build::PartSpec { name: "Block".into(), size: glam::Vec3::splat(2.0), color: [255, 0, 0], ..Default::default() });
+		let rbxm = dir.join("scene.rbxm");
+		std::fs::write(&rbxm, model.to_rbxm().unwrap()).unwrap();
+		let playback_path = dir.join("playback.json");
+		let playback_json = serde_json::json!({
+			"time": 0.5,
+			"actions": [{ "at": 0.25, "target": "Scene.Block", "set": { "Transparency": 1.0 } }]
+		});
+		std::fs::write(&playback_path, playback_json.to_string()).unwrap();
+
+		let adapter = GpuAdapter::find().expect("a GPU (or software adapter)");
+		let adapter_info = adapter.adapter.get_info();
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&dir) });
+		let state = Arc::new_cyclic(|me| State {
+			me: me.clone(),
+			adapter,
+			adapter_info,
+			assets,
+			awake: RwLock::new(None),
+			waking: Mutex::new(()),
+			wakes: AtomicU64::new(0),
+			wake_ms: AtomicU64::new(0),
+			last_wake: Mutex::new(Instant::now()),
+			scenes: SceneCache::default(),
+			gpu: crate::budget::GpuGate::default(),
+			started: Instant::now(),
+			last_activity: Mutex::new(Instant::now()),
+			last_job: Mutex::new(Instant::now()),
+			running: AtomicU64::new(0),
+			done: AtomicU64::new(0),
+			failed: AtomicU64::new(0),
+			shutting_down: AtomicBool::new(false),
+			build: "test-playback-file".into(),
+			warming: AtomicBool::new(false),
+			state_dir: dir.clone(),
+			offline: true,
+			source: None,
+			idle: Duration::from_secs(60),
+			handed_over: AtomicBool::new(false),
+		});
+
+		let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+		let port = listener.local_addr().unwrap().port();
+		let server_state = state.clone();
+		let server = std::thread::spawn(move || {
+			for _ in 0..3 {
+				let (stream, _) = listener.accept().unwrap();
+				handle(&server_state, &stream).unwrap();
+			}
+		});
+
+		// 1. `/render` with `playbackFile` alone preserves the file's `time: 0.5` (block becomes hidden).
+		let render_hidden = serde_json::json!({
+			"input": rbxm,
+			"playbackFile": playback_path,
+			"views": [{ "name": "front", "width": 32, "height": 32, "msaa": 1, "bloom": false, "background": { "color": [0.0, 0.0, 0.0] } }],
+			"noPng": true,
+		});
+		let (status, body) = http::request_as(port, "POST", "/render", "X-ROR: 1\r\nX-ROR-Offline: 1", render_hidden.to_string().as_bytes(), client::RENDER_TIMEOUT).unwrap();
+		assert_eq!(status, 200, "render with playbackFile failed: {}", String::from_utf8_lossy(&body));
+		let hidden: serde_json::Value = serde_json::from_slice(&body).unwrap();
+		assert_eq!(hidden["parts"], 0, "at t=0.5 from playbackFile, block must be hidden: {hidden}");
+
+		// 2. `/render` with `playbackFile` + `playbackTime: 0.0` overrides the file's `time` (block visible).
+		let render_visible = serde_json::json!({
+			"input": rbxm,
+			"playbackFile": playback_path,
+			"playbackTime": 0.0,
+			"views": [{ "name": "front", "width": 32, "height": 32, "msaa": 1, "bloom": false, "background": { "color": [0.0, 0.0, 0.0] } }],
+			"noPng": true,
+		});
+		let (status, body) = http::request_as(port, "POST", "/render", "X-ROR: 1\r\nX-ROR-Offline: 1", render_visible.to_string().as_bytes(), client::RENDER_TIMEOUT).unwrap();
+		assert_eq!(status, 200, "render with playbackTime override failed: {}", String::from_utf8_lossy(&body));
+		let visible: serde_json::Value = serde_json::from_slice(&body).unwrap();
+		assert_eq!(visible["parts"], 1, "at overridden t=0.0, block must be visible: {visible}");
+
+		// 3. `/video` with `playbackFile` and no inline `playback` loads the file on the server side.
+		let video_job = serde_json::json!({
+			"input": rbxm,
+			"out": dir.join("video"),
+			"view": { "width": 32, "height": 32, "msaa": 1, "bloom": false, "background": { "color": [0.0, 0.0, 0.0] } },
+			"playbackFile": playback_path,
+			"start": 0.0,
+			"duration": 0.5,
+			"fps": 4.0,
+			"format": "png",
+			"sheet": 0,
+		});
+		let (status, body) = http::request_as(port, "POST", "/video", "X-ROR: 1\r\nX-ROR-Offline: 1", video_job.to_string().as_bytes(), client::RENDER_TIMEOUT).unwrap();
+		assert_eq!(status, 200, "video with playbackFile failed: {}", String::from_utf8_lossy(&body));
+		let video: serde_json::Value = serde_json::from_slice(&body).unwrap();
+		assert_eq!(video["frames"], 2);
+		assert_eq!(video["stats"]["parts"], 1);
+
+		server.join().unwrap();
+		drop(state);
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	/// Default idle lifecycle keeps the GPU device and warm caches alive past `ROR_QUIET_RELEASE`
+	/// (10 s) and only hands over to a dormant process after `ROR_QUIET_DORMANT` (120 s).
+	#[test]
+	fn quiet_release_keeps_warm_device_until_quiet_dormant() {
+		assert!(quiet_dormant() > quiet_release(), "dormant handover must wait longer than transient quiet release");
+		assert!(quiet_dormant() >= Duration::from_secs(60), "default dormant timeout must avoid mid-session handover churn");
+
+		let dir = std::env::temp_dir().join(format!("ror-quiet-tiers-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		let adapter = GpuAdapter::find().expect("a GPU (or software adapter)");
+		let adapter_info = adapter.adapter.get_info();
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&dir) });
+		let state = Arc::new_cyclic(|me| State {
+			me: me.clone(),
+			adapter,
+			adapter_info,
+			assets,
+			awake: RwLock::new(None),
+			waking: Mutex::new(()),
+			wakes: AtomicU64::new(0),
+			wake_ms: AtomicU64::new(0),
+			last_wake: Mutex::new(Instant::now()),
+			scenes: SceneCache::default(),
+			gpu: crate::budget::GpuGate::default(),
+			started: Instant::now(),
+			last_activity: Mutex::new(Instant::now()),
+			last_job: Mutex::new(Instant::now()),
+			running: AtomicU64::new(0),
+			done: AtomicU64::new(0),
+			failed: AtomicU64::new(0),
+			shutting_down: AtomicBool::new(false),
+			build: "test-quiet-tiers".into(),
+			warming: AtomicBool::new(false),
+			state_dir: dir.clone(),
+			offline: true,
+			source: None,
+			idle: Duration::from_secs(600),
+			handed_over: AtomicBool::new(false),
+		});
+		let awake = state.awake().unwrap();
+		assert_eq!(state.wakes.load(Ordering::SeqCst), 1);
+		// Simulate 15 s idle (past 10 s quiet_release, before 120 s quiet_dormant).
+		let fifteen_ago = Instant::now() - Duration::from_secs(15);
+		*state.last_job.lock() = fifteen_ago;
+		*state.last_wake.lock() = fifteen_ago;
+		assert!(state.go_dormant(Duration::from_secs(120)).is_none(), "must not go dormant after only 15 s idle");
+		awake.renderer.release_idle();
+		assert!(state.awake_now().is_some(), "transient release_idle must keep the GPU device warm");
+		assert!(!state.handed_over.load(Ordering::SeqCst));
+		drop((awake, state));
+		let _ = std::fs::remove_dir_all(&dir);
 	}
 }

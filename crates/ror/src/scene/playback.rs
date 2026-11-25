@@ -1324,6 +1324,60 @@ pub struct NaturalEnd {
 }
 
 impl Playback {
+	/// Reads a playback JSON file from disk.
+	pub fn load_file(path: &std::path::Path) -> Result<Self> {
+		let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+		serde_json::from_slice(&bytes).with_context(|| format!("--playback {}", path.display()))
+	}
+
+	/// Applies CLI overrides (`--emit`, `--enable`, `--disable`, `--set`, `--tween`, `--parent`,
+	/// `ROR_PARTICLE_SALT`, `--time`) on top of a playback loaded from a file.
+	pub fn merge_overlay(&mut self, overlay: Playback, override_time: Option<f32>) {
+		if let Some(time) = override_time {
+			self.time = time;
+		}
+		if !overlay.salt.is_empty() {
+			self.salt = overlay.salt;
+		}
+		self.actions.extend(overlay.actions);
+		self.tweens.extend(overlay.tweens);
+		self.motion.extend(overlay.motion);
+		if overlay.play {
+			self.play = true;
+		}
+		if !overlay.viewer.is_empty() {
+			self.viewer = overlay.viewer;
+		}
+		if overlay.frames.is_some() {
+			self.frames = overlay.frames;
+		}
+		if overlay.prewarm != 0.0 {
+			self.prewarm = overlay.prewarm;
+		}
+	}
+
+	/// Resolves the effective playback for a job: inline `playback` (when supplied directly), else
+	/// `playback_file` read from disk, with any `overlay` and explicit `time` override merged on top.
+	pub fn resolve_source(playback: Option<&Playback>, file: Option<&std::path::Path>, overlay: Option<&Playback>, time: Option<f32>) -> Result<Option<Playback>> {
+		if playback.is_none() && file.is_none() && overlay.is_none() && time.is_none() {
+			return Ok(None);
+		}
+		let mut resolved = match (playback, file) {
+			(Some(playback), _) => playback.clone(),
+			(None, Some(path)) => Self::load_file(path)?,
+			(None, None) => Playback::default(),
+		};
+		match overlay {
+			Some(overlay) => resolved.merge_overlay(overlay.clone(), time),
+			None => {
+				if let Some(time) = time {
+					resolved.time = time;
+				}
+			}
+		}
+		Ok(Some(resolved))
+	}
+
 	/// No motion, tweens, property sets, switching or parenting at any moment: only emits (and
 	/// Clear, TimeScale), which the extracted scene's history carries ([`Resolved::apply_history`]).
 	pub fn changes_nothing(&self) -> bool {

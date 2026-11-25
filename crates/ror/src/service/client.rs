@@ -395,6 +395,30 @@ fn relative_here(named: Option<PathBuf>) -> Option<PathBuf> {
 	named.map(|folder| absolute(&folder)).or_else(|| std::env::current_dir().ok())
 }
 
+/// The local render service refused or could not handle the request; the caller should fall back to
+/// rendering in-process.
+#[derive(Debug)]
+pub struct ServiceRefused(pub String);
+
+impl std::fmt::Display for ServiceRefused {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(&self.0)
+	}
+}
+
+impl std::error::Error for ServiceRefused {}
+
+/// Whether `error` came from the render service refusing or failing to handle the request (as
+/// opposed to a bad input/job error returned by the job itself, or a timeout where the job may
+/// still be running in the service).
+pub fn is_refused(error: &anyhow::Error) -> bool {
+	error.downcast_ref::<ServiceRefused>().is_some()
+}
+
+fn refused(message: impl Into<String>) -> anyhow::Error {
+	anyhow::Error::new(ServiceRefused(message.into()))
+}
+
 /// Sends a job to the service (starting it if needed) and returns its result JSON.
 pub fn render(state_dir: &Path, job: &Job, offline: bool) -> Result<serde_json::Value> {
 	let mut job = job.clone();
@@ -405,6 +429,7 @@ pub fn render(state_dir: &Path, job: &Job, offline: bool) -> Result<serde_json::
 	if let Some(map) = &mut job.map {
 		map.file = file_here(&map.file);
 	}
+	job.playback_file = job.playback_file.as_deref().map(absolute);
 	job.out = job.out.as_deref().map(absolute);
 	post(state_dir, "/render", &serde_json::to_vec(&job)?, offline, RENDER_TIMEOUT)
 }
@@ -460,32 +485,49 @@ fn post(state_dir: &Path, route: &str, body: &[u8], offline: bool, timeout: Dura
 	let mut attempt = 0;
 	loop {
 		attempt += 1;
-		let port = ensure(state_dir, offline)?;
-		match http::request_hearing(port, "POST", route, &header, body, timeout, &mut |note| eprintln!("ror: {note}")) {
-			Ok((status, response)) => {
-				let value: serde_json::Value = serde_json::from_slice(&response).map_err(|error| anyhow!("the render service's answer ({status}) is not JSON ({error}): {}", String::from_utf8_lossy(&response)))?;
-				if status != 200 {
-					match value.get("error").and_then(|error| error.as_str()).filter(|error| !error.trim().is_empty()) {
-						Some(error) => bail!("{error}"),
-						None => bail!("the render service answered {status} without saying why: {value} (its log: {})", log.display()),
-					}
-				}
-				return Ok(value);
-			}
-			Err(http::Unanswered::NotSent(error)) if attempt < 2 => {
-				eprintln!("ror: the job could not be sent to the render service on port {port} ({error:#}); sending it again");
-			}
-			Err(http::Unanswered::Closed(why)) if attempt < 2 => {
-				eprintln!("ror: the render service on port {port} closed the connection without an answer ({why}): it exited or crashed (its log: {}); sending the job again", log.display());
-			}
-			Err(http::Unanswered::NotSent(error)) => bail!("could not send the job to the render service on port {port}: {error:#} (its log: {})", log.display()),
-			Err(http::Unanswered::Closed(why)) => bail!("the render service on port {port} closed the connection without an answer ({why}), twice: it exited or crashed (its log: {})", log.display()),
-			Err(http::Unanswered::TimedOut) => bail!(
-				"the render service on port {port} gave no answer in {:.0} s; the job may still be running there (its log: {}). `ror service status` shows its jobs and memory",
-				timeout.as_secs_f64(),
-				log.display()
-			),
+		let port = ensure(state_dir, offline).map_err(|error| refused(format!("{error:#}")))?;
+		match post_once(port, route, &header, body, timeout, &log) {
+			PostAttempt::Ok(value) => return Ok(value),
+			PostAttempt::Retry(message) if attempt < 2 => eprintln!("ror: {message}; sending the job again"),
+			PostAttempt::Retry(message) => return Err(refused(message)),
+			PostAttempt::Refused(message) => return Err(refused(message)),
+			PostAttempt::JobError(error) => return Err(error),
 		}
+	}
+}
+
+enum PostAttempt {
+	Ok(serde_json::Value),
+	Retry(String),
+	Refused(String),
+	JobError(anyhow::Error),
+}
+
+fn post_once(port: u16, route: &str, header: &str, body: &[u8], timeout: Duration, log: &Path) -> PostAttempt {
+	match http::request_hearing(port, "POST", route, header, body, timeout, &mut |note| eprintln!("ror: {note}")) {
+		Ok((status, response)) => {
+			let value: serde_json::Value = match serde_json::from_slice(&response) {
+				Ok(value) => value,
+				Err(error) => return PostAttempt::Refused(format!("the render service's answer ({status}) is not JSON ({error}): {}", String::from_utf8_lossy(&response))),
+			};
+			if status != 200 {
+				let message = match value.get("error").and_then(|error| error.as_str()).filter(|error| !error.trim().is_empty()) {
+					Some(error) => error.to_string(),
+					None => format!("the render service answered {status} without saying why: {value} (its log: {})", log.display()),
+				};
+				// HTTP 400 comes from the job itself failing validation or asset lookup; any other
+				// non-200 status (403, 404, 413, 500, 503, ...) means the service refused or broke.
+				return if status == 400 { PostAttempt::JobError(anyhow!("{message}")) } else { PostAttempt::Refused(format!("HTTP {status}: {message}")) };
+			}
+			PostAttempt::Ok(value)
+		}
+		Err(http::Unanswered::NotSent(error)) => PostAttempt::Retry(format!("could not send the job to the render service on port {port}: {error:#} (its log: {})", log.display())),
+		Err(http::Unanswered::Closed(why)) => PostAttempt::Retry(format!("the render service on port {port} closed the connection without an answer ({why}): it exited or crashed (its log: {})", log.display())),
+		Err(http::Unanswered::TimedOut) => PostAttempt::JobError(anyhow!(
+			"the render service on port {port} gave no answer in {:.0} s; the job may still be running there (its log: {}). `ror service status` shows its jobs and memory",
+			timeout.as_secs_f64(),
+			log.display()
+		)),
 	}
 }
 
@@ -564,5 +606,33 @@ mod tests {
 		assert!(prune_if_same(&unchanged, &stale), "matching stale record should be pruned");
 		assert!(!unchanged.exists());
 		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	/// Service refusals (403, 413, 500, 503, non-JSON) classify as `Refused` so the CLI falls back
+	/// to in-process rendering, while HTTP 400 job errors stay `JobError`.
+	#[test]
+	fn service_refusal_is_distinguished_from_job_error() {
+		let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+		let port = listener.local_addr().unwrap().port();
+		let server = std::thread::spawn(move || {
+			let replies: [(u16, &[u8]); 4] = [
+				(500, br#"{"error":"request body rejected"}"#),
+				(413, br#"{"error":"payload too large"}"#),
+				(400, br#"{"error":"no such file"}"#),
+				(503, b"not json"),
+			];
+			for (status, body) in replies {
+				let (stream, _) = listener.accept().unwrap();
+				let _ = http::read_request(&stream);
+				let _ = http::write_response_and_close(&stream, status, "application/json", body);
+			}
+		});
+		let log = PathBuf::from("serve.log");
+		let header = "X-ROR: 1";
+		assert!(matches!(post_once(port, "/render", header, b"{}", Duration::from_secs(5), &log), PostAttempt::Refused(msg) if msg.contains("HTTP 500") && msg.contains("request body rejected")));
+		assert!(matches!(post_once(port, "/render", header, b"{}", Duration::from_secs(5), &log), PostAttempt::Refused(msg) if msg.contains("HTTP 413")));
+		assert!(matches!(post_once(port, "/render", header, b"{}", Duration::from_secs(5), &log), PostAttempt::JobError(err) if !is_refused(&err) && err.to_string().contains("no such file")));
+		assert!(matches!(post_once(port, "/render", header, b"{}", Duration::from_secs(5), &log), PostAttempt::Refused(msg) if msg.contains("not JSON")));
+		server.join().unwrap();
 	}
 }
