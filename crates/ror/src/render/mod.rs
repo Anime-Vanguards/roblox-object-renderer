@@ -798,6 +798,14 @@ mod surface_tests {
 		std::fs::write(&file, b"one").unwrap();
 		assert_ne!(content_key(&plain), plain);
 		assert_ne!(content_key(&plain.replace('\\', "/")), plain.replace('\\', "/"));
+		// A time-preserving copy whose mtime is older than 2 s and whose size stays equal still gets a new key.
+		let old_mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+		std::fs::write(&file, b"alpha").unwrap();
+		std::fs::File::options().write(true).open(&file).unwrap().set_modified(old_mtime).unwrap();
+		let old_before = content_key(&uri);
+		std::fs::write(&file, b"bravo").unwrap();
+		std::fs::File::options().write(true).open(&file).unwrap().set_modified(old_mtime).unwrap();
+		assert_ne!(old_before, content_key(&uri), "same-size time-preserving copy with >2 s old mtime must change cache key");
 		std::fs::remove_file(&file).unwrap();
 		assert_eq!(content_key("rbxassetid://123"), "rbxassetid://123");
 		assert_eq!(content_key(&transcode::image_key("rbxassetid://123")), transcode::image_key("rbxassetid://123"));
@@ -809,33 +817,66 @@ mod surface_tests {
 	#[test]
 	fn a_rewritten_local_image_gets_a_new_material() {
 		let state = std::env::temp_dir().join(format!("ror-material-stamp-test-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&state);
 		std::fs::create_dir_all(&state).unwrap();
 		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let file = state.join("paint.png");
 		let paint = |side: u32, rgba: [u8; 4]| crate::output::write_png(&file, side, side, &rgba.repeat((side * side) as usize), true).unwrap();
+		let set_mtime = |time: std::time::SystemTime| {
+			std::fs::File::options().write(true).open(&file).unwrap().set_modified(time).unwrap();
+		};
 		paint(4, [255, 0, 0, 255]);
-		let key = MaterialKey { color: Some(format!("file:///{}", file.display().to_string().replace('\\', "/").replace(' ', "%20"))), ..MaterialKey::default() };
+		let uri = format!("file:///{}", file.display().to_string().replace('\\', "/").replace(' ', "%20"));
+		let key = MaterialKey { color: Some(uri.clone()), ..MaterialKey::default() };
 		let mut missing = Vec::new();
 		let first = renderer.material_bind_group(&key, &mut missing);
 		assert!(Arc::ptr_eq(&first, &renderer.material_bind_group(&key, &mut missing)), "an unchanged image keeps its material");
 		paint(8, [0, 255, 0, 255]);
+		let meta_second = std::fs::metadata(&file).unwrap();
+		let mtime_second = meta_second.modified().unwrap();
+		let change_second = file_change_time(&file, &meta_second);
+		let stamped_second = content_key_for_stamp(&uri, &file, meta_second.len(), Some(mtime_second), change_second);
 		// `first` is still held, as the geometry prepared with it holds it
 		let second = renderer.material_bind_group(&key, &mut missing);
 		assert!(missing.is_empty(), "{missing:?}");
 		assert!(!Arc::ptr_eq(&first, &second), "the rewritten image drew with its first version's material");
 		assert_eq!(second.maps[0].as_ref().map(|map| map.width), Some(8));
 		assert_eq!(first.maps[0].as_ref().map(|map| map.width), Some(4));
-		// rewriting again immediately at the same dimensions and byte length still gets a new material
+		// Rewriting again at the exact same dimensions, byte length, and mtime (and even when OS
+		// timestamp ticks collide so len/mtime/ctime are all identical) still gets a new key & material.
 		paint(8, [0, 0, 255, 255]);
+		set_mtime(mtime_second);
+		let meta_third = std::fs::metadata(&file).unwrap();
+		assert_eq!(meta_third.len(), meta_second.len(), "test setup needs identical byte length");
+		assert_eq!(meta_third.modified().unwrap(), mtime_second, "test setup needs identical mtime");
+		assert_ne!(
+			stamped_second,
+			content_key_for_stamp(&uri, &file, meta_third.len(), Some(mtime_second), change_second),
+			"same-tick recent rewrite with identical len/mtime/change_time must hash contents"
+		);
 		let third = renderer.material_bind_group(&key, &mut missing);
 		assert!(missing.is_empty(), "{missing:?}");
-		assert!(!Arc::ptr_eq(&second, &third), "same-size immediate rewrite kept its previous material");
+		assert!(!Arc::ptr_eq(&second, &third), "same-size same-mtime rewrite kept its previous material");
+		// A time-preserving copy whose mtime is older than the 2 s recent window still gets a new material
+		// because NTFS ChangeTime / Unix ctime advances on the overwrite.
+		let old_mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+		set_mtime(old_mtime);
+		let meta_old_before = std::fs::metadata(&file).unwrap();
+		let fourth = renderer.material_bind_group(&key, &mut missing);
+		paint(8, [255, 0, 0, 255]);
+		set_mtime(old_mtime);
+		let meta_old_after = std::fs::metadata(&file).unwrap();
+		assert_eq!(meta_old_after.len(), meta_old_before.len(), "old-mtime rewrite needs identical byte length");
+		assert_eq!(meta_old_after.modified().unwrap(), meta_old_before.modified().unwrap(), "old-mtime rewrite needs identical mtime");
+		let fifth = renderer.material_bind_group(&key, &mut missing);
+		assert!(missing.is_empty(), "{missing:?}");
+		assert!(!Arc::ptr_eq(&fourth, &fifth), "same-size time-preserving copy with >2 s old mtime kept its previous material");
 		// an asset id's key is kept as it is
 		let asset = MaterialKey { color: Some("rbxassetid://123".into()), ..MaterialKey::default() };
 		assert!(matches!(asset.stamped(), std::borrow::Cow::Borrowed(_)));
-		drop((first, second, third, renderer));
+		drop((first, second, third, fourth, fifth, renderer));
 		let _ = std::fs::remove_dir_all(&state);
 	}
 
@@ -5789,6 +5830,79 @@ pub(crate) fn names_local_file(uri: &str) -> bool {
 	matches!(ror_assets::ContentId::parse(path), Ok(ror_assets::ContentId::File(_)))
 }
 
+/// The inode/metadata change time of `path` (NTFS `FILE_BASIC_INFO.ChangeTime` on Windows, `ctime`
+/// on Unix), which advances on rewrites and time-preserving copies even when `mtime` is restored to
+/// an older timestamp.
+#[cfg(windows)]
+fn file_change_time(path: &std::path::Path, _meta: &std::fs::Metadata) -> Option<std::time::SystemTime> {
+	use std::os::windows::ffi::OsStrExt;
+	use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+	use windows_sys::Win32::Storage::FileSystem::{
+		CreateFileW, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileBasicInfo, GetFileInformationByHandleEx, OPEN_EXISTING,
+	};
+	let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+	// SAFETY: `wide` is null-terminated UTF-16; `handle` is closed before returning.
+	unsafe {
+		let handle = CreateFileW(
+			wide.as_ptr(),
+			FILE_READ_ATTRIBUTES,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			std::ptr::null(),
+			OPEN_EXISTING,
+			FILE_FLAG_BACKUP_SEMANTICS,
+			std::ptr::null_mut(),
+		);
+		if handle == INVALID_HANDLE_VALUE {
+			return None;
+		}
+		let mut info: FILE_BASIC_INFO = std::mem::zeroed();
+		let ok = GetFileInformationByHandleEx(handle, FileBasicInfo, (&raw mut info).cast(), std::mem::size_of::<FILE_BASIC_INFO>() as u32);
+		CloseHandle(handle);
+		if ok == 0 || info.ChangeTime <= 0 {
+			return None;
+		}
+		// Windows FILETIME: 100 ns ticks since 1601-01-01; Unix epoch is 116_444_736_000_000_000 ticks later.
+		const EPOCH_DIFF: u64 = 116_444_736_000_000_000;
+		let ticks = (info.ChangeTime as u64).checked_sub(EPOCH_DIFF)?;
+		Some(std::time::UNIX_EPOCH + std::time::Duration::new(ticks / 10_000_000, ((ticks % 10_000_000) * 100) as u32))
+	}
+}
+
+#[cfg(unix)]
+fn file_change_time(_path: &std::path::Path, meta: &std::fs::Metadata) -> Option<std::time::SystemTime> {
+	use std::os::unix::fs::MetadataExt;
+	let secs = u64::try_from(meta.ctime()).ok()?;
+	let nanos = u32::try_from(meta.ctime_nsec()).ok()?;
+	Some(std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos))
+}
+
+#[cfg(not(any(windows, unix)))]
+fn file_change_time(_path: &std::path::Path, _meta: &std::fs::Metadata) -> Option<std::time::SystemTime> {
+	None
+}
+
+fn content_key_for_stamp(uri: &str, file: &std::path::Path, len: u64, modified_time: Option<std::time::SystemTime>, change_time: Option<std::time::SystemTime>) -> String {
+	let unix_nanos = |time: Option<std::time::SystemTime>| time.and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |time| time.as_nanos());
+	let modified = unix_nanos(modified_time);
+	let changed = unix_nanos(change_time);
+	// Windows file timestamps can quantise to ~15.6 ms ticks: an in-place rewrite at the same byte
+	// length right after a render can keep `(len, mtime, change_time)`. Including `change_time` also
+	// catches time-preserving copies whose restored `mtime` is older than 2 s, and hashing files
+	// whose `mtime` or `change_time` is within 2 s closes same-tick collisions without reading old
+	// unchanged files.
+	let is_recent = |time: Option<std::time::SystemTime>| time.is_some_and(|time| time.elapsed().map_or(true, |age| age < std::time::Duration::from_secs(2)));
+	let recent = modified_time.is_none() || is_recent(modified_time) || is_recent(change_time);
+	if recent
+		&& len <= 64 << 20
+		&& let Ok(bytes) = std::fs::read(file)
+	{
+		let hash = blake3::hash(&bytes);
+		format!("{uri}@{len}:{modified}:{changed}:{}", &hash.to_hex()[..16])
+	} else {
+		format!("{uri}@{len}:{modified}:{changed}")
+	}
+}
+
 pub(crate) fn content_key(uri: &str) -> String {
 	let path = uri.split_once('#').map_or(uri, |(path, _)| path);
 	// a URI with a scheme other than file: (rbxassetid://, a transcode's or a composite's key) names no
@@ -5803,23 +5917,7 @@ pub(crate) fn content_key(uri: &str) -> String {
 	}
 	match ror_assets::ContentId::parse(path) {
 		Ok(ror_assets::ContentId::File(file)) => match std::fs::metadata(&file) {
-			Ok(meta) => {
-				let modified_time = meta.modified().ok();
-				let modified = modified_time.and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |time| time.as_nanos());
-				// Windows file mtimes can quantise to ~15.6 ms ticks: an in-place rewrite at the same
-				// byte length right after a render can keep `(len, mtime)`. Hash recently-modified files
-				// so `Renderer.textures` and `MaterialKey::stamped` never keep stale paint.
-				let recent = modified_time.is_none_or(|time| time.elapsed().map_or(true, |age| age < std::time::Duration::from_secs(2)));
-				if recent
-					&& meta.len() <= 64 << 20
-					&& let Ok(bytes) = std::fs::read(&file)
-				{
-					let hash = blake3::hash(&bytes);
-					format!("{uri}@{}:{modified}:{}", meta.len(), &hash.to_hex()[..16])
-				} else {
-					format!("{uri}@{}:{modified}", meta.len())
-				}
-			}
+			Ok(meta) => content_key_for_stamp(uri, &file, meta.len(), meta.modified().ok(), file_change_time(&file, &meta)),
 			Err(_) => uri.to_string(),
 		},
 		_ => uri.to_string(),
