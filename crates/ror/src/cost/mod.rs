@@ -24,6 +24,7 @@ pub mod prices;
 pub mod report;
 #[cfg(windows)]
 pub mod studio;
+pub mod timeline;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -218,6 +219,10 @@ pub struct CostOptions {
 	/// With `budget`: the run fails when a view is over it.
 	#[serde(default)]
 	pub fail_over_budget: bool,
+	/// Multi-frame timeline costing (`--duration` or `--times`): steps a playback from one load and
+	/// writes `timeline.json` and `analysis.txt`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub timeline: Option<timeline::TimelineOptions>,
 }
 
 impl CostOptions {

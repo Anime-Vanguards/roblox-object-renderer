@@ -401,13 +401,19 @@ pub fn measure_cached(scene: &Scene, meshes: &Meshes, assets: &Assets, cache: &m
 	measure_many(&[scene], &meshes.stats, assets, cache)
 }
 
-/// Measures deduplicated mesh and texture memory across the union of `scenes` (e.g. a timeline's
-/// frames), using decoded mesh entries from `mesh_stats` and caching texture lookups in `cache`.
-pub fn measure_many(scenes: &[&Scene], mesh_stats: &HashMap<String, Arc<MeshStats>>, assets: &Assets, cache: &mut TextureCache) -> MemoryReport {
-	// 1. Deduplicate meshes across all scenes (count instances in the peak scene, or total across
-	// a single scene; for multi-frame timelines use the max simultaneous instances of each mesh).
-	let mut mesh_instances: BTreeMap<String, u64> = BTreeMap::new();
-	for scene in scenes {
+/// Incremental collector for deduplicated mesh and texture references across one or more scenes
+/// (allows multi-frame timeline runs to accumulate memory without retaining every frame's `Scene`).
+#[derive(Default)]
+pub struct MemoryCollector {
+	mesh_instances: BTreeMap<String, u64>,
+	wanted: BTreeMap<String, TextureWanted>,
+	pack_cache: HashMap<String, Option<PackMaps>>,
+	warmed_packs: std::collections::HashSet<String>,
+}
+
+impl MemoryCollector {
+	/// Records one scene's mesh and texture references into the collector.
+	pub fn add_scene(&mut self, scene: &Scene, assets: &Assets) {
 		let mut frame_counts: HashMap<String, u64> = HashMap::new();
 		for part in &scene.parts {
 			if let Some(key) = meshes::mesh_key(&part.geometry) {
@@ -415,86 +421,39 @@ pub fn measure_many(scenes: &[&Scene], mesh_stats: &HashMap<String, Arc<MeshStat
 			}
 		}
 		for (key, count) in frame_counts {
-			let entry = mesh_instances.entry(key).or_default();
+			let entry = self.mesh_instances.entry(key).or_default();
 			*entry = (*entry).max(count);
 		}
-	}
 
-	let mut mesh_mem = MeshMemory { unique: mesh_instances.len() as u64, ..Default::default() };
-	let mut mesh_entries = Vec::with_capacity(mesh_instances.len());
-	let mut missing_mesh_ids = Vec::new();
-	for (id, instances) in mesh_instances {
-		mesh_mem.instances += instances;
-		if let Some(stats) = mesh_stats.get(&id) {
-			mesh_mem.loaded += 1;
-			mesh_mem.file_bytes += stats.file_bytes;
-			mesh_mem.vertex_bytes += stats.vertex_bytes;
-			mesh_mem.index_bytes += stats.index_bytes;
-			mesh_mem.skinning_bytes += stats.skinning_bytes;
-			mesh_mem.gpu_bytes += stats.gpu_bytes;
-			mesh_entries.push(MeshEntry {
-				id,
-				instances,
-				vertices: stats.vertices,
-				indices: stats.indices,
-				lods: stats.lods.len(),
-				skinned: stats.skinned,
-				file_bytes: stats.file_bytes,
-				vertex_bytes: stats.vertex_bytes,
-				index_bytes: stats.index_bytes,
-				skinning_bytes: stats.skinning_bytes,
-				gpu_bytes: stats.gpu_bytes,
-			});
-		} else {
-			mesh_mem.missing += 1;
-			mesh_mem.missing_instances += instances;
-			if missing_mesh_ids.len() < TOP_LIST {
-				missing_mesh_ids.push(id);
-			}
-		}
-	}
-	mesh_entries.sort_by(|a, b| b.gpu_bytes.cmp(&a.gpu_bytes).then_with(|| a.id.cmp(&b.id)));
-	mesh_entries.truncate(TOP_LIST);
-	mesh_mem.top = mesh_entries;
-
-	// 2. Collect authored texture references across all scenes (deduplicated by canonical URI).
-	// When online, batch-warm any uncached TexturePack XMLs first so pack inspection runs without
-	// serial HTTP round-trips.
-	let offline_assets = assets.with_offline(true);
-	if !assets.offline() {
-		let mut uncached_packs = Vec::new();
-		let mut seen_packs = std::collections::HashSet::new();
-		for scene in scenes {
+		if !assets.offline() {
+			let offline_assets = assets.with_offline(true);
+			let mut uncached_packs = Vec::new();
 			for part in &scene.parts {
 				if let Some(pack) = part.surface_appearance.as_ref().and_then(|a| a.texture_pack.as_deref())
 					&& is_asset_id(pack)
-					&& seen_packs.insert(meshes::canonical(pack))
+					&& self.warmed_packs.insert(meshes::canonical(pack))
 					&& offline_assets.fetch(pack).is_err()
 				{
 					uncached_packs.push(Download::Asset(pack.trim().to_string()));
 				}
 				if let Some(pack) = scene.materials.variant(part.material, &part.material_variant).and_then(|v| v.texture_pack.as_deref())
 					&& is_asset_id(pack)
-					&& seen_packs.insert(meshes::canonical(pack))
+					&& self.warmed_packs.insert(meshes::canonical(pack))
 					&& offline_assets.fetch(pack).is_err()
 				{
 					uncached_packs.push(Download::Asset(pack.trim().to_string()));
 				}
 			}
+			if !uncached_packs.is_empty() {
+				assets.warm(&uncached_packs, &ktx2_pack_count_fast);
+			}
 		}
-		if !uncached_packs.is_empty() {
-			assets.warm(&uncached_packs, &ktx2_pack_count_fast);
-		}
-	}
 
-	let mut wanted: BTreeMap<String, TextureWanted> = BTreeMap::new();
-	let mut pack_cache: HashMap<String, Option<PackMaps>> = HashMap::new();
-	let use_transcodes = transcodes_enabled();
-	for scene in scenes {
+		let use_transcodes = transcodes_enabled();
 		let mut frame_refs: BTreeMap<String, TextureWanted> = BTreeMap::new();
-		collect_scene_textures(scene, assets, use_transcodes, &mut pack_cache, &mut frame_refs);
+		collect_scene_textures(scene, assets, use_transcodes, &mut self.pack_cache, &mut frame_refs);
 		for (key, item) in frame_refs {
-			wanted
+			self.wanted
 				.entry(key)
 				.and_modify(|existing| {
 					existing.references = existing.references.max(item.references);
@@ -504,161 +463,215 @@ pub fn measure_many(scenes: &[&Scene], mesh_stats: &HashMap<String, Arc<MeshStat
 		}
 	}
 
-	// Phase 1: inspect every uncached texture from disk/memory once (no network, no zstd decode
-	// on Roblox KTX2 files). Only genuinely missing assets or missing progressive packs hit the
-	// network in Phase 2, so warm runs never call `assets.warm` or re-read cached pack 0 files.
-	let uncached: Vec<(&String, &TextureWanted)> = wanted.iter().filter(|(key, _)| !cache.entries.contains_key(*key)).collect();
-	if !uncached.is_empty() {
-		let probed: Vec<(&String, &TextureWanted, ProbeResult)> = uncached
-			.into_par_iter()
-			.map(|(key, item)| (key, item, probe_texture_offline(item, &offline_assets, assets.offline(), use_transcodes)))
-			.collect();
+	/// Inspects collected textures once and produces the honest upper-bound [`MemoryReport`].
+	pub fn finish(self, mesh_stats: &HashMap<String, Arc<MeshStats>>, assets: &Assets, cache: &mut TextureCache) -> MemoryReport {
+		let Self { mesh_instances, wanted, .. } = self;
+		let offline_assets = assets.with_offline(true);
+		let use_transcodes = transcodes_enabled();
 
-		let mut needs_network: Vec<(&String, &TextureWanted)> = Vec::new();
-		let mut missing_packs: Vec<(&String, TextureInfo, String, Transcode, Vec<u32>)> = Vec::new();
-		for (key, item, outcome) in probed {
-			match outcome {
-				ProbeResult::Done(info) => {
-					cache.entries.insert(key.clone(), info);
-				}
-				ProbeResult::MissingPacks { info, uri, layer, packs } => {
-					missing_packs.push((key, info, uri, layer, packs));
-				}
-				ProbeResult::NeedsNetwork => {
-					needs_network.push((key, item));
+		let mut mesh_mem = MeshMemory { unique: mesh_instances.len() as u64, ..Default::default() };
+		let mut mesh_entries = Vec::with_capacity(mesh_instances.len());
+		let mut missing_mesh_ids = Vec::new();
+		for (id, instances) in mesh_instances {
+			mesh_mem.instances += instances;
+			if let Some(stats) = mesh_stats.get(&id) {
+				mesh_mem.loaded += 1;
+				mesh_mem.file_bytes += stats.file_bytes;
+				mesh_mem.vertex_bytes += stats.vertex_bytes;
+				mesh_mem.index_bytes += stats.index_bytes;
+				mesh_mem.skinning_bytes += stats.skinning_bytes;
+				mesh_mem.gpu_bytes += stats.gpu_bytes;
+				mesh_entries.push(MeshEntry {
+					id,
+					instances,
+					vertices: stats.vertices,
+					indices: stats.indices,
+					lods: stats.lods.len(),
+					skinned: stats.skinned,
+					file_bytes: stats.file_bytes,
+					vertex_bytes: stats.vertex_bytes,
+					index_bytes: stats.index_bytes,
+					skinning_bytes: stats.skinning_bytes,
+					gpu_bytes: stats.gpu_bytes,
+				});
+			} else {
+				mesh_mem.missing += 1;
+				mesh_mem.missing_instances += instances;
+				if missing_mesh_ids.len() < TOP_LIST {
+					missing_mesh_ids.push(id);
 				}
 			}
 		}
+		mesh_entries.sort_by(|a, b| b.gpu_bytes.cmp(&a.gpu_bytes).then_with(|| a.id.cmp(&b.id)));
+		mesh_entries.truncate(TOP_LIST);
+		mesh_mem.top = mesh_entries;
 
-		// Phase 2a: warm and inspect only textures whose pack 0 / upload was not cached on disk.
-		if !needs_network.is_empty() {
-			let mut downloads = Vec::new();
-			for (_, item) in &needs_network {
-				if let Some(layer) = item.pack_layer {
-					if is_asset_id(&item.uri) {
-						downloads.push(Download::Transcode(item.uri.clone(), layer));
-					}
-				} else if is_asset_id(&item.uri) {
-					downloads.push(if item.prefer_transcode && use_transcodes {
-						Download::Transcode(item.uri.clone(), Transcode::Image)
-					} else {
-						Download::Asset(item.uri.clone())
-					});
-				}
-			}
-			if !downloads.is_empty() {
-				assets.warm(&downloads, &ktx2_pack_count_fast);
-			}
-			let fetched: Vec<(String, Option<TextureInfo>)> = needs_network
+		// Phase 1: inspect every uncached texture from disk/memory once (no network, no zstd decode
+		// on Roblox KTX2 files). Only genuinely missing assets or missing progressive packs hit the
+		// network in Phase 2, so warm runs never call `assets.warm` or re-read cached pack 0 files.
+		let uncached: Vec<(&String, &TextureWanted)> = wanted.iter().filter(|(key, _)| !cache.entries.contains_key(*key)).collect();
+		if !uncached.is_empty() {
+			let probed: Vec<(&String, &TextureWanted, ProbeResult)> = uncached
 				.into_par_iter()
-				.map(|(key, item)| (key.clone(), inspect_texture(item, assets, use_transcodes)))
+				.map(|(key, item)| (key, item, probe_texture_offline(item, &offline_assets, assets.offline(), use_transcodes)))
 				.collect();
-			for (key, info) in fetched {
-				cache.entries.insert(key, info);
-			}
-		}
 
-		// Phase 2b: for transcodes whose pack 0 was already read once in Phase 1, fetch ONLY the
-		// missing packs 1..N without reading or parsing pack 0 again.
-		if !missing_packs.is_empty() {
-			let completed: Vec<(String, Option<TextureInfo>)> = missing_packs
-				.into_par_iter()
-				.map(|(key, mut info, uri, layer, packs)| {
-					for pack in packs {
-						if let Ok(fetched) = assets.fetch_transcode(&uri, layer, pack) {
-							info.file_bytes += fetched.bytes.len() as u64;
-							info.packs_loaded += 1;
+			let mut needs_network: Vec<(&String, &TextureWanted)> = Vec::new();
+			let mut missing_packs: Vec<(&String, TextureInfo, String, Transcode, Vec<u32>)> = Vec::new();
+			for (key, item, outcome) in probed {
+				match outcome {
+					ProbeResult::Done(info) => {
+						cache.entries.insert(key.clone(), info);
+					}
+					ProbeResult::MissingPacks { info, uri, layer, packs } => {
+						missing_packs.push((key, info, uri, layer, packs));
+					}
+					ProbeResult::NeedsNetwork => {
+						needs_network.push((key, item));
+					}
+				}
+			}
+
+			// Phase 2a: warm and inspect only textures whose pack 0 / upload was not cached on disk.
+			if !needs_network.is_empty() {
+				let mut downloads = Vec::new();
+				for (_, item) in &needs_network {
+					if let Some(layer) = item.pack_layer {
+						if is_asset_id(&item.uri) {
+							downloads.push(Download::Transcode(item.uri.clone(), layer));
 						}
+					} else if is_asset_id(&item.uri) {
+						downloads.push(if item.prefer_transcode && use_transcodes {
+							Download::Transcode(item.uri.clone(), Transcode::Image)
+						} else {
+							Download::Asset(item.uri.clone())
+						});
 					}
-					(key.clone(), Some(info))
-				})
-				.collect();
-			for (key, info) in completed {
-				cache.entries.insert(key, info);
+				}
+				if !downloads.is_empty() {
+					assets.warm(&downloads, &ktx2_pack_count_fast);
+				}
+				let fetched: Vec<(String, Option<TextureInfo>)> = needs_network
+					.into_par_iter()
+					.map(|(key, item)| (key.clone(), inspect_texture(item, assets, use_transcodes)))
+					.collect();
+				for (key, info) in fetched {
+					cache.entries.insert(key, info);
+				}
+			}
+
+			// Phase 2b: for transcodes whose pack 0 was already read once in Phase 1, fetch ONLY the
+			// missing packs 1..N without reading or parsing pack 0 again.
+			if !missing_packs.is_empty() {
+				let completed: Vec<(String, Option<TextureInfo>)> = missing_packs
+					.into_par_iter()
+					.map(|(key, mut info, uri, layer, packs)| {
+						for pack in packs {
+							if let Ok(fetched) = assets.fetch_transcode(&uri, layer, pack) {
+								info.file_bytes += fetched.bytes.len() as u64;
+								info.packs_loaded += 1;
+							}
+						}
+						(key.clone(), Some(info))
+					})
+					.collect();
+				for (key, info) in completed {
+					cache.entries.insert(key, info);
+				}
 			}
 		}
-	}
 
-	let mut tex_mem = TextureMemory { unique: wanted.len() as u64, ..Default::default() };
-	let mut tex_entries = Vec::with_capacity(wanted.len());
-	let mut missing_tex_ids = Vec::new();
-	for (id, item) in wanted {
-		tex_mem.references += item.references;
-		let Some(Some(info)) = cache.entries.get(&id) else {
-			tex_mem.missing += 1;
-			tex_mem.missing_references += item.references;
-			if missing_tex_ids.len() < TOP_LIST {
-				missing_tex_ids.push(id);
+		let mut tex_mem = TextureMemory { unique: wanted.len() as u64, ..Default::default() };
+		let mut tex_entries = Vec::with_capacity(wanted.len());
+		let mut missing_tex_ids = Vec::new();
+		for (id, item) in wanted {
+			tex_mem.references += item.references;
+			let Some(Some(info)) = cache.entries.get(&id) else {
+				tex_mem.missing += 1;
+				tex_mem.missing_references += item.references;
+				if missing_tex_ids.len() < TOP_LIST {
+					missing_tex_ids.push(id);
+				}
+				continue;
+			};
+			let entry = build_texture_entry(id, item.references, item.is_normal, item.pack_layer.is_some(), info);
+			tex_mem.loaded += 1;
+			tex_mem.file_bytes += entry.file_bytes;
+			tex_mem.rgba8_base_bytes += entry.rgba8_base_bytes;
+			tex_mem.rgba8_mip_bytes += entry.rgba8_mip_bytes;
+			tex_mem.desktop_bc_mip_bytes += entry.desktop_bc_mip_bytes;
+			tex_mem.mobile_etc2_mip_bytes += entry.mobile_etc2_mip_bytes;
+			tex_mem.missing_packs += u64::from(entry.packs_expected.saturating_sub(entry.packs_loaded));
+			let bucket = match entry.source {
+				TextureSource::Transcode => &mut tex_mem.sources.transcode,
+				TextureSource::Upload => &mut tex_mem.sources.upload,
+				TextureSource::Local => &mut tex_mem.sources.local,
+				TextureSource::Studio => &mut tex_mem.sources.studio,
+			};
+			bucket.count += 1;
+			bucket.file_bytes += entry.file_bytes;
+			bucket.rgba8_mip_bytes += entry.rgba8_mip_bytes;
+			bucket.desktop_bc_mip_bytes += entry.desktop_bc_mip_bytes;
+			bucket.mobile_etc2_mip_bytes += entry.mobile_etc2_mip_bytes;
+			tex_entries.push(entry);
+		}
+		tex_mem.file_bytes_partial = tex_mem.missing > 0 || tex_mem.missing_packs > 0;
+		tex_entries.sort_by(|a, b| b.rgba8_mip_bytes.cmp(&a.rgba8_mip_bytes).then_with(|| a.id.cmp(&b.id)));
+		tex_entries.truncate(TOP_LIST);
+		tex_mem.top = tex_entries;
+
+		let uncounted_assets = mesh_mem.missing + tex_mem.missing;
+		let partial = uncounted_assets > 0 || tex_mem.missing_packs > 0;
+		let uncounted_bytes = partial.then(|| {
+			let mut parts = Vec::new();
+			if mesh_mem.missing > 0 {
+				parts.push(format!("{} missing meshes ({} instances)", mesh_mem.missing, mesh_mem.missing_instances));
 			}
-			continue;
+			if tex_mem.missing > 0 {
+				parts.push(format!("{} missing textures ({} references)", tex_mem.missing, tex_mem.missing_references));
+			}
+			if tex_mem.missing_packs > 0 {
+				parts.push(format!("{} missing progressive KTX2 pack files (excluded from fileBytes)", tex_mem.missing_packs));
+			}
+			format!("unknown: bytes of {} could not be read; reported totals exclude them and are partial", parts.join(", "))
+		});
+		let missing = MissingMemory {
+			meshes: mesh_mem.missing,
+			mesh_instances: mesh_mem.missing_instances,
+			textures: tex_mem.missing,
+			texture_references: tex_mem.missing_references,
+			transcode_packs: tex_mem.missing_packs,
+			assets: uncounted_assets,
+			uncounted_bytes,
+			mesh_ids: missing_mesh_ids,
+			texture_ids: missing_tex_ids,
 		};
-		let entry = build_texture_entry(id, item.references, item.is_normal, item.pack_layer.is_some(), info);
-		tex_mem.loaded += 1;
-		tex_mem.file_bytes += entry.file_bytes;
-		tex_mem.rgba8_base_bytes += entry.rgba8_base_bytes;
-		tex_mem.rgba8_mip_bytes += entry.rgba8_mip_bytes;
-		tex_mem.desktop_bc_mip_bytes += entry.desktop_bc_mip_bytes;
-		tex_mem.mobile_etc2_mip_bytes += entry.mobile_etc2_mip_bytes;
-		tex_mem.missing_packs += u64::from(entry.packs_expected.saturating_sub(entry.packs_loaded));
-		let bucket = match entry.source {
-			TextureSource::Transcode => &mut tex_mem.sources.transcode,
-			TextureSource::Upload => &mut tex_mem.sources.upload,
-			TextureSource::Local => &mut tex_mem.sources.local,
-			TextureSource::Studio => &mut tex_mem.sources.studio,
+		let total_gpu_bytes = TotalGpuBytes {
+			partial,
+			uncounted_assets,
+			rgba8: mesh_mem.gpu_bytes + tex_mem.rgba8_mip_bytes,
+			desktop_bc: mesh_mem.gpu_bytes + tex_mem.desktop_bc_mip_bytes,
+			mobile_etc2: mesh_mem.gpu_bytes + tex_mem.mobile_etc2_mip_bytes,
 		};
-		bucket.count += 1;
-		bucket.file_bytes += entry.file_bytes;
-		bucket.rgba8_mip_bytes += entry.rgba8_mip_bytes;
-		bucket.desktop_bc_mip_bytes += entry.desktop_bc_mip_bytes;
-		bucket.mobile_etc2_mip_bytes += entry.mobile_etc2_mip_bytes;
-		tex_entries.push(entry);
+		MemoryReport {
+			partial,
+			missing,
+			meshes: mesh_mem,
+			textures: tex_mem,
+			total_gpu_bytes,
+			..MemoryReport::default()
+		}
 	}
-	tex_mem.file_bytes_partial = tex_mem.missing > 0 || tex_mem.missing_packs > 0;
-	tex_entries.sort_by(|a, b| b.rgba8_mip_bytes.cmp(&a.rgba8_mip_bytes).then_with(|| a.id.cmp(&b.id)));
-	tex_entries.truncate(TOP_LIST);
-	tex_mem.top = tex_entries;
+}
 
-	let uncounted_assets = mesh_mem.missing + tex_mem.missing;
-	let partial = uncounted_assets > 0 || tex_mem.missing_packs > 0;
-	let uncounted_bytes = partial.then(|| {
-		let mut parts = Vec::new();
-		if mesh_mem.missing > 0 {
-			parts.push(format!("{} missing meshes ({} instances)", mesh_mem.missing, mesh_mem.missing_instances));
-		}
-		if tex_mem.missing > 0 {
-			parts.push(format!("{} missing textures ({} references)", tex_mem.missing, tex_mem.missing_references));
-		}
-		if tex_mem.missing_packs > 0 {
-			parts.push(format!("{} missing progressive KTX2 pack files (excluded from fileBytes)", tex_mem.missing_packs));
-		}
-		format!("unknown: bytes of {} could not be read; reported totals exclude them and are partial", parts.join(", "))
-	});
-	let missing = MissingMemory {
-		meshes: mesh_mem.missing,
-		mesh_instances: mesh_mem.missing_instances,
-		textures: tex_mem.missing,
-		texture_references: tex_mem.missing_references,
-		transcode_packs: tex_mem.missing_packs,
-		assets: uncounted_assets,
-		uncounted_bytes,
-		mesh_ids: missing_mesh_ids,
-		texture_ids: missing_tex_ids,
-	};
-	let total_gpu_bytes = TotalGpuBytes {
-		partial,
-		uncounted_assets,
-		rgba8: mesh_mem.gpu_bytes + tex_mem.rgba8_mip_bytes,
-		desktop_bc: mesh_mem.gpu_bytes + tex_mem.desktop_bc_mip_bytes,
-		mobile_etc2: mesh_mem.gpu_bytes + tex_mem.mobile_etc2_mip_bytes,
-	};
-	MemoryReport {
-		partial,
-		missing,
-		meshes: mesh_mem,
-		textures: tex_mem,
-		total_gpu_bytes,
-		..MemoryReport::default()
+/// Measures deduplicated mesh and texture memory across the union of `scenes` (e.g. a timeline's
+/// frames), using decoded mesh entries from `mesh_stats` and caching texture lookups in `cache`.
+pub fn measure_many(scenes: &[&Scene], mesh_stats: &HashMap<String, Arc<MeshStats>>, assets: &Assets, cache: &mut TextureCache) -> MemoryReport {
+	let mut collector = MemoryCollector::default();
+	for scene in scenes {
+		collector.add_scene(scene, assets);
 	}
+	collector.finish(mesh_stats, assets, cache)
 }
 
 /// Concise single-line memory summary for `analysis.txt` and `cost` reports.

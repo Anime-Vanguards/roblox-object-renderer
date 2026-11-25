@@ -39,6 +39,7 @@ ror cost Map.rbxm --paths 4 --check --profile    # Compare against Studio counte
 | `--check` | Load the scene into capture Studio (`ror studio open`, pass `--technology` to match) and print Studio's real counters beside `ror`'s estimates (`cost-check.json`). Requires a Studio MCP bridge ([parity.md](parity.md)). |
 | `--profile` | With `--check`, pull render-job CPU timings (`queryOcclusion`, render-thread wait, render-thread work) from Studio's MicroProfiler via LibMP. |
 | `--preset phone\|desktop`, `--edits`, `--look`, `--export`, `--explain`, `--budget`, `--heat` | Cost-loop flags for preset frame attribution (phone calibrated ms by default and on `--preset phone`; `--preset desktop` uses estimated reference-PC CPU ms + uncalibrated GPU refused as `null` with `gpuUnits`), what-if edits, and Lune export; see [cost-loop.md](cost-loop.md). |
+| `--duration SECONDS\|auto`, `--start`, `--fps`, `--times`, `--camera-track` | Multi-frame timeline costing over a playback (`--duration auto` derives the natural end from actions, emitter/trail lifetimes, tweens, and motion, capped at 120 s). Steps one loaded document, matches single-moment `ror cost --playback --time <t>` frame for frame, and writes `timeline.json` (`ror-cost-timeline/1`) plus `analysis.txt` with mean, peak, nearest-rank `p50`/`p95`/`p99`, `top1PctMean`, and time integral. Pass `--memory` to include the deduplicated honest upper-bound `memory` block across the timeline. |
 
 ## Output files
 

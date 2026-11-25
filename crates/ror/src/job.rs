@@ -646,6 +646,64 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 		if let Some(map) = &job.map {
 			scenes.add_map(&mut document, map)?;
 		}
+		// Multi-frame timeline costing steps one loaded document across moments without mutating it.
+		if let Some(options) = &job.cost
+			&& let Some(tl) = &options.timeline
+		{
+			if let Some(playback) = &job.playback {
+				document.play = playback.play;
+				document.salt = playback.salt.clone();
+				lent_lighting = scenes.give_lighting(&mut document, playback, lighting_from)?;
+			}
+			let lighting_from = lighting_from.filter(|_| !lent_lighting);
+			let lent_lighting_flag = lighting_from.is_some() || lent_lighting;
+			let collision_filter = job.collision;
+			if collision_filter.is_some() {
+				scene::collision::require()?;
+			}
+			let lend = |scene: &mut Scene| -> Result<()> {
+				if materials_from.is_some() || lighting_from.is_some() {
+					scenes.lend(scene, materials_from, lighting_from)?;
+				}
+				if let Some(filter) = collision_filter {
+					*scene = scene::collision::view(scene, filter).0;
+				}
+				Ok(())
+			};
+			timings.load_ms = start.elapsed().as_secs_f64() * 1000.0;
+			let out = job.out.clone().unwrap_or_else(|| output::state_dir().join("out").join(input_name(&job.input)));
+			std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
+			let cost = crate::cost::timeline::run(
+				renderer,
+				&mut document,
+				job.playback.as_ref(),
+				options,
+				tl,
+				&job.views,
+				job.frame,
+				job.focus.as_deref(),
+				&out,
+				gpu,
+				&job.input,
+				lent_lighting_flag,
+				&lend,
+			)?;
+			timings.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+			let result = JobResult {
+				out: out.clone(),
+				views: Vec::new(),
+				parts: cost.scene.parts as usize,
+				lights: 0,
+				bounds: None,
+				stats: RenderStats::default(),
+				weightless: Motion::default().weightless(),
+				cost: Some(cost),
+				warnings: Vec::new(),
+				timings,
+			};
+			output::write_json_atomic(&out.join("summary.json"), &result, true)?;
+			return Ok(result);
+		}
 		match &job.playback {
 			Some(playback) => {
 				if job.cost.is_none() && scenes.frame_by_frame(path) {

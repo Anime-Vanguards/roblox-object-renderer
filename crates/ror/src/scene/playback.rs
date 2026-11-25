@@ -1310,6 +1310,80 @@ impl Playback {
 		self.actions.iter().map(|action| action.at).chain(self.tweens.iter().map(|tween| tween.at)).map(|at| at + 10.0).fold(time, f32::max)
 	}
 
+	/// Natural end of the playback in seconds (for `ror cost --duration auto`): the latest action
+	/// (plus the maximum particle/trail lifetime tail, clamped to 10 s), tween finish (one cycle for
+	/// infinite repeats), or motion keyframe, falling back to 2 s and capped at 120 s.
+	pub fn natural_end(&self, document: &Document) -> f32 {
+		let mut end = 0.0f32;
+		for action in &self.actions {
+			let at = if action.at.is_finite() { action.at.max(0.0) } else { 0.0 };
+			end = end.max(at);
+			if action.emit.is_some() || action.enabled.is_some() {
+				if let Ok(targets) = resolve(document, &action.target) {
+					for target in targets {
+						for referent in descendants(document, target) {
+							let Some(instance) = document.dom.get_by_ref(referent) else {
+								continue;
+							};
+							if action.class.as_deref().is_some_and(|class| !props::is_a(instance, class)) {
+								continue;
+							}
+							let life = match instance.class.as_str() {
+								"ParticleEmitter" => match props::get(instance, "Lifetime") {
+									Some(Variant::NumberRange(range)) => range.min.max(range.max),
+									_ => 5.0,
+								},
+								"Trail" => props::f32(instance, "Lifetime", 2.0),
+								"Fire" => 1.5,
+								"Smoke" => 4.0,
+								"Sparkles" => 1.5,
+								"Explosion" => 1.0,
+								_ => continue,
+							};
+							let life = if life.is_finite() { life.clamp(0.0, 10.0) } else { 0.0 };
+							let (delay, dur) = match &action.emit {
+								Some(Emit::Mode(_)) => (
+									attribute_number(instance, "EmitDelay").unwrap_or(0.0).max(0.0),
+									attribute_number(instance, "EmitDuration").unwrap_or(0.0).max(0.0),
+								),
+								_ => (0.0, 0.0),
+							};
+							end = end.max(at + delay + dur + life);
+						}
+					}
+				}
+			}
+		}
+		for tween in &self.tweens {
+			if !tween.keys.is_empty() {
+				for key in &tween.keys {
+					if key.at.is_finite() {
+						end = end.max(key.at.max(0.0));
+					}
+				}
+			} else if tween.to.is_some() {
+				let at = if tween.at.is_finite() { tween.at.max(0.0) } else { 0.0 };
+				let delay = if tween.delay.is_finite() { tween.delay.max(0.0) } else { 0.0 };
+				let dur = if tween.duration.is_finite() { tween.duration.max(0.0) } else { 0.0 };
+				let cycle = dur * if tween.reverses { 2.0 } else { 1.0 };
+				let repeats = if tween.repeat_count < 0 { 1.0 } else { tween.repeat_count as f32 + 1.0 };
+				end = end.max(at + delay + cycle * repeats);
+			}
+		}
+		for motion in &self.motion {
+			for key in &motion.keys {
+				if key.at.is_finite() {
+					end = end.max(key.at.max(0.0));
+				}
+			}
+		}
+		if !end.is_finite() || end <= 0.0 {
+			2.0
+		} else {
+			end.clamp(0.1, 120.0)
+		}
+	}
+
 	/// [`Playback::resolve`] for the moment `time` (whatever `self.time` holds).
 	pub fn resolve_at<'a>(&'a self, document: &Document, time: f32) -> Result<Resolved<'a>> {
 		let latest = self.latest(time);

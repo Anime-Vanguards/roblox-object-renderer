@@ -248,6 +248,23 @@ struct CostArgs {
 	/// Emit at a time: <path>[=<count>|=attributes|=immediate|=cutscene|=delayed][@<seconds>] (as render)
 	#[arg(long)]
 	emit: Vec<String>,
+	/// Multi-frame timeline costing over this duration in seconds, or "auto" (playback's natural end);
+	/// writes timeline.json and analysis.txt
+	#[arg(long, value_name = "SECONDS|auto")]
+	duration: Option<String>,
+	/// With --duration: start time in seconds (default 0)
+	#[arg(long, value_name = "SECONDS")]
+	start: Option<f32>,
+	/// With --duration: sampling rate in frames per second (default 10)
+	#[arg(long, value_name = "FPS")]
+	fps: Option<f32>,
+	/// Multi-frame timeline costing at explicit moments (comma-separated seconds or a JSON array file);
+	/// writes timeline.json and analysis.txt
+	#[arg(long, value_name = "T1,T2,...|FILE")]
+	times: Option<String>,
+	/// With --duration or --times: moving camera track JSON (list of {"at", "cframe", "fov"} keys)
+	#[arg(long, value_name = "FILE")]
+	camera_track: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -1705,6 +1722,8 @@ fn cost(mut args: CostArgs) -> Result<()> {
 		vec![named("render".into(), serde_json::from_str(camera).context("--camera JSON")?)]
 	} else if let Some(yaw) = args.yaw {
 		vec![named("render".into(), CameraSpec::Orbit { yaw, pitch: args.pitch, distance: None, padding: 0.08, target: None, fov })]
+	} else if args.camera_track.is_some() {
+		vec![named("render".into(), CameraSpec::LookAt { eye: [0.0, 0.0, 10.0], target: [0.0; 3], fov })]
 	} else {
 		job::preset_views(&args.views, width, height, Background::Sky, args.fov)?
 	};
@@ -1731,6 +1750,44 @@ fn cost(mut args: CostArgs) -> Result<()> {
 	}
 	let lod = args.lod.as_deref().map(ror::lod::Lod::parse).transpose()?;
 	let client_quality = args.client_quality.or_else(|| args.lod.as_deref().and_then(ror::lod::parse_client_bar));
+	let timeline = if args.duration.is_some() || args.times.is_some() {
+		if args.time.is_some() {
+			bail!("--time cannot be combined with --duration or --times");
+		}
+		let start = args.start.unwrap_or(0.0);
+		if !start.is_finite() || start < 0.0 {
+			bail!("--start must be finite and non-negative (got {start})");
+		}
+		let fps = args.fps.unwrap_or(10.0);
+		if !fps.is_finite() || fps <= 0.0 {
+			bail!("--fps must be finite and positive (got {fps})");
+		}
+		let (duration, auto_duration) = match args.duration.as_deref() {
+			Some(raw) if raw.trim().eq_ignore_ascii_case("auto") => (None, true),
+			Some(raw) => {
+				let seconds: f32 = raw.trim().parse().with_context(|| format!("--duration {raw:?}: seconds or \"auto\""))?;
+				if !seconds.is_finite() || seconds < 0.0 {
+					bail!("--duration must be finite and non-negative (got {seconds})");
+				}
+				(Some(seconds), false)
+			}
+			None => (None, false),
+		};
+		let times = args.times.as_deref().map(read_times).transpose()?;
+		if let Some(ts) = &times
+			&& (ts.is_empty() || ts.iter().any(|t| !t.is_finite() || *t < 0.0))
+		{
+			bail!("--times must be a non-empty list of finite non-negative seconds");
+		}
+		let camera_track = args.camera_track.as_deref().map(read_camera_track).transpose()?;
+		Some(ror::cost::timeline::TimelineOptions { start, duration, auto_duration, fps, times, camera_track })
+	} else {
+		if args.camera_track.is_some() {
+			bail!("--camera-track requires --duration or --times");
+		}
+		None
+	};
+	let is_timeline = timeline.is_some();
 	let playback = playback_args(&TimelineArgs { playback: args.playback.as_deref(), time: args.time, emit: &args.emit, enable: &[], disable: &[], changes: None })?;
 	let out = match args.out.clone() {
 		Some(out) => out,
@@ -1742,7 +1799,7 @@ fn cost(mut args: CostArgs) -> Result<()> {
 		select: args.select.clone(),
 		out: Some(out.clone()),
 		views,
-		no_png: args.grid.is_some() || args.no_images,
+		no_png: is_timeline || args.grid.is_some() || args.no_images,
 		compact_png: false,
 		materials_from: args.materials_from.as_deref().map(absolute),
 		lighting_from: args.lighting_from.as_deref().map(absolute),
@@ -1761,7 +1818,7 @@ fn cost(mut args: CostArgs) -> Result<()> {
 			full_detail: args.full_detail || (args.check && lod.is_none()),
 			studio_lod: args.check && lod.is_some(),
 			top: args.top,
-			no_images: args.no_images,
+			no_images: is_timeline || args.no_images,
 			grid: args.grid,
 			grid_area,
 			items: args.items,
@@ -1781,6 +1838,7 @@ fn cost(mut args: CostArgs) -> Result<()> {
 			explain: args.explain.clone(),
 			budget: args.budget.clone(),
 			fail_over_budget: args.fail_over_budget,
+			timeline,
 		}),
 		relative_to: std::env::current_dir().ok(),
 		alone: None,
@@ -1800,6 +1858,11 @@ fn cost(mut args: CostArgs) -> Result<()> {
 	let report = report.context("the render service returned no cost (an older build: rebuild ror)")?;
 	if args.json {
 		output::print_json(&report, false)?;
+	} else if is_timeline {
+		for line in report.get("agent").and_then(|lines| lines.as_array()).into_iter().flatten().filter_map(|line| line.as_str()) {
+			println!("{line}");
+		}
+		println!("timeline.json and analysis.txt in {}", out.display());
 	} else {
 		for line in report.get("lines").and_then(|lines| lines.as_array()).into_iter().flatten() {
 			println!("{}", line.as_str().unwrap_or_default());
