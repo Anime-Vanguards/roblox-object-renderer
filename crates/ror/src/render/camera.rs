@@ -97,6 +97,16 @@ impl Camera {
 		(self.projection(aspect) * Mat4::from(rotation.inverse())).inverse()
 	}
 
+	/// The key every see-through draw is ordered by, the farthest first: `point`'s depth along the camera's
+	/// forward axis, not its distance from the eye (blend-depth-order, the engine 0.747: a part 180 studs
+	/// tall at Transparency 0.3 with rows of unlit effects along its top face; from one eye 32 studs out,
+	/// looking 10.6 degrees down all four rows draw over the face and looking 7.1 degrees up only the
+	/// nearest, the eye unmoved; a row nearer the eye than the part's middle by 16 studs but 8 deeper
+	/// along the look draws under; 1,287 of 1,440 readings against 1,164 by distance).
+	pub fn depth(&self, point: Vec3) -> f32 {
+		(point - self.eye).dot(-Vec3::from(self.world.matrix3.z_axis))
+	}
+
 	/// This camera exactly, as a spec (a view placed once and drawn by more than one renderer).
 	pub fn spec(&self) -> CameraSpec {
 		CameraSpec::CFrame { components: self.cframe_components(), fov: self.fov, near: Some(self.near) }

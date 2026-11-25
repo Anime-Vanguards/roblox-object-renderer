@@ -4673,35 +4673,29 @@ impl Renderer {
 			(msaa, layer, composited)
 		});
 		let lit_view = legacy_targets.as_ref().map(|(_, _, composited)| composited.clone()).unwrap_or_else(|| color_view.clone());
-		// transparent parts and beams together, back to front from this camera (beam-order: a
-		// transparent part in front of a beam covers it)
+		// transparent parts and beams together, back to front along this camera's forward axis
+		// (Camera::depth; beam-order: a transparent part in front of a beam covers it)
 		// with multisampling, parts at Transparency 0 whose SurfaceAppearance is in AlphaMode Transparency
 		// are drawn by alpha to coverage with the opaque parts, not blended in this order
-		let mut transparent: Vec<(f32, Blended)> = visible_draws.iter().copied().filter(|draw| draw.transparent && !draw.decal && (!draw.highlight_only || draw.glass) && !(coverage && draw.write_depth)).map(|draw| (draw.center.distance_squared(camera.eye), Blended::Part(draw))).collect();
+		let mut transparent: Vec<(f32, Blended)> = visible_draws.iter().copied().filter(|draw| draw.transparent && !draw.decal && (!draw.highlight_only || draw.glass) && !(coverage && draw.write_depth)).map(|draw| (camera.depth(draw.center), Blended::Part(draw))).collect();
 		// a see-through part's decals (an invisible one's too) sort with it, drawn after it in ZIndex
 		// order: Studio draws a particle 1.5 studs behind an invisible plate's decal under the decal and
 		// one in front over it, and a half-transparent plate under its own decal (particle-decal-order;
 		// an effect's clash: its smoke behind the comet's decals)
 		let mut see_through_decals: Vec<&DrawItem> = visible_draws.iter().copied().filter(|draw| draw.decal && draw.transparent).collect();
 		see_through_decals.sort_by_key(|draw| draw.decal_order);
-		transparent.extend(see_through_decals.into_iter().map(|draw| (draw.center.distance_squared(camera.eye), Blended::Decal(draw))));
-		transparent.extend(beam_view.draws.iter().filter(|draw| prepared.beam_textures[draw.beam].is_some()).map(|draw| (draw.center.distance_squared(camera.eye), Blended::Beam(draw))));
-		transparent.extend(trail_view.draws.iter().filter(|draw| prepared.trail_textures[draw.trail].is_some()).map(|draw| (draw.center.distance_squared(camera.eye), Blended::Trail(draw))));
+		transparent.extend(see_through_decals.into_iter().map(|draw| (camera.depth(draw.center), Blended::Decal(draw))));
+		transparent.extend(beam_view.draws.iter().filter(|draw| prepared.beam_textures[draw.beam].is_some()).map(|draw| (camera.depth(draw.center), Blended::Beam(draw))));
+		transparent.extend(trail_view.draws.iter().filter(|draw| prepared.trail_textures[draw.trail].is_some()).map(|draw| (camera.depth(draw.center), Blended::Trail(draw))));
 		stats.missing.extend(particle_missing);
 		// particles by their emitter's position moved towards the camera by ZOffset (particle-sort
 		// glass-zoffset: a particle behind a glass block's centre pulled out in front of it draws over it)
-		transparent.extend(particle_view.draws.iter().filter(|draw| !scene.particles[draw.emitter].linear).map(|draw| {
-			let distance = (draw.center.distance(camera.eye) - scene.particles[draw.emitter].z_offset).max(0.0);
-			(distance * distance, Blended::Particles(draw))
-		}));
+		transparent.extend(particle_view.draws.iter().filter(|draw| !scene.particles[draw.emitter].linear).map(|draw| (camera.depth(draw.center) - scene.particles[draw.emitter].z_offset, Blended::Particles(draw))));
 		// legacy effects into their layer, back to front among themselves
-		let mut legacy_draws: Vec<(f32, &particles::ParticleDraw)> = particle_view.draws.iter().filter(|draw| scene.particles[draw.emitter].linear).map(|draw| (draw.center.distance_squared(camera.eye), draw)).collect();
+		let mut legacy_draws: Vec<(f32, &particles::ParticleDraw)> = particle_view.draws.iter().filter(|draw| scene.particles[draw.emitter].linear).map(|draw| (camera.depth(draw.center), draw)).collect();
 		legacy_draws.sort_by(|a, b| b.0.total_cmp(&a.0));
 		// GUIs sort by their face's centre or their anchor; on a shared face a higher ZOffset draws later
-		transparent.extend(view_guis.draws.iter().filter(|draw| !draw.overlay).map(|draw| {
-			let distance = (draw.center.distance(camera.eye) - draw.z_offset * 1e-3).max(0.0);
-			(distance * distance, Blended::Gui(draw))
-		}));
+		transparent.extend(view_guis.draws.iter().filter(|draw| !draw.overlay).map(|draw| (camera.depth(draw.center) - draw.z_offset * 1e-3, Blended::Gui(draw))));
 		// at one distance parts, beams and trails draw before particles and GUIs after them
 		// (particle-part-ties: a white particle at the centre of a red ball, ForceField or
 		// SmoothPlastic, draws over it whatever their sizes or their order in the file); emitters
@@ -4750,7 +4744,6 @@ impl Renderer {
 		// (the far blur grows with depth), so each layer holds a run of the order.
 		let far_steps: Vec<u8> = match depth_of_field {
 			Some(focus) if scene_depth.is_some() => {
-				let forward = camera.world.transform_vector3(-Vec3::Z).normalize_or_zero();
 				transparent.iter().map(|(_, item)| {
 					let center = match item {
 						Blended::Part(draw) | Blended::Decal(draw) => draw.center,
@@ -4759,7 +4752,7 @@ impl Renderer {
 						Blended::Particles(draw) => draw.center,
 						Blended::Gui(draw) => draw.center,
 					};
-					(post::far_blur_share(focus, (center - camera.eye).dot(forward)) * post::FAR_STEPS as f32).round() as u8
+					(post::far_blur_share(focus, camera.depth(center)) * post::FAR_STEPS as f32).round() as u8
 				}).collect()
 			}
 			_ => Vec::new(),
@@ -7326,6 +7319,84 @@ mod camera_reuse_tests {
 		assert_eq!(renderer.fit_vram_with(high_vram, None), high_vram);
 		assert_eq!(renderer.preparations.stats().0, 0, "process budget over 85% must still relieve idle caches");
 
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+}
+
+#[cfg(test)]
+mod blend_order_tests {
+	use super::*;
+	use crate::scene::build::{ModelBuilder, PartSpec};
+	use rbx_dom_weak::InstanceBuilder;
+	use rbx_dom_weak::types::{Color3, ColorSequence, ColorSequenceKeypoint, NumberSequence, NumberSequenceKeypoint, Variant};
+
+	/// A see-through part (Transparency 0.3, its top face at y 0, 40 x 24 studs) with four unlit red beams
+	/// 0.1 over the face at x -15, -5, 5 and 15, each facing the camera and ordered whole: a beam is drawn over the face or
+	/// under it by its depth along the camera's forward axis against the part's middle's, not by their
+	/// distances from the eye (blend-depth-order, the engine 0.747, rows x -15 / -5 / 5 / 15). By distance
+	/// the second and third cases read over in every row and the fourth under at x -15 and 15.
+	#[test]
+	fn a_see_through_part_and_effects_order_by_depth_along_the_cameras_forward_axis() {
+		let state = std::env::temp_dir().join(format!("ror-blend-order-test-{}", std::process::id()));
+		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		const ROWS: [f32; 4] = [-15.0, -5.0, 5.0, 15.0];
+		// each row a little further across, so that from a low eye no beam stands before the next row's
+		const STAGGER: f32 = 0.6;
+		let scene = |height: f32| {
+			let mut model = ModelBuilder::new("Order");
+			model.part(&PartSpec { name: "Water".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, -height * 0.5, 0.0)), size: Vec3::new(40.0, height, 24.0), color: [0, 110, 255], transparency: 0.3, cast_shadow: false, ..Default::default() });
+			let red = Color3::new(1.0, 0.0, 0.0);
+			for x in ROWS {
+				let holder = model.part(&PartSpec { name: "Holder".into(), cframe: Affine3A::from_translation(Vec3::new(x, 0.1, x * STAGGER)), size: Vec3::splat(0.2), transparency: 1.0, cast_shadow: false, ..Default::default() });
+				let end = |z: f32| InstanceBuilder::new("Attachment").with_property("CFrame", crate::scene::build::cframe(Affine3A::from_translation(Vec3::new(0.0, 0.0, z))));
+				let (a0, a1) = (model.child(holder, end(-1.5)), model.child(holder, end(1.5)));
+				model.child(
+					holder,
+					InstanceBuilder::new("Beam")
+						.with_property("Attachment0", Variant::Ref(a0))
+						.with_property("Attachment1", Variant::Ref(a1))
+						.with_property("Color", ColorSequence { keypoints: vec![ColorSequenceKeypoint::new(0.0, red), ColorSequenceKeypoint::new(1.0, red)] })
+						.with_property("Transparency", NumberSequence { keypoints: vec![NumberSequenceKeypoint::new(0.0, 0.0, 0.0), NumberSequenceKeypoint::new(1.0, 0.0, 0.0)] })
+						.with_property("Width0", 2.0f32)
+						.with_property("Width1", 2.0f32)
+						.with_property("FaceCamera", true)
+						.with_property("LightEmission", 0.0f32)
+						.with_property("LightInfluence", 0.0f32),
+				);
+			}
+			crate::scene::extract::extract(&model.into_document())
+		};
+		const SIZE: (u32, u32) = (320, 180);
+		// (the part's height, the eye, where it looks, the field of view, each row over the face)
+		let cases: [(f32, [f32; 3], [f32; 3], f32, [bool; 4]); 4] = [
+			(180.0, [-32.0, 6.0, 0.0], [0.0, 0.0, 0.0], 50.0, [true, true, true, true]),
+			(180.0, [-32.0, 6.0, 0.0], [0.0, 10.0, 0.0], 75.0, [true, false, false, false]),
+			(180.0, [-150.0, 12.0, 0.0], [0.0, 0.0, 0.0], 16.0, [true, true, true, false]),
+			(0.4, [0.0, 100.0, 0.0], [0.0, 0.0, 0.0], 30.0, [true, true, true, true]),
+		];
+		for (height, eye, target, fov, over) in cases {
+			let spec = CameraSpec::LookAt { eye, target, fov };
+			let view = ViewRequest { width: SIZE.0, height: SIZE.1, camera: spec.clone(), background: Background::Color([0.0, 0.0, 0.0]), bloom: false, ..Default::default() };
+			let (images, _) = renderer.render(&scene(height), &[view]).unwrap();
+			let project = spec.place(None, SIZE.0, SIZE.1).view_projection(SIZE.0 as f32 / SIZE.1 as f32);
+			let mut read = Vec::new();
+			let drawn: Vec<bool> = ROWS
+				.iter()
+				.map(|&x| {
+					let clip = project * Vec3::new(x, 0.1, x * STAGGER).extend(1.0);
+					let (column, row) = (((clip.x / clip.w * 0.5 + 0.5) * SIZE.0 as f32) as usize, ((0.5 - clip.y / clip.w * 0.5) * SIZE.1 as f32) as usize);
+					let pixel = &images[0].rgba[(row * SIZE.0 as usize + column) * 4..][..3];
+					read.push([pixel[0], pixel[1], pixel[2]]);
+					assert!(pixel[0] > 60, "eye {eye:?} looking at {target:?}: no beam at x {x} ({pixel:?})");
+					// its own red, or that under 0.7 of the part's blue
+					pixel[2] < 60
+				})
+				.collect();
+			assert_eq!(drawn, over, "part {height} studs tall, eye {eye:?} looking at {target:?}: the rows drawn over the face (read {read:?})");
+		}
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
 	}

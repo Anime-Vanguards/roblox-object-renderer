@@ -22,7 +22,7 @@ With a playback timeline ([playback.md](playback.md)), `ror` simulates emissions
 ## Behavior and extension rules
 
 - **Deterministic seeding:** Each emitter maintains independent random streams seeded by its instance path and copy index. Rerenders are identical, while duplicate emitters remain visually distinct like in Studio.
-- **Depth sorting:** Particles sort back-to-front within each emitter. Emitters, beams, and transparent parts sort relative to each other by part/attachment positions, with `ZOffset` shifting particles along view depth.
+- **Depth sorting:** Particles sort back-to-front within each emitter. Emitters, beams, and transparent parts sort relative to each other by the depth of their part/attachment positions along the camera's forward axis (not their distance from the eye: turning the camera can change which of two draws is in front, moving it sideways cannot), with `ZOffset` shifting particles along view depth.
 - **Off-screen freezing:** Emitters outside the camera frustum or beyond draw range pause—neither emitting nor aging—matching Studio. In video renders, the active camera track controls which emitters advance.
 - **Local lighting:** Particles, beams, and trails sample local lights from a voxel light field rather than per-pixel lighting, matching Studio.
 - **Beam and trail geometry:** Beams tessellate into `Segments` quads between attachments bent by `CurveSize0`/`CurveSize1` (oriented via `FaceCamera`). Trails record one point per frame within their `Lifetime` and `MinLength`.
