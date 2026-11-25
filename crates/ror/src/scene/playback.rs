@@ -1284,6 +1284,45 @@ struct RateScan {
 	stream: u64,
 }
 
+/// One continuous emitter still enabled past the playback's last event (never disabled or moved
+/// out of the world). Its particle count climbs for `lifetime` seconds after `enabled_since`,
+/// reaching steady state at `steady_state_at`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoopingEmitter {
+	pub path: String,
+	pub class: String,
+	/// Enabled in the file before any playback action (starts empty at `t=0` unless `prewarm > 0`).
+	pub file_enabled: bool,
+	/// Start of the uninterrupted still-open enabled window (`-prewarm` when enabled from the file).
+	pub enabled_since: f32,
+	/// Effective maximum particle lifetime in seconds (`max_lifetime / TimeScale`, clamped to 20 s).
+	pub lifetime: f32,
+	/// Earliest non-negative time in seconds when steady state is reached.
+	pub steady_state_at: f32,
+}
+
+/// Natural-end and looping-emitter provenance for a [`Playback`] on a [`Document`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct NaturalEnd {
+	/// Resolved end time in seconds (clamped to `[0.1, 120.0]`, fallback `2.0`).
+	pub seconds: f32,
+	/// Latest finite playback event (action + lifetime tail, tween, or motion keyframe), `0.0` if none.
+	pub finite_end: f32,
+	/// Short provenance tag: `"actions"`, `"tweens"`, `"infinite-tween"`, `"motion"`,
+	/// `"looping-emitters"`, `"looping-emitters-and-playback"`, or `"fallback-empty"`.
+	pub source: &'static str,
+	/// Human-readable explanation of where `seconds` came from.
+	pub detail: String,
+	/// True when no playback events or looping emitters existed and the 2 s fallback ran.
+	pub fallback: bool,
+	/// True when at least one tween repeats forever (`repeatCount < 0`; sampled for 1 cycle).
+	pub has_infinite_tween: bool,
+	/// Continuous emitters still enabled past the playback's last event, in deterministic path order.
+	pub looping_emitters: Vec<LoopingEmitter>,
+	/// Earliest moment `>= 0` when all `looping_emitters` reach steady state (`None` if none).
+	pub steady_state_at: Option<f32>,
+}
+
 impl Playback {
 	/// No motion, tweens, property sets, switching or parenting at any moment: only emits (and
 	/// Clear, TimeScale), which the extracted scene's history carries ([`Resolved::apply_history`]).
@@ -1312,12 +1351,22 @@ impl Playback {
 
 	/// Natural end of the playback in seconds (for `ror cost --duration auto`): the latest action
 	/// (plus the maximum particle/trail lifetime tail, clamped to 10 s), tween finish (one cycle for
-	/// infinite repeats), or motion keyframe, falling back to 2 s and capped at 120 s.
+	/// infinite repeats), motion keyframe, or looping emitter steady-state window (`steady_state_at + 1 s`),
+	/// falling back to 2 s and capped at 120 s.
 	pub fn natural_end(&self, document: &Document) -> f32 {
-		let mut end = 0.0f32;
+		self.natural_end_info(document).seconds
+	}
+
+	/// Detailed natural-end and looping-emitter analysis of this playback against `document`.
+	pub fn natural_end_info(&self, document: &Document) -> NaturalEnd {
+		let mut action_end = 0.0f32;
+		let mut tween_end = 0.0f32;
+		let mut motion_end = 0.0f32;
+		let mut has_infinite_tween = false;
+
 		for action in &self.actions {
 			let at = if action.at.is_finite() { action.at.max(0.0) } else { 0.0 };
-			end = end.max(at);
+			action_end = action_end.max(at);
 			if action.emit.is_some() || action.enabled.is_some() {
 				if let Ok(targets) = resolve(document, &action.target) {
 					for target in targets {
@@ -1331,7 +1380,7 @@ impl Playback {
 							let life = match instance.class.as_str() {
 								"ParticleEmitter" => match props::get(instance, "Lifetime") {
 									Some(Variant::NumberRange(range)) => range.min.max(range.max),
-									_ => 5.0,
+									_ => 10.0,
 								},
 								"Trail" => props::f32(instance, "Lifetime", 2.0),
 								"Fire" => 1.5,
@@ -1348,7 +1397,7 @@ impl Playback {
 								),
 								_ => (0.0, 0.0),
 							};
-							end = end.max(at + delay + dur + life);
+							action_end = action_end.max(at + delay + dur + life);
 						}
 					}
 				}
@@ -1358,7 +1407,7 @@ impl Playback {
 			if !tween.keys.is_empty() {
 				for key in &tween.keys {
 					if key.at.is_finite() {
-						end = end.max(key.at.max(0.0));
+						tween_end = tween_end.max(key.at.max(0.0));
 					}
 				}
 			} else if tween.to.is_some() {
@@ -1366,22 +1415,360 @@ impl Playback {
 				let delay = if tween.delay.is_finite() { tween.delay.max(0.0) } else { 0.0 };
 				let dur = if tween.duration.is_finite() { tween.duration.max(0.0) } else { 0.0 };
 				let cycle = dur * if tween.reverses { 2.0 } else { 1.0 };
-				let repeats = if tween.repeat_count < 0 { 1.0 } else { tween.repeat_count as f32 + 1.0 };
-				end = end.max(at + delay + cycle * repeats);
+				let repeats = if tween.repeat_count < 0 {
+					has_infinite_tween = true;
+					1.0
+				} else {
+					tween.repeat_count as f32 + 1.0
+				};
+				tween_end = tween_end.max(at + delay + cycle * repeats);
 			}
 		}
 		for motion in &self.motion {
 			for key in &motion.keys {
 				if key.at.is_finite() {
-					end = end.max(key.at.max(0.0));
+					motion_end = motion_end.max(key.at.max(0.0));
 				}
 			}
 		}
-		if !end.is_finite() || end <= 0.0 {
+
+		let finite_end = action_end.max(tween_end).max(motion_end);
+		let looping_emitters = self.detect_looping_emitters(document);
+		let steady_state_at = looping_emitters.iter().map(|e| e.steady_state_at).reduce(f32::max);
+		let steady_window = steady_state_at.map(|t| t + 1.0);
+
+		let finite_parts = || {
+			let mut parts = Vec::new();
+			if action_end > 0.0 {
+				parts.push(format!("actions {:.2}s", action_end));
+			}
+			if tween_end > 0.0 {
+				if has_infinite_tween {
+					parts.push(format!("infinite tween 1 cycle {:.2}s", tween_end));
+				} else {
+					parts.push(format!("tweens {:.2}s", tween_end));
+				}
+			}
+			if motion_end > 0.0 {
+				parts.push(format!("motion {:.2}s", motion_end));
+			}
+			parts.join(", ")
+		};
+
+		let (raw_seconds, source, detail, fallback) = if let Some(steady_at) = steady_state_at {
+			let target = steady_window.unwrap_or(steady_at + 1.0);
+			let combined = finite_end.max(target);
+			let count = looping_emitters.len();
+			if finite_end > 0.0 {
+				(
+					combined,
+					"looping-emitters-and-playback",
+					format!(
+						"{count} looping emitter{} (steady state at {steady_at:.2}s + 1.00s window) and playback ({})",
+						if count == 1 { "" } else { "s" },
+						finite_parts()
+					),
+					false,
+				)
+			} else {
+				(
+					combined,
+					"looping-emitters",
+					format!(
+						"{count} looping emitter{} still running (steady state at {steady_at:.2}s + 1.00s steady window)",
+						if count == 1 { "" } else { "s" }
+					),
+					false,
+				)
+			}
+		} else if !finite_end.is_finite() || finite_end <= 0.0 {
+			(
+				2.0,
+				"fallback-empty",
+				"fallback 2.00s (no playback actions, tweens, motion, or looping emitters)".to_string(),
+				true,
+			)
+		} else {
+			let source = if tween_end >= action_end && tween_end >= motion_end {
+				if has_infinite_tween { "infinite-tween" } else { "tweens" }
+			} else if action_end >= motion_end {
+				"actions"
+			} else {
+				"motion"
+			};
+			(finite_end, source, finite_parts(), false)
+		};
+
+		let seconds = if !raw_seconds.is_finite() || raw_seconds <= 0.0 {
 			2.0
 		} else {
-			end.clamp(0.1, 120.0)
+			raw_seconds.clamp(0.1, 120.0)
+		};
+
+		NaturalEnd {
+			seconds,
+			finite_end: if finite_end.is_finite() { finite_end.max(0.0) } else { 0.0 },
+			source,
+			detail,
+			fallback,
+			has_infinite_tween,
+			looping_emitters,
+			steady_state_at,
 		}
+	}
+
+	/// Continuous emitters (`ParticleEmitter` with `Rate > 0`, `Fire`, `Smoke`, `Sparkles`) that are
+	/// in the world and still enabled after the playback's last event.
+	fn detect_looping_emitters(&self, document: &Document) -> Vec<LoopingEmitter> {
+		struct State {
+			path: String,
+			class: String,
+			initial_in_world: bool,
+			initial_enabled: bool,
+			in_world: Vec<(f32, bool)>,
+			enabled: Vec<(f32, bool)>,
+			forced: Vec<(f32, bool)>,
+			rate_events: Vec<(f32, f32)>,
+			time_scale_events: Vec<(f32, f32)>,
+			raw_life: f32,
+		}
+
+		let mut world_set: std::collections::HashSet<Ref> = std::collections::HashSet::new();
+		for &root in &document.roots {
+			world_set.extend(descendants(document, root));
+		}
+
+		let prewarm = if self.prewarm.is_finite() { self.prewarm.max(0.0) } else { 0.0 };
+		let mut states: std::collections::HashMap<Ref, State> = std::collections::HashMap::new();
+		for instance in document.dom.descendants() {
+			let class = instance.class.as_str();
+			if !matches!(class, "ParticleEmitter" | "Fire" | "Smoke" | "Sparkles") {
+				continue;
+			}
+			let referent = instance.referent();
+			let initial_in_world = world_set.contains(&referent);
+			let initial_enabled = props::bool(instance, "Enabled", true);
+			let initial_rate = if class == "ParticleEmitter" {
+				props::f32(instance, "Rate", 20.0).max(0.0)
+			} else {
+				1.0
+			};
+			let initial_time_scale = props::f32(instance, "TimeScale", 1.0).max(0.0);
+			let raw_life = match class {
+				"ParticleEmitter" => match props::get(instance, "Lifetime") {
+					Some(Variant::NumberRange(range)) => range.min.max(range.max),
+					_ => 10.0,
+				},
+				"Fire" => 1.5,
+				"Smoke" => 4.0,
+				"Sparkles" => 1.5,
+				_ => 0.0,
+			};
+			states.insert(
+				referent,
+				State {
+					path: path_of(document, referent),
+					class: class.to_string(),
+					initial_in_world,
+					initial_enabled,
+					in_world: vec![(-prewarm, initial_in_world)],
+					enabled: if initial_enabled { vec![(-prewarm, true)] } else { Vec::new() },
+					forced: Vec::new(),
+					rate_events: vec![(-prewarm, initial_rate)],
+					time_scale_events: vec![(-prewarm, initial_time_scale)],
+					raw_life,
+				},
+			);
+		}
+		if states.is_empty() {
+			return Vec::new();
+		}
+
+		for action in &self.actions {
+			let at = if action.at.is_finite() { action.at.max(0.0) } else { 0.0 };
+			let Ok(targets) = resolve(document, &action.target) else {
+				continue;
+			};
+			let by_attributes = match &action.emit {
+				Some(Emit::Mode(mode)) => ByAttributes::parse(mode).ok(),
+				_ => None,
+			};
+			for &target in &targets {
+				for referent in descendants(document, target) {
+					let Some(instance) = document.dom.get_by_ref(referent) else {
+						continue;
+					};
+					let Some(state) = states.get_mut(&referent) else {
+						continue;
+					};
+					if action.class.as_deref().is_some_and(|class| !props::is_a(instance, class)) {
+						continue;
+					}
+					if let Some(on) = action.enabled {
+						if action.force {
+							state.forced.push((at, on));
+						} else {
+							state.enabled.push((at, on));
+						}
+					}
+					if let Some(ts) = action.time_scale {
+						state.time_scale_events.push((at, ts.max(0.0)));
+					}
+					if instance.class == "ParticleEmitter"
+						&& let Some(mode) = by_attributes
+					{
+						let delay = attribute_number(instance, "EmitDelay").unwrap_or(0.0).max(0.0);
+						let dur = attribute_number(instance, "EmitDuration").unwrap_or(0.0).max(0.0);
+						match mode {
+							ByAttributes::Attributes | ByAttributes::Immediate => {
+								state.enabled.push((at, true));
+								state.enabled.push((at + dur, false));
+							}
+							ByAttributes::Cutscene | ByAttributes::Delayed if dur > 0.0 => {
+								state.enabled.push((at + delay, true));
+								state.enabled.push((at + delay + dur, false));
+							}
+							_ => {}
+						}
+					}
+				}
+			}
+
+			// Property sets (`set`) and parenting (`parent`) use `of_class` targeting.
+			if !action.set.is_empty() || action.parent.is_some() {
+				let own = of_class(document, targets, action.class.as_deref());
+				if !action.set.is_empty() {
+					for &referent in &own {
+						let Some(state) = states.get_mut(&referent) else {
+							continue;
+						};
+						if let Some(v) = action.set.get("Enabled").and_then(|v| v.as_bool()) {
+							state.enabled.push((at, v));
+						}
+						if state.class == "ParticleEmitter"
+							&& let Some(v) = action.set.get("Rate").and_then(|v| v.as_f64())
+						{
+							state.rate_events.push((at, (v as f32).max(0.0)));
+						}
+						if let Some(v) = action.set.get("TimeScale").and_then(|v| v.as_f64()) {
+							state.time_scale_events.push((at, (v as f32).max(0.0)));
+						}
+					}
+				}
+				if let Some(path) = &action.parent {
+					let trimmed = path.trim();
+					let into_world = if trimmed.is_empty() || trimmed == "nil" {
+						false
+					} else if let Ok(parents) = resolve(document, trimmed) {
+						parents.first().is_some_and(|p| world_set.contains(p) || document.roots.contains(p))
+					} else {
+						false
+					};
+					for &moved in &own {
+						for descendant in descendants(document, moved) {
+							if let Some(state) = states.get_mut(&descendant) {
+								state.in_world.push((at, into_world));
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Finite tweens on Rate / TimeScale can turn a looping emitter off.
+		for tween in &self.tweens {
+			if tween.repeat_count < 0 || tween.reverses {
+				continue;
+			}
+			let prop = tween.property.as_str();
+			if prop != "Rate" && prop != "TimeScale" {
+				continue;
+			}
+			let Ok(targets) = resolve(document, &tween.target) else {
+				continue;
+			};
+			let final_val = if let Some(last) = tween.keys.last() {
+				last.value.as_f64().map(|v| (last.at, v as f32))
+			} else if let Some(to) = tween.to.as_ref().and_then(|v| v.as_f64()) {
+				let at = if tween.at.is_finite() { tween.at.max(0.0) } else { 0.0 };
+				let delay = if tween.delay.is_finite() { tween.delay.max(0.0) } else { 0.0 };
+				let dur = if tween.duration.is_finite() { tween.duration.max(0.0) } else { 0.0 };
+				Some((at + delay + dur * (tween.repeat_count as f32 + 1.0), to as f32))
+			} else {
+				None
+			};
+			let Some((end_at, end_val)) = final_val else {
+				continue;
+			};
+			for referent in of_class(document, targets, tween.class.as_deref()) {
+				if let Some(state) = states.get_mut(&referent) {
+					if prop == "Rate" && state.class == "ParticleEmitter" {
+						state.rate_events.push((end_at, end_val.max(0.0)));
+					} else if prop == "TimeScale" {
+						state.time_scale_events.push((end_at, end_val.max(0.0)));
+					}
+				}
+			}
+		}
+
+		let open_since = |events: &mut Vec<(f32, bool)>| -> Option<f32> {
+			events.sort_by(|a, b| a.0.total_cmp(&b.0));
+			if !events.last().is_some_and(|(_, on)| *on) {
+				return None;
+			}
+			let mut since = events.last().unwrap().0;
+			for &(t, on) in events.iter().rev() {
+				if on {
+					since = t;
+				} else {
+					break;
+				}
+			}
+			Some(since)
+		};
+
+		let mut out = Vec::new();
+		for mut state in states.into_values() {
+			if !state.forced.is_empty() {
+				state.forced.sort_by(|a, b| a.0.total_cmp(&b.0));
+				let first = state.forced[0].0;
+				state.enabled.retain(|(t, _)| *t < first - 1e-6);
+				state.enabled.extend_from_slice(&state.forced);
+			}
+			let Some(in_world_since) = open_since(&mut state.in_world) else {
+				continue;
+			};
+			let Some(enabled_since_raw) = open_since(&mut state.enabled) else {
+				continue;
+			};
+			state.rate_events.sort_by(|a, b| a.0.total_cmp(&b.0));
+			let final_rate = state.rate_events.last().map(|(_, r)| *r).unwrap_or(0.0);
+			if final_rate <= 0.0 {
+				continue;
+			}
+			state.time_scale_events.sort_by(|a, b| a.0.total_cmp(&b.0));
+			let final_ts = state.time_scale_events.last().map(|(_, s)| *s).unwrap_or(1.0);
+			if final_ts <= 0.0 {
+				continue;
+			}
+			let enabled_since = enabled_since_raw.max(in_world_since);
+			let lifetime = if state.raw_life.is_finite() {
+				(state.raw_life.max(0.0) / final_ts).clamp(0.0, 20.0)
+			} else {
+				0.0
+			};
+			let steady_state_at = (enabled_since + lifetime).max(0.0);
+			out.push(LoopingEmitter {
+				path: state.path,
+				class: state.class,
+				file_enabled: state.initial_in_world && state.initial_enabled,
+				enabled_since,
+				lifetime,
+				steady_state_at,
+			});
+		}
+		out.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.class.cmp(&b.class)));
+		out
 	}
 
 	/// [`Playback::resolve`] for the moment `time` (whatever `self.time` holds).

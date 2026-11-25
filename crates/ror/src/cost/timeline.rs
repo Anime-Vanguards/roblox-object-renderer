@@ -74,6 +74,56 @@ pub struct OffscreenEmittersReport {
 	pub note: String,
 }
 
+/// Where the timeline's end time / sample window came from.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DurationSource {
+	/// `"auto"`, `"explicit-duration"`, or `"explicit-times"`.
+	pub mode: &'static str,
+	/// Specific origin: `"actions"`, `"tweens"`, `"infinite-tween"`, `"motion"`,
+	/// `"looping-emitters"`, `"looping-emitters-and-playback"`, `"fallback-empty"`,
+	/// `"explicit-duration"`, or `"explicit-times"`.
+	pub source: &'static str,
+	/// Human-readable description printed in `analysis.txt`.
+	pub detail: String,
+	/// True when `--duration auto` found no playback events or looping emitters and used the 2 s fallback.
+	pub fallback: bool,
+	/// True when the playback contains an infinite-repeat tween (`repeatCount < 0`, capped to 1 cycle).
+	pub has_infinite_tween: bool,
+	/// Playback `prewarm` in seconds (`0` means file-enabled emitters start empty at `t=0`).
+	pub prewarm: f64,
+}
+
+/// Climb vs steady-state breakdown when one or more continuous emitters are still running at the
+/// end of the playback.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoopingReport {
+	/// Number of continuous emitters still enabled past the playback's last event.
+	pub emitters_still_running: usize,
+	/// Paths of continuous emitters still enabled at the end (capped to 20).
+	pub emitter_paths: Vec<String>,
+	/// True when file-enabled looping emitters start empty at `t=0` (`prewarm == 0`).
+	pub file_enabled_start_empty: bool,
+	/// Earliest time in seconds when all still-running emitters reach steady state.
+	pub steady_state_at: f64,
+	/// True when at least one sampled frame lies at or after `steady_state_at`.
+	pub steady_state_reached: bool,
+	/// Number of sampled frames during the initial climb (`t < steady_state_at`).
+	pub climb_frames: usize,
+	/// Number of sampled frames at steady state (`t >= steady_state_at`).
+	pub steady_frames: usize,
+	/// Summary over climb frames only (`None` when the run starts at/after `steady_state_at`).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub climb: Option<TimelineSummary>,
+	/// Summary over steady-state frames only (`None` when the run ended before `steady_state_at`).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub steady_state: Option<TimelineSummary>,
+	/// Non-empty warning when the run ended before steady state was reached.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub warning: Option<String>,
+}
+
 /// One sampled moment along the timeline.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -161,7 +211,10 @@ pub struct TimelineReport {
 	pub prices: Vec<Price>,
 	pub fidelity: serde_json::Value,
 	pub unmodeled: Vec<serde_json::Value>,
+	pub duration_source: DurationSource,
 	pub offscreen_emitters: OffscreenEmittersReport,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub looping: Option<LoopingReport>,
 	pub pixels_counted: bool,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub memory: Option<MemoryReport>,
@@ -185,8 +238,9 @@ pub fn track_camera(track: &[CameraKey], time: f32) -> CameraSpec {
 	CameraSpec::CFrame { components: key.cframe, fov: key.fov, near: None }
 }
 
-/// Builds the rounded sample moments `(times, start, duration, fps_opt)`.
-pub fn sample_times(opts: &TimelineOptions, playback: &Playback, document: &Document) -> (Vec<f64>, f64, f64, Option<f64>) {
+/// Builds the rounded sample moments `(times, start, duration, fps_opt)` using a precomputed
+/// [`crate::scene::playback::NaturalEnd`].
+pub fn sample_times_with_info(opts: &TimelineOptions, info: &crate::scene::playback::NaturalEnd) -> (Vec<f64>, f64, f64, Option<f64>) {
 	if let Some(explicit) = &opts.times
 		&& !explicit.is_empty()
 	{
@@ -198,14 +252,21 @@ pub fn sample_times(opts: &TimelineOptions, playback: &Playback, document: &Docu
 	let fps = if opts.fps.is_finite() && opts.fps > 0.0 { f64::from(opts.fps) } else { 10.0 };
 	let start = if opts.start.is_finite() && opts.start >= 0.0 { f64::from(opts.start) } else { 0.0 };
 	let dur = if opts.auto_duration {
-		let natural = f64::from(playback.natural_end(document));
-		(natural - start).max(1.0 / fps)
+		let natural = f64::from(info.seconds);
+		let min_span = if !info.looping_emitters.is_empty() { 1.0 } else { 1.0 / fps };
+		(natural - start).max(min_span)
 	} else {
 		f64::from(opts.duration.unwrap_or(2.0)).max(0.0)
 	};
 	let count = ((dur * fps).round() as usize).clamp(1, MAX_TIMELINE_FRAMES);
 	let times: Vec<f64> = (0..count).map(|i| round6(start + i as f64 / fps)).collect();
 	(times, round6(start), round6(dur), Some(round6(fps)))
+}
+
+/// Builds the rounded sample moments `(times, start, duration, fps_opt)`.
+pub fn sample_times(opts: &TimelineOptions, playback: &Playback, document: &Document) -> (Vec<f64>, f64, f64, Option<f64>) {
+	let info = playback.natural_end_info(document);
+	sample_times_with_info(opts, &info)
 }
 
 fn nearest_rank_percentile(sorted: &[f64], pct: f64) -> f64 {
@@ -293,6 +354,43 @@ pub fn summarize(series: &[f64], times: &[f64], uniform_dt: Option<f64>) -> Metr
 	}
 }
 
+fn summarize_frames(frames: &[FrameCost], uniform_dt: Option<f64>, desktop: bool) -> TimelineSummary {
+	let times: Vec<f64> = frames.iter().map(|f| f.time).collect();
+	let draws_s: Vec<f64> = frames.iter().map(|f| f.draws as f64).collect();
+	let tris_s: Vec<f64> = frames.iter().map(|f| f.triangles as f64).collect();
+	let particles_s: Vec<f64> = frames.iter().map(|f| f.particles as f64).collect();
+	let pfill_s: Vec<f64> = frames.iter().map(|f| f.particle_fill).collect();
+	let bvp_s: Vec<f64> = frames.iter().map(|f| f.blended_viewports).collect();
+	let gpuu_s: Vec<f64> = frames.iter().map(|f| f.gpu_units).collect();
+	let cpu_s: Vec<f64> = frames.iter().map(|f| f.cpu_ms).collect();
+	let ms_s: Vec<f64> = frames.iter().map(|f| f.ms).collect();
+	let gpu_ms_summary = if desktop || frames.iter().any(|f| f.gpu_ms.is_none()) {
+		None
+	} else {
+		let gpu_s: Vec<f64> = frames.iter().map(|f| f.gpu_ms.unwrap_or(0.0)).collect();
+		let mut s = summarize(&gpu_s, &times, uniform_dt);
+		s.peak_frame = frames.get(s.peak_frame).map_or(s.peak_frame, |f| f.frame);
+		Some(s)
+	};
+	let remap = |mut s: MetricSummary| -> MetricSummary {
+		if let Some(f) = frames.get(s.peak_frame) {
+			s.peak_frame = f.frame;
+		}
+		s
+	};
+	TimelineSummary {
+		draws: remap(summarize(&draws_s, &times, uniform_dt)),
+		triangles: remap(summarize(&tris_s, &times, uniform_dt)),
+		particles: remap(summarize(&particles_s, &times, uniform_dt)),
+		particle_fill: remap(summarize(&pfill_s, &times, uniform_dt)),
+		blended_viewports: remap(summarize(&bvp_s, &times, uniform_dt)),
+		gpu_units: remap(summarize(&gpuu_s, &times, uniform_dt)),
+		cpu_ms: remap(summarize(&cpu_s, &times, uniform_dt)),
+		gpu_ms: gpu_ms_summary,
+		ms: remap(summarize(&ms_s, &times, uniform_dt)),
+	}
+}
+
 #[derive(Default)]
 struct InstAcc {
 	class: String,
@@ -327,7 +425,37 @@ pub fn run(
 	lend: &dyn Fn(&mut Scene) -> Result<()>,
 ) -> Result<CostReport> {
 	let mut owned_playback = playback.cloned().unwrap_or_default();
-	let (times, start, duration, fps_opt) = sample_times(tl, &owned_playback, document);
+	let natural_info = owned_playback.natural_end_info(document);
+	let (times, start, duration, fps_opt) = sample_times_with_info(tl, &natural_info);
+	let prewarm = if owned_playback.prewarm.is_finite() { round6(f64::from(owned_playback.prewarm.max(0.0))) } else { 0.0 };
+	let duration_source = if tl.times.as_deref().is_some_and(|ts| !ts.is_empty()) {
+		DurationSource {
+			mode: "explicit-times",
+			source: "explicit-times",
+			detail: format!("explicit --times ({} moments)", times.len()),
+			fallback: false,
+			has_infinite_tween: natural_info.has_infinite_tween,
+			prewarm,
+		}
+	} else if tl.auto_duration {
+		DurationSource {
+			mode: "auto",
+			source: natural_info.source,
+			detail: natural_info.detail.clone(),
+			fallback: natural_info.fallback,
+			has_infinite_tween: natural_info.has_infinite_tween,
+			prewarm,
+		}
+	} else {
+		DurationSource {
+			mode: "explicit-duration",
+			source: "explicit-duration",
+			detail: format!("explicit --duration {duration:.2}s"),
+			fallback: false,
+			has_infinite_tween: natural_info.has_infinite_tween,
+			prewarm,
+		}
+	};
 	let (view_w, view_h) = views.first().map(|v| (v.view.width, v.view.height)).unwrap_or((1920, 1080));
 	let dummy_cam = CameraSpec::LookAt { eye: [0.0, 0.0, 10.0], target: [0.0; 3], fov: 70.0 }.place(None, view_w.max(1), view_h.max(1));
 	let preset = agent::preset_of(options, &[(dummy_cam, view_w, view_h)])?;
@@ -563,31 +691,42 @@ pub fn run(
 	});
 
 	let uniform_dt = fps_opt.map(|fps| 1.0 / fps);
-	let draws_s: Vec<f64> = frames.iter().map(|f| f.draws as f64).collect();
-	let tris_s: Vec<f64> = frames.iter().map(|f| f.triangles as f64).collect();
-	let particles_s: Vec<f64> = frames.iter().map(|f| f.particles as f64).collect();
-	let pfill_s: Vec<f64> = frames.iter().map(|f| f.particle_fill).collect();
-	let bvp_s: Vec<f64> = frames.iter().map(|f| f.blended_viewports).collect();
-	let gpuu_s: Vec<f64> = frames.iter().map(|f| f.gpu_units).collect();
-	let cpu_s: Vec<f64> = frames.iter().map(|f| f.cpu_ms).collect();
-	let ms_s: Vec<f64> = frames.iter().map(|f| f.ms).collect();
-	let gpu_ms_summary = if desktop || frames.iter().any(|f| f.gpu_ms.is_none()) {
-		None
-	} else {
-		let gpu_s: Vec<f64> = frames.iter().map(|f| f.gpu_ms.unwrap_or(0.0)).collect();
-		Some(summarize(&gpu_s, &times, uniform_dt))
-	};
+	let summary = summarize_frames(&frames, uniform_dt, desktop);
 
-	let summary = TimelineSummary {
-		draws: summarize(&draws_s, &times, uniform_dt),
-		triangles: summarize(&tris_s, &times, uniform_dt),
-		particles: summarize(&particles_s, &times, uniform_dt),
-		particle_fill: summarize(&pfill_s, &times, uniform_dt),
-		blended_viewports: summarize(&bvp_s, &times, uniform_dt),
-		gpu_units: summarize(&gpuu_s, &times, uniform_dt),
-		cpu_ms: summarize(&cpu_s, &times, uniform_dt),
-		gpu_ms: gpu_ms_summary,
-		ms: summarize(&ms_s, &times, uniform_dt),
+	let looping = if !natural_info.looping_emitters.is_empty() {
+		let steady_at = round6(f64::from(natural_info.steady_state_at.unwrap_or(0.0)));
+		let file_enabled_start_empty = prewarm <= 0.0 && natural_info.looping_emitters.iter().any(|e| e.file_enabled);
+		let climb_slice: Vec<FrameCost> = frames.iter().filter(|f| f.time < steady_at - 1e-4).cloned().collect();
+		let steady_slice: Vec<FrameCost> = frames.iter().filter(|f| f.time >= steady_at - 1e-4).cloned().collect();
+		let climb_frames = climb_slice.len();
+		let steady_frames = steady_slice.len();
+		let steady_state_reached = steady_frames > 0;
+		let climb = (!climb_slice.is_empty()).then(|| summarize_frames(&climb_slice, uniform_dt, desktop));
+		let steady_state = (!steady_slice.is_empty()).then(|| summarize_frames(&steady_slice, uniform_dt, desktop));
+		let warning = if !steady_state_reached {
+			let last_t = frames.last().map(|f| f.time).unwrap_or(start);
+			let suggested = round4((steady_at + 1.0 - start).max(steady_at + 1.0));
+			Some(format!(
+				"steady state NOT reached (looping emitters climb until t={steady_at:.2}s, last sampled frame t={last_t:.2}s{}); reported mean reflects climb-only particles — re-run with --duration auto or --duration >= {suggested:.2} (or --start {steady_at:.2})",
+				if file_enabled_start_empty { "; file-enabled emitters start empty at t=0" } else { "" }
+			))
+		} else {
+			None
+		};
+		Some(LoopingReport {
+			emitters_still_running: natural_info.looping_emitters.len(),
+			emitter_paths: natural_info.looping_emitters.iter().take(TOP_INSTANCES).map(|e| e.path.clone()).collect(),
+			file_enabled_start_empty,
+			steady_state_at: steady_at,
+			steady_state_reached,
+			climb_frames,
+			steady_frames,
+			climb,
+			steady_state,
+			warning,
+		})
+	} else {
+		None
 	};
 
 	let n_frames = frames.len().max(1) as f64;
@@ -618,8 +757,12 @@ pub fn run(
 
 	let mut fidelity = prices::fidelity(&preset, options.pixels);
 	if let Some(map) = fidelity.as_object_mut() {
+		map.insert("durationSource".into(), serde_json::json!(duration_source.source));
 		map.insert("offscreenEmitters".into(), serde_json::json!(offscreen_emitters.rule));
 		map.insert("offscreenEmittersSource".into(), serde_json::json!(offscreen_emitters.source));
+		if let Some(loop_rep) = &looping {
+			map.insert("steadyStateReached".into(), serde_json::json!(loop_rep.steady_state_reached));
+		}
 	}
 	let mut unmodeled = prices::unmodeled(&preset, &quality);
 	if tl.all_emitters_running {
@@ -628,6 +771,16 @@ pub fn run(
 			"scope": "particles,draws,gpu",
 			"reason": "--all-emitters-running forced every emitter to emit and age even out of the camera's view; live Roblox clients pause emitters out of view.",
 			"settleWith": "Omit --all-emitters-running to pause emitters out of the camera's view.",
+		}));
+	}
+	if let Some(loop_rep) = &looping
+		&& !loop_rep.steady_state_reached
+	{
+		unmodeled.push(serde_json::json!({
+			"kind": "steadyStateNotReached",
+			"scope": "particles,draws,gpu,ms",
+			"reason": loop_rep.warning.clone().unwrap_or_else(|| "timeline ended before looping emitters reached steady state".into()),
+			"settleWith": format!("Re-run with --duration auto or --duration >= {:.2} (or --start {:.2}).", loop_rep.steady_state_at + 1.0, loop_rep.steady_state_at),
 		}));
 	}
 
@@ -644,7 +797,9 @@ pub fn run(
 		prices: prices::table_for(&preset),
 		fidelity,
 		unmodeled,
+		duration_source,
 		offscreen_emitters,
+		looping,
 		pixels_counted: options.pixels,
 		memory: memory.clone(),
 		summary,
@@ -683,31 +838,110 @@ fn format_lines(report: &TimelineReport, desktop: bool) -> Vec<String> {
 		None => format!("{:.2}..+{:.2}s (explicit times)", report.start, report.duration),
 	};
 	lines.push(format!(
-		"cost timeline ({TIMELINE_SCHEMA}): {}, {} frames ({span}), preset {} ({}x{}, {quality_label}{})",
+		"cost timeline ({TIMELINE_SCHEMA}): {}, {} frames ({span}; {}: {}), preset {} ({}x{}, {quality_label}{})",
 		report.input,
 		report.frame_count,
+		report.duration_source.mode,
+		report.duration_source.detail,
 		report.preset.name,
 		report.preset.width,
 		report.preset.height,
 		if report.quality.sun_shadows { ", sun shadows" } else { ", no sun shadows" }
 	));
 	let s = &report.summary;
-	if !desktop {
+	if let Some(looping) = &report.looping {
+		if let Some(steady) = &looping.steady_state {
+			if !desktop {
+				lines.push(format!(
+					"steady-state frame time (t>={:.2}s, {} frames): mean {:.2} ms, p95 {:.2} ms, peak {:.2} ms at t={:.3}s (frame {})",
+					looping.steady_state_at, looping.steady_frames, steady.ms.mean, steady.ms.p95, steady.ms.peak, steady.ms.peak_time, steady.ms.peak_frame
+				));
+			} else {
+				lines.push(format!(
+					"steady-state desktop CPU frame time (t>={:.2}s, {} frames): mean {:.2} ms, p95 {:.2} ms, peak {:.2} ms at t={:.3}s (frame {}); GPU uncalibrated (mean {:.2} / peak {:.2} gpuUnits, gpuMs: null)",
+					looping.steady_state_at, looping.steady_frames, steady.ms.mean, steady.ms.p95, steady.ms.peak, steady.ms.peak_time, steady.ms.peak_frame, steady.gpu_units.mean, steady.gpu_units.peak
+				));
+				lines.push("fidelity: desktop CPU ms is estimated from one reference PC ratio (1/2.224); desktop GPU ms is uncalibrated (gpuMs = null)".into());
+			}
+			lines.push(format!(
+				"steady-state counts: draws mean {:.1} / peak {:.0} (t={:.3}s); triangles mean {:.0}k / peak {:.0}k; particles mean {:.1} / peak {:.0}; blended mean {:.2} / peak {:.2} vp",
+				steady.draws.mean,
+				steady.draws.peak,
+				steady.draws.peak_time,
+				steady.triangles.mean / 1000.0,
+				steady.triangles.peak / 1000.0,
+				steady.particles.mean,
+				steady.particles.peak,
+				steady.blended_viewports.mean,
+				steady.blended_viewports.peak
+			));
+			if let Some(climb) = &looping.climb {
+				let start_note = if looping.file_enabled_start_empty {
+					format!("; file-enabled emitters start empty at t=0, prewarm {:.2}s", report.duration_source.prewarm)
+				} else {
+					String::new()
+				};
+				lines.push(format!(
+					"climb (t<{:.2}s, {} frames{start_note}): mean {:.2} ms, peak {:.2} ms; particles mean {:.1} / peak {:.0}; blended mean {:.2} vp",
+					looping.steady_state_at, looping.climb_frames, climb.ms.mean, climb.ms.peak, climb.particles.mean, climb.particles.peak, climb.blended_viewports.mean
+				));
+			} else {
+				lines.push(format!(
+					"climb: none (run starts at t={:.2}s >= steady state t={:.2}s)",
+					report.start, looping.steady_state_at
+				));
+			}
+			lines.push(format!(
+				"whole run ({} frames): mean {:.2} ms, peak {:.2} ms at t={:.3}s (frame {}); particles mean {:.1} / peak {:.0} (endless emitters: steady-state mean is the headline figure)",
+				report.frame_count, s.ms.mean, s.ms.peak, s.ms.peak_time, s.ms.peak_frame, s.particles.mean, s.particles.peak
+			));
+		} else {
+			if let Some(warn) = &looping.warning {
+				lines.push(format!("WARNING: {warn}"));
+			}
+			if !desktop {
+				lines.push(format!(
+					"frame time (climb-only, before steady state): mean {:.2} ms, p95 {:.2} ms, peak {:.2} ms at t={:.3}s (frame {})",
+					s.ms.mean, s.ms.p95, s.ms.peak, s.ms.peak_time, s.ms.peak_frame
+				));
+			} else {
+				lines.push(format!(
+					"desktop CPU frame time (climb-only, before steady state): mean {:.2} ms, p95 {:.2} ms, peak {:.2} ms at t={:.3}s (frame {}); GPU uncalibrated (mean {:.2} / peak {:.2} gpuUnits, gpuMs: null)",
+					s.ms.mean, s.ms.p95, s.ms.peak, s.ms.peak_time, s.ms.peak_frame, s.gpu_units.mean, s.gpu_units.peak
+				));
+				lines.push("fidelity: desktop CPU ms is estimated from one reference PC ratio (1/2.224); desktop GPU ms is uncalibrated (gpuMs = null)".into());
+			}
+			lines.push(format!(
+				"counts (climb-only, before steady state): draws mean {:.1} / peak {:.0} (t={:.3}s); triangles mean {:.0}k / peak {:.0}k; particles mean {:.1} / peak {:.0}; blended mean {:.2} / peak {:.2} vp",
+				s.draws.mean, s.draws.peak, s.draws.peak_time, s.triangles.mean / 1000.0, s.triangles.peak / 1000.0, s.particles.mean, s.particles.peak, s.blended_viewports.mean, s.blended_viewports.peak
+			));
+		}
+		let shown: Vec<&str> = looping.emitter_paths.iter().take(6).map(String::as_str).collect();
+		let more = looping.emitters_still_running.saturating_sub(shown.len());
+		let suffix = if more > 0 { format!(" (+{more} more)") } else { String::new() };
 		lines.push(format!(
-			"frame time: mean {:.2} ms, p95 {:.2} ms, peak {:.2} ms at t={:.3}s (frame {}); integral {:.2} ms*s",
-			s.ms.mean, s.ms.p95, s.ms.peak, s.ms.peak_time, s.ms.peak_frame, s.ms.integral
+			"looping emitters still running at end ({}): {}{suffix}",
+			looping.emitters_still_running,
+			shown.join(", ")
 		));
 	} else {
+		if !desktop {
+			lines.push(format!(
+				"frame time: mean {:.2} ms, p95 {:.2} ms, peak {:.2} ms at t={:.3}s (frame {}); integral {:.2} ms*s",
+				s.ms.mean, s.ms.p95, s.ms.peak, s.ms.peak_time, s.ms.peak_frame, s.ms.integral
+			));
+		} else {
+			lines.push(format!(
+				"desktop CPU frame time: mean {:.2} ms, p95 {:.2} ms, peak {:.2} ms at t={:.3}s (frame {}); GPU uncalibrated (mean {:.2} / peak {:.2} gpuUnits, gpuMs: null)",
+				s.ms.mean, s.ms.p95, s.ms.peak, s.ms.peak_time, s.ms.peak_frame, s.gpu_units.mean, s.gpu_units.peak
+			));
+			lines.push("fidelity: desktop CPU ms is estimated from one reference PC ratio (1/2.224); desktop GPU ms is uncalibrated (gpuMs = null)".into());
+		}
 		lines.push(format!(
-			"desktop CPU frame time: mean {:.2} ms, p95 {:.2} ms, peak {:.2} ms at t={:.3}s (frame {}); GPU uncalibrated (mean {:.2} / peak {:.2} gpuUnits, gpuMs: null)",
-			s.ms.mean, s.ms.p95, s.ms.peak, s.ms.peak_time, s.ms.peak_frame, s.gpu_units.mean, s.gpu_units.peak
+			"counts: draws mean {:.1} / peak {:.0} (t={:.3}s); triangles mean {:.0}k / peak {:.0}k; particles mean {:.1} / peak {:.0}; blended mean {:.2} / peak {:.2} vp",
+			s.draws.mean, s.draws.peak, s.draws.peak_time, s.triangles.mean / 1000.0, s.triangles.peak / 1000.0, s.particles.mean, s.particles.peak, s.blended_viewports.mean, s.blended_viewports.peak
 		));
-		lines.push("fidelity: desktop CPU ms is estimated from one reference PC ratio (1/2.224); desktop GPU ms is uncalibrated (gpuMs = null)".into());
 	}
-	lines.push(format!(
-		"counts: draws mean {:.1} / peak {:.0} (t={:.3}s); triangles mean {:.0}k / peak {:.0}k; particles mean {:.1} / peak {:.0}; blended mean {:.2} / peak {:.2} vp",
-		s.draws.mean, s.draws.peak, s.draws.peak_time, s.triangles.mean / 1000.0, s.triangles.peak / 1000.0, s.particles.mean, s.particles.peak, s.blended_viewports.mean, s.blended_viewports.peak
-	));
 	lines.push(format!(
 		"offscreen emitters: {} ({}; {})",
 		report.offscreen_emitters.rule,
@@ -1051,6 +1285,135 @@ mod tests {
 		let j_stream: serde_json::Value = serde_json::from_slice(&std::fs::read(out_stream.join("timeline.json")).unwrap()).unwrap();
 		let counts: Vec<u64> = j_stream["frames"].as_array().unwrap().iter().map(|f| f["particles"].as_u64().unwrap()).collect();
 		assert_eq!(counts, vec![0, 1, 2, 3, 4, 5], "10 s unseen emitter must ramp 0..5 at 0.5 s steps");
+		let _ = std::fs::remove_dir_all(&temp);
+	}
+
+	#[test]
+	fn timeline_auto_reports_provenance_detects_looping_and_separates_climb_from_steady() {
+		let temp = std::env::temp_dir().join(format!("ror-timeline-looping-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&temp);
+		std::fs::create_dir_all(&temp).unwrap();
+		let renderer = make_test_renderer(&temp.join("cache"));
+
+		// Endless file-enabled emitter (Rate 20, Lifetime 1.5 -> steady ~30 at t>=1.5) + short burst (ends 1.3).
+		let mut model = ModelBuilder::new("Looping");
+		let host = model.part(&PartSpec { name: "Host".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, 2.0, 0.0)), size: Vec3::ONE, transparency: 1.0, ..Default::default() });
+		model.child(
+			host,
+			InstanceBuilder::new("ParticleEmitter")
+				.with_name("Endless")
+				.with_property("Rate", 20.0f32)
+				.with_property("Lifetime", NumberRange::new(1.5, 1.5))
+				.with_property("Speed", NumberRange::new(1.0, 1.0))
+				.with_property("Enabled", true),
+		);
+		model.child(
+			host,
+			InstanceBuilder::new("ParticleEmitter")
+				.with_name("ShortBurst")
+				.with_property("Rate", 0.0f32)
+				.with_property("Lifetime", NumberRange::new(0.8, 0.8))
+				.with_property("Speed", NumberRange::new(1.0, 1.0))
+				.with_property("Enabled", false),
+		);
+		let mut doc = model.into_document();
+		let pb_with_burst = Playback {
+			actions: vec![Action { at: 0.5, target: "Looping.Host.ShortBurst".into(), emit: Some(Emit::Count(10)), ..Default::default() }],
+			..Default::default()
+		};
+
+		// Provenance check on Playback::natural_end_info:
+		let info_burst = pb_with_burst.natural_end_info(&doc);
+		assert_eq!(info_burst.source, "looping-emitters-and-playback");
+		assert!(!info_burst.fallback);
+		assert_eq!(info_burst.looping_emitters.len(), 1);
+		assert_eq!(info_burst.looping_emitters[0].path, "Looping.Host.Endless");
+		assert!((info_burst.steady_state_at.unwrap() - 1.5).abs() < 1e-4);
+		assert!((info_burst.seconds - 2.5).abs() < 1e-4, "auto must extend past 1.3s burst to 1.5+1.0=2.5s, got {}", info_burst.seconds);
+
+		// Empty playback on a doc with ONLY looping emitter -> source = "looping-emitters" (not fallback-empty).
+		let info_only_loop = Playback::default().natural_end_info(&doc);
+		assert_eq!(info_only_loop.source, "looping-emitters");
+		assert!(!info_only_loop.fallback);
+		assert!((info_only_loop.seconds - 2.5).abs() < 1e-4);
+
+		// Disabling Endless at t=0.5 removes it from looping_emitters (finite tail 0.5+1.5=2.0).
+		let pb_disabled = Playback {
+			actions: vec![Action { at: 0.5, target: "Looping.Host.Endless".into(), enabled: Some(false), ..Default::default() }],
+			..Default::default()
+		};
+		let info_disabled = pb_disabled.natural_end_info(&doc);
+		assert!(info_disabled.looping_emitters.is_empty(), "disabled emitter must not be flagged looping");
+		assert_eq!(info_disabled.source, "actions");
+		assert!((info_disabled.seconds - 2.0).abs() < 1e-4);
+
+		// Truly empty scene with no actions and no looping emitters -> fallback-empty 2.0s.
+		let (dyn_doc, _) = build_dynamic_scene();
+		let info_empty = Playback::default().natural_end_info(&dyn_doc);
+		assert_eq!(info_empty.source, "fallback-empty");
+		assert!(info_empty.fallback);
+		assert!((info_empty.seconds - 2.0).abs() < 1e-4);
+
+		let views = vec![NamedView {
+			name: "render".into(),
+			view: crate::render::ViewRequest {
+				width: 1280,
+				height: 720,
+				camera: CameraSpec::LookAt { eye: [0.0, 2.0, 15.0], target: [0.0, 2.0, 0.0], fov: 60.0 },
+				..Default::default()
+			},
+		}];
+		let cost_opts = CostOptions { attribute: true, pixels: false, no_images: true, ..Default::default() };
+
+		// 1) --duration auto on endless + burst: reaches steady state, separates climb vs steady (~30 particles headline).
+		let out_auto = temp.join("auto");
+		std::fs::create_dir_all(&out_auto).unwrap();
+		let tl_auto = TimelineOptions { start: 0.0, duration: None, auto_duration: true, fps: 10.0, times: None, camera_track: None, all_emitters_running: false };
+		run(&renderer, &mut doc, Some(&pb_with_burst), &cost_opts, &tl_auto, &views, None, None, &out_auto, None, "looping.rbxmx", false, &|_| Ok(())).unwrap();
+		let j_auto: serde_json::Value = serde_json::from_slice(&std::fs::read(out_auto.join("timeline.json")).unwrap()).unwrap();
+		let t_auto = std::fs::read_to_string(out_auto.join("analysis.txt")).unwrap();
+		assert_eq!(j_auto["durationSource"]["mode"], "auto");
+		assert_eq!(j_auto["durationSource"]["source"], "looping-emitters-and-playback");
+		assert_eq!(j_auto["looping"]["emittersStillRunning"], 1);
+		assert_eq!(j_auto["looping"]["steadyStateReached"], true);
+		assert_eq!(j_auto["looping"]["fileEnabledStartEmpty"], true);
+		assert_eq!(j_auto["looping"]["climbFrames"], 15);
+		assert_eq!(j_auto["looping"]["steadyFrames"], 10);
+		let steady_p = j_auto["looping"]["steadyState"]["particles"]["mean"].as_f64().unwrap();
+		let climb_p = j_auto["looping"]["climb"]["particles"]["mean"].as_f64().unwrap();
+		assert!((28.0..=32.0).contains(&steady_p), "steady particles mean should be ~30, got {steady_p}");
+		assert!(climb_p < steady_p - 5.0, "climb particles mean ({climb_p}) must be clearly below steady ({steady_p})");
+		assert!(t_auto.contains("steady-state frame time (t>=1.50s, 10 frames):"), "{t_auto}");
+		assert!(t_auto.contains("climb (t<1.50s, 15 frames; file-enabled emitters start empty at t=0"), "{t_auto}");
+		assert!(t_auto.contains("looping emitters still running at end (1): Looping.Host.Endless"), "{t_auto}");
+		assert!(!t_auto.contains("WARNING:"), "auto run reached steady state and should not warn:\n{t_auto}");
+
+		// 2) Short explicit --duration 1.0 (last sample t=0.9 < 1.5): steady state NOT reached + clear WARNING line.
+		let out_short = temp.join("short");
+		std::fs::create_dir_all(&out_short).unwrap();
+		let tl_short = TimelineOptions { start: 0.0, duration: Some(1.0), auto_duration: false, fps: 10.0, times: None, camera_track: None, all_emitters_running: false };
+		run(&renderer, &mut doc, None, &cost_opts, &tl_short, &views, None, None, &out_short, None, "looping.rbxmx", false, &|_| Ok(())).unwrap();
+		let j_short: serde_json::Value = serde_json::from_slice(&std::fs::read(out_short.join("timeline.json")).unwrap()).unwrap();
+		let t_short = std::fs::read_to_string(out_short.join("analysis.txt")).unwrap();
+		assert_eq!(j_short["durationSource"]["mode"], "explicit-duration");
+		assert_eq!(j_short["looping"]["steadyStateReached"], false);
+		assert_eq!(j_short["looping"]["steadyFrames"], 0);
+		assert!(j_short["looping"]["steadyState"].is_null());
+		assert!(j_short["looping"]["warning"].as_str().unwrap().contains("steady state NOT reached"));
+		assert!(j_short["unmodeled"].as_array().unwrap().iter().any(|u| u["kind"] == "steadyStateNotReached"));
+		assert!(t_short.contains("WARNING: steady state NOT reached"), "short run must warn clearly:\n{t_short}");
+		assert!(t_short.contains("frame time (climb-only, before steady state):"), "{t_short}");
+
+		// 3) --start 1.5 --duration 1.0: skips climb completely, starts directly in steady state.
+		let out_start = temp.join("start_steady");
+		std::fs::create_dir_all(&out_start).unwrap();
+		let tl_start = TimelineOptions { start: 1.5, duration: Some(1.0), auto_duration: false, fps: 10.0, times: None, camera_track: None, all_emitters_running: false };
+		run(&renderer, &mut doc, None, &cost_opts, &tl_start, &views, None, None, &out_start, None, "looping.rbxmx", false, &|_| Ok(())).unwrap();
+		let j_start: serde_json::Value = serde_json::from_slice(&std::fs::read(out_start.join("timeline.json")).unwrap()).unwrap();
+		assert_eq!(j_start["looping"]["steadyStateReached"], true);
+		assert_eq!(j_start["looping"]["climbFrames"], 0);
+		assert_eq!(j_start["looping"]["steadyFrames"], 10);
+		assert!(j_start["looping"]["climb"].is_null());
 		let _ = std::fs::remove_dir_all(&temp);
 	}
 }
