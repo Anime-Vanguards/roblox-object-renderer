@@ -237,6 +237,21 @@ fn local_variant(value: &Variant, folder: &Path) -> Option<Variant> {
 			_ => None,
 		},
 		Variant::ContentId(id) => relative_file(id.as_str(), folder).map(|uri| rbx_dom_weak::types::ContentId::from(uri).into()),
+		Variant::Font(font) => {
+			let family = relative_file(&font.family, folder);
+			let cached = font.cached_face_id.as_deref().and_then(|uri| relative_file(uri, folder));
+			if family.is_none() && cached.is_none() {
+				return None;
+			}
+			let mut resolved = font.clone();
+			if let Some(uri) = family {
+				resolved.family = uri;
+			}
+			if let Some(uri) = cached {
+				resolved.cached_face_id = Some(uri);
+			}
+			Some(Variant::Font(resolved))
+		}
 		_ => None,
 	}
 }

@@ -403,6 +403,8 @@ pub(super) struct GuiDraw {
 	/// The GUI's index in `Scene::guis`.
 	gui: usize,
 	pub(super) key: GuiKey,
+	/// Live local-file snapshots taken when `key` was built, verified before keeping rur's output.
+	local_snaps: Arc<[(PathBuf, Option<ror_assets::FileSnapshot>)]>,
 	/// Top-left, top-right, bottom-left, bottom-right.
 	corners: [Vec3; 4],
 	normal: Vec3,
@@ -429,6 +431,7 @@ struct FramedDraw {
 	/// Its picture's size in pixels, at the frame's own proportions.
 	size: (u32, u32),
 	over: Option<GuiKey>,
+	over_snaps: Arc<[(PathBuf, Option<ror_assets::FileSnapshot>)]>,
 	/// Its UIGradient's t over it (scene::guis::Gradient::plane).
 	plane: [f32; 3],
 }
@@ -467,9 +470,15 @@ fn plan_framed(gui: &Gui, canvas: [f32; 2], key: &GuiKey, height: &dyn Fn([f32; 
 			let fit = (MAX_TEXTURE / shown.max(shown * width / tall)).min(1.0);
 			let rows = (shown * fit).round().clamp(FRAMED_MIN, MAX_TEXTURE);
 			let columns = (rows * width / tall).round().clamp(FRAMED_MIN, MAX_TEXTURE);
-			let over = framed.over.as_ref().map(|(_, hash)| GuiKey { content: *hash, ..*key });
+			let (over, over_snaps) = match framed.over.as_ref() {
+				Some((_, base_hash)) => {
+					let (stamped, snaps) = crate::scene::guis::stamp_gui_hash(*base_hash, &framed.over_local_files);
+					(Some(GuiKey { content: stamped, ..*key }), Arc::from(snaps))
+				}
+				None => (None, Arc::from([])),
+			};
 			let plane = framed.gradient.as_ref().map_or([0.0; 3], |gradient| gradient.plane([width, tall]));
-			Some(FramedDraw { viewport: index, rect, size: (columns as u32, rows as u32), over, plane })
+			Some(FramedDraw { viewport: index, rect, size: (columns as u32, rows as u32), over, over_snaps, plane })
 		})
 		.collect()
 }
@@ -508,7 +517,8 @@ pub(super) fn plan(scene: &Scene, camera: &Camera, request: &ViewRequest) -> Vec
 				// with GlobalShadows Studio lights a SurfaceGui from its light-grid voxel, which its own
 				// part fills: no sun (gui-light: default, every orientation)
 				let sun = if scene.environment.global_shadows { 0.0 } else { 1.0 };
-				let key = GuiKey::new(gui.content_hash, surface.canvas, SURFACE_SCALE, gui.clips);
+				let (content_hash, local_snaps) = crate::scene::guis::stamp_gui_hash(gui.base_content_hash, &gui.local_files);
+				let key = GuiKey::new(content_hash, surface.canvas, SURFACE_SCALE, gui.clips);
 				let (across, upward) = (right, up);
 				let [left, top, right, bottom] = key.extent();
 				// a framed ViewportFrame's picture as tall as the view shows the frame (its sides projected),
@@ -527,6 +537,7 @@ pub(super) fn plan(scene: &Scene, camera: &Camera, request: &ViewRequest) -> Vec
 				draws.push(GuiDraw {
 					gui: index,
 					key,
+					local_snaps: Arc::from(local_snaps),
 					corners: [surface.point(left, top), surface.point(right, top), surface.point(left, bottom), surface.point(right, bottom)],
 					normal,
 					params: [gui.light_influence, gui.brightness, sun, 0.0],
@@ -571,7 +582,8 @@ pub(super) fn plan(scene: &Scene, camera: &Camera, request: &ViewRequest) -> Vec
 				// size, the corner on a whole pixel (gui-billboard-basics: sizeoffset, studs-12)
 				let x = relative.dot(right) / depth * focal + grid_width * 0.5 + billboard.size_offset[0] * pixel_width;
 				let y = -relative.dot(up) / depth * focal + grid_height * 0.5 - billboard.size_offset[1] * pixel_height;
-				let key = GuiKey::new(gui.content_hash, [pixel_width / gui_scale, pixel_height / gui_scale], gui_scale, gui.clips);
+				let (content_hash, local_snaps) = crate::scene::guis::stamp_gui_hash(gui.base_content_hash, &gui.local_files);
+				let key = GuiKey::new(content_hash, [pixel_width / gui_scale, pixel_height / gui_scale], gui_scale, gui.clips);
 				// the texture's margins in these pixels (wider than its texels when a big billboard's
 				// texture is drawn at a smaller scale)
 				let [margin_x, margin_y] = key.margin().map(|margin| margin as f32 * gui_scale / key.scale());
@@ -586,6 +598,7 @@ pub(super) fn plan(scene: &Scene, camera: &Camera, request: &ViewRequest) -> Vec
 				draws.push(GuiDraw {
 					gui: index,
 					key,
+					local_snaps: Arc::from(local_snaps),
 					corners: [corner(left, top), corner(right_edge, top), corner(left, bottom_edge), corner(right_edge, bottom_edge)],
 					// lit facing the camera (gui-light: bb-front, bb-behind)
 					normal: back,
@@ -605,7 +618,8 @@ pub(super) fn plan(scene: &Scene, camera: &Camera, request: &ViewRequest) -> Vec
 				if (height as f32 - top) < 1.0 {
 					continue;
 				}
-				let key = GuiKey::new(gui.content_hash, [width as f32 / gui_scale, (height as f32 - top) / gui_scale], gui_scale, true);
+				let (content_hash, local_snaps) = crate::scene::guis::stamp_gui_hash(gui.base_content_hash, &gui.local_files);
+				let key = GuiKey::new(content_hash, [width as f32 / gui_scale, (height as f32 - top) / gui_scale], gui_scale, true);
 				// the canvas as the texture holds it (a canvas past MAX_TEXTURE is drawn smaller and magnified)
 				let [canvas_width, canvas_height] = key.canvas().map(|size| size * gui_scale);
 				let focal = height as f32 * 0.5 / tan;
@@ -622,6 +636,7 @@ pub(super) fn plan(scene: &Scene, camera: &Camera, request: &ViewRequest) -> Vec
 				draws.push(GuiDraw {
 					gui: index,
 					key,
+					local_snaps: Arc::from(local_snaps),
 					corners: [corner(0.0, top), corner(canvas_width, top), corner(0.0, top + canvas_height), corner(canvas_width, top + canvas_height)],
 					normal: back,
 					params: [0.0, 1.0, 0.0, 0.0],
@@ -685,25 +700,38 @@ pub(super) struct Worlds {
 	pub pictures: Vec<Picture>,
 }
 
-/// GUI images a lookup or a rur call is about: each one's key, its GUI and the content drawn (the GUI's
-/// own, or what draws over one of its framed ViewportFrames).
-type Members<'a> = Vec<(GuiKey, &'a Gui, &'a Arc<Vec<u8>>)>;
+/// Live local-file snapshots carried with a GUI request.
+type GuiSnaps = Arc<[(PathBuf, Option<ror_assets::FileSnapshot>)]>;
+
+/// GUI images a lookup or a rur call is about: each one's key, its GUI, the content drawn (the GUI's
+/// own, or what draws over one of its framed ViewportFrames), and the local-file snapshots captured
+/// when `key` was built.
+type Members<'a> = Vec<(GuiKey, &'a Gui, &'a Arc<Vec<u8>>, &'a GuiSnaps)>;
 
 /// The GUI images `draws` of `scene` need ([`GuiDraw::keys`]).
-fn wanted<'a>(scene: &'a Scene, draws: &[&GuiDraw]) -> Members<'a> {
+fn wanted<'a>(scene: &'a Scene, draws: &[&'a GuiDraw]) -> Members<'a> {
 	let mut wanted = Vec::new();
 	for draw in draws {
 		let Some(gui) = scene.guis.get(draw.gui) else {
 			continue;
 		};
-		wanted.push((draw.key, gui, &gui.content));
+		wanted.push((draw.key, gui, &gui.content, &draw.local_snaps));
 		for framed in &draw.framed {
 			if let (Some(key), Some(ViewportKind::Framed(crate::scene::guis::Framed { over: Some((content, _)), .. }))) = (framed.over, gui.viewports.get(framed.viewport).map(|viewport| &viewport.kind)) {
-				wanted.push((key, gui, content));
+				wanted.push((key, gui, content, &framed.over_snaps));
 			}
 		}
 	}
 	wanted
+}
+
+/// Whether every local-file snapshot in `snaps` still reflects the file on disk (used to avoid
+/// caching transient failures when a local file moved).
+fn snaps_still_unchanged(snaps: &[(PathBuf, Option<ror_assets::FileSnapshot>)]) -> bool {
+	snaps.iter().all(|(path, snap)| match snap {
+		Some(snap) => snap.still_unchanged(path),
+		None => !path.exists(),
+	})
 }
 
 /// GUI images kept on disk; past that the least recently used go (a billboard has an image per size,
@@ -840,23 +868,23 @@ fn prune_disk_cache(directory: &std::path::Path) {
 /// a rur call that finds no warm VM waiting runs in a new one, ~1 s, far more than drawing the second
 /// image (an emote's portrait, two images of 2.1 M pixels a frame: a 3 s clip made 63 more calls, 14 ->
 /// 65 s).
-fn frame_batches<'a>(guis: Vec<(usize, GuiKey, &'a Gui, &'a Arc<Vec<u8>>)>) -> Vec<(u32, Members<'a>, u64)> {
+fn frame_batches<'a>(guis: Vec<(usize, GuiKey, &'a Gui, &'a Arc<Vec<u8>>, &'a GuiSnaps)>) -> Vec<(u32, Members<'a>, u64)> {
 	let mut batches: Vec<(u32, Members, u64)> = Vec::new();
 	// the frame being batched and where its batches start
 	let mut current = (usize::MAX, 0);
-	for (frame, key, gui, content) in guis {
+	for (frame, key, gui, content, snaps) in guis {
 		if frame != current.0 {
 			current = (frame, batches.len());
 		}
 		let (width, height) = rur::image_size(key.canvas(), key.scale(), key.margin());
 		let pixels = width as u64 * height as u64;
-		let fits = |scale: &u32, members: &Members, total: &u64| *scale == key.scale && (*total + pixels <= BATCH_PIXELS || (*total + pixels <= 2 * BATCH_PIXELS && members.iter().all(|(_, other, _)| std::ptr::eq(*other, gui))));
+		let fits = |scale: &u32, members: &Members, total: &u64| *scale == key.scale && (*total + pixels <= BATCH_PIXELS || (*total + pixels <= 2 * BATCH_PIXELS && members.iter().all(|(_, other, _, _)| std::ptr::eq(*other, gui))));
 		match batches[current.1..].iter_mut().find(|(scale, members, total)| fits(scale, members, total)) {
 			Some((_, members, total)) => {
-				members.push((key, gui, content));
+				members.push((key, gui, content, snaps));
 				*total += pixels;
 			}
-			None => batches.push((key.scale, vec![(key, gui, content)], pixels)),
+			None => batches.push((key.scale, vec![(key, gui, content, snaps)], pixels)),
 		}
 	}
 	batches
@@ -941,14 +969,14 @@ impl Renderer {
 	/// as when every frame asked for its own: rur draws a GUI a little differently by what shares its
 	/// atlas (render::rur). The batches of all the frames are drawn RUR_WORKERS at a time, each written
 	/// to disk and mip-mapped as it arrives. Problems go into `warnings`.
-	fn resolve_guis(&self, frames: &[Members], warnings: &mut Vec<String>) -> (GuiTextures, HashMap<GuiKey, Arc<GuiImage>>) {
+	fn resolve_guis(&self, frames: &[Members], warnings: &mut Vec<String>) -> (GuiTextures, HashMap<GuiKey, (Arc<GuiImage>, bool)>) {
 		let mut textures = HashMap::new();
-		let mut images = HashMap::new();
+		let mut images: HashMap<GuiKey, (Arc<GuiImage>, bool)> = HashMap::new();
 		let mut seen = std::collections::HashSet::new();
-		// (frame, key, GUI, content) of what the GPU cache misses, in frame order
-		let mut missing: Vec<(usize, GuiKey, &Gui, &Arc<Vec<u8>>)> = Vec::new();
+		// (frame, key, GUI, content, snaps) of what the GPU cache misses, in frame order
+		let mut missing: Vec<(usize, GuiKey, &Gui, &Arc<Vec<u8>>, &GuiSnaps)> = Vec::new();
 		for (frame, members) in frames.iter().enumerate() {
-			for &(key, gui, content) in members {
+			for &(key, gui, content, snaps) in members {
 				if !seen.insert(key) {
 					continue;
 				}
@@ -956,7 +984,7 @@ impl Renderer {
 					Some(texture) => {
 						textures.insert(key, texture);
 					}
-					None => missing.push((frame, key, gui, content)),
+					None => missing.push((frame, key, gui, content, snaps)),
 				}
 			}
 		}
@@ -978,7 +1006,7 @@ impl Renderer {
 		let directory = guis_dir.join(&folder);
 		let from_disk: Vec<Option<GuiImage>> = missing
 			.par_iter()
-			.map(|(_, key, _, _)| {
+			.map(|(_, key, _, _, _)| {
 				if revision == UNBUILT {
 					return None;
 				}
@@ -991,12 +1019,12 @@ impl Renderer {
 			})
 			.collect();
 		let mut left = Vec::new();
-		for ((frame, key, gui, content), image) in missing.into_iter().zip(from_disk) {
+		for ((frame, key, gui, content, snaps), image) in missing.into_iter().zip(from_disk) {
 			match image {
 				Some(image) => {
-					images.insert(key, Arc::new(image));
+					images.insert(key, (Arc::new(image), true));
 				}
-				None => left.push((frame, key, gui, content)),
+				None => left.push((frame, key, gui, content, snaps)),
 			}
 		}
 		if profile && !images.is_empty() {
@@ -1006,7 +1034,7 @@ impl Renderer {
 		{
 			let mut failures = self.gui_failures.keys.lock();
 			failures.retain(|_, (when, _)| when.elapsed() < FAILURE_TTL);
-			left.retain(|(_, key, gui, _)| match failures.get(key) {
+			left.retain(|(_, key, gui, _, _)| match failures.get(key) {
 				Some((_, reason)) => {
 					warnings.push(format!("{}: not drawn ({reason})", gui.path));
 					false
@@ -1022,7 +1050,7 @@ impl Renderer {
 		let offline = self.assets.offline();
 		let calls = batches.len();
 		let next = std::sync::atomic::AtomicUsize::new(0);
-		let finished: Mutex<Vec<(GuiKey, GuiImage)>> = Mutex::new(Vec::new());
+		let finished: Mutex<Vec<(GuiKey, GuiImage, bool)>> = Mutex::new(Vec::new());
 		let problems: Mutex<Vec<String>> = Mutex::new(Vec::new());
 		std::thread::scope(|scope| {
 			for _ in 0..RUR_WORKERS.min(calls) {
@@ -1032,7 +1060,10 @@ impl Renderer {
 						let Some((scale, members, _)) = batches.get(index) else {
 							break;
 						};
-						let requests: Vec<rur::Request> = members.iter().map(|(key, gui, content)| rur::Request { content: (*content).clone(), canvas: key.canvas(), margin: key.margin(), z_index_behavior: gui.z_index_behavior }).collect();
+						let requests: Vec<rur::Request> = members
+							.iter()
+							.map(|(key, gui, content, snaps)| rur::Request { content: (*content).clone(), canvas: key.canvas(), margin: key.margin(), z_index_behavior: gui.z_index_behavior, local_snaps: (*snaps).clone() })
+							.collect();
 						match rur::render(&rur, &requests, *scale as f32 / 1024.0, &directory, offline) {
 							Ok((pieces, report)) => {
 								// rur may have rebuilt itself for these: its images go with its new build's (a folder
@@ -1043,27 +1074,32 @@ impl Renderer {
 								if let Err(error) = std::fs::create_dir_all(&directory) {
 									found.push(format!("caching GUI textures in {}: {error}", directory.display()));
 								}
-								// made ready for the GPU and written to the disk cache on every core
-								let done: Vec<(GuiKey, GuiImage, Option<String>)> = members
+								// made ready for the GPU and written to the disk cache on every core;
+								// images whose local inputs moved between key-stamp and read are drawn
+								// once without writing to disk, store, or the GPU cache.
+								let done: Vec<(GuiKey, GuiImage, bool, Option<String>)> = members
 									.par_iter()
 									.zip(pieces.into_par_iter())
-									.filter_map(|((key, gui, _), piece)| match GuiImage::from_rgba(piece.width, piece.height, piece.rgba) {
-										Ok(image) => {
-											let file = directory.join(key.file_name());
-											let written = if revision == UNBUILT { Ok(()) } else { crate::output::write_atomic(&file, &image.file_bytes()).inspect(|_| publish(&images_folder(&revision), &file)) };
-											let problem = written.err().map(|error| format!("{}: caching its GUI texture: {error:#}", gui.path));
-											Some((*key, image, problem))
-										}
-										Err(error) => {
-											problems.lock().push(format!("{}: encoding its GUI texture: {error:#}", gui.path));
-											None
+									.filter_map(|((key, gui, _, _), piece)| {
+										let stable = piece.stable;
+										match GuiImage::from_rgba(piece.width, piece.height, piece.rgba) {
+											Ok(image) => {
+												let file = directory.join(key.file_name());
+												let written = if !stable || revision == UNBUILT { Ok(()) } else { crate::output::write_atomic(&file, &image.file_bytes()).inspect(|_| publish(&images_folder(&revision), &file)) };
+												let problem = written.err().map(|error| format!("{}: caching its GUI texture: {error:#}", gui.path));
+												Some((*key, image, stable, problem))
+											}
+											Err(error) => {
+												problems.lock().push(format!("{}: encoding its GUI texture: {error:#}", gui.path));
+												None
+											}
 										}
 									})
 									.collect();
 								let mut finished = finished.lock();
-								for (key, image, problem) in done {
+								for (key, image, stable, problem) in done {
 									found.extend(problem);
-									finished.push((key, image));
+									finished.push((key, image, stable));
 								}
 								problems.lock().extend(found);
 							}
@@ -1072,9 +1108,9 @@ impl Renderer {
 								let mut failures = self.gui_failures.keys.lock();
 								let mut problems = problems.lock();
 								let transient = self.assets.is_offline_view();
-								for (key, gui, _) in members {
+								for (key, gui, _, snaps) in members {
 									problems.push(format!("{}: not drawn ({reason})", gui.path));
-									if !transient {
+									if !transient && snaps_still_unchanged(snaps) {
 										failures.insert(*key, (Instant::now(), reason.clone()));
 									}
 								}
@@ -1087,8 +1123,8 @@ impl Renderer {
 		warnings.extend(problems.into_inner());
 		let finished = finished.into_inner();
 		let drawn = finished.len();
-		for (key, image) in finished {
-			images.insert(key, Arc::new(image));
+		for (key, image, stable) in finished {
+			images.insert(key, (Arc::new(image), stable));
 		}
 		prune_disk_cache(&guis_dir.join(images_folder(&rur::revision(&rur))));
 		if profile {
@@ -1210,8 +1246,8 @@ impl Renderer {
 	/// `warnings`.
 	pub(super) fn gui_textures(&self, scene: &Scene, draws: &[&GuiDraw], warnings: &mut Vec<String>) -> GuiTextures {
 		let (mut textures, images) = self.resolve_guis(&[wanted(scene, draws)], warnings);
-		// a still's are kept: the render after the service's prefetch finds them in the GPU cache
-		self.upload_guis(images.into_iter().map(|(key, image)| (key, image, true)).collect(), &mut textures, warnings);
+		// a still's stable images are kept: the render after the service's prefetch finds them in the GPU cache
+		self.upload_guis(images.into_iter().map(|(key, (image, stable))| (key, image, stable)).collect(), &mut textures, warnings);
 		textures
 	}
 
@@ -1268,10 +1304,10 @@ impl Renderer {
 				for key in plan.iter().flat_map(GuiDraw::keys) {
 					if let Some(texture) = textures.get(&key) {
 						frame.textures.insert(key, texture.clone());
-					} else if let Some(image) = images.get(&key)
+					} else if let Some((image, stable)) = images.get(&key)
 						&& !frame.images.iter().any(|(kept, _, _)| *kept == key)
 					{
-						frame.images.push((key, image.clone(), frames_drawing.get(&key).is_some_and(|&frames| frames > 1)));
+						frame.images.push((key, image.clone(), *stable && frames_drawing.get(&key).is_some_and(|&frames| frames > 1)));
 					}
 				}
 				frame
@@ -1643,7 +1679,9 @@ mod tests {
 			path: path.into(),
 			kind: GuiKind::Billboard(crate::scene::guis::BillboardGui { anchor: Vec3::ZERO, extents: Vec3::ZERO, size: [0.0; 4], size_offset: [0.0; 2], camera_offset: Vec3::ZERO, world_offset: Vec3::ZERO }),
 			content: Arc::new(Vec::new()),
+			base_content_hash: 0,
 			content_hash: 0,
+			local_files: Vec::new(),
 			light_influence: 0.0,
 			brightness: 1.0,
 			always_on_top: false,
@@ -1654,28 +1692,29 @@ mod tests {
 		};
 		let guis: Vec<Gui> = (0..9).map(|index| gui(&format!("Gui{index}"))).collect();
 		let content = Arc::new(Vec::new());
+		let snaps: GuiSnaps = Arc::from([]);
 		// 1000 x 1000 canvases at 1.5: 2.25 M device pixels, one to a batch of BATCH_PIXELS (4.2 M)
 		let big = |content| GuiKey::new(content, [1000.0, 1000.0], 1.5, true);
 		let small = |content| GuiKey::new(content, [100.0, 100.0], 1.5, true);
 		let other_scale = |content| GuiKey::new(content, [100.0, 100.0], 2.0, true);
 		let images = vec![
-			(0, small(1), &guis[0], &content),
-			(0, other_scale(2), &guis[1], &content),
-			(0, small(3), &guis[2], &content),
-			(1, small(4), &guis[3], &content),
-			(1, big(5), &guis[4], &content),
-			(1, big(6), &guis[5], &content),
-			(3, small(7), &guis[6], &content),
+			(0, small(1), &guis[0], &content, &snaps),
+			(0, other_scale(2), &guis[1], &content, &snaps),
+			(0, small(3), &guis[2], &content, &snaps),
+			(1, small(4), &guis[3], &content, &snaps),
+			(1, big(5), &guis[4], &content, &snaps),
+			(1, big(6), &guis[5], &content, &snaps),
+			(3, small(7), &guis[6], &content, &snaps),
 			// a GUI's own image and what draws over its ViewportFrame: one batch while they fit two
-			(4, big(8), &guis[7], &content),
-			(4, big(9), &guis[7], &content),
-			(4, big(10), &guis[8], &content),
+			(4, big(8), &guis[7], &content, &snaps),
+			(4, big(9), &guis[7], &content, &snaps),
+			(4, big(10), &guis[8], &content, &snaps),
 		];
 		let batches = frame_batches(images);
-		let contents: Vec<Vec<u64>> = batches.iter().map(|(_, members, _)| members.iter().map(|(key, _, _)| key.content).collect()).collect();
+		let contents: Vec<Vec<u64>> = batches.iter().map(|(_, members, _)| members.iter().map(|(key, _, _, _)| key.content).collect()).collect();
 		// a frame's GUIs never share a batch with another frame's, however much room is left
 		assert_eq!(contents, vec![vec![1, 3], vec![2], vec![4, 5], vec![6], vec![7], vec![8, 9], vec![10]]);
-		assert!(batches.iter().all(|(_, members, pixels)| *pixels <= BATCH_PIXELS || (*pixels <= 2 * BATCH_PIXELS && members.iter().all(|(_, gui, _)| std::ptr::eq(*gui, members[0].1)))));
+		assert!(batches.iter().all(|(_, members, pixels)| *pixels <= BATCH_PIXELS || (*pixels <= 2 * BATCH_PIXELS && members.iter().all(|(_, gui, _, _)| std::ptr::eq(*gui, members[0].1)))));
 	}
 
 	#[test]
@@ -1687,12 +1726,14 @@ mod tests {
 
 		let billboard = BillboardGui { anchor: Vec3::ZERO, extents: Vec3::ZERO, size: [8.0, 0.0, 6.0, 0.0], size_offset: [0.0; 2], camera_offset: Vec3::ZERO, world_offset: Vec3::ZERO };
 		let frame = Placement { size: [0.9, 0.0, 0.8, 0.0], position: [0.5, 0.0, 0.5, 0.0], anchor: [0.5, 0.5] };
-		let framed = Framed { camera: [0.0, 0.0, 8.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], fov: 40.0, over: Some((Arc::new(vec![1]), 99)), gradient: None };
+		let framed = Framed { camera: [0.0, 0.0, 8.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], fov: 40.0, over: Some((Arc::new(vec![1]), 99)), over_local_files: Vec::new(), gradient: None };
 		let gui = Gui {
 			path: "Billboard".into(),
 			kind: GuiKind::Billboard(billboard),
 			content: Arc::new(Vec::new()),
+			base_content_hash: 7,
 			content_hash: 7,
+			local_files: Vec::new(),
 			light_influence: 0.0,
 			brightness: 1.0,
 			always_on_top: false,
@@ -1730,14 +1771,16 @@ mod tests {
 			placement: vec![Placement { size, position, anchor: [0.0, 0.0] }],
 			tint: [1.0; 4],
 			scene: Arc::new(Scene::default()),
-			kind: ViewportKind::Framed(Framed { camera: [0.0, 0.0, 8.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], fov: 40.0, over: None, gradient: None }),
+			kind: ViewportKind::Framed(Framed { camera: [0.0, 0.0, 8.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], fov: 40.0, over: None, over_local_files: Vec::new(), gradient: None }),
 			corner_radius: None,
 		};
 		let gui = |inset: bool| Gui {
 			path: "PlayerGui.View".into(),
 			kind: GuiKind::Screen(ScreenGui { display_order: -5, inset }),
 			content: Arc::new(Vec::new()),
+			base_content_hash: 7,
 			content_hash: 7,
+			local_files: Vec::new(),
 			light_influence: 0.0,
 			brightness: 1.0,
 			always_on_top: false,
@@ -1879,7 +1922,9 @@ mod tests {
 			path: "Billboard".into(),
 			kind: GuiKind::Billboard(billboard),
 			content: Arc::new(Vec::new()),
+			base_content_hash: 7,
 			content_hash: 7,
+			local_files: Vec::new(),
 			light_influence: 0.0,
 			brightness: 1.0,
 			always_on_top: false,
@@ -1914,7 +1959,9 @@ mod tests {
 			path: format!("PlayerGui.{name}"),
 			kind: GuiKind::Screen(ScreenGui { display_order, inset }),
 			content: Arc::new(Vec::new()),
+			base_content_hash: display_order as u64,
 			content_hash: display_order as u64,
+			local_files: Vec::new(),
 			light_influence: 0.0,
 			brightness: 1.0,
 			always_on_top: false,
@@ -1949,5 +1996,78 @@ mod tests {
 		let mut layer = vec![(Some(2), 0.0), (None, 4.0), (Some(1), 0.0), (None, 9.0), (Some(1), 1.0)];
 		layer.sort_by(|a, b| overlay_order(*a, *b));
 		assert_eq!(layer, vec![(None, 9.0), (None, 4.0), (Some(1), 0.0), (Some(1), 1.0), (Some(2), 0.0)]);
+	}
+
+	/// A Scene kept warm in SceneCache is not re-extracted when a local PNG referenced by one of its
+	/// SurfaceGuis or BillboardGuis is rewritten on disk: `plan()` must re-stamp local files live so
+	/// the GuiKey changes, and `rur::stage_local_files` must mark a moving file (A -> B -> A between
+	/// plan and read) unstable so it is never kept under A's key.
+	#[test]
+	fn plan_stamps_local_gui_images_live_and_stage_rejects_moving_file() {
+		use crate::render::camera::CameraSpec;
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use rbx_dom_weak::InstanceBuilder;
+		use rbx_dom_weak::types::{Content, Enum, UDim, UDim2};
+
+		let dir = std::env::temp_dir().join(format!("ror-gui-live-plan-test-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		let sign = dir.join("sign.png");
+		let png_a = b"PNG_BYTES_VERSION_A_1234";
+		let png_b = b"PNG_BYTES_VERSION_B_9876";
+		std::fs::write(&sign, png_a).unwrap();
+		let sign_uri = format!("file:///{}", sign.display().to_string().replace('\\', "/"));
+
+		let mut model = ModelBuilder::new("SignModel");
+		let part = model.part(&PartSpec { size: Vec3::new(4.0, 4.0, 1.0), ..Default::default() });
+		let surface = model.child(part, InstanceBuilder::new("SurfaceGui").with_name("FrontSign").with_property("Face", Enum::from_u32(5)));
+		model.child(surface, InstanceBuilder::new("ImageLabel").with_property("ImageContent", Content::from_uri(sign_uri.as_str())));
+		let billboard = model.child(part, InstanceBuilder::new("BillboardGui").with_name("HeadSign").with_property("Size", UDim2::new(UDim::new(4.0, 0), UDim::new(2.0, 0))));
+		model.child(billboard, InstanceBuilder::new("ImageLabel").with_property("ImageContent", Content::from_uri(sign_uri.as_str())));
+		let scene = crate::scene::extract::extract(&model.into_document());
+		assert_eq!(scene.guis.len(), 2);
+
+		let request = ViewRequest { width: 512, height: 512, camera: CameraSpec::LookAt { eye: [0.0, 0.0, -10.0], target: [0.0; 3], fov: 40.0 }, ..Default::default() };
+		let camera = request.camera.place(None, request.width, request.height);
+
+		let draws_a = plan(&scene, &camera, &request);
+		assert_eq!(draws_a.len(), 2);
+
+		// Rewrite sign.png without re-extracting `scene` (as when SceneCache reuses it).
+		std::fs::write(&sign, png_b).unwrap();
+		let draws_b = plan(&scene, &camera, &request);
+		assert_eq!(draws_b.len(), 2);
+		for i in 0..2 {
+			assert_ne!(draws_a[i].key, draws_b[i].key, "GUI {i} key must change live on same cached Scene");
+		}
+
+		// Deterministic A -> B -> A hook during staging: plan sees A, hook writes B before read,
+		// so stage_local_files reads B while snapshot expects A -> stable must be false.
+		std::fs::write(&sign, png_a).unwrap();
+		let draws_for_race = plan(&scene, &camera, &request);
+		let sign_for_hook = sign.clone();
+		crate::render::set_test_read_hook(sign.clone(), move || {
+			let _ = std::fs::write(&sign_for_hook, png_b);
+		});
+		let work = dir.join("work");
+		let reqs: Vec<rur::Request> = draws_for_race
+			.iter()
+			.map(|d| rur::Request { content: scene.guis[d.gui].content.clone(), canvas: d.key.canvas(), margin: d.key.margin(), z_index_behavior: scene.guis[d.gui].z_index_behavior, local_snaps: d.local_snaps.clone() })
+			.collect();
+		let (staged_race, stable_race) = rur::stage_local_files(&reqs, &work);
+		assert_eq!(stable_race, vec![false, false], "moving file between plan() and rur staging must be marked unstable");
+
+		// Return to A without hook: now stable must be true, and the staged URI must differ from B's.
+		std::fs::write(&sign, png_a).unwrap();
+		let draws_settled = plan(&scene, &camera, &request);
+		let reqs_settled: Vec<rur::Request> = draws_settled
+			.iter()
+			.map(|d| rur::Request { content: scene.guis[d.gui].content.clone(), canvas: d.key.canvas(), margin: d.key.margin(), z_index_behavior: scene.guis[d.gui].z_index_behavior, local_snaps: d.local_snaps.clone() })
+			.collect();
+		let (staged_a, stable_a) = rur::stage_local_files(&reqs_settled, &work);
+		assert_eq!(stable_a, vec![true, true], "unchanged file must be marked stable");
+		assert_ne!(staged_race.get(&sign), staged_a.get(&sign), "staged content-addressed path must change between B and A");
+
+		let _ = std::fs::remove_dir_all(&dir);
 	}
 }

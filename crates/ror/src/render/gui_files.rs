@@ -39,8 +39,9 @@ pub struct GuiImage {
 }
 
 /// A `.gui` file: this, then width, height, levels and the number of pieces (u32, little-endian),
-/// each piece's compressed length, then the pieces.
-const GUI_FILE_MAGIC: &[u8; 8] = b"RORGUI2\0";
+/// each piece's compressed length, then the pieces. Bumped to `RORGUI3` so pre-stamp cached GUI
+/// images under older `ROR_GUI_CODE` folders are never reused for GUIs referencing local files.
+const GUI_FILE_MAGIC: &[u8; 8] = b"RORGUI3\0";
 const GUI_FILE_HEADER: usize = 24;
 /// The decompressed bytes of a piece: a big image's pieces spread over the cores (one zstd frame each
 /// left a frame's upload waiting 3-4 ms on its largest image).

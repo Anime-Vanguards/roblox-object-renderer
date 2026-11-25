@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use parking_lot::Mutex;
-use rbx_dom_weak::types::{Enum, UDim, UDim2};
+use rbx_dom_weak::types::{ContentType, Enum, UDim, UDim2, Variant};
 use rbx_dom_weak::{InstanceBuilder, WeakDom};
 
 /// A path without Windows' verbatim prefix ([`crate::output::plain_path`]): rur.mjs runs only when
@@ -84,6 +84,8 @@ pub struct Request {
 	pub margin: [u32; 2],
 	/// `Enum.ZIndexBehavior` of the GUI.
 	pub z_index_behavior: u32,
+	/// Live local-file snapshots captured when this request's [`GuiKey`] was built.
+	pub local_snaps: Arc<[(PathBuf, Option<ror_assets::FileSnapshot>)]>,
 }
 
 /// A GUI's pixels: straight-alpha RGBA8 (display values), the canvas covering `canvas · scale` device
@@ -92,6 +94,9 @@ pub struct Image {
 	pub width: u32,
 	pub height: u32,
 	pub rgba: Vec<u8>,
+	/// True when every local file read for this GUI matched the snapshot taken when its key was
+	/// built; false when any local file moved, so the image is drawn once and not kept under that key.
+	pub stable: bool,
 }
 
 /// What rur reported besides the pixels (missing images and fonts, script errors).
@@ -194,11 +199,185 @@ pub fn render(rur: &Path, requests: &[Request], scale: f32, base: &Path, offline
 	render_atlas(rur, requests, &sizes, &cells, (width, height), scale, &slot.directory(base), offline)
 }
 
+/// Stages every unique local file referenced by `requests` into `<work>/local/<len>-<hex>.<ext>`
+/// after reading its bytes and verifying each request's snapshot against the bytes read.
+///
+/// Rewriting local URIs in the atlas model to content-addressed copies under `<work>/local/`
+/// accomplishes two things at once:
+/// 1. What rur reads is guaranteed to be the exact bytes whose snapshot we verified (never a later
+///    mutation, even while rur runs).
+/// 2. rur's warm service caches decoded images by `(path, len, mtime)`; pointing rur at an
+///    immutable content-addressed path prevents rur from returning stale decoded pixels on same-tick
+///    or mtime-restored saves, while still hitting rur's decoded-image cache across repeated draws
+///    of unchanged files.
+pub(super) fn stage_local_files(requests: &[Request], work: &Path) -> (HashMap<PathBuf, String>, Vec<bool>) {
+	let mut unique: Vec<PathBuf> = Vec::new();
+	for request in requests {
+		for (path, _) in request.local_snaps.iter() {
+			if !unique.contains(path) {
+				unique.push(path.clone());
+			}
+		}
+	}
+	if unique.is_empty() {
+		return (HashMap::new(), vec![true; requests.len()]);
+	}
+	let local_dir = plain(&work.join("local"));
+	let _ = std::fs::create_dir_all(&local_dir);
+	let mut read_bytes: HashMap<PathBuf, Option<Vec<u8>>> = HashMap::with_capacity(unique.len());
+	let mut staged_uris: HashMap<PathBuf, String> = HashMap::with_capacity(unique.len());
+	let mut keep_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+	// Stage non-JSON files first so any FontFace .json referencing local faces can rewrite them too.
+	unique.sort_by_key(|path| path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("json")));
+	for path in &unique {
+		crate::render::run_test_read_hook(path);
+		match std::fs::read(path) {
+			Ok(bytes) => {
+				let write_bytes = if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("json")) {
+					rewrite_font_json(&bytes, path.parent(), &staged_uris).unwrap_or_else(|| bytes.clone())
+				} else {
+					bytes.clone()
+				};
+				let stamp = ror_assets::FileStamp::of_bytes(&write_bytes);
+				let suffix = stamp.key_suffix().replace(':', "-");
+				let ext = path.extension().and_then(|ext| ext.to_str()).filter(|ext| ext.bytes().all(|b| b.is_ascii_alphanumeric())).unwrap_or("bin");
+				let file_name = format!("{suffix}.{ext}");
+				let target = local_dir.join(&file_name);
+				if !target.is_file() {
+					let _ = ror_assets::store::write(&target, &write_bytes);
+				}
+				keep_names.insert(file_name);
+				let uri = format!("file:///{}", target.display().to_string().replace('\\', "/").replace('%', "%25").replace(' ', "%20"));
+				staged_uris.insert(path.clone(), uri);
+				read_bytes.insert(path.clone(), Some(bytes));
+			}
+			Err(_) => {
+				read_bytes.insert(path.clone(), None);
+			}
+		}
+	}
+	// Keep `<work>/local` bounded across many edits.
+	if let Ok(entries) = std::fs::read_dir(&local_dir) {
+		let mut files: Vec<(std::time::SystemTime, PathBuf, String)> = entries
+			.flatten()
+			.filter_map(|entry| {
+				let name = entry.file_name().to_string_lossy().into_owned();
+				let modified = entry.metadata().ok()?.modified().ok()?;
+				Some((modified, entry.path(), name))
+			})
+			.collect();
+		if files.len() > 128 {
+			files.sort_by_key(|(modified, _, _)| *modified);
+			let excess = files.len() - 64;
+			for (_, path, name) in files.into_iter().take(excess) {
+				if !keep_names.contains(&name) {
+					let _ = std::fs::remove_file(path);
+				}
+			}
+		}
+	}
+	let stable = requests
+		.iter()
+		.map(|request| {
+			request.local_snaps.iter().all(|(path, snap)| match (snap, read_bytes.get(path).and_then(|bytes| bytes.as_deref())) {
+				(Some(snap), Some(bytes)) => snap.verify_read(path, bytes),
+				(None, None) => !path.exists(),
+				_ => false,
+			})
+		})
+		.collect();
+	(staged_uris, stable)
+}
+
+/// Rewrites local `faces[].assetId` references in a FontFace JSON to their staged URIs.
+fn rewrite_font_json(bytes: &[u8], parent: Option<&Path>, staged: &HashMap<PathBuf, String>) -> Option<Vec<u8>> {
+	let mut value = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+	let faces = value.get_mut("faces")?.as_array_mut()?;
+	let mut changed = false;
+	for face in faces {
+		let Some(asset_id) = face.get("assetId").and_then(|v| v.as_str()).map(str::to_string) else {
+			continue;
+		};
+		let path = if let Some(path) = crate::scene::guis::local_file_from_uri(&asset_id) {
+			if path.is_relative() { parent.map(|dir| dir.join(&path)).unwrap_or(path) } else { path }
+		} else if !asset_id.contains("://")
+			&& let Some(dir) = parent
+		{
+			dir.join(asset_id.trim())
+		} else {
+			continue;
+		};
+		if let Some(uri) = staged.get(&path) {
+			face["assetId"] = serde_json::Value::String(uri.clone());
+			changed = true;
+		}
+	}
+	changed.then(|| serde_json::to_vec(&value).ok()).flatten()
+}
+
+/// Rewrites any local URI inside `dom` under `root` whose path is in `staged` to its immutable
+/// staged URI (keeping any `#fragment`).
+fn rewrite_staged_uris(dom: &mut WeakDom, root: rbx_dom_weak::types::Ref, staged: &HashMap<PathBuf, String>) {
+	if staged.is_empty() {
+		return;
+	}
+	let rewrite = |uri: &str| -> Option<String> {
+		let (base, fragment) = match uri.trim().split_once('#') {
+			Some((base, fragment)) => (base, Some(fragment)),
+			None => (uri.trim(), None),
+		};
+		let path = crate::scene::guis::local_file_from_uri(base)?;
+		let mut out = staged.get(&path)?.clone();
+		if let Some(fragment) = fragment {
+			out.push('#');
+			out.push_str(fragment);
+		}
+		Some(out)
+	};
+	let referents: Vec<rbx_dom_weak::types::Ref> = dom.descendants_of(root).map(|instance| instance.referent()).collect();
+	for referent in referents {
+		let Some(instance) = dom.get_by_ref_mut(referent) else {
+			continue;
+		};
+		for value in instance.properties.values_mut() {
+			match value {
+				Variant::Content(content) => {
+					if let ContentType::Uri(uri) = content.value()
+						&& let Some(new_uri) = rewrite(uri)
+					{
+						*value = rbx_dom_weak::types::Content::from_uri(new_uri).into();
+					}
+				}
+				Variant::ContentId(id) => {
+					if let Some(new_uri) = rewrite(id.as_str()) {
+						*value = rbx_dom_weak::types::ContentId::from(new_uri).into();
+					}
+				}
+				Variant::Font(font) => {
+					let family = rewrite(&font.family);
+					let cached = font.cached_face_id.as_deref().and_then(&rewrite);
+					if family.is_some() || cached.is_some() {
+						let mut updated = font.clone();
+						if let Some(uri) = family {
+							updated.family = uri;
+						}
+						if let Some(uri) = cached {
+							updated.cached_face_id = Some(uri);
+						}
+						*value = Variant::Font(updated);
+					}
+				}
+				_ => {}
+			}
+		}
+	}
+}
+
 /// The atlas model: a ScreenGui per request at its cell, holding the GUI's children. rur draws an
 /// atlas's GUIs a little differently by where they fall in it (an edge pixel 2-9 levels off here and
 /// there: its sizes and places are fractions of the atlas, and its vertices are scaled into the
 /// atlas's viewport), so a GUI's image depends on what shared its atlas.
-fn atlas_model(requests: &[Request], cells: &[(u32, u32)], (width, height): (u32, u32), scale: f32) -> Result<Vec<u8>> {
+fn atlas_model(requests: &[Request], cells: &[(u32, u32)], (width, height): (u32, u32), scale: f32, staged: &HashMap<PathBuf, String>) -> Result<Vec<u8>> {
 	let (logical_width, logical_height) = (width as f64 / scale as f64, height as f64 / scale as f64);
 	let mut atlas = WeakDom::new(InstanceBuilder::new("DataModel"));
 	let root = atlas.root_ref();
@@ -252,6 +431,7 @@ fn atlas_model(requests: &[Request], cells: &[(u32, u32)], (width, height): (u32
 			let clone = content.clone_into_external(child, &mut atlas);
 			atlas.transfer_within(clone, canvas);
 		}
+		rewrite_staged_uris(&mut atlas, screen, staged);
 	}
 	let mut model = Vec::new();
 	rbx_binary::to_writer(&mut model, &atlas, &roots).map_err(|error| anyhow!("writing the GUI atlas: {error}"))?;
@@ -262,9 +442,10 @@ fn atlas_model(requests: &[Request], cells: &[(u32, u32)], (width, height): (u32
 fn render_atlas(rur: &Path, requests: &[Request], sizes: &[(u32, u32)], cells: &[(u32, u32)], (width, height): (u32, u32), scale: f32, work: &Path, offline: bool) -> Result<(Vec<Image>, Report)> {
 	let started = Instant::now();
 	let (logical_width, logical_height) = (width as f64 / scale as f64, height as f64 / scale as f64);
-	let model = atlas_model(requests, cells, (width, height), scale)?;
 	std::fs::create_dir_all(work).with_context(|| format!("creating {}", work.display()))?;
 	let work = plain(work);
+	let (staged, stable) = stage_local_files(requests, &work);
+	let model = atlas_model(requests, cells, (width, height), scale, &staged)?;
 	let model_path = work.join("atlas.rbxm");
 	std::fs::write(&model_path, &model)?;
 	let out = work.join("out");
@@ -325,7 +506,7 @@ fn render_atlas(rur: &Path, requests: &[Request], sizes: &[(u32, u32)], cells: &
 			let start = ((row * width + cell_x) * 4) as usize;
 			rgba.extend_from_slice(&pixels[start..start + (w * 4) as usize]);
 		}
-		images.push(Image { width: w, height: h, rgba });
+		images.push(Image { width: w, height: h, rgba, stable: stable[index] });
 	}
 	report.milliseconds = started.elapsed().as_secs_f64() * 1000.0;
 	Ok((images, report))

@@ -2,10 +2,11 @@
 //! and the ScreenGuis of a PlayerGui, drawn over the finished image ("ScreenGuis"). Their 2D content
 //! is the GUI's own subtree, which rur lays out and rasterises (render::guis).
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use glam::{Affine3A, Vec3};
-use rbx_dom_weak::types::{Ref, Variant};
+use rbx_dom_weak::types::{ContentType, Ref, Variant};
 use rbx_dom_weak::{Instance, InstanceBuilder, WeakDom};
 
 use super::environment::ViewportLighting;
@@ -26,8 +27,13 @@ pub struct Gui {
 	/// The GUI instance and its descendants as a binary model (references outside it cleared): what
 	/// rur draws.
 	pub content: Arc<Vec<u8>>,
-	/// FNV-1a of `content`.
+	/// FNV-1a of `content` alone, before folding local-file stamps.
+	pub base_content_hash: u64,
+	/// FNV-1a of `content`, folded with the stamps of every local image or font file in `local_files`.
 	pub content_hash: u64,
+	/// Local files referenced by the GUI's encoded subtree (images, sprite sheets, local fonts),
+	/// sorted and deduplicated, so cached scenes re-stamp them live on every draw.
+	pub local_files: Vec<PathBuf>,
 	pub light_influence: f32,
 	pub brightness: f32,
 	pub always_on_top: bool,
@@ -79,9 +85,11 @@ pub struct Framed {
 	pub camera: [f32; 12],
 	pub fov: f32,
 	/// What the GUI draws over the frame: its content with everything drawn up to and including the
-	/// frame drawing none of its own (where each is and what it holds kept), and that content's FNV-1a;
-	/// `None` when nothing draws after the frame.
+	/// frame drawing none of its own (where each is and what it holds kept), and that content's base
+	/// FNV-1a (before local-file stamps); `None` when nothing draws after the frame.
 	pub over: Option<(Arc<Vec<u8>>, u64)>,
+	/// Local files referenced by `over`'s encoded subtree, sorted and deduplicated.
+	pub over_local_files: Vec<PathBuf>,
 	/// Its UIGradient, which shades its picture as it shades an image.
 	pub gradient: Option<Gradient>,
 }
@@ -242,12 +250,137 @@ pub struct BillboardGui {
 }
 
 fn fnv1a(bytes: &[u8]) -> u64 {
-	let mut hash = 0xcbf29ce484222325u64;
+	fnv1a_extend(0xcbf29ce484222325u64, bytes)
+}
+
+fn fnv1a_extend(mut hash: u64, bytes: &[u8]) -> u64 {
 	for &byte in bytes {
 		hash ^= byte as u64;
 		hash = hash.wrapping_mul(0x100000001b3);
 	}
 	hash
+}
+
+/// If `uri` names a local file (`file://` or a local filesystem path, with optional `#fragment`),
+/// returns that file's path.
+pub(crate) fn local_file_from_uri(uri: &str) -> Option<PathBuf> {
+	let base = uri.trim().split('#').next().unwrap_or("").trim();
+	if base.is_empty() {
+		return None;
+	}
+	match ror_assets::ContentId::parse(base) {
+		Ok(ror_assets::ContentId::File(path)) => Some(path),
+		_ => None,
+	}
+}
+
+/// Local face files referenced by a local FontFace `.json` (`{"faces":[{"assetId":"..."}]}`).
+fn collect_font_json_files(json_path: &Path, out: &mut Vec<PathBuf>) {
+	if !json_path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("json")) {
+		return;
+	}
+	let Ok(meta) = std::fs::metadata(json_path) else {
+		return;
+	};
+	if !meta.is_file() || meta.len() > 256 * 1024 {
+		return;
+	}
+	let Ok(bytes) = std::fs::read(json_path) else {
+		return;
+	};
+	let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+		return;
+	};
+	let parent = json_path.parent();
+	for face in value["faces"].as_array().into_iter().flatten() {
+		let Some(asset_id) = face["assetId"].as_str() else {
+			continue;
+		};
+		if let Some(path) = local_file_from_uri(asset_id) {
+			let resolved = if path.is_relative() {
+				parent.map(|dir| dir.join(&path)).unwrap_or(path)
+			} else {
+				path
+			};
+			out.push(resolved);
+		} else if !asset_id.contains("://")
+			&& let Some(dir) = parent
+		{
+			let candidate = dir.join(asset_id.trim());
+			if candidate.is_file() {
+				out.push(candidate);
+			}
+		}
+	}
+}
+
+/// Walks an already-pruned GUI DOM subtree and returns every local file path referenced by any
+/// `Content`, `ContentId`, or `Font` property (images, sprite sheets, local fonts), sorted and
+/// deduplicated.
+fn collect_local_files(dom: &WeakDom, root: Ref) -> Vec<PathBuf> {
+	let mut files = Vec::new();
+	let mut stack = vec![root];
+	while let Some(current) = stack.pop() {
+		let Some(instance) = dom.get_by_ref(current) else {
+			continue;
+		};
+		for value in instance.properties.values() {
+			match value {
+				Variant::Content(content) => {
+					if let ContentType::Uri(uri) = content.value()
+						&& let Some(path) = local_file_from_uri(uri)
+					{
+						files.push(path);
+					}
+				}
+				Variant::ContentId(id) => {
+					if let Some(path) = local_file_from_uri(id.as_str()) {
+						files.push(path);
+					}
+				}
+				Variant::Font(font) => {
+					for uri in std::iter::once(font.family.as_str()).chain(font.cached_face_id.as_deref()) {
+						if let Some(path) = local_file_from_uri(uri) {
+							collect_font_json_files(&path, &mut files);
+							files.push(path);
+						}
+					}
+				}
+				_ => {}
+			}
+		}
+		stack.extend(instance.children().iter().copied());
+	}
+	files.sort();
+	files.dedup();
+	files
+}
+
+/// Folds live [`ror_assets::FileSnapshot`] stamps for every path in `local_files` into `base_hash`,
+/// returning the stamped hash and the snapshots captured for verification before caching rur's output.
+/// When `local_files` is empty, returns `(base_hash, Vec::new())` without touching the filesystem.
+pub fn stamp_gui_hash(base_hash: u64, local_files: &[PathBuf]) -> (u64, Vec<(PathBuf, Option<ror_assets::FileSnapshot>)>) {
+	if local_files.is_empty() {
+		return (base_hash, Vec::new());
+	}
+	let mut hash = fnv1a_extend(base_hash, b"\0gui-local-stamps\0");
+	let mut snaps = Vec::with_capacity(local_files.len());
+	for path in local_files {
+		hash = fnv1a_extend(hash, path.to_string_lossy().as_bytes());
+		hash = fnv1a_extend(hash, &[0xff]);
+		match ror_assets::FileStamp::snapshot_file(path) {
+			Some(snap) => {
+				hash = fnv1a_extend(hash, snap.stamp.key_suffix().as_bytes());
+				hash = fnv1a_extend(hash, &[0]);
+				snaps.push((path.clone(), Some(snap)));
+			}
+			None => {
+				hash = fnv1a_extend(hash, b"missing\0");
+				snaps.push((path.clone(), None));
+			}
+		}
+	}
+	(hash, snaps)
 }
 
 /// Whether an instance is part of a GUI's 2D content (a GUI object, a UI component, a LayerCollector),
@@ -256,11 +389,12 @@ fn is_gui(instance: &Instance) -> bool {
 	props::class_is_a(instance.class.as_str(), "GuiBase") || props::class_is_a(instance.class.as_str(), "UIComponent")
 }
 
-/// The GUI's subtree as a binary model of its own (references to instances outside it cleared). A
-/// ViewportFrame's world is left out: rur draws a ViewportFrame's background alone (render::guis draws
-/// the world), and a world that moves would otherwise make a new image (a new rur call) every frame.
-/// Fails as rbx_binary does on a property holding a value of another type than its class gives it.
-fn content(document: &Document, referent: Ref) -> Result<Vec<u8>, rbx_binary::EncodeError> {
+/// The GUI's subtree as a binary model of its own (references to instances outside it cleared) and
+/// the local files referenced inside it: what rur draws. A ViewportFrame's world is left out: rur
+/// draws a ViewportFrame's background alone (render::guis draws the world), and a world that moves
+/// would otherwise make a new image (a new rur call) every frame. Fails as rbx_binary does on a
+/// property holding a value of another type than its class gives it.
+fn content(document: &Document, referent: Ref) -> Result<(Vec<u8>, Vec<PathBuf>), rbx_binary::EncodeError> {
 	let (dom, clone) = subtree(document, referent);
 	encode(dom, clone)
 }
@@ -281,7 +415,7 @@ const VIEWPORT_ONLY: [&str; 8] = ["Ambient", "LightColor", "LightDirection", "Im
 /// worlds: what rur draws of them is their background (and what they hold of GUI), the same pixels as
 /// a ViewportFrame's, and render::guis draws their worlds. Given a ViewportFrame, rur can ask a ROR
 /// worker for a picture of each new state of it (its `rur-viewport://` images), which nothing here uses.
-fn encode(mut dom: WeakDom, clone: Ref) -> Result<Vec<u8>, rbx_binary::EncodeError> {
+fn encode(mut dom: WeakDom, clone: Ref) -> Result<(Vec<u8>, Vec<PathBuf>), rbx_binary::EncodeError> {
 	let mut worlds = Vec::new();
 	let mut frames = Vec::new();
 	let mut stack = vec![clone];
@@ -312,9 +446,10 @@ fn encode(mut dom: WeakDom, clone: Ref) -> Result<Vec<u8>, rbx_binary::EncodeErr
 			}
 		}
 	}
+	let local_files = collect_local_files(&dom, clone);
 	let mut bytes = Vec::new();
 	rbx_binary::to_writer(&mut bytes, &dom, &[clone])?;
-	Ok(bytes)
+	Ok((bytes, local_files))
 }
 
 /// The GuiObjects under a GUI in the order it draws them, as rur draws them (its export's walk): with
@@ -380,7 +515,7 @@ fn clear_own(dom: &mut WeakDom, referent: Ref) {
 /// What a GUI draws over one of its ViewportFrames (`frame`), as content of its own ([`Framed::over`]):
 /// what the GUI draws up to and including the frame draws none of its own. `None` when nothing draws
 /// after the frame.
-fn over_content(document: &Document, gui: Ref, frame: Ref, global: bool) -> Option<Result<Vec<u8>, rbx_binary::EncodeError>> {
+fn over_content(document: &Document, gui: Ref, frame: Ref, global: bool) -> Option<Result<(Vec<u8>, Vec<PathBuf>), rbx_binary::EncodeError>> {
 	// the frame's copy, found by its child indices from the GUI
 	let mut path = Vec::new();
 	let mut current = frame;
@@ -517,15 +652,15 @@ fn viewports(document: &Document, gui: Ref, windows: bool, global: bool, warning
 			if scene.parts.is_empty() {
 				continue;
 			}
-			let over = match over_content(document, gui, child, global) {
-				Some(Ok(bytes)) => Some((fnv1a(&bytes), Arc::new(bytes))),
+			let (over, over_local_files) = match over_content(document, gui, child, global) {
+				Some(Ok((bytes, local_files))) => (Some((Arc::new(bytes.clone()), fnv1a(&bytes))), local_files),
 				Some(Err(error)) => {
 					warnings.push(format!("{}: could not serialise what draws over its ViewportFrame (drawn under its world): {error}", document.path_of(child)));
-					None
+					(None, Vec::new())
 				}
-				None => None,
+				None => (None, Vec::new()),
 			};
-			let kind = ViewportKind::Framed(Framed { camera, fov, over: over.map(|(hash, bytes)| (bytes, hash)), gradient: gradient(document, item) });
+			let kind = ViewportKind::Framed(Framed { camera, fov, over, over_local_files, gradient: gradient(document, item) });
 			framed.push((child, Viewport { placement, tint, scene, kind, corner_radius }));
 		}
 	}
@@ -656,8 +791,8 @@ pub fn read(document: &Document, referent: Ref, instance: &Instance, warnings: &
 			})
 		}
 	};
-	let content = match content(document, referent) {
-		Ok(content) => content,
+	let (content, local_files) = match content(document, referent) {
+		Ok(result) => result,
 		Err(error) => {
 			warnings.push(format!("{path}: could not serialise the GUI (not drawn): {error}"));
 			return None;
@@ -668,11 +803,15 @@ pub fn read(document: &Document, referent: Ref, instance: &Instance, warnings: &
 	// through the frame's own camera (a portal arm drawn over the screen by a camera that follows the
 	// player's)
 	let viewports = viewports(document, referent, matches!(kind, GuiKind::Surface(_)), z_index_behavior == 0, warnings);
+	let base_content_hash = fnv1a(&content);
+	let (content_hash, _) = stamp_gui_hash(base_content_hash, &local_files);
 	Some(Gui {
 		viewports,
 		path,
 		kind,
-		content_hash: fnv1a(&content),
+		base_content_hash,
+		content_hash,
+		local_files,
 		content: Arc::new(content),
 		light_influence: props::f32(instance, "LightInfluence", 0.0).clamp(0.0, 1.0),
 		brightness: props::f32(instance, "Brightness", 1.0).max(0.0),
@@ -1019,5 +1158,92 @@ mod tests {
 		assert_eq!(scene.warnings.len(), 1, "{:?}", scene.warnings);
 		let warning = &scene.warnings[0];
 		assert!(warning.contains("Sign: could not serialise the GUI (not drawn): ") && warning.contains("ImageLabel.Size to be of type UDim2"), "{warning}");
+	}
+
+	#[test]
+	fn local_gui_images_spritesheets_fonts_and_map_guis_fold_stamps_into_content_hash() {
+		use rbx_dom_weak::types::{Content, Font, FontStyle, FontWeight, Vector2};
+
+		let dir = std::env::temp_dir().join(format!("ror-gui-local-stamp-test-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+
+		let sign = dir.join("sign.png");
+		let sprite = dir.join("sheet.png");
+		let font_ttf = dir.join("custom.ttf");
+		let font_json = dir.join("custom_font.json");
+		let map_sign = dir.join("map_sign.png");
+		std::fs::write(&sign, b"PNG_RED_A_123456").unwrap();
+		std::fs::write(&sprite, b"SPRITE_SHEET_V1_").unwrap();
+		std::fs::write(&font_ttf, b"TTF_FONT_DATA_V1").unwrap();
+		let font_ttf_uri = format!("file:///{}", font_ttf.display().to_string().replace('\\', "/"));
+		std::fs::write(&font_json, format!("{{\"name\":\"Custom\",\"faces\":[{{\"name\":\"Regular\",\"weight\":400,\"style\":\"normal\",\"assetId\":\"{font_ttf_uri}\"}}]}}")).unwrap();
+		std::fs::write(&map_sign, b"MAP_SIGN_IMG_V1_").unwrap();
+
+		let uri = |p: &std::path::Path| format!("file:///{}", p.display().to_string().replace('\\', "/"));
+
+		// 1. SurfaceGui + BillboardGui + ImageRectOffset sprite sheet + local FontFace JSON (relative path)
+		let build_scene = || {
+			let mut model = ModelBuilder::new("GuiStamps");
+			let part = model.part(&PartSpec::default());
+			let surface = model.child(part, InstanceBuilder::new("SurfaceGui").with_name("SurfaceSign"));
+			model.child(surface, InstanceBuilder::new("ImageLabel").with_property("ImageContent", Content::from_uri(uri(&sign))));
+
+			let billboard = model.child(part, InstanceBuilder::new("BillboardGui").with_name("BillboardSign").with_property("Size", UDim2::new(UDim::new(4.0, 0), UDim::new(2.0, 0))));
+			model.child(
+				billboard,
+				InstanceBuilder::new("ImageLabel")
+					.with_property("ImageContent", Content::from_uri(uri(&sprite)))
+					.with_property("ImageRectOffset", Vector2::new(64.0, 0.0))
+					.with_property("ImageRectSize", Vector2::new(64.0, 64.0)),
+			);
+
+			let text_gui = model.child(part, InstanceBuilder::new("SurfaceGui").with_name("FontSign"));
+			let font = Font { family: "custom_font.json".into(), weight: FontWeight::Regular, style: FontStyle::Normal, cached_face_id: None };
+			model.child(text_gui, InstanceBuilder::new("TextLabel").with_property("FontFace", font));
+
+			let mut document = model.into_document();
+			document.read_relative_to(&dir);
+
+			// Also attach a lending map (--map) carrying its own SurfaceGui with a local image.
+			let mut map = ModelBuilder::new("Setting");
+			let map_part = map.part(&PartSpec::default());
+			let map_gui = map.child(map_part, InstanceBuilder::new("SurfaceGui").with_name("MapSign"));
+			map.child(map_gui, InstanceBuilder::new("ImageLabel").with_property("ImageContent", Content::from_uri(uri(&map_sign))));
+			document.add_setting(&map.into_document(), None);
+			crate::scene::extract::extract(&document)
+		};
+
+		let first = build_scene();
+		assert_eq!(first.guis.len(), 4);
+		let hash_of = |scene: &crate::scene::Scene, suffix: &str| scene.guis.iter().find(|gui| gui.path.ends_with(suffix)).unwrap().content_hash;
+
+		// Same files -> identical hashes.
+		let same = build_scene();
+		for name in ["SurfaceSign", "BillboardSign", "FontSign", "MapSign"] {
+			assert_eq!(hash_of(&first, name), hash_of(&same, name), "{name} unchanged");
+		}
+
+		// Rewrite each file with same length, different bytes -> only that GUI's hash changes.
+		std::fs::write(&sign, b"PNG_BLUE_B_12345").unwrap();
+		let after_sign = build_scene();
+		assert_ne!(hash_of(&first, "SurfaceSign"), hash_of(&after_sign, "SurfaceSign"), "SurfaceGui local image must change hash");
+		assert_eq!(hash_of(&first, "BillboardSign"), hash_of(&after_sign, "BillboardSign"));
+
+		std::fs::write(&sprite, b"SPRITE_SHEET_V2_").unwrap();
+		let after_sprite = build_scene();
+		assert_ne!(hash_of(&first, "BillboardSign"), hash_of(&after_sprite, "BillboardSign"), "BillboardGui ImageRectOffset sheet must change hash");
+
+		// Rewrite the local .ttf referenced inside custom_font.json (without changing the JSON itself).
+		std::fs::write(&font_ttf, b"TTF_FONT_DATA_V2").unwrap();
+		let after_ttf = build_scene();
+		assert_ne!(hash_of(&first, "FontSign"), hash_of(&after_ttf, "FontSign"), "local FontFace .ttf referenced by font JSON must change hash");
+
+		// Rewrite the local image in the --map GUI.
+		std::fs::write(&map_sign, b"MAP_SIGN_IMG_V2_").unwrap();
+		let after_map = build_scene();
+		assert_ne!(hash_of(&first, "MapSign"), hash_of(&after_map, "MapSign"), "GUI under --map must change hash");
+
+		let _ = std::fs::remove_dir_all(&dir);
 	}
 }
