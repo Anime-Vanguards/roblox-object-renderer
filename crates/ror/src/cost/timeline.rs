@@ -1949,4 +1949,195 @@ mod tests {
 		}
 		let _ = std::fs::remove_dir_all(&temp);
 	}
+
+	#[test]
+	fn timeline_summary_figures_match_exact_formulas_in_json_and_text() {
+		// Part A: closed-form check of every MetricSummary field for uniform dt, explicit times, tie-breaking, and >100-frame top1PctMean.
+		let series = [10.0, 40.0, 20.0, 40.0, 90.0];
+		let uniform_times = [0.0, 0.1, 0.2, 0.3, 0.4];
+		let u = summarize(&series, &uniform_times, Some(0.1));
+		assert!((u.mean - 40.0).abs() < 1e-6, "mean expected 40.0, got {}", u.mean);
+		assert!((u.peak - 90.0).abs() < 1e-6);
+		assert!((u.peak_time - 0.4).abs() < 1e-6);
+		assert_eq!(u.peak_frame, 4);
+		assert!((u.p50 - 40.0).abs() < 1e-6);
+		assert!((u.p95 - 90.0).abs() < 1e-6);
+		assert!((u.p99 - 90.0).abs() < 1e-6);
+		assert!((u.top1_pct_mean - 90.0).abs() < 1e-6);
+		assert!((u.integral - 20.0).abs() < 1e-6, "uniform integral expected 20.0, got {}", u.integral);
+
+		let uneven_times = [0.0, 0.2, 0.5, 1.0, 1.5];
+		let nv = summarize(&series, &uneven_times, None);
+		// 10*0.2 + 40*0.3 + 20*0.5 + 40*0.5 + 90*0.5 = 89.0
+		assert!((nv.integral - 89.0).abs() < 1e-6, "explicit-times integral expected 89.0, got {}", nv.integral);
+		assert!((nv.peak_time - 1.5).abs() < 1e-6);
+
+		// Tie-breaking: earliest peak frame wins.
+		let tied = summarize(&[5.0, 20.0, 20.0, 10.0], &[0.0, 0.1, 0.2, 0.3], Some(0.1));
+		assert_eq!(tied.peak_frame, 1);
+		assert!((tied.peak_time - 0.1).abs() < 1e-6);
+
+		// 101 samples: ceil(0.01 * 101) = 2 -> top1_pct_mean averages the top two (100 and 200 -> 150).
+		let mut big = vec![1.0; 99];
+		big.push(100.0);
+		big.push(200.0);
+		let big_times: Vec<f64> = (0..101).map(|i| i as f64 * 0.1).collect();
+		let bs = summarize(&big, &big_times, Some(0.1));
+		assert!((bs.top1_pct_mean - 150.0).abs() < 1e-6, "expected 150.0, got {}", bs.top1_pct_mean);
+		assert!((bs.p99 - 100.0).abs() < 1e-6, "p99 expected 100.0, got {}", bs.p99);
+		assert!((bs.mean - (399.0 / 101.0)).abs() < 1e-5, "mean expected {}, got {}", 399.0 / 101.0, bs.mean);
+
+		// Part B: end-to-end timeline::run verification of EVERY metric in timeline.json["summary"] and EVERY printed figure in analysis.txt.
+		let temp = std::env::temp_dir().join(format!("ror-timeline-summary-exact-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&temp);
+		std::fs::create_dir_all(&temp).unwrap();
+		let renderer = make_test_renderer(&temp.join("cache"));
+		let (mut doc, pb) = build_dynamic_scene();
+		let views = vec![NamedView {
+			name: "render".into(),
+			view: crate::render::ViewRequest {
+				width: 2532,
+				height: 1170,
+				camera: CameraSpec::LookAt { eye: [0.0, 8.0, 22.0], target: [0.0, 2.0, 0.0], fov: 70.0 },
+				..Default::default()
+			},
+		}];
+		let tl_opts = TimelineOptions { start: 0.0, duration: Some(0.6), auto_duration: false, fps: 10.0, times: None, camera_track: None, all_emitters_running: false };
+		let cost_opts = CostOptions { attribute: true, pixels: true, preset: Some("phone".into()), no_images: true, ..Default::default() };
+		let out = temp.join("out");
+		std::fs::create_dir_all(&out).unwrap();
+		run(&renderer, &mut doc, Some(&pb), &cost_opts, &tl_opts, &views, None, None, &out, None, "test.rbxm", false, &|_| Ok(())).unwrap();
+
+		let j: serde_json::Value = serde_json::from_slice(&std::fs::read(out.join("timeline.json")).unwrap()).unwrap();
+		let txt = std::fs::read_to_string(out.join("analysis.txt")).unwrap();
+		let frames = j["frames"].as_array().unwrap();
+		let n = frames.len();
+		assert_eq!(n, 6);
+		let times: Vec<f64> = frames.iter().map(|f| f["time"].as_f64().unwrap()).collect();
+
+		for metric in ["draws", "triangles", "particles", "particleFill", "blendedViewports", "gpuUnits", "cpuMs", "gpuMs", "ms"] {
+			let vals: Vec<f64> = frames.iter().map(|f| f[metric].as_f64().unwrap()).collect();
+			let sum: f64 = vals.iter().sum();
+			let exp_mean = sum / n as f64;
+			let (exp_peak_idx, exp_peak) = vals.iter().enumerate().fold((0usize, vals[0]), |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) });
+			let exp_peak_time = times[exp_peak_idx];
+			let mut sorted = vals.clone();
+			sorted.sort_by(|a, b| a.total_cmp(b));
+			let rank = |p: f64| sorted[((p / 100.0 * n as f64).ceil() as usize).clamp(1, n) - 1];
+			let exp_p50 = rank(50.0);
+			let exp_p95 = rank(95.0);
+			let exp_p99 = rank(99.0);
+			let exp_top1 = sorted[n - 1];
+			let exp_int = sum * 0.1;
+
+			let got = &j["summary"][metric];
+			assert!((got["mean"].as_f64().unwrap() - exp_mean).abs() <= 1e-5, "{metric} mean mismatch: got {} exp {exp_mean}", got["mean"]);
+			assert!((got["peak"].as_f64().unwrap() - exp_peak).abs() <= 1e-5, "{metric} peak mismatch");
+			assert_eq!(got["peakFrame"].as_u64().unwrap() as usize, exp_peak_idx, "{metric} peakFrame mismatch");
+			assert!((got["peakTime"].as_f64().unwrap() - exp_peak_time).abs() <= 1e-5, "{metric} peakTime mismatch");
+			assert!((got["p50"].as_f64().unwrap() - exp_p50).abs() <= 1e-5, "{metric} p50 mismatch");
+			assert!((got["p95"].as_f64().unwrap() - exp_p95).abs() <= 1e-5, "{metric} p95 mismatch");
+			assert!((got["p99"].as_f64().unwrap() - exp_p99).abs() <= 1e-5, "{metric} p99 mismatch");
+			assert!((got["top1PctMean"].as_f64().unwrap() - exp_top1).abs() <= 1e-5, "{metric} top1PctMean mismatch");
+			assert!((got["integral"].as_f64().unwrap() - exp_int).abs() <= 1e-5, "{metric} integral mismatch");
+		}
+
+		// Verify every figure printed in analysis.txt matches the exact recomputed summary.
+		let s = &j["summary"];
+		let expected_ft = format!(
+			"frame time: mean {:.2} ms, p95 {:.2} ms, peak {:.2} ms at t={:.3}s (frame {}); integral {:.2} ms*s",
+			s["ms"]["mean"].as_f64().unwrap(),
+			s["ms"]["p95"].as_f64().unwrap(),
+			s["ms"]["peak"].as_f64().unwrap(),
+			s["ms"]["peakTime"].as_f64().unwrap(),
+			s["ms"]["peakFrame"].as_u64().unwrap(),
+			s["ms"]["integral"].as_f64().unwrap(),
+		);
+		assert!(txt.contains(&expected_ft), "analysis.txt missing exact frame time line:\nexpected: {expected_ft}\ngot:\n{txt}");
+		let expected_counts = format!(
+			"counts: draws mean {:.1} / peak {:.0} (t={:.3}s); triangles mean {:.0}k / peak {:.0}k; particles mean {:.1} / peak {:.0}; blended mean {:.2} / peak {:.2} vp",
+			s["draws"]["mean"].as_f64().unwrap(),
+			s["draws"]["peak"].as_f64().unwrap(),
+			s["draws"]["peakTime"].as_f64().unwrap(),
+			s["triangles"]["mean"].as_f64().unwrap() / 1000.0,
+			s["triangles"]["peak"].as_f64().unwrap() / 1000.0,
+			s["particles"]["mean"].as_f64().unwrap(),
+			s["particles"]["peak"].as_f64().unwrap(),
+			s["blendedViewports"]["mean"].as_f64().unwrap(),
+			s["blendedViewports"]["peak"].as_f64().unwrap(),
+		);
+		assert!(txt.contains(&expected_counts), "analysis.txt missing exact counts line:\nexpected: {expected_counts}\ngot:\n{txt}");
+		let _ = std::fs::remove_dir_all(&temp);
+	}
+
+	#[test]
+	fn natural_end_includes_emitter_lifetime_tail_beyond_motion_and_tweens() {
+		let mut model = ModelBuilder::new("TailTest");
+		let host = model.part(&PartSpec { name: "Host".into(), size: Vec3::ONE, ..Default::default() });
+		let a0 = model.child(host, InstanceBuilder::new("Attachment").with_name("A0"));
+		let a1 = model.child(host, InstanceBuilder::new("Attachment").with_name("A1"));
+		model.child(
+			host,
+			InstanceBuilder::new("ParticleEmitter")
+				.with_name("Burst")
+				.with_property("Rate", 0.0f32)
+				.with_property("Lifetime", NumberRange::new(1.3, 1.3))
+				.with_property("Enabled", false),
+		);
+		let mut attrs = rbx_dom_weak::types::Attributes::new();
+		attrs.insert("EmitDelay".into(), rbx_dom_weak::types::Variant::Float32(0.2));
+		attrs.insert("EmitDuration".into(), rbx_dom_weak::types::Variant::Float32(0.3));
+		attrs.insert("EmitCount".into(), rbx_dom_weak::types::Variant::Int32(8));
+		model.child(
+			host,
+			InstanceBuilder::new("ParticleEmitter")
+				.with_name("AttrEmitter")
+				.with_property("Rate", 0.0f32)
+				.with_property("Lifetime", NumberRange::new(1.1, 1.1))
+				.with_property("Enabled", false)
+				.with_property("Attributes", attrs),
+		);
+		model.child(
+			host,
+			InstanceBuilder::new("Trail")
+				.with_name("TailTrail")
+				.with_property("Attachment0", a0)
+				.with_property("Attachment1", a1)
+				.with_property("Lifetime", 0.9f32)
+				.with_property("Enabled", false),
+		);
+		let doc = model.into_document();
+
+		// Motion ends at 0.20, tween ends at 0.25 — strictly shorter than every lifetime tail below.
+		let base_pb = Playback {
+			tweens: vec![Tween { target: "TailTest.Host".into(), property: "Transparency".into(), at: 0.05, duration: 0.2, to: Some(serde_json::json!(0.5)), ..Default::default() }],
+			motion: vec![Motion {
+				target: "TailTest.Host".into(),
+				keys: vec![
+					MotionKey { at: 0.0, cframe: vec![0.0, 0.0, 0.0], ..Default::default() },
+					MotionKey { at: 0.2, cframe: vec![2.0, 0.0, 0.0], ..Default::default() },
+				],
+				..Default::default()
+			}],
+			..Default::default()
+		};
+
+		// 1) Burst at 0.1 + 1.3 lifetime = 1.4 (dropping +life yields 0.25).
+		let mut pb_burst = base_pb.clone();
+		pb_burst.actions.push(Action { at: 0.1, target: "TailTest.Host.Burst".into(), emit: Some(Emit::Count(10)), ..Default::default() });
+		let end_burst = pb_burst.natural_end(&doc);
+		assert!((end_burst - 1.4).abs() < 1e-4, "burst tail must be 0.1 + 1.3 = 1.4, got {end_burst}");
+
+		// 2) Attribute emit at 0.1 + 0.2 delay + 0.3 duration + 1.1 lifetime = 1.7 (dropping +life yields 0.6).
+		let mut pb_attr = base_pb.clone();
+		pb_attr.actions.push(Action { at: 0.1, target: "TailTest.Host.AttrEmitter".into(), emit: Some(Emit::Mode("attributes".into())), ..Default::default() });
+		let end_attr = pb_attr.natural_end(&doc);
+		assert!((end_attr - 1.7).abs() < 1e-4, "attribute emit tail must be 0.1 + 0.2 + 0.3 + 1.1 = 1.7, got {end_attr}");
+
+		// 3) Trail enabled at 0.1 + 0.9 lifetime = 1.0 (dropping +life yields 0.25).
+		let mut pb_trail = base_pb;
+		pb_trail.actions.push(Action { at: 0.1, target: "TailTest.Host.TailTrail".into(), enabled: Some(true), ..Default::default() });
+		let end_trail = pb_trail.natural_end(&doc);
+		assert!((end_trail - 1.0).abs() < 1e-4, "trail tail must be 0.1 + 0.9 = 1.0, got {end_trail}");
+	}
 }

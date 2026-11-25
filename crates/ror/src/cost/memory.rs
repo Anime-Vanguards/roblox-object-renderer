@@ -1793,4 +1793,42 @@ mod tests {
 		assert_eq!(entry.desktop_bc_mip_bytes, 5_488);
 		let _ = std::fs::remove_dir_all(&dir);
 	}
+
+	#[test]
+	fn pack_only_missing_marks_memory_report_partial() {
+		let dir = std::env::temp_dir().join(format!("ror-memory-pack-only-partial-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		let cache_dir = dir.join("cache");
+		std::fs::create_dir_all(&cache_dir).unwrap();
+
+		// Zero missing meshes and zero missing textures: ONLY progressive KTX2 pack 1 is absent offline.
+		let pack0 = make_ktx2_bc(131, 32, 32, &[("transcodedWidth", "64"), ("transcodedHeight", "64"), ("pack_0", "1,6"), ("pack_1", "0,1"), ("packIndex", "0")]);
+		cache_write_key(&cache_dir, &format!("rbxassetid://4001#ktx2/7rdo/{}", Transcode::Image.fidelity(0)), &pack0);
+
+		let mut model = ModelBuilder::new("PackOnlyPartial");
+		let part = model.part(&PartSpec { name: "Block".into(), ..Default::default() });
+		model.child(part, InstanceBuilder::new("Decal").with_property("Texture", ContentId::from("rbxassetid://4001")).with_property("Face", Enum::from_u32(1)));
+		let document = model.into_document();
+		let scene = crate::scene::extract::extract(&document);
+		let assets = Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&cache_dir) });
+		let meshes = Meshes::load(&scene.parts, &assets);
+		let report = measure(&scene, &meshes, &assets);
+
+		assert_eq!(report.meshes.missing, 0);
+		assert_eq!(report.textures.missing, 0);
+		assert_eq!(report.missing.assets, 0);
+		assert_eq!(report.textures.missing_packs, 1);
+		assert_eq!(report.missing.transcode_packs, 1);
+		assert!(report.textures.file_bytes_partial, "file_bytes_partial must be true when a progressive pack is missing");
+		assert!(report.partial, "pack-only missing must mark MemoryReport.partial = true even with 0 missing meshes/textures");
+		assert!(report.total_gpu_bytes.partial, "pack-only missing must mark total_gpu_bytes.partial = true");
+		assert!(
+			report.missing.uncounted_bytes.as_deref().is_some_and(|s| s.contains("1 missing progressive")),
+			"uncounted_bytes must explain missing progressive pack: {:?}",
+			report.missing.uncounted_bytes
+		);
+		let line = summary_line(&report, false);
+		assert!(line.contains("PARTIAL upper-bound estimate") && line.contains("PARTIAL total est GPU upper bound"), "{line}");
+		let _ = std::fs::remove_dir_all(&dir);
+	}
 }
