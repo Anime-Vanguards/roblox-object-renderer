@@ -1142,6 +1142,20 @@ fn read_times(text: &str) -> Result<Vec<f32>> {
 	text.split(',').map(|part| part.trim().parse::<f32>().with_context(|| format!("--times: {part:?} is not a number of seconds"))).collect()
 }
 
+/// Parses and validates `ror cost --times`: non-empty, finite, non-negative, non-decreasing order.
+fn parse_cost_times(text: &str) -> Result<Vec<f32>> {
+	let ts = read_times(text)?;
+	if ts.is_empty() || ts.iter().any(|t| !t.is_finite() || *t < 0.0) {
+		bail!("--times must be a non-empty list of finite non-negative seconds");
+	}
+	for pair in ts.windows(2) {
+		if pair[1] < pair[0] {
+			bail!("--times must be in non-decreasing order (got {} after {})", pair[1], pair[0]);
+		}
+	}
+	Ok(ts)
+}
+
 fn video(mut args: VideoArgs) -> Result<()> {
 	use ror::video::{VideoFormat, VideoJob};
 	// a script: recorded to the clip's last moment and one frame past it, its recording the playback
@@ -1837,12 +1851,7 @@ fn cost(mut args: CostArgs) -> Result<()> {
 			}
 			None => (None, false),
 		};
-		let times = args.times.as_deref().map(read_times).transpose()?;
-		if let Some(ts) = &times
-			&& (ts.is_empty() || ts.iter().any(|t| !t.is_finite() || *t < 0.0))
-		{
-			bail!("--times must be a non-empty list of finite non-negative seconds");
-		}
+		let times = args.times.as_deref().map(parse_cost_times).transpose()?;
 		let camera_track = args.camera_track.as_deref().map(read_camera_track).transpose()?;
 		Some(ror::cost::timeline::TimelineOptions {
 			start,
@@ -2464,5 +2473,13 @@ mod tests {
 			let msg = err.to_string();
 			assert!(msg.contains(expected), "refusal for {argv:?} should mention {expected:?}, got {msg:?}");
 		}
+	}
+
+	#[test]
+	fn parse_cost_times_refuses_out_of_order_and_accepts_non_decreasing() {
+		assert_eq!(parse_cost_times("0.0,0.5,0.5,1.25").unwrap(), vec![0.0, 0.5, 0.5, 1.25]);
+		let err = parse_cost_times("2.0,0.5,1.0").expect_err("out-of-order --times must be refused");
+		assert!(err.to_string().contains("non-decreasing order"), "got: {err}");
+		assert!(parse_cost_times("-0.1,0.5").is_err());
 	}
 }

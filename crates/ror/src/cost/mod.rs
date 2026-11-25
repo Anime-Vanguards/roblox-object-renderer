@@ -1984,6 +1984,10 @@ pub fn run(
 			}
 		}
 	}
+	let mut warnings = analysis.warnings.clone();
+	if let Some(mem) = &memory {
+		warnings.extend(memory::missing_texture_warnings(mem));
+	}
 	let mut report = CostReport {
 		technology: analysis.technology,
 		quality: analysis.quality,
@@ -1994,7 +1998,7 @@ pub fn run(
 		opportunities: report::summarize(&costs),
 		views: costs,
 		lines: Vec::new(),
-		warnings: analysis.warnings.clone(),
+		warnings,
 		agent: agent_lines,
 		over_budget,
 	};

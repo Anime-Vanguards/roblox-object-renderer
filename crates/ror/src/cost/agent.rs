@@ -421,6 +421,9 @@ fn summary_lines(input: &str, setup: &Setup, views: &[ViewLine], mean: &Work, wo
 	}
 	if let Some(memory) = memory {
 		lines.push(memory::summary_line(memory, !desktop));
+		for warning in memory::missing_texture_warnings(memory) {
+			lines.push(format!("warning: {warning}"));
+		}
 	}
 	if let Some(budget) = budget {
 		let over: Vec<&ViewLine> = views.iter().filter(|view| !view.over_budget.is_empty()).collect();
@@ -1115,5 +1118,52 @@ mod tests {
 		assert_eq!((custom.draws, custom.triangles, custom.ms), (400, 500_000, 6.5));
 		assert_eq!(custom.check(450, 100, 1.0), ["draws 450 > 400"]);
 		assert!(Budget::parse("frames=3").is_err());
+	}
+
+	#[test]
+	fn missing_texture_id_is_named_on_stdout_and_analysis_txt_when_memory_requested() {
+		let state = std::env::temp_dir().join(format!("ror-missing-tex-warn-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&state);
+		std::fs::create_dir_all(&state).unwrap();
+
+		let mut model = ModelBuilder::new("MissingTex");
+		let wall = model.part(&PartSpec { name: "Wall".into(), size: Vec3::new(10.0, 10.0, 1.0), ..Default::default() });
+		model.child(
+			wall,
+			rbx_dom_weak::InstanceBuilder::new("Decal")
+				.with_property("Texture", rbx_dom_weak::types::ContentId::from("rbxassetid://99999991"))
+				.with_property("Face", rbx_dom_weak::types::Enum::from_u32(5)),
+		);
+		let document = model.into_document();
+		let scene = crate::scene::extract::extract(&document);
+		let gpu = std::sync::Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(state.join("cache")) });
+		let renderer = crate::render::Renderer::new(gpu, assets).expect("a renderer");
+
+		let spec = CameraSpec::LookAt { eye: [0.0, 2.0, 20.0], target: [0.0, 0.0, 0.0], fov: 60.0 };
+		let views = vec![crate::job::NamedView {
+			name: "front".into(),
+			view: crate::render::ViewRequest { width: 320, height: 180, camera: spec.clone(), ..Default::default() },
+		}];
+		let shots = vec![(spec.place(None, 320, 180), 320, 180)];
+
+		// Without --memory: no missing texture warning emitted (plain cost unchanged).
+		let out_plain = state.join("plain");
+		std::fs::create_dir_all(&out_plain).unwrap();
+		let plain = crate::cost::run(&renderer, &scene, &document, &CostOptions { attribute: true, pixels: false, no_images: true, memory: false, ..Default::default() }, &views, &shots, &out_plain, None, None, "map", (false, false)).unwrap();
+		assert!(plain.warnings.is_empty(), "plain run without --memory must emit zero warnings: {:?}", plain.warnings);
+		assert!(!plain.lines.iter().any(|l| l.contains("texture not loaded")), "plain run without --memory must not warn on missing textures: {:?}", plain.lines);
+		assert!(!plain.agent.iter().any(|l| l.contains("texture not loaded")));
+
+		// With --memory: missing texture id is printed on stdout (lines + agent) and in analysis.txt.
+		let out_mem = state.join("mem");
+		std::fs::create_dir_all(&out_mem).unwrap();
+		let mem = crate::cost::run(&renderer, &scene, &document, &CostOptions { attribute: true, pixels: false, no_images: true, memory: true, ..Default::default() }, &views, &shots, &out_mem, None, None, "map", (false, false)).unwrap();
+		assert!(mem.warnings.iter().any(|w| w.contains("texture not loaded") && w.contains("rbxassetid://99999991")), "{:?}", mem.warnings);
+		assert!(mem.lines.iter().any(|l| l.contains("warning: texture not loaded (bytes uncounted): rbxassetid://99999991")), "{:?}", mem.lines);
+		assert!(mem.agent.iter().any(|l| l.contains("warning: texture not loaded (bytes uncounted): rbxassetid://99999991")), "{:?}", mem.agent);
+		let txt = std::fs::read_to_string(out_mem.join("analysis.txt")).unwrap();
+		assert!(txt.contains("warning: texture not loaded (bytes uncounted): rbxassetid://99999991"), "{txt}");
+		let _ = std::fs::remove_dir_all(&state);
 	}
 }

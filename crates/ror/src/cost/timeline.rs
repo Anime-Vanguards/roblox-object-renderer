@@ -151,10 +151,21 @@ pub struct TimelineBudget {
 	pub mean: TimelineBudgetCheck,
 }
 
-/// Validates that `options` and `tl` contain no unsupported single-frame/cost-loop flags.
+/// Validates that `options` and `tl` contain no unsupported single-frame/cost-loop flags and that
+/// explicit `--times` moments are finite, non-negative, and in non-decreasing order.
 pub fn validate_options(options: &CostOptions, tl: &TimelineOptions, view_count: usize) -> Result<()> {
 	if (tl.duration.is_some() || tl.auto_duration) && tl.times.as_deref().is_some_and(|ts| !ts.is_empty()) {
 		bail!("--duration and --times cannot be combined; pass one or the other");
+	}
+	if let Some(ts) = &tl.times {
+		if ts.is_empty() || ts.iter().any(|t| !t.is_finite() || *t < 0.0) {
+			bail!("--times must be a non-empty list of finite non-negative seconds");
+		}
+		for pair in ts.windows(2) {
+			if pair[1] < pair[0] {
+				bail!("--times must be in non-decreasing order (got {} after {})", pair[1], pair[0]);
+			}
+		}
 	}
 	if options.edits.is_some() || options.look || options.export.is_some() {
 		bail!("--edits (--look, --export) is not supported on timelines (--duration/--times); run single-moment cost without --duration/--times");
@@ -827,6 +838,13 @@ pub fn run(
 		let mut tex_cache = TextureCache::default();
 		collector.finish(&loaded_meshes, &renderer.assets, &mut tex_cache)
 	});
+	if let Some(mem) = &memory {
+		for w in memory::missing_texture_warnings(mem) {
+			if !warnings.contains(&w) {
+				warnings.push(w);
+			}
+		}
+	}
 
 	let uniform_dt = fps_opt.map(|fps| 1.0 / fps);
 	let summary = summarize_frames(&frames, uniform_dt, desktop);
@@ -1182,6 +1200,9 @@ fn format_lines(report: &TimelineReport, desktop: bool, top_shown: usize, fail_o
 	));
 	if let Some(memory) = &report.memory {
 		lines.push(memory::summary_line(memory, !desktop));
+		for warning in memory::missing_texture_warnings(memory) {
+			lines.push(format!("warning: {warning}"));
+		}
 	}
 	if let Some(budget) = &report.budget {
 		let verdict = if budget.over { "OVER" } else { "PASS" };
@@ -2139,5 +2160,48 @@ mod tests {
 		pb_trail.actions.push(Action { at: 0.1, target: "TailTest.Host.TailTrail".into(), enabled: Some(true), ..Default::default() });
 		let end_trail = pb_trail.natural_end(&doc);
 		assert!((end_trail - 1.0).abs() < 1e-4, "trail tail must be 0.1 + 0.9 = 1.0, got {end_trail}");
+	}
+
+	#[test]
+	fn timeline_refuses_out_of_order_times_and_names_missing_textures() {
+		let base = CostOptions::default();
+		let bad = TimelineOptions { times: Some(vec![2.0, 0.5, 1.0]), ..Default::default() };
+		let err = validate_options(&base, &bad, 1).expect_err("out-of-order --times must be refused");
+		assert!(err.to_string().contains("non-decreasing order"), "got: {err}");
+
+		let dup_ok = TimelineOptions { times: Some(vec![0.0, 0.5, 0.5, 1.0]), ..Default::default() };
+		assert!(validate_options(&base, &dup_ok, 1).is_ok(), "non-decreasing times with duplicate must be accepted");
+
+		// Timeline run with --memory prints missing texture ID on analysis.txt and CostReport.warnings.
+		let temp = std::env::temp_dir().join(format!("ror-timeline-missing-tex-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&temp);
+		std::fs::create_dir_all(&temp).unwrap();
+		let renderer = make_test_renderer(&temp.join("cache"));
+		let mut model = ModelBuilder::new("MissingTexTl");
+		let wall = model.part(&PartSpec { name: "Wall".into(), size: Vec3::new(6.0, 6.0, 1.0), ..Default::default() });
+		model.child(
+			wall,
+			InstanceBuilder::new("Decal")
+				.with_property("Texture", rbx_dom_weak::types::ContentId::from("rbxassetid://99999992"))
+				.with_property("Face", rbx_dom_weak::types::Enum::from_u32(5)),
+		);
+		let mut doc = model.into_document();
+		let views = vec![NamedView {
+			name: "render".into(),
+			view: crate::render::ViewRequest {
+				width: 640,
+				height: 360,
+				camera: CameraSpec::LookAt { eye: [0.0, 0.0, 15.0], target: [0.0; 3], fov: 60.0 },
+				..Default::default()
+			},
+		}];
+		let tl_opts = TimelineOptions { times: Some(vec![0.0, 0.5]), ..Default::default() };
+		let out = temp.join("out");
+		std::fs::create_dir_all(&out).unwrap();
+		let rep = run(&renderer, &mut doc, None, &CostOptions { attribute: true, pixels: false, no_images: true, memory: true, ..Default::default() }, &tl_opts, &views, None, None, &out, None, "tex.rbxmx", false, &|_| Ok(())).unwrap();
+		let txt = std::fs::read_to_string(out.join("analysis.txt")).unwrap();
+		assert!(rep.warnings.iter().any(|w| w.contains("rbxassetid://99999992")), "{:?}", rep.warnings);
+		assert!(txt.contains("warning: texture not loaded (bytes uncounted): rbxassetid://99999992"), "{txt}");
+		let _ = std::fs::remove_dir_all(&temp);
 	}
 }

@@ -736,6 +736,22 @@ pub fn summary_line(memory: &MemoryReport, phone: bool) -> String {
 	)
 }
 
+/// Warning lines naming each missing texture id when `--memory` is active (mirroring missing-mesh
+/// warnings so callers see which texture ids were uncounted on stdout and in `analysis.txt`).
+pub fn missing_texture_warnings(memory: &MemoryReport) -> Vec<String> {
+	let mut out: Vec<String> = memory
+		.missing
+		.texture_ids
+		.iter()
+		.map(|id| format!("texture not loaded (bytes uncounted): {id}"))
+		.collect();
+	let omitted = memory.missing.textures.saturating_sub(memory.missing.texture_ids.len() as u64);
+	if omitted > 0 {
+		out.push(format!("texture not loaded (bytes uncounted): +{omitted} more missing textures (see memory.missing.textureIds)"));
+	}
+	out
+}
+
 struct PackMaps {
 	usage: u32,
 	color: Option<String>,
