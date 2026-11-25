@@ -1327,4 +1327,35 @@ mod retry_tests {
 		drop((offline, online));
 		let _ = std::fs::remove_dir_all(&state);
 	}
+
+	/// Guards `key.content(image)` for character composite clothing layers in `Key::part`: rewriting a
+	/// local clothing image must invalidate the prepared `SceneKey` even when the URI string is unchanged.
+	#[test]
+	fn rewriting_local_composite_layer_changes_prepared_scene_key() {
+		use crate::scene::character::{Composite, Layer, Layout};
+
+		let dir = std::env::temp_dir().join(format!("ror-prepared-composite-key-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		let shirt = dir.join("shirt.png");
+		std::fs::write(&shirt, b"SHIRT_TEMPLATE_V1").unwrap();
+		let uri = format!("file:///{}", shirt.display().to_string().replace('\\', "/").replace(' ', "%20"));
+
+		let mut model = crate::scene::build::ModelBuilder::new("Rig");
+		model.part(&crate::scene::build::PartSpec { name: "Torso".into(), ..Default::default() });
+		let mut scene = crate::scene::extract::extract(&model.into_document());
+		Arc::make_mut(&mut scene.parts[0]).composite = Some(Composite {
+			layout: Layout::R6,
+			colors: vec![[1.0, 0.8, 0.7]; 6],
+			pants: None,
+			shirt: Some(Layer { image: uri, tint: [1.0, 1.0, 1.0] }),
+			graphic: None,
+		});
+
+		let key_a = super::key(&scene, 0.0, false);
+		std::fs::write(&shirt, b"SHIRT_TEMPLATE_V2").unwrap();
+		let key_b = super::key(&scene, 0.0, false);
+		assert!(!key_a.same(&key_b), "rewriting a local composite layer image must change the prepared SceneKey");
+		let _ = std::fs::remove_dir_all(&dir);
+	}
 }

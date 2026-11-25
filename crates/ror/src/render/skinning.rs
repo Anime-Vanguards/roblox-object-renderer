@@ -538,4 +538,121 @@ mod tests {
 		// the part's normal (1, 0, 0) turned to +Y; in mesh space a normal scales by S (still +Y)
 		assert!(close(skinned[0].normal, [0.0, 1.0, 0.0]));
 	}
+
+	/// Guards stamping the local mesh URI in `Renderer::posed_mesh` (`self.skins.sources`): rewriting a
+	/// local skinned `.mesh` file under the same path must reload its `SkinSource` instead of reusing
+	/// the cached bind vertices / bone weights from the earlier version.
+	#[test]
+	fn rewriting_local_skinned_mesh_reloads_skin_source() {
+		use std::sync::Arc;
+		use super::Renderer;
+		use crate::scene::Geometry;
+
+		fn skinned_v4(tip_x: f32) -> Vec<u8> {
+			let mut b = Vec::new();
+			let u16 = |b: &mut Vec<u8>, v: u16| b.extend_from_slice(&v.to_le_bytes());
+			let u32 = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+			let f32 = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
+			let vec3 = |b: &mut Vec<u8>, v: [f32; 3]| {
+				f32(b, v[0]);
+				f32(b, v[1]);
+				f32(b, v[2]);
+			};
+			let names = b"Root\0Child\0";
+			b.extend_from_slice(b"version 4.01\n");
+			u16(&mut b, 24);
+			u16(&mut b, 3);
+			u32(&mut b, 4); // num_verts
+			u32(&mut b, 2); // num_faces
+			u16(&mut b, 0); // num_lods
+			u16(&mut b, 2); // num_bones
+			u32(&mut b, names.len() as u32);
+			u16(&mut b, 1); // num_subsets
+			b.push(1); // num_hq_lods
+			b.push(0); // unused
+			// 4 vertices (40 bytes each: pos[3], norm[3], uv[2], tangent[4], color[4])
+			let verts = [[0.0, 0.0, 0.0], [tip_x, 1.0, 0.0], [tip_x, 2.0, 0.0], [0.0, 2.0, 0.0]];
+			for pos in verts {
+				vec3(&mut b, pos);
+				vec3(&mut b, [0.0, 0.0, 1.0]);
+				f32(&mut b, 0.0);
+				f32(&mut b, 0.0);
+				b.extend_from_slice(&[254, 127, 127, 254]);
+				b.extend_from_slice(&[255, 255, 255, 255]);
+			}
+			// 4 envelopes (8 bytes each: 4 bone slots, 4 weights): all weighted 100% to subset slot 0 (bone 1 = Child)
+			for _ in 0..4 {
+				b.extend_from_slice(&[0, 0, 0, 0, 255, 0, 0, 0]);
+			}
+			// 2 faces
+			for [i0, i1, i2] in [[0u32, 1, 2], [0, 2, 3]] {
+				u32(&mut b, i0);
+				u32(&mut b, i1);
+				u32(&mut b, i2);
+			}
+			// 2 bones: Root (parent 0xFFFF, pos 0), Child (parent 0, pos (0,1,0)), identity rotation
+			for (name_off, parent, pos) in [(0u32, 0xFFFFu16, [0.0, 0.0, 0.0]), (5, 0, [0.0, 1.0, 0.0])] {
+				u32(&mut b, name_off);
+				u16(&mut b, parent);
+				u16(&mut b, 0xFFFF);
+				f32(&mut b, 2.0);
+				vec3(&mut b, [1.0, 0.0, 0.0]);
+				vec3(&mut b, [0.0, 1.0, 0.0]);
+				vec3(&mut b, [0.0, 0.0, 1.0]);
+				vec3(&mut b, pos);
+			}
+			b.extend_from_slice(names);
+			// 1 subset: faces_begin=0, faces_len=2, verts_begin=0, verts_len=4, num_bones=2, table=[1, 0, 0xFFFF..]
+			u32(&mut b, 0);
+			u32(&mut b, 2);
+			u32(&mut b, 0);
+			u32(&mut b, 4);
+			u32(&mut b, 2);
+			let mut table = [0xFFFFu16; 26];
+			table[0] = 1;
+			table[1] = 0;
+			for entry in table {
+				u16(&mut b, entry);
+			}
+			b
+		}
+
+		let state = std::env::temp_dir().join(format!("ror-skin-source-stamp-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&state);
+		std::fs::create_dir_all(&state).unwrap();
+		let mesh_path = state.join("rig.mesh");
+		let uri = format!("file:///{}", mesh_path.display().to_string().replace('\\', "/").replace(' ', "%20"));
+
+		let gpu = Arc::new(super::super::gpu::Gpu::new().expect("a GPU (or software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("renderer");
+
+		let mut model = crate::scene::build::ModelBuilder::new("Rig");
+		model.part(&crate::scene::build::PartSpec { name: "Body".into(), class: "MeshPart", size: Vec3::splat(2.0), ..Default::default() });
+		let mut scene = crate::scene::extract::extract(&model.into_document());
+		let part = Arc::make_mut(&mut scene.parts[0]);
+		part.geometry = Geometry::MeshPart { mesh: uri.clone(), initial_size: Vec3::splat(2.0), fidelity: 0 };
+		// Rotate Child bone 90 degrees about Z (moves vertex (tip_x, 1, 0) to (0, 1 + tip_x, 0)).
+		part.skeleton = Some(Arc::new(skeleton(&[
+			("Root", Affine3A::IDENTITY),
+			("Child", Affine3A::from_translation(Vec3::Y) * Affine3A::from_rotation_z(std::f32::consts::FRAC_PI_2)),
+		])));
+
+		std::fs::write(&mesh_path, skinned_v4(1.0)).unwrap();
+		let bind_a = renderer.load_mesh(&uri).unwrap();
+		let (posed_a, _, _) = renderer.skinned(part, (bind_a, Affine3A::IDENTITY, false), None);
+
+		std::fs::write(&mesh_path, skinned_v4(5.0)).unwrap();
+		let bind_b = renderer.load_mesh(&uri).unwrap();
+		let (posed_b, _, _) = renderer.skinned(part, (bind_b, Affine3A::IDENTITY, false), None);
+
+		assert!(
+			(posed_b.drawn.1.y - posed_a.drawn.1.y).abs() > 2.0,
+			"rewriting local skinned mesh must reload SkinSource (drawn_a={:?}, drawn_b={:?})",
+			posed_a.drawn,
+			posed_b.drawn
+		);
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+	}
 }

@@ -709,4 +709,37 @@ mod tests {
 		}
 		let _ = std::fs::remove_dir_all(&dir);
 	}
+
+	/// Guards the `if kept_os == os` check on settled `FILE_HASHES` entries: once a file is settled
+	/// under `os_a`, a subsequent look with a different OS stamp `os_b` (same volume/file_id, new
+	/// USN/change_nanos, outside the recent window) must drop the stale settled entry instead of
+	/// returning `os_a`'s content hash.
+	#[test]
+	fn settled_entry_is_rejected_when_os_stamp_changes() {
+		let dir = std::env::temp_dir().join(format!("ror-stamp-settled-guard-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("settled.bin");
+		let bytes_a = b"settled-alpha-01";
+		let bytes_b = b"settled-bravo-02";
+		std::fs::write(&path, bytes_a).unwrap();
+		let (os_a, _, mod_a, chg_a) = read_os_stamp(&path).unwrap();
+		assert!(os_a.trusted, "temp dir should be on a trusted filesystem");
+		// 1. Fresh look inserts `(os_a, hash_a, settled = false)`.
+		let fresh = FileStamp::from_os_stamp(&path, os_a, mod_a, chg_a);
+		assert_eq!(fresh, FileStamp::of_bytes(bytes_a));
+		// 2. First aged look settles `(os_a, hash_a, settled = true)`.
+		let old = SystemTime::now() - Duration::from_secs(3600);
+		let settled = FileStamp::from_os_stamp(&path, os_a, Some(old), Some(old));
+		assert_eq!(settled, FileStamp::of_bytes(bytes_a));
+		// 3. File changes on disk (new USN / change_nanos, same `(volume, file_id)`), viewed aged.
+		std::fs::write(&path, bytes_b).unwrap();
+		let (os_b, _, _, _) = read_os_stamp(&path).unwrap();
+		assert_eq!((os_b.volume, os_b.file_id), (os_a.volume, os_a.file_id));
+		assert_ne!(os_b, os_a, "rewriting file must advance OS stamp");
+		let after = FileStamp::from_os_stamp(&path, os_b, Some(old), Some(old));
+		assert_ne!(after, settled, "changed OS stamp must not reuse settled hash of earlier bytes");
+		assert!(!after.is_content_hashed(), "aged changed file should drop stale settled entry and return Os(os_b)");
+		let _ = std::fs::remove_dir_all(&dir);
+	}
 }

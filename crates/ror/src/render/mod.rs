@@ -7732,6 +7732,130 @@ mod camera_reuse_tests {
 		drop(r);
 		let _ = std::fs::remove_dir_all(&state);
 	}
+
+	/// Guards stamping the local asset URI in `Renderer::load_union`: rewriting a local CSGMDL union
+	/// under the same path must reload it instead of serving the cached earlier union geometry.
+	#[test]
+	fn rewriting_local_union_reloads_union_mesh() {
+		fn csgmdl_v2(extent_x: f32) -> Vec<u8> {
+			const CSG_KEY: [u8; 31] = [86, 46, 110, 88, 49, 32, 48, 4, 52, 105, 12, 119, 12, 1, 94, 0, 26, 96, 55, 105, 29, 82, 43, 7, 79, 36, 89, 101, 83, 4, 122];
+			let mut b = Vec::new();
+			b.extend_from_slice(b"CSGMDL");
+			b.extend_from_slice(&2u32.to_le_bytes());
+			b.extend_from_slice(&[0xAB; 32]);
+			b.extend_from_slice(&4u32.to_le_bytes());
+			b.extend_from_slice(&84u32.to_le_bytes());
+			for (i, pos) in [[0.0f32, 0.0, 0.0], [extent_x, 0.0, 0.0], [extent_x, 1.0, 0.0], [0.0, 1.0, 0.0]].iter().enumerate() {
+				for v in pos {
+					b.extend_from_slice(&v.to_le_bytes());
+				}
+				for v in [0.0f32, 0.0, 1.0] {
+					b.extend_from_slice(&v.to_le_bytes());
+				}
+				b.extend_from_slice(&[200, 100, 50, 255]);
+				b.extend_from_slice(&((i as u32 % 6) + 1).to_le_bytes());
+				b.extend_from_slice(&0.0f32.to_le_bytes());
+				b.extend_from_slice(&0.0f32.to_le_bytes());
+				b.extend_from_slice(&[0u8; 16]);
+				for v in [1.0f32, 0.0, 0.0] {
+					b.extend_from_slice(&v.to_le_bytes());
+				}
+				b.extend_from_slice(&[0u8; 16]);
+			}
+			b.extend_from_slice(&6u32.to_le_bytes());
+			for idx in [0u32, 1, 2, 0, 2, 3] {
+				b.extend_from_slice(&idx.to_le_bytes());
+			}
+			for (offset, byte) in b.iter_mut().enumerate() {
+				*byte ^= CSG_KEY[offset % CSG_KEY.len()];
+			}
+			b
+		}
+
+		let state = std::env::temp_dir().join(format!("ror-union-stamp-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&state);
+		std::fs::create_dir_all(&state).unwrap();
+		let path = state.join("part.csg");
+		let uri = format!("file:///{}", path.display().to_string().replace('\\', "/").replace(' ', "%20"));
+		let r = renderer(&state.join("state"));
+
+		std::fs::write(&path, csgmdl_v2(1.0)).unwrap();
+		let first = r.load_union(Some(&uri), None).unwrap();
+		assert!((first.bounds.1.x - 1.0).abs() < 1e-3, "first union bounds {:?}", first.bounds);
+
+		std::fs::write(&path, csgmdl_v2(5.0)).unwrap();
+		let second = r.load_union(Some(&uri), None).unwrap();
+		assert!((second.bounds.1.x - 5.0).abs() < 1e-3, "rewriting local union must reload geometry, got {:?}", second.bounds);
+
+		drop(r);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	/// Guards stamping the local URI in `Renderer::texture_pack`: rewriting a local texture-pack XML
+	/// under the same path must reload its map references instead of returning the cached pack.
+	#[test]
+	fn rewriting_local_texture_pack_reloads_pack() {
+		let state = std::env::temp_dir().join(format!("ror-pack-stamp-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&state);
+		std::fs::create_dir_all(&state).unwrap();
+		let path = state.join("pack.xml");
+		let uri = format!("file:///{}", path.display().to_string().replace('\\', "/").replace(' ', "%20"));
+		let r = renderer(&state.join("state"));
+
+		std::fs::write(&path, b"<roblox><texturepack_version>2</texturepack_version><color>111111</color></roblox>").unwrap();
+		let first = r.texture_pack(&uri).unwrap();
+		assert_eq!(first.color.as_deref(), Some("rbxassetid://111111"));
+
+		std::fs::write(&path, b"<roblox><texturepack_version>2</texturepack_version><color>222222</color></roblox>").unwrap();
+		let second = r.texture_pack(&uri).unwrap();
+		assert_eq!(second.color.as_deref(), Some("rbxassetid://222222"), "rewriting local texture pack must reload it");
+
+		drop(r);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	/// Guards stamping local skybox face URIs in `Renderer::environment`: rewriting a local skybox face
+	/// PNG must invalidate `self.skies` and `self.environments` and render the new sky colour.
+	#[test]
+	fn rewriting_local_skybox_face_reloads_sky_environment() {
+		let state = std::env::temp_dir().join(format!("ror-sky-stamp-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&state);
+		std::fs::create_dir_all(&state).unwrap();
+		let make_png = |name: &str, rgba: [u8; 4]| -> Vec<u8> {
+			let p = state.join(name);
+			crate::output::write_png(&p, 8, 8, &rgba.repeat(64), true).unwrap();
+			std::fs::read(&p).unwrap()
+		};
+		let red = make_png("red.png", [235, 30, 30, 255]);
+		let blue = make_png("blue.png", [30, 50, 235, 255]);
+		let faces: [std::path::PathBuf; 6] = std::array::from_fn(|i| state.join(format!("face_{i}.png")));
+		for p in &faces {
+			std::fs::write(p, &red).unwrap();
+		}
+		let skybox: [String; 6] = std::array::from_fn(|i| format!("file:///{}", faces[i].display().to_string().replace('\\', "/").replace(' ', "%20")));
+		let mut scene = crate::scene::Scene::default();
+		scene.environment.sky = Some(crate::scene::environment::Sky { skybox, celestial_bodies_shown: false, ..Default::default() });
+		let request = ViewRequest { width: 32, height: 32, camera: CameraSpec::LookAt { eye: [0.0, 0.0, -5.0], target: [0.0; 3], fov: 60.0 }, background: Background::Sky, bloom: false, ..Default::default() };
+
+		let r = renderer(&state.join("state"));
+		let (first, _) = r.render(&scene, std::slice::from_ref(&request)).unwrap();
+		let mid = |rgba: &[u8]| {
+			let i = ((16 * 32 + 16) * 4) as usize;
+			(rgba[i] as i32, rgba[i + 1] as i32, rgba[i + 2] as i32)
+		};
+		let (r1, _, b1) = mid(&first[0].rgba);
+		assert!(r1 > b1 + 40, "initial skybox should be red, got {r1},{b1}");
+
+		for p in &faces {
+			std::fs::write(p, &blue).unwrap();
+		}
+		let (second, _) = r.render(&scene, std::slice::from_ref(&request)).unwrap();
+		let (r2, _, b2) = mid(&second[0].rgba);
+		assert!(b2 > r2 + 40, "rewritten local skybox faces must redraw blue, got {r2},{b2}");
+
+		drop(r);
+		let _ = std::fs::remove_dir_all(&state);
+	}
 }
 
 #[cfg(test)]
