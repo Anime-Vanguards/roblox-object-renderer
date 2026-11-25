@@ -12,8 +12,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use glam::Vec3;
+use rbx_dom_weak::types::Ref;
 use serde::{Deserialize, Serialize};
 
 use super::agent;
@@ -124,6 +125,59 @@ pub struct LoopingReport {
 	pub warning: Option<String>,
 }
 
+/// One budget check (either worst frame or steady/overall mean) against [`agent::Budget`].
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineBudgetCheck {
+	pub draws: f64,
+	pub triangles: f64,
+	pub ms: f64,
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	pub over: Vec<String>,
+}
+
+/// Budget verdict over a timeline: checked against both the worst sampled frame and the steady
+/// (or climb-only / overall) mean.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineBudget {
+	pub limits: agent::Budget,
+	pub over: bool,
+	pub frames_over: usize,
+	pub frame_count: usize,
+	pub worst_frame: TimelineBudgetCheck,
+	/// Which mean was checked: `"steadyMean"`, `"climbMean"`, or `"mean"`.
+	pub mean_kind: &'static str,
+	pub mean: TimelineBudgetCheck,
+}
+
+/// Validates that `options` and `tl` contain no unsupported single-frame/cost-loop flags.
+pub fn validate_options(options: &CostOptions, tl: &TimelineOptions, view_count: usize) -> Result<()> {
+	if (tl.duration.is_some() || tl.auto_duration) && tl.times.as_deref().is_some_and(|ts| !ts.is_empty()) {
+		bail!("--duration and --times cannot be combined; pass one or the other");
+	}
+	if options.edits.is_some() || options.look || options.export.is_some() {
+		bail!("--edits (--look, --export) is not supported on timelines (--duration/--times); run single-moment cost without --duration/--times");
+	}
+	if options.items {
+		bail!("--items is not supported on timelines (--duration/--times); run single-moment cost without --duration/--times");
+	}
+	if options.heat {
+		bail!("--heat is not supported on timelines (--duration/--times); run single-moment cost without --duration/--times");
+	}
+	if options.grid.is_some() {
+		bail!("--grid is not supported on timelines (--duration/--times); run single-moment cost without --duration/--times");
+	}
+	if options.all_emitters {
+		bail!("--all-emitters (view fullest-list limit) is not supported on timelines (--duration/--times); pass --all-emitters-running for worst-case offscreen emitter simulation");
+	}
+	let has_track = tl.camera_track.as_deref().is_some_and(|t| !t.is_empty());
+	if view_count > 1 && !has_track {
+		bail!("multi-view options (--paths, --sweep, --cameras, or multiple --views/--camera-from views) are not supported on timelines (--duration/--times); pass a single camera or --camera-track");
+	}
+	Ok(())
+}
+
 /// One sampled moment along the timeline.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -218,6 +272,8 @@ pub struct TimelineReport {
 	pub pixels_counted: bool,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub memory: Option<MemoryReport>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub budget: Option<TimelineBudget>,
 	pub summary: TimelineSummary,
 	pub top_instances: Vec<TimelineInstance>,
 	pub frames: Vec<FrameCost>,
@@ -424,6 +480,49 @@ pub fn run(
 	lent_lighting: bool,
 	lend: &dyn Fn(&mut Scene) -> Result<()>,
 ) -> Result<CostReport> {
+	validate_options(options, tl, views.len())?;
+	let budget_spec = options.budget.as_deref().map(agent::Budget::parse).transpose()?;
+
+	struct ExplainAcc {
+		id: String,
+		root: Ref,
+		uid: Option<String>,
+		class: Option<String>,
+		frames: Vec<serde_json::Value>,
+		sum: Work,
+		peak_ms: f64,
+		peak_gpu_units: f64,
+		peak_draws: f64,
+		peak_triangles: f64,
+		peak_blended: f64,
+		peak_time: f64,
+		peak_frame: usize,
+		leaves: BTreeMap<String, Work>,
+	}
+	let mut explain_accs: Vec<ExplainAcc> = Vec::new();
+	if !options.explain.is_empty() {
+		let base_ids = InstanceIds::new(document);
+		for id in &options.explain {
+			let root = base_ids.require(id)?;
+			explain_accs.push(ExplainAcc {
+				id: id.clone(),
+				root,
+				uid: base_ids.uid(root).map(str::to_string),
+				class: base_ids.info(root).map(|info| info.1.clone()),
+				frames: Vec::new(),
+				sum: Work::default(),
+				peak_ms: 0.0,
+				peak_gpu_units: 0.0,
+				peak_draws: 0.0,
+				peak_triangles: 0.0,
+				peak_blended: 0.0,
+				peak_time: 0.0,
+				peak_frame: 0,
+				leaves: BTreeMap::new(),
+			});
+		}
+	}
+
 	let mut owned_playback = playback.cloned().unwrap_or_default();
 	let natural_info = owned_playback.natural_end_info(document);
 	let (times, start, duration, fps_opt) = sample_times_with_info(tl, &natural_info);
@@ -675,6 +774,45 @@ pub fn run(
 				}
 			}
 
+			for acc in &mut explain_accs {
+				let mut frame_work = Work::default();
+				let mut ordered: Vec<(String, &Work)> = view_work
+					.by_instance
+					.iter()
+					.filter(|&(referent, _)| {
+						let mut cur = *referent;
+						while !cur.is_none() {
+							if cur == acc.root {
+								return true;
+							}
+							cur = document.dom.get_by_ref(cur).map(|inst| inst.parent()).unwrap_or_else(Ref::none);
+						}
+						false
+					})
+					.map(|(referent, work)| (ids.id(*referent).unwrap_or_default().to_string(), work))
+					.collect();
+				ordered.sort_by(|a, b| a.0.cmp(&b.0));
+				for (leaf, work) in ordered {
+					frame_work.add(work);
+					acc.leaves.entry(leaf).or_default().add(work);
+				}
+				let fw = frame_work.rounded();
+				acc.sum.add(&frame_work);
+				let better_peak = acc.frames.is_empty()
+					|| fw.ms > acc.peak_ms
+					|| (desktop && fw.ms == acc.peak_ms && fw.gpu_units > acc.peak_gpu_units);
+				if better_peak {
+					acc.peak_ms = fw.ms;
+					acc.peak_time = t;
+					acc.peak_frame = frame_idx;
+				}
+				acc.peak_gpu_units = acc.peak_gpu_units.max(fw.gpu_units);
+				acc.peak_draws = acc.peak_draws.max(fw.draws);
+				acc.peak_triangles = acc.peak_triangles.max(fw.triangles);
+				acc.peak_blended = acc.peak_blended.max(fw.blended);
+				acc.frames.push(serde_json::json!({ "frame": frame_idx, "time": t, "work": fw }));
+			}
+
 			if let Some(collector) = mem_collector.as_mut() {
 				collector.add_scene(&scene, &renderer.assets);
 			}
@@ -753,7 +891,45 @@ pub fn run(
 		let ord = if desktop { ord.then_with(|| b.peak_gpu_units.total_cmp(&a.peak_gpu_units)) } else { ord };
 		ord.then_with(|| b.mean_ms.total_cmp(&a.mean_ms)).then_with(|| a.id.cmp(&b.id))
 	});
-	top_instances.truncate(TOP_INSTANCES);
+	let top_limit = options.top.unwrap_or(TOP_INSTANCES);
+	top_instances.truncate(top_limit);
+
+	let budget = budget_spec.map(|limits| {
+		let frames_over = frames.iter().filter(|f| !limits.check(f.draws, f.triangles, f.ms).is_empty()).count();
+		let worst_draws = frames.iter().map(|f| f.draws).max().unwrap_or(0);
+		let worst_tris = frames.iter().map(|f| f.triangles).max().unwrap_or(0);
+		let worst_ms = summary.ms.peak;
+		let worst_over = limits.check(worst_draws, worst_tris, worst_ms);
+		let (mean_kind, mean_sum) = match &looping {
+			Some(l) => match &l.steady_state {
+				Some(steady) => ("steadyMean", steady),
+				None => ("climbMean", &summary),
+			},
+			None => ("mean", &summary),
+		};
+		let mean_over = limits.check_f64(mean_sum.draws.mean, mean_sum.triangles.mean, mean_sum.ms.mean);
+		let over = !worst_over.is_empty() || !mean_over.is_empty() || frames_over > 0;
+		TimelineBudget {
+			limits,
+			over,
+			frames_over,
+			frame_count: frames.len(),
+			worst_frame: TimelineBudgetCheck {
+				draws: worst_draws as f64,
+				triangles: worst_tris as f64,
+				ms: worst_ms,
+				over: worst_over,
+			},
+			mean_kind,
+			mean: TimelineBudgetCheck {
+				draws: mean_sum.draws.mean,
+				triangles: mean_sum.triangles.mean,
+				ms: mean_sum.ms.mean,
+				over: mean_over,
+			},
+		}
+	});
+	let over_budget = budget.as_ref().map_or(0, |b| if b.over { b.frames_over.max(1) } else { 0 });
 
 	let mut fidelity = prices::fidelity(&preset, options.pixels);
 	if let Some(map) = fidelity.as_object_mut() {
@@ -802,13 +978,65 @@ pub fn run(
 		looping,
 		pixels_counted: options.pixels,
 		memory: memory.clone(),
+		budget,
 		summary,
 		top_instances,
 		frames,
 	};
 
 	crate::output::write_json_atomic(&out.join("timeline.json"), &report, true)?;
-	let text_lines = format_lines(&report, desktop);
+	let mut text_lines = format_lines(&report, desktop, options.top.unwrap_or(8), options.fail_over_budget);
+	for acc in explain_accs {
+		let mean = acc.sum.scaled(1.0 / n_frames).rounded();
+		let mut ranked: Vec<(String, Work)> = acc
+			.leaves
+			.into_iter()
+			.map(|(leaf, work)| (leaf, work.scaled(1.0 / n_frames).rounded()))
+			.collect();
+		ranked.sort_by(|a, b| {
+			let ord = b.1.ms.total_cmp(&a.1.ms);
+			let ord = if desktop { ord.then_with(|| b.1.gpu_units.total_cmp(&a.1.gpu_units)) } else { ord };
+			ord.then_with(|| a.0.cmp(&b.0))
+		});
+		let explained = serde_json::json!({
+			"schema": "ror-cost-timeline-explain/1",
+			"id": acc.id,
+			"uid": acc.uid,
+			"class": acc.class,
+			"frameCount": acc.frames.len(),
+			"summary": {
+				"mean": mean,
+				"peakMs": round4(acc.peak_ms),
+				"peakTime": round6(acc.peak_time),
+				"peakFrame": acc.peak_frame,
+				"peakGpuUnits": round4(acc.peak_gpu_units),
+				"peakDraws": round4(acc.peak_draws),
+				"peakTriangles": round4(acc.peak_triangles),
+				"peakBlended": round4(acc.peak_blended),
+			},
+			"frames": acc.frames,
+			"costliest": ranked.iter().take(50).map(|(leaf, work)| serde_json::json!({ "id": leaf, "mean": work })).collect::<Vec<_>>(),
+		});
+		let explain_file = format!("explain-{}.json", agent::file_name(&acc.id));
+		crate::output::write_json_atomic(&out.join(&explain_file), &explained, true)?;
+		text_lines.push(format!(
+			"explain {} (timeline, {} frames; {explain_file}): mean {:.2} ms, peak {:.2} ms at t={:.3}s (frame {}), peak {:.1} draws, peak {:.2} gpuUnits",
+			acc.id,
+			report.frame_count,
+			mean.ms,
+			acc.peak_ms,
+			acc.peak_time,
+			acc.peak_frame,
+			acc.peak_draws,
+			acc.peak_gpu_units
+		));
+		for (leaf, work) in ranked.iter().take(5) {
+			text_lines.push(format!(
+				"  mean {:>6.2} ms  {:.2} draws {:.0} tris {:.2} gpuUnits  {leaf}",
+				work.ms, work.draws, work.triangles, work.gpu_units
+			));
+		}
+	}
 	crate::output::write_atomic(&out.join("analysis.txt"), (text_lines.join("\n") + "\n").as_bytes())?;
 
 	Ok(CostReport {
@@ -823,11 +1051,11 @@ pub fn run(
 		lines: Vec::new(),
 		warnings,
 		agent: text_lines,
-		over_budget: 0,
+		over_budget,
 	})
 }
 
-fn format_lines(report: &TimelineReport, desktop: bool) -> Vec<String> {
+fn format_lines(report: &TimelineReport, desktop: bool, top_shown: usize, fail_over_budget: bool) -> Vec<String> {
 	let mut lines = Vec::new();
 	let quality_label = match report.quality.client_level {
 		Some(bar) => format!("quality {} (client bar {bar}, {:.0} studs)", report.quality.level, report.quality.view_distance),
@@ -955,9 +1183,54 @@ fn format_lines(report: &TimelineReport, desktop: bool) -> Vec<String> {
 	if let Some(memory) = &report.memory {
 		lines.push(memory::summary_line(memory, !desktop));
 	}
-	if !report.top_instances.is_empty() {
+	if let Some(budget) = &report.budget {
+		let verdict = if budget.over { "OVER" } else { "PASS" };
+		lines.push(format!(
+			"budget {} ({} draws, {}k triangles, {:.2} ms): {verdict} ({} of {} frames over)",
+			budget.limits.name,
+			budget.limits.draws,
+			budget.limits.triangles / 1000,
+			budget.limits.ms,
+			budget.frames_over,
+			budget.frame_count
+		));
+		let worst_v = if budget.worst_frame.over.is_empty() {
+			"PASS".to_string()
+		} else {
+			format!("OVER ({})", budget.worst_frame.over.join(", "))
+		};
+		lines.push(format!(
+			"  worst frame: {worst_v} [{:.0} draws, {:.0}k tris, {:.2} ms]",
+			budget.worst_frame.draws,
+			budget.worst_frame.triangles / 1000.0,
+			budget.worst_frame.ms
+		));
+		let mean_label = match budget.mean_kind {
+			"steadyMean" => format!(
+				"steady mean (t>={:.2}s)",
+				report.looping.as_ref().map_or(0.0, |l| l.steady_state_at)
+			),
+			"climbMean" => "climb-only mean (before steady state)".to_string(),
+			_ => "mean".to_string(),
+		};
+		let mean_v = if budget.mean.over.is_empty() {
+			"PASS".to_string()
+		} else {
+			format!("OVER ({})", budget.mean.over.join(", "))
+		};
+		lines.push(format!(
+			"  {mean_label}: {mean_v} [{:.1} draws, {:.0}k tris, {:.2} ms]",
+			budget.mean.draws,
+			budget.mean.triangles / 1000.0,
+			budget.mean.ms
+		));
+		if fail_over_budget && budget.over {
+			lines.push("over budget: timeline failed --fail-over-budget".into());
+		}
+	}
+	if !report.top_instances.is_empty() && top_shown > 0 {
 		lines.push("peak costing instances across timeline:".into());
-		for inst in report.top_instances.iter().take(8) {
+		for inst in report.top_instances.iter().take(top_shown) {
 			lines.push(format!(
 				"  peak {:>7.2} ms (t={:.3}s, mean {:>6.2} ms, peak {:>5.2} gpuUnits, peak {:>4.0} draws)  {}",
 				inst.peak_ms, inst.peak_time, inst.mean_ms, inst.peak_gpu_units, inst.peak_draws, inst.id
@@ -965,6 +1238,90 @@ fn format_lines(report: &TimelineReport, desktop: bool) -> Vec<String> {
 		}
 	}
 	lines
+}
+
+/// Compares a timeline report JSON against an earlier timeline run's `timeline.json` in `before_dir`.
+pub fn compare_timelines(after: &serde_json::Value, before_dir: &Path) -> Result<Vec<String>> {
+	let file = before_dir.join("timeline.json");
+	let before: serde_json::Value = serde_json::from_slice(
+		&std::fs::read(&file).with_context(|| format!("--compare: reading {} (timeline --compare expects an earlier timeline output folder)", file.display()))?,
+	)?;
+	if before.get("schema").and_then(|v| v.as_str()) != Some(TIMELINE_SCHEMA) {
+		bail!("--compare: {} is not a {TIMELINE_SCHEMA} file", file.display());
+	}
+	let mut lines = vec![format!(
+		"compared timeline with {} ({} -> {} frames):",
+		before_dir.display(),
+		before["frameCount"].as_u64().unwrap_or(0),
+		after["frameCount"].as_u64().unwrap_or(0)
+	)];
+	let b_preset = before.pointer("/preset/name").and_then(|v| v.as_str()).unwrap_or("?");
+	let a_preset = after.pointer("/preset/name").and_then(|v| v.as_str()).unwrap_or("?");
+	if b_preset != a_preset {
+		lines.push(format!("  warning: preset changed ({b_preset} -> {a_preset})"));
+	}
+	let b_off = before.pointer("/offscreenEmitters/rule").and_then(|v| v.as_str()).unwrap_or("?");
+	let a_off = after.pointer("/offscreenEmitters/rule").and_then(|v| v.as_str()).unwrap_or("?");
+	if b_off != a_off {
+		lines.push(format!("  warning: offscreen emitters rule changed ({b_off} -> {a_off})"));
+	}
+	let num = |root: &serde_json::Value, ptr: &str| root.pointer(ptr).and_then(|v| v.as_f64()).unwrap_or(0.0);
+	let delta = |base: &serde_json::Value, curr: &serde_json::Value, ptr: &str, label: &str, digits: usize| -> String {
+		let (a, b) = (num(base, ptr), num(curr, ptr));
+		let pct = if a.abs() > 1e-9 { format!(" ({:+.1}%)", 100.0 * (b - a) / a) } else { String::new() };
+		format!("{label} {a:.digits$} -> {b:.digits$}{pct}")
+	};
+	let compare_summary = |lines: &mut Vec<String>, label: &str, b_sum: &serde_json::Value, a_sum: &serde_json::Value, show_integral: bool| {
+		let mut ms_line = format!(
+			"  {label} ms: {}, {}, {}",
+			delta(b_sum, a_sum, "/ms/mean", "mean", 2),
+			delta(b_sum, a_sum, "/ms/p95", "p95", 2),
+			delta(b_sum, a_sum, "/ms/peak", "peak", 2),
+		);
+		if show_integral {
+			ms_line.push_str(&format!(", {}", delta(b_sum, a_sum, "/ms/integral", "integral", 2)));
+		}
+		lines.push(ms_line);
+		lines.push(format!(
+			"  {label} counts: {}, {}, {}, {}, {}",
+			delta(b_sum, a_sum, "/draws/mean", "draws mean", 1),
+			delta(b_sum, a_sum, "/draws/peak", "peak", 0),
+			delta(b_sum, a_sum, "/triangles/mean", "tris mean", 0),
+			delta(b_sum, a_sum, "/particles/mean", "particles mean", 1),
+			delta(b_sum, a_sum, "/blendedViewports/mean", "blended vp", 2),
+		));
+		lines.push(format!(
+			"  {label} gpuUnits: {}, {}",
+			delta(b_sum, a_sum, "/gpuUnits/mean", "mean", 2),
+			delta(b_sum, a_sum, "/gpuUnits/peak", "peak", 2),
+		));
+	};
+	if let (Some(b_st), Some(a_st)) = (before.pointer("/looping/steadyState"), after.pointer("/looping/steadyState"))
+		&& b_st.is_object()
+		&& a_st.is_object()
+	{
+		compare_summary(&mut lines, "steady-state", b_st, a_st, false);
+	}
+	compare_summary(&mut lines, "whole-run", &before["summary"], &after["summary"], true);
+	if let (Some(b_mem), Some(a_mem)) = (before.get("memory"), after.get("memory"))
+		&& b_mem.is_object()
+		&& a_mem.is_object()
+	{
+		let mb = |root: &serde_json::Value, ptr: &str| num(root, ptr) / (1024.0 * 1024.0);
+		let desktop = a_preset == "desktop";
+		let (field, tag) = if desktop { ("/totalGpuBytes/desktopBc", "BCn") } else { ("/totalGpuBytes/mobileEtc2", "ETC2") };
+		let (ba, aa) = (mb(b_mem, field), mb(a_mem, field));
+		let pct = if ba.abs() > 1e-9 { format!(" ({:+.1}%)", 100.0 * (aa - ba) / ba) } else { String::new() };
+		let b_partial = b_mem.get("partial").and_then(|v| v.as_bool()).unwrap_or(false);
+		let a_partial = a_mem.get("partial").and_then(|v| v.as_bool()).unwrap_or(false);
+		let caveat = if b_partial || a_partial {
+			format!(" [PARTIAL: before partial={b_partial}, after partial={a_partial}; missing assets excluded]")
+		} else {
+			String::new()
+		};
+		lines.push(format!("  memory ({tag} est GPU upper bound): {ba:.2} -> {aa:.2} MB{pct}{caveat}"));
+	}
+	Ok(lines)
 }
 
 #[cfg(test)]
@@ -1414,6 +1771,182 @@ mod tests {
 		assert_eq!(j_start["looping"]["climbFrames"], 0);
 		assert_eq!(j_start["looping"]["steadyFrames"], 10);
 		assert!(j_start["looping"]["climb"].is_null());
+		let _ = std::fs::remove_dir_all(&temp);
+	}
+
+	#[test]
+	fn timeline_budget_checks_worst_frame_and_steady_mean_and_reports_over_budget() {
+		let temp = std::env::temp_dir().join(format!("ror-timeline-budget-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&temp);
+		std::fs::create_dir_all(&temp).unwrap();
+		let renderer = make_test_renderer(&temp.join("cache"));
+
+		// Looping emitter + short burst so worst frame > steady mean.
+		let mut model = ModelBuilder::new("BudgetFx");
+		let host = model.part(&PartSpec { name: "Host".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, 2.0, 0.0)), size: Vec3::ONE, transparency: 1.0, ..Default::default() });
+		model.child(
+			host,
+			InstanceBuilder::new("ParticleEmitter")
+				.with_name("Endless")
+				.with_property("Rate", 20.0f32)
+				.with_property("Lifetime", NumberRange::new(1.0, 1.0))
+				.with_property("Speed", NumberRange::new(1.0, 1.0))
+				.with_property("Enabled", true),
+		);
+		model.child(
+			host,
+			InstanceBuilder::new("ParticleEmitter")
+				.with_name("Burst")
+				.with_property("Rate", 0.0f32)
+				.with_property("Lifetime", NumberRange::new(0.3, 0.3))
+				.with_property("Speed", NumberRange::new(1.0, 1.0))
+				.with_property("Enabled", false),
+		);
+		let mut doc = model.into_document();
+		let pb = Playback {
+			actions: vec![Action { at: 0.2, target: "BudgetFx.Host.Burst".into(), emit: Some(Emit::Count(10)), ..Default::default() }],
+			..Default::default()
+		};
+		let views = vec![NamedView {
+			name: "render".into(),
+			view: crate::render::ViewRequest {
+				width: 1280,
+				height: 720,
+				camera: CameraSpec::LookAt { eye: [0.0, 2.0, 15.0], target: [0.0, 2.0, 0.0], fov: 60.0 },
+				..Default::default()
+			},
+		}];
+		let tl_opts = TimelineOptions { start: 0.0, duration: None, auto_duration: true, fps: 10.0, times: None, camera_track: None, all_emitters_running: false };
+
+		// 1) Generous budget passes cleanly (over_budget == 0).
+		let out_pass = temp.join("pass");
+		std::fs::create_dir_all(&out_pass).unwrap();
+		let pass_opts = CostOptions { attribute: true, pixels: false, no_images: true, budget: Some("draws=500,triangles=500k,ms=50".into()), fail_over_budget: true, ..Default::default() };
+		let rep_pass = run(&renderer, &mut doc, Some(&pb), &pass_opts, &tl_opts, &views, None, None, &out_pass, None, "budget.rbxmx", false, &|_| Ok(())).unwrap();
+		assert_eq!(rep_pass.over_budget, 0);
+		let j_pass: serde_json::Value = serde_json::from_slice(&std::fs::read(out_pass.join("timeline.json")).unwrap()).unwrap();
+		let t_pass = std::fs::read_to_string(out_pass.join("analysis.txt")).unwrap();
+		assert_eq!(j_pass["budget"]["over"], false);
+		assert_eq!(j_pass["budget"]["meanKind"], "steadyMean");
+		assert!(t_pass.contains("budget custom") && t_pass.contains(": PASS"));
+		assert!(t_pass.contains("worst frame: PASS"));
+		assert!(t_pass.contains("steady mean (t>=1.00s): PASS"));
+
+		// 2) Tight budget (draws=1) fails BOTH worst frame and steady mean -> over_budget > 0.
+		let out_fail = temp.join("fail");
+		std::fs::create_dir_all(&out_fail).unwrap();
+		let fail_opts = CostOptions { attribute: true, pixels: false, no_images: true, budget: Some("draws=1".into()), fail_over_budget: true, ..Default::default() };
+		let rep_fail = run(&renderer, &mut doc, Some(&pb), &fail_opts, &tl_opts, &views, None, None, &out_fail, None, "budget.rbxmx", false, &|_| Ok(())).unwrap();
+		assert!(rep_fail.over_budget > 0, "over-budget timeline must set CostReport.over_budget > 0");
+		let j_fail: serde_json::Value = serde_json::from_slice(&std::fs::read(out_fail.join("timeline.json")).unwrap()).unwrap();
+		let t_fail = std::fs::read_to_string(out_fail.join("analysis.txt")).unwrap();
+		assert_eq!(j_fail["budget"]["over"], true);
+		assert_eq!(j_fail["budget"]["meanKind"], "steadyMean");
+		assert!(!j_fail["budget"]["worstFrame"]["over"].as_array().unwrap().is_empty());
+		assert!(!j_fail["budget"]["mean"]["over"].as_array().unwrap().is_empty());
+		assert!(t_fail.contains("worst frame: OVER"));
+		assert!(t_fail.contains("steady mean (t>=1.00s): OVER"));
+		assert!(t_fail.contains("over budget: timeline failed --fail-over-budget"));
+
+		// 3) Budget between steady draws and burst worst-frame draws fails worst frame ONLY.
+		let steady_draws = j_pass["looping"]["steadyState"]["draws"]["mean"].as_f64().unwrap();
+		let peak_draws = j_pass["summary"]["draws"]["peak"].as_f64().unwrap();
+		assert!(peak_draws > steady_draws, "burst must lift worst-frame draws ({peak_draws}) above steady mean ({steady_draws})");
+		let mid = steady_draws.ceil() as u64;
+		let out_worst = temp.join("worst_only");
+		std::fs::create_dir_all(&out_worst).unwrap();
+		let worst_opts = CostOptions { attribute: true, pixels: false, no_images: true, budget: Some(format!("draws={mid}")), fail_over_budget: true, ..Default::default() };
+		let rep_worst = run(&renderer, &mut doc, Some(&pb), &worst_opts, &tl_opts, &views, None, None, &out_worst, None, "budget.rbxmx", false, &|_| Ok(())).unwrap();
+		assert!(rep_worst.over_budget > 0);
+		let j_worst: serde_json::Value = serde_json::from_slice(&std::fs::read(out_worst.join("timeline.json")).unwrap()).unwrap();
+		assert!(!j_worst["budget"]["worstFrame"]["over"].as_array().unwrap().is_empty());
+		assert!(j_worst["budget"]["mean"].get("over").is_none());
+
+		// 4) Short duration before steady state labels budget mean check as climbMean.
+		let out_climb = temp.join("climb_mean");
+		std::fs::create_dir_all(&out_climb).unwrap();
+		let tl_short = TimelineOptions { start: 0.0, duration: Some(0.5), auto_duration: false, fps: 10.0, times: None, camera_track: None, all_emitters_running: false };
+		run(&renderer, &mut doc, None, &fail_opts, &tl_short, &views, None, None, &out_climb, None, "budget.rbxmx", false, &|_| Ok(())).unwrap();
+		let j_climb: serde_json::Value = serde_json::from_slice(&std::fs::read(out_climb.join("timeline.json")).unwrap()).unwrap();
+		let t_climb = std::fs::read_to_string(out_climb.join("analysis.txt")).unwrap();
+		assert_eq!(j_climb["budget"]["meanKind"], "climbMean");
+		assert!(t_climb.contains("climb-only mean (before steady state): OVER"));
+		let _ = std::fs::remove_dir_all(&temp);
+	}
+
+	#[test]
+	fn timeline_explain_compare_top_and_refusals_work_end_to_end() {
+		let temp = std::env::temp_dir().join(format!("ror-timeline-flags-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&temp);
+		std::fs::create_dir_all(&temp).unwrap();
+		let renderer = make_test_renderer(&temp.join("cache"));
+		let (mut doc, pb) = build_dynamic_scene();
+
+		let views = vec![NamedView {
+			name: "render".into(),
+			view: crate::render::ViewRequest {
+				width: 1280,
+				height: 720,
+				camera: CameraSpec::LookAt { eye: [0.0, 8.0, 22.0], target: [0.0, 2.0, 0.0], fov: 70.0 },
+				..Default::default()
+			},
+		}];
+		let tl_opts = TimelineOptions { start: 0.0, duration: Some(0.5), auto_duration: false, fps: 10.0, times: None, camera_track: None, all_emitters_running: false };
+
+		// --explain + --top honoured.
+		let out_a = temp.join("before");
+		std::fs::create_dir_all(&out_a).unwrap();
+		let opts_a = CostOptions { attribute: true, pixels: false, no_images: true, top: Some(1), explain: vec!["Root.Mover".into()], ..Default::default() };
+		run(&renderer, &mut doc, Some(&pb), &opts_a, &tl_opts, &views, None, None, &out_a, None, "test.rbxm", false, &|_| Ok(())).unwrap();
+		let j_a: serde_json::Value = serde_json::from_slice(&std::fs::read(out_a.join("timeline.json")).unwrap()).unwrap();
+		let t_a = std::fs::read_to_string(out_a.join("analysis.txt")).unwrap();
+		assert_eq!(j_a["topInstances"].as_array().unwrap().len(), 1, "--top 1 must cap topInstances");
+		let exp: serde_json::Value = serde_json::from_slice(&std::fs::read(out_a.join("explain-Root.Mover.json")).unwrap()).unwrap();
+		assert_eq!(exp["schema"], "ror-cost-timeline-explain/1");
+		assert_eq!(exp["id"], "Root.Mover");
+		assert_eq!(exp["frameCount"], 5);
+		assert!(exp["summary"]["peakMs"].as_f64().unwrap() > 0.0);
+		assert!(t_a.contains("explain Root.Mover (timeline, 5 frames; explain-Root.Mover.json):"), "{t_a}");
+
+		// Invalid --explain ID errors cleanly instead of silently ignoring.
+		let out_bad = temp.join("bad_explain");
+		std::fs::create_dir_all(&out_bad).unwrap();
+		let opts_bad = CostOptions { attribute: true, pixels: false, no_images: true, explain: vec!["Root.DoesNotExist".into()], ..Default::default() };
+		assert!(run(&renderer, &mut doc, Some(&pb), &opts_bad, &tl_opts, &views, None, None, &out_bad, None, "test.rbxm", false, &|_| Ok(())).is_err());
+
+		// --compare compares two timeline runs and warns on rule/preset changes.
+		let out_b = temp.join("after");
+		std::fs::create_dir_all(&out_b).unwrap();
+		let mut pb_smaller = pb.clone();
+		pb_smaller.actions[0].emit = Some(Emit::Count(5));
+		let tl_b = TimelineOptions { all_emitters_running: true, ..tl_opts.clone() };
+		let opts_b = CostOptions { attribute: true, pixels: false, no_images: true, ..Default::default() };
+		run(&renderer, &mut doc, Some(&pb_smaller), &opts_b, &tl_b, &views, None, None, &out_b, None, "test.rbxm", false, &|_| Ok(())).unwrap();
+		let j_b: serde_json::Value = serde_json::from_slice(&std::fs::read(out_b.join("timeline.json")).unwrap()).unwrap();
+		let cmp_lines = compare_timelines(&j_b, &out_a).unwrap();
+		let cmp_text = cmp_lines.join("\n");
+		assert!(cmp_text.contains("compared timeline with"), "{cmp_text}");
+		assert!(cmp_text.contains("offscreen emitters rule changed (paused-out-of-view -> all-running)"), "{cmp_text}");
+		assert!(cmp_text.contains("particles mean"), "{cmp_text}");
+
+		// validate_options refuses every unsupported cost-loop / multi-view flag.
+		let edits = crate::cost::edits::EditsFile::read(r#"{"edits":[{"op":"hide","targets":["Root.Floor"]}]}"#).unwrap();
+		let base_opts = CostOptions::default();
+		let cases: Vec<(CostOptions, TimelineOptions, usize, &str)> = vec![
+			(CostOptions { edits: Some(edits), ..base_opts.clone() }, tl_opts.clone(), 1, "--edits"),
+			(CostOptions { look: true, ..base_opts.clone() }, tl_opts.clone(), 1, "--edits"),
+			(CostOptions { export: Some(temp.join("kit")), ..base_opts.clone() }, tl_opts.clone(), 1, "--edits"),
+			(CostOptions { items: true, ..base_opts.clone() }, tl_opts.clone(), 1, "--items"),
+			(CostOptions { heat: true, ..base_opts.clone() }, tl_opts.clone(), 1, "--heat"),
+			(CostOptions { grid: Some(20.0), ..base_opts.clone() }, tl_opts.clone(), 1, "--grid"),
+			(CostOptions { all_emitters: true, ..base_opts.clone() }, tl_opts.clone(), 1, "--all-emitters"),
+			(base_opts.clone(), tl_opts.clone(), 4, "multi-view"),
+			(base_opts, TimelineOptions { times: Some(vec![0.0, 0.5]), ..tl_opts }, 1, "--duration and --times"),
+		];
+		for (o, t, vc, expected) in cases {
+			let err = validate_options(&o, &t, vc).expect_err(&format!("expected refusal containing {expected}"));
+			assert!(err.to_string().contains(expected), "expected {expected} in {err}");
+		}
 		let _ = std::fs::remove_dir_all(&temp);
 	}
 }

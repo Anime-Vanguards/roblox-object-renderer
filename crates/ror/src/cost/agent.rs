@@ -85,13 +85,27 @@ impl Budget {
 		Ok(budget)
 	}
 
-	fn check(&self, draws: u64, triangles: u64, ms: f64) -> Vec<String> {
+	pub(crate) fn check(&self, draws: u64, triangles: u64, ms: f64) -> Vec<String> {
 		let mut over = Vec::new();
 		if draws > self.draws {
 			over.push(format!("draws {draws} > {}", self.draws));
 		}
 		if triangles > self.triangles {
 			over.push(format!("triangles {triangles} > {}", self.triangles));
+		}
+		if ms > self.ms {
+			over.push(format!("ms {ms:.2} > {:.2}", self.ms));
+		}
+		over
+	}
+
+	pub(crate) fn check_f64(&self, draws: f64, triangles: f64, ms: f64) -> Vec<String> {
+		let mut over = Vec::new();
+		if draws > self.draws as f64 {
+			over.push(format!("draws {draws:.1} > {}", self.draws));
+		}
+		if triangles > self.triangles as f64 {
+			over.push(format!("triangles {triangles:.0} > {}", self.triangles));
 		}
 		if ms > self.ms {
 			over.push(format!("ms {ms:.2} > {:.2}", self.ms));
@@ -357,7 +371,7 @@ pub fn run(setup: &Setup, scene: &Scene, document: &Document, reload: Option<&dy
 	Ok((costed, lines))
 }
 
-fn file_name(id: &str) -> String {
+pub(crate) fn file_name(id: &str) -> String {
 	id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }).collect::<String>().chars().take(80).collect()
 }
 

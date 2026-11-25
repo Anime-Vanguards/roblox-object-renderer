@@ -1639,7 +1639,66 @@ fn path_views(document: &ror::scene::load::Document, count: usize, fov: f32) -> 
 	views
 }
 
+/// Validates CLI flags that interact with multi-frame timelines (`--duration` / `--times`).
+/// Rejects single-frame / cost-loop flags that timelines do not run so no flag is silently ignored.
+fn validate_cost_timeline_args(args: &CostArgs, view_count: Option<usize>) -> Result<()> {
+	let is_timeline = args.duration.is_some() || args.times.is_some();
+	if !is_timeline {
+		if args.camera_track.is_some() {
+			bail!("--camera-track requires --duration or --times");
+		}
+		if args.all_emitters_running {
+			bail!("--all-emitters-running requires --duration or --times");
+		}
+		if args.start.is_some() {
+			bail!("--start requires --duration");
+		}
+		if args.fps.is_some() {
+			bail!("--fps requires --duration");
+		}
+		return Ok(());
+	}
+	if args.duration.is_some() && args.times.is_some() {
+		bail!("--duration and --times cannot be combined; pass one or the other");
+	}
+	if args.time.is_some() {
+		bail!("--time cannot be combined with --duration or --times");
+	}
+	if args.times.is_some() && (args.start.is_some() || args.fps.is_some()) {
+		bail!("--start and --fps go with --duration, not --times");
+	}
+	if args.edits.is_some() || args.look || args.export.is_some() {
+		bail!("--edits (--look, --export) is not supported on timelines (--duration/--times); run single-moment cost without --duration/--times");
+	}
+	if args.check || args.profile {
+		bail!("--check (--profile) is not supported on timelines (--duration/--times); run single-moment cost without --duration/--times");
+	}
+	if args.items {
+		bail!("--items is not supported on timelines (--duration/--times); run single-moment cost without --duration/--times");
+	}
+	if args.heat {
+		bail!("--heat is not supported on timelines (--duration/--times); run single-moment cost without --duration/--times");
+	}
+	if args.grid.is_some() || args.region.is_some() {
+		bail!("--grid (--region) is not supported on timelines (--duration/--times); run single-moment cost without --duration/--times");
+	}
+	if args.all_emitters {
+		bail!("--all-emitters (view fullest-list limit) is not supported on timelines (--duration/--times); pass --all-emitters-running for worst-case offscreen emitter simulation");
+	}
+	if args.paths.is_some() || args.sweep.is_some() || args.cameras.is_some() {
+		bail!("multi-view options (--paths, --sweep, --cameras) are not supported on timelines (--duration/--times); pass a single camera or --camera-track");
+	}
+	if let Some(count) = view_count
+		&& count > 1
+		&& args.camera_track.is_none()
+	{
+		bail!("multiple views ({count}) are not supported on timelines (--duration/--times); pass a single camera or --camera-track");
+	}
+	Ok(())
+}
+
 fn cost(mut args: CostArgs) -> Result<()> {
+	validate_cost_timeline_args(&args, None)?;
 	if let Some(studio) = &args.studio {
 		let bytes = ror::studio::export::export(studio, &args.input, true)?;
 		let name: String = args.input.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
@@ -1738,6 +1797,7 @@ fn cost(mut args: CostArgs) -> Result<()> {
 			view.view.camera = cameras.get(&view.name).cloned().with_context(|| format!("--camera-from {}: it has no view {:?} (it has {})", dir.display(), view.name, names()))?;
 		}
 	}
+	validate_cost_timeline_args(&args, Some(views.len()))?;
 	// a grid counts each cell's draws and triangles from above; the cost loop needs views
 	if args.grid.is_some() {
 		let loop_flags = [("--edits", args.edits.is_some()), ("--explain", !args.explain.is_empty()), ("--heat", args.heat), ("--budget", args.budget.is_some()), ("--preset", args.preset.is_some()), ("--pixel-scale", args.pixel_scale.is_some())];
@@ -1894,7 +1954,14 @@ fn cost(mut args: CostArgs) -> Result<()> {
 	}
 	let over_budget = report.get("overBudget").and_then(|value| value.as_u64()).unwrap_or(0);
 	if let Some(dir) = &args.compare {
-		for line in cost_compare(&report, dir)? {
+		let lines = if is_timeline {
+			let after_file = out.join("timeline.json");
+			let after: serde_json::Value = serde_json::from_slice(&std::fs::read(&after_file).with_context(|| format!("--compare: reading {}", after_file.display()))?)?;
+			ror::cost::timeline::compare_timelines(&after, dir)?
+		} else {
+			cost_compare(&report, dir)?
+		};
+		for line in lines {
 			println!("{line}");
 		}
 	}
@@ -1905,7 +1972,11 @@ fn cost(mut args: CostArgs) -> Result<()> {
 		bail!("--check needs Windows (the capture Studio)");
 	}
 	if args.fail_over_budget && over_budget > 0 {
-		eprintln!("ror cost: {over_budget} views over the budget");
+		if is_timeline {
+			eprintln!("ror cost: timeline over budget ({over_budget} over)");
+		} else {
+			eprintln!("ror cost: {over_budget} views over the budget");
+		}
 		std::process::exit(2);
 	}
 	Ok(())
@@ -2340,5 +2411,58 @@ mod tests {
 	fn studio_capture_distinguishes_an_omitted_output_from_an_explicit_one() {
 		assert_eq!(capture_out(&[]), None);
 		assert_eq!(capture_out(&["--out", "out/studio-capture.png"]), Some(PathBuf::from("out/studio-capture.png")));
+	}
+
+	fn parse_cost(extra: &[&str]) -> CostArgs {
+		let argv = ["ror", "cost", "fx.rbxmx"].into_iter().chain(extra.iter().copied());
+		match Cli::try_parse_from(argv).expect("CLI parse").command {
+			Command::Cost(args) => args,
+			_ => panic!("expected cost command"),
+		}
+	}
+
+	#[test]
+	fn cost_timeline_cli_flag_validation_honours_or_refuses_every_flag() {
+		// Supported timeline flags pass validation.
+		for ok in [
+			&["--duration", "1"][..],
+			&["--duration", "auto", "--start", "0.5", "--fps", "20", "--budget", "phone", "--fail-over-budget", "--compare", "before", "--explain", "Root.Fx", "--top", "5", "--memory", "--preset", "phone", "--all-emitters-running"][..],
+			&["--times", "0.0,0.5,1.0", "--camera-track", "cam.json", "--budget", "draws=10"][..],
+		] {
+			let args = parse_cost(ok);
+			assert!(validate_cost_timeline_args(&args, Some(1)).is_ok(), "should accept {ok:?}");
+		}
+
+		// Unsupported flags on timelines are refused with crisp messages naming the flag.
+		let refused: &[(&[&str], Option<usize>, &str)] = &[
+			(&["--duration", "1", "--times", "0,1"], None, "--duration and --times"),
+			(&["--duration", "1", "--time", "0.5"], None, "--time"),
+			(&["--times", "0,1", "--start", "0.5"], None, "--start and --fps"),
+			(&["--times", "0,1", "--fps", "20"], None, "--start and --fps"),
+			(&["--duration", "1", "--edits", "edits.json"], None, "--edits"),
+			(&["--duration", "1", "--edits", "edits.json", "--look"], None, "--edits"),
+			(&["--duration", "1", "--edits", "edits.json", "--export", "out/kit"], None, "--edits"),
+			(&["--duration", "1", "--check"], None, "--check"),
+			(&["--duration", "1", "--check", "--profile"], None, "--check"),
+			(&["--duration", "1", "--items"], None, "--items"),
+			(&["--duration", "1", "--heat"], None, "--heat"),
+			(&["--duration", "1", "--grid", "20"], None, "--grid"),
+			(&["--duration", "1", "--grid", "20", "--region", "0,0,10,10"], None, "--grid"),
+			(&["--duration", "1", "--all-emitters"], None, "--all-emitters"),
+			(&["--duration", "1", "--paths", "2"], None, "multi-view"),
+			(&["--duration", "1", "--sweep", "2"], None, "multi-view"),
+			(&["--duration", "1", "--cameras", "cams.json"], None, "multi-view"),
+			(&["--duration", "1", "--views", "front,back"], Some(2), "multiple views"),
+			(&["--camera-track", "cam.json"], None, "--camera-track"),
+			(&["--all-emitters-running"], None, "--all-emitters-running"),
+			(&["--start", "1"], None, "--start"),
+			(&["--fps", "20"], None, "--fps"),
+		];
+		for (argv, view_count, expected) in refused {
+			let args = parse_cost(argv);
+			let err = validate_cost_timeline_args(&args, *view_count).expect_err(&format!("expected refusal for {argv:?}"));
+			let msg = err.to_string();
+			assert!(msg.contains(expected), "refusal for {argv:?} should mention {expected:?}, got {msg:?}");
+		}
 	}
 }
