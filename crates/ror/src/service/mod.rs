@@ -1,10 +1,8 @@
 //! The render service: one warm process per state dir that keeps the GPU device, pipelines,
 //! meshes, textures and parsed models loaded while jobs come, and runs many callers' render jobs at
-//! once. Quiet `ROR_QUIET_TRIM` s (default 10 s), it trims transient idle render targets and
-//! preparations in-process while keeping its GPU device and warm asset/scene caches hot; quiet
-//! `ROR_QUIET_RELEASE` s (default 120 s), it hands over to a dormant copy of itself, which holds
-//! the GPU's instance and adapter but no device, and makes the device again for the next job
-//! ([`State::go_dormant`]).
+//! once. Quiet `ROR_QUIET_RELEASE` s (default 10 s), it hands over to a dormant copy of itself,
+//! which holds the GPU's instance and adapter but no device, and makes the device again for the
+//! next job ([`State::go_dormant`]).
 //!
 //! `ror serve` listens on 127.0.0.1 (a port the OS assigns) and records it in
 //! `<state dir>/services/<build>.json` and, as the latest service, `<state dir>/service.json`;
@@ -249,11 +247,15 @@ impl State {
 	/// threads gone, freed and never purged; 13 MB of it live), a fresh dormant copy holds ~30 MB.
 	/// Returns what it did, for the log.
 	fn go_dormant(&self, quiet: Duration) -> Option<String> {
+		self.go_dormant_with(quiet, std::env::var("ROR_SERVICE_HANDOVER").map_or(true, |value| value != "0"))
+	}
+
+	fn go_dormant_with(&self, quiet: Duration, handover: bool) -> Option<String> {
 		if !self.quiet(&self.awake.read(), quiet) || self.handed_over.load(Ordering::SeqCst) || self.shutting_down.load(Ordering::SeqCst) {
 			return None;
 		}
 		let left = self.idle.saturating_sub(self.last_job.lock().elapsed());
-		if !left.is_zero() && std::env::var("ROR_SERVICE_HANDOVER").map_or(true, |value| value != "0") {
+		if handover && !left.is_zero() {
 			match client::start_dormant(&self.state_dir, self.offline, &self.build, self.source.clone(), left) {
 				Ok(port) => {
 					// its records name the copy: new clients go there, this one's last jobs finish here
@@ -297,19 +299,11 @@ impl State {
 /// After the last job ends: the allocator's free memory and the GPU's dropped resources go back to
 /// the system ([`crate::release_free_memory`]).
 const QUIET_COLLECT: Duration = Duration::from_secs(2);
-/// After the last job ends: transient per-render caches (targets, preparations, shadow maps, GUI
-/// textures, posed skins, download bytes) are released in-process while the GPU device, warm
-/// textures/meshes/sky caches, and parsed scenes stay hot for the next command in the session.
-/// `ROR_QUIET_TRIM` (seconds) sets it.
-fn quiet_trim() -> Duration {
-	quiet("ROR_QUIET_TRIM", 10.0)
-}
-/// After the last job ends: the service goes dormant ([`State::go_dormant`]), handing over to a
-/// lightweight copy with no GPU device or caches; the next job makes the device again on the kept
-/// adapter. Kept well above short interactive pauses so a multi-command session keeps warm caches.
-/// `ROR_QUIET_RELEASE` (seconds) sets it.
+/// After the last job ends: the service goes dormant ([`State::go_dormant`]), its renderer and GPU
+/// device dropped (handing over to a ~30 MB dormant copy) and made again on the kept adapter for
+/// the next job. `ROR_QUIET_RELEASE` (seconds) sets it.
 fn quiet_release() -> Duration {
-	quiet("ROR_QUIET_RELEASE", 120.0)
+	quiet("ROR_QUIET_RELEASE", 10.0)
 }
 
 fn quiet(name: &str, default: f64) -> Duration {
@@ -473,10 +467,8 @@ pub fn serve(options: ServeOptions) -> Result<()> {
 		let idle = options.idle;
 		std::thread::spawn(move || {
 			let mut kept_rur = Instant::now();
-			// the job end whose leftovers were collected / transient caches trimmed
+			// the job end whose leftovers were collected
 			let mut collected = None;
-			let mut trimmed = None;
-			let quiet_trim = quiet_trim();
 			let quiet_release = quiet_release();
 			let mut relieved = None;
 			loop {
@@ -486,17 +478,6 @@ pub fn serve(options: ServeOptions) -> Result<()> {
 				if state.running.load(Ordering::SeqCst) == 0 {
 					if let Some(done) = state.go_dormant(quiet_release) {
 						eprintln!("ror: {:.0} s without jobs: {done}", quiet_release.as_secs_f64());
-					} else if since_job >= quiet_trim
-						&& trimmed != Some(last_job)
-						&& let Some(awake) = state.awake_now()
-					{
-						trimmed = Some(last_job);
-						collected = Some(last_job);
-						// Trim transient render targets, preparations, shadows, GUI frames and
-						// download buffers while keeping the GPU device and warm texture/mesh/scene
-						// caches hot across pauses within one session.
-						awake.renderer.release_idle();
-						crate::release_free_memory();
 					} else if since_job > QUIET_COLLECT
 						&& collected != Some(last_job)
 						&& let Some(awake) = state.awake_now()
@@ -1240,9 +1221,12 @@ mod tests {
 				let (stream, _) = listener.accept().unwrap();
 				handle(&server_state, &stream).unwrap();
 			}
-			// Fourth request tests an explicit over-limit body refusal through `handle_with_limit`.
-			let (stream, _) = listener.accept().unwrap();
-			handle_with_limit(&server_state, &stream, 64 * 1024).unwrap();
+			// Fourth and fifth requests test explicit over-limit body refusals through `handle_with_limit`
+			// (a burst 16 MiB body and a slow paced 4 MiB body spanning > 600 ms).
+			for _ in 0..2 {
+				let (stream, _) = listener.accept().unwrap();
+				handle_with_limit(&server_state, &stream, 64 * 1024).unwrap();
+			}
 		});
 
 		// 1. `/render` with `playbackFile` alone preserves the file's `time: 0.5` (block becomes hidden).
@@ -1297,24 +1281,67 @@ mod tests {
 		let error = refusal["error"].as_str().unwrap_or("");
 		assert!(error.contains("16777216") && error.contains("65536") && error.contains("playbackFile"), "unexpected 413 message: {error}");
 
+		// 5. A paced oversized body (4 MiB sent over ~750 ms, far past the old 250 ms drain cap)
+		//    must still be drained cleanly without a TCP RST so the client reads HTTP 413.
+		{
+			use std::io::{BufRead, BufReader, Read, Write};
+			let total = 4 * 1024 * 1024usize;
+			let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+			stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+			stream.set_nodelay(true).unwrap();
+			let head = format!("POST /video HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-ROR: 1\r\nContent-Type: application/json\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n");
+			stream.write_all(head.as_bytes()).unwrap();
+			let chunk = vec![b'b'; 64 * 1024];
+			let chunks = total / chunk.len();
+			for i in 0..chunks {
+				stream.write_all(&chunk).unwrap_or_else(|err| panic!("server reset connection before draining paced 413 body at chunk {i}/{chunks}: {err}"));
+				if i + 1 < chunks {
+					std::thread::sleep(Duration::from_millis(12));
+				}
+			}
+			stream.flush().unwrap();
+			let mut reader = BufReader::new(stream);
+			let mut status_line = String::new();
+			reader.read_line(&mut status_line).expect("client must read 413 status line after slow paced body");
+			assert!(status_line.contains(" 413 "), "expected HTTP 413 status line, got {status_line:?}");
+			let mut content_len = 0usize;
+			loop {
+				let mut line = String::new();
+				reader.read_line(&mut line).unwrap();
+				let trimmed = line.trim_end();
+				if trimmed.is_empty() {
+					break;
+				}
+				if let Some((k, v)) = trimmed.split_once(':')
+					&& k.trim().eq_ignore_ascii_case("content-length")
+				{
+					content_len = v.trim().parse().unwrap_or(0);
+				}
+			}
+			let mut body = vec![0u8; content_len];
+			reader.read_exact(&mut body).unwrap();
+			let refusal: serde_json::Value = serde_json::from_slice(&body).unwrap();
+			let error = refusal["error"].as_str().unwrap_or("");
+			assert!(error.contains("4194304") && error.contains("65536") && error.contains("playbackFile"), "unexpected paced 413 message: {error}");
+		}
+
 		server.join().unwrap();
 		drop(state);
 		let _ = std::fs::remove_dir_all(&dir);
 	}
 
-	/// Default idle lifecycle trims transient buffers after `ROR_QUIET_TRIM` (10 s) while keeping
-	/// the GPU device warm, and only hands over to a dormant process after `ROR_QUIET_RELEASE`
-	/// (120 s), preserving the historical meaning of `ROR_QUIET_RELEASE`.
+	/// Idle lifecycle preserves `main`'s 10 s `ROR_QUIET_RELEASE` default and releases the GPU
+	/// device in-process when handover is disabled (without spawning a child process).
 	#[test]
-	fn quiet_trim_keeps_warm_device_until_quiet_release() {
+	fn quiet_release_defaults_to_10s_and_drops_device_in_process() {
 		assert_eq!(quiet_from(None, 10.0), Duration::from_secs(10));
-		assert_eq!(quiet_from(None, 120.0), Duration::from_secs(120));
-		assert_eq!(quiet_from(Some("1"), 120.0), Duration::from_secs(1));
-		assert_eq!(quiet_from(Some("-5"), 120.0), Duration::ZERO);
-		assert!(quiet_release() > quiet_trim(), "dormant release must wait longer than transient quiet trim");
-		assert!(quiet_release() >= Duration::from_secs(60), "default quiet release must avoid mid-session handover churn");
+		assert_eq!(quiet_from(Some("1"), 10.0), Duration::from_secs(1));
+		assert_eq!(quiet_from(Some("-5"), 10.0), Duration::ZERO);
+		if std::env::var_os("ROR_QUIET_RELEASE").is_none() {
+			assert_eq!(quiet_release(), Duration::from_secs(10));
+		}
 
-		let dir = std::env::temp_dir().join(format!("ror-quiet-tiers-{}", std::process::id()));
+		let dir = std::env::temp_dir().join(format!("ror-quiet-release-{}", std::process::id()));
 		let _ = std::fs::remove_dir_all(&dir);
 		std::fs::create_dir_all(&dir).unwrap();
 		let adapter = GpuAdapter::find().expect("a GPU (or software adapter)");
@@ -1339,7 +1366,7 @@ mod tests {
 			done: AtomicU64::new(0),
 			failed: AtomicU64::new(0),
 			shutting_down: AtomicBool::new(false),
-			build: "test-quiet-tiers".into(),
+			build: "test-quiet-release".into(),
 			warming: AtomicBool::new(false),
 			state_dir: dir.clone(),
 			offline: true,
@@ -1349,18 +1376,20 @@ mod tests {
 		});
 		let awake = state.awake().unwrap();
 		assert_eq!(state.wakes.load(Ordering::SeqCst), 1);
-		// Simulate 15 s idle (past 10 s `ROR_QUIET_TRIM`, before 120 s `ROR_QUIET_RELEASE`).
-		let fifteen_ago = Instant::now() - Duration::from_secs(15);
-		*state.last_job.lock() = fifteen_ago;
-		*state.last_wake.lock() = fifteen_ago;
-		assert!(state.go_dormant(Duration::from_secs(120)).is_none(), "must not go dormant after only 15 s idle");
-		awake.renderer.release_idle();
-		assert!(state.awake_now().is_some(), "transient release_idle must keep the GPU device warm");
-		assert!(!state.handed_over.load(Ordering::SeqCst));
+		// Simulate 5 s idle (before 10 s `ROR_QUIET_RELEASE`): stays awake.
+		let five_ago = Instant::now() - Duration::from_secs(5);
+		*state.last_job.lock() = five_ago;
+		*state.last_wake.lock() = five_ago;
+		assert!(state.go_dormant_with(Duration::from_secs(10), false).is_none(), "must stay awake before quiet_release elapses");
+		assert!(state.awake_now().is_some());
 		drop(awake);
-		// Short `ROR_QUIET_RELEASE` (e.g. 1 s) still makes `go_dormant` release the device promptly
-		// (when `ROR_SERVICE_HANDOVER=0` or without a source binary, it releases in-process).
-		assert!(state.go_dormant(Duration::from_secs(1)).is_some(), "short ROR_QUIET_RELEASE must still drop the awake device");
+		// Once `quiet_release` elapses, `go_dormant_with(..., false)` drops the GPU device in-process
+		// immediately (no child process spawned, no 90 s handover wait).
+		let started = Instant::now();
+		let note = state.go_dormant_with(Duration::from_secs(1), false).expect("must drop awake device once quiet_release elapses");
+		assert!(started.elapsed() < Duration::from_secs(5), "in-process dormant release took too long: {:?}", started.elapsed());
+		assert!(note.contains("dormant, the GPU device"), "unexpected dormant note: {note}");
+		assert!(!state.handed_over.load(Ordering::SeqCst), "handover=false must not spawn a dormant copy");
 		assert!(state.awake_now().is_none(), "device should be released once quiet_release elapses");
 		drop(state);
 		let _ = std::fs::remove_dir_all(&dir);
