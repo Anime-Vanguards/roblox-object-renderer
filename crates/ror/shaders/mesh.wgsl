@@ -1461,9 +1461,18 @@ fn vs_shadow_cutout(input: VertexInput, @builtin(instance_index) instance_index:
 // 128 at 0.5, 215 and 214 at 0.7: one cut at 0.252 of opacity, where Transparency alone cuts at 0.748)
 const SHADOW_CUT_OPACITY: f32 = 0.252;
 
+// The cut reads the colour map's alpha two levels finer than the shadow map's texels pick (as far as level
+// 0; render::residency holds them): checkerboards of alpha 0 and 255 on cards 3 studs over a floor
+// (fixtures/sun-shadows.luau "patterns", a Roblox 0.747 client) shadow the floor as the same pattern built
+// from Parts does, holes 134.5 of 153 against 135 under 1.5-stud squares in the cascade 150 studs out;
+// ror's alpha at the texels' own level closed the holes to 121 (its Parts 132.5), now 133.5
+const SHADOW_CUT_SHARPEN: f32 = 0.25;
+
 @fragment
 fn fs_shadow_cutout(input: ShadowCutoutOutput) {
-	let alpha = studio_mips(color_map, material_info.sizes[0].xy, input.uv, dpdx(input.uv), dpdy(input.uv)).a;
+	let dx = dpdx(input.uv) * SHADOW_CUT_SHARPEN;
+	let dy = dpdy(input.uv) * SHADOW_CUT_SHARPEN;
+	let alpha = studio_mips(color_map, material_info.sizes[0].xy, input.uv, dx, dy).a;
 	if (alpha * instances[input.instance].texture.z <= SHADOW_CUT_OPACITY) {
 		discard;
 	}
