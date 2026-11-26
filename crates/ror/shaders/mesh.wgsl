@@ -1008,6 +1008,11 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 	if ((flags & TEX_METALNESS) != 0u) {
 		surface.metalness = metalness_texel;
 	}
+	// 2022 Foil's lobe widens with the view depth: α = roughness² grows from instance.lobe.y² by instance.lobe.x a
+	// stud (render::materials FOIL_LOBE: sharp glints off its crumples up close, a wide sheen far away)
+	if (instance.lobe.x > 0.0 && (flags & TEX_ROUGHNESS) == 0u) {
+		surface.roughness = sqrt(instance.lobe.y * instance.lobe.y + instance.lobe.x * view_depth);
+	}
 	surface.roughness = clamp(surface.roughness, 0.03, 1.0);
 	surface.f0 = instance.specular.x;
 	surface.fresnel = instance.specular.y;

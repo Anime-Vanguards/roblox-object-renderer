@@ -117,11 +117,11 @@ pub fn params(material: u32) -> MaterialParams {
 		1040 => standard(0.7, 0.8),
 		// DiamondPlate
 		1056 => standard(0.4, 1.0),
-		// Foil
 		// Foil (its pack has no roughness map): 0.45 catches the low sun's glints off its crumples
 		// (metal-diffuse, the slab at EnvironmentSpecularScale 1: Studio 0.750, ror 0.567 at 0.3,
-		// 0.767 at 0.45, 0.993 at 0.6; at 0.5: 0.672 / 0.550 / 0.645) and the sky in its ball's
-		// reflection (ibl-spheres: per-pixel rms 8.4-10.8 % at 0.3, 7.5-8.8 % at 0.45)
+		// 0.767 at 0.45, 0.993 at 0.6; at 0.5: 0.672 / 0.550 / 0.645); pre-2022 Foil in the client
+		// alike (fixtures/sky-specular.luau: within 0.96-1.04 at 12, 48 and 200 studs). The 2022 pack's
+		// lobe widens with the view depth instead (FOIL_LOBE)
 		1072 => standard(0.45, 1.0),
 		// Metal
 		1088 => standard(0.35, 1.0),
@@ -186,6 +186,10 @@ pub struct BuiltInTextures {
 	/// (view depth in studs, power): nearer than that depth the strength grows as (depth / it) to the power (a
 	/// negative one; 0: the same strength at every depth).
 	pub normal_falloff: (f32, f32),
+	/// A lobe widening with the view depth where the pack has no roughness map: (roughness at depth 0, the GGX
+	/// width α = roughness²'s growth per stud of depth); growth 0: the material's roughness at every depth (2022
+	/// Foil: FOIL_LOBE).
+	pub lobe: (f32, f32),
 }
 
 /// Plastic's normal map draws at under half its relief: 0.44 of its pack's (9475362634; 0.38 of the
@@ -368,12 +372,13 @@ const fn pack_2022(material: u32, pack: &'static str, noise: f32) -> BuiltInText
 		skip_color: material == 1056,
 		normal_strength: 1.0,
 		normal_falloff: (1.0, 0.0),
+		lobe: (0.0, 0.0),
 	}
 }
 
 /// A pre-2022 pack, tiling regularly from a random offset per part.
 const fn pre(pack: &'static str, studs_per_tile: f32) -> BuiltInTextures {
-	BuiltInTextures { pack, studs_per_tile, organic: None, wang: false, far: None, random_offset: true, skip_color: false, normal_strength: 1.0, normal_falloff: (1.0, 0.0) }
+	BuiltInTextures { pack, studs_per_tile, organic: None, wang: false, far: None, random_offset: true, skip_color: false, normal_strength: 1.0, normal_falloff: (1.0, 0.0), lobe: (0.0, 0.0) }
 }
 
 /// A pre-2022 pack tiled in Wang cells.
@@ -451,6 +456,7 @@ pub fn built_in_textures(material: u32, use_2022: bool) -> Option<BuiltInTexture
 				_ => 1.0,
 			},
 			normal_falloff: if material == 1072 { tune_foil_normal().map_or(FOIL_NORMAL_FALLOFF, |(_, falloff)| falloff) } else { (1.0, 0.0) },
+			lobe: if material == 1072 { foil_lobe() } else { (0.0, 0.0) },
 			far: FAR_2022.iter().find(|(value, _)| *value == material).map(|&(_, far)| far),
 			..pack_2022(material, pack, noise)
 		})
@@ -472,6 +478,32 @@ fn tune_foil_normal() -> Option<(f32, (f32, f32))> {
 			[strength, depth, power] => Some((strength, (depth, power))),
 			_ => None,
 		}
+	})
+}
+
+/// 2022 Foil's lobe, (roughness at view depth 0, the GGX width's growth per stud of view depth): α = roughness²
+/// grows linearly with the depth, sharp glints off its crumples up close and a wide sheen far away. The client
+/// (fixtures/sky-specular.luau, 2022 Foil at EnvironmentSpecularScale 1 under a low sun and the sky) wants
+/// roughness 0.20-0.21 at 12 studs in every view (straight down, and 40 and 70 degrees up from four sides: at 0.2
+/// client / ror 0.97-1.02 in green radiance, at 0.45 0.63-0.97), 0.25-0.27 at 48 and 0.44 at 200 (straight down;
+/// metal-diffuse's 200-stud slab in Studio was fitted at 0.45). Straight down at 12 / 24 / 48 / 200 studs ror
+/// at the fixed 0.45 read 1.38 / 1.34 / 1.32 / 1.03 x the client's sun and sky together, the sky alone 1.11 /
+/// 1.10 / 1.12 / 1.03 x. Pre-2022 Foil keeps 0.45 at every depth (the client within 0.96-1.04 of it at 12, 48 and
+/// 200 studs; this lobe would read 0.68 at 200).
+const FOIL_LOBE: (f32, f32) = (0.1817, 0.00078);
+
+/// [`FOIL_LOBE`], or `ROR_TUNE_FOIL_ROUGHNESS=<roughness at depth 0>,<growth of α per stud>` (2022 Foil) for fits.
+fn foil_lobe() -> (f32, f32) {
+	static TUNE: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
+	*TUNE.get_or_init(|| {
+		let tuned = std::env::var("ROR_TUNE_FOIL_ROUGHNESS").ok().and_then(|text| {
+			let numbers: Vec<f32> = text.split(',').map(|number| number.trim().parse().ok()).collect::<Option<_>>()?;
+			match numbers[..] {
+				[roughness, growth] => Some((roughness, growth)),
+				_ => None,
+			}
+		});
+		tuned.unwrap_or(FOIL_LOBE)
 	})
 }
 
@@ -550,6 +582,22 @@ mod tests {
 		assert_eq!(falloff(1072, false), (120.0, -0.14));
 		for material in [256, 1056, 848, 800] {
 			assert_eq!(falloff(material, true).1, 0.0);
+		}
+	}
+
+	/// 2022 Foil's lobe widens with the view depth as the client's does (sharp glints at 12 studs, roughness ~0.21;
+	/// ~0.26 at 48; a sheen at 200, ~0.44); pre-2022 Foil and the other packs keep their roughness at every depth.
+	#[test]
+	fn foil_lobe_widens_with_depth() {
+		let lobe = |material, generation| built_in_textures(material, generation).unwrap().lobe;
+		let (roughness, growth) = lobe(1072, true);
+		let at = |depth: f32| (roughness * roughness + growth * depth).sqrt();
+		for (depth, client) in [(12.0, 0.205), (48.0, 0.26), (200.0, 0.44)] {
+			assert!((at(depth) - client).abs() < 0.01, "{depth} studs: {} against the client's {client}", at(depth));
+		}
+		assert_eq!(lobe(1072, false).1, 0.0);
+		for material in [256, 1056, 1088, 800] {
+			assert_eq!(lobe(material, true).1, 0.0);
 		}
 	}
 

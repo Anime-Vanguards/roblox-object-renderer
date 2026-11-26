@@ -366,6 +366,7 @@ struct InstanceData {
 	material: [f32; 4],
 	texture: [f32; 4],
 	tint: [f32; 4],
+	lobe: [f32; 4],
 }
 
 #[repr(C)]
@@ -1094,6 +1095,8 @@ struct PartMaterial {
 	/// falloff: (the view depth from which it holds, the power of depth / that depth it follows nearer).
 	normal_strength: f32,
 	normal_falloff: (f32, f32),
+	/// A lobe widening with the view depth (built-in packs: render::materials::BuiltInTextures::lobe)
+	lobe: (f32, f32),
 	/// Material textures: the colour map's far tiling (far tiles per tile, 0: none) and 1 / the view
 	/// depth where it has taken over (render::materials::FarTiling).
 	far: [f32; 2],
@@ -4006,7 +4009,7 @@ impl Renderer {
 		let (instances, draws, missing) = (&mut out.instances, &mut out.draws, &mut out.missing);
 		let neon_share = context.neon_share;
 		{
-			let PartMaterial { mut key, mut flags, params, studs_per_tile, emissive: emission, offset, noise_offset, noise_frequency, normal_strength, normal_falloff, far, pack_proofs } = material;
+			let PartMaterial { mut key, mut flags, params, studs_per_tile, emissive: emission, offset, noise_offset, noise_frequency, normal_strength, normal_falloff, lobe, far, pack_proofs } = material;
 			if let Some(local_keys) = local_keys {
 				for (uri, proof) in &pack_proofs {
 					stable &= proof_matches(uri, proof, local_keys);
@@ -4171,6 +4174,7 @@ impl Renderer {
 					material: [0.0; 4],
 					texture: [0.0; 4],
 					tint: [1.0; 4],
+					lobe: [0.0; 4],
 				});
 				let runs = self.decal_runs(&mesh, &local, box_size, decal.face.min(5), decal_flags);
 				draws.push(DrawItem {
@@ -4295,6 +4299,7 @@ impl Renderer {
 				// what of it shadows (`fs_shadow_cutout`): 1 - Transparency, a shadow-only part's whole
 				texture: [far[0], far[1], if part.shadow_only { 1.0 } else { 1.0 - part.transparency }, normal_falloff.1],
 				tint: [tint.x, tint.y, tint.z, normal_falloff.0],
+				lobe: [lobe.1, lobe.0, 0.0, 0.0],
 			});
 			let lod = draw_lod(&mesh);
 			// a posed skinned mesh sorts by where its Bones put it, not by its part (skin-sort: a character
@@ -5994,6 +5999,7 @@ impl Renderer {
 			noise_frequency: materials::VARIANT_ORGANIC_NOISE,
 			normal_strength: 1.0,
 			normal_falloff: (1.0, 0.0),
+			lobe: (0.0, 0.0),
 			far: [0.0; 2],
 			pack_proofs: Vec::new(),
 		};
@@ -6207,6 +6213,7 @@ impl Renderer {
 				}
 				material.normal_strength = textures.normal_strength;
 				material.normal_falloff = textures.normal_falloff;
+				material.lobe = textures.lobe;
 				maps
 			} else {
 				[None, None, None, None, None]

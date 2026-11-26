@@ -122,6 +122,9 @@ struct Instance {
 	// rgb the colour map's tint where it overlays the part colour (SurfaceAppearance.Color in
 	// AlphaMode Overlay, linear), else 1; a the view depth where the material normal map's falloff ends
 	tint: vec4<f32>,
+	// a built-in pack's lobe widening with the view depth where it has no roughness map (2022 Foil): x the GGX width
+	// α's growth per stud (0: none), y the roughness at depth 0; zw unused
+	lobe: vec4<f32>,
 }
 
 struct Light {
