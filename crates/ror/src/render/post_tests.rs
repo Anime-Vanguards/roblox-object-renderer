@@ -1,5 +1,5 @@
-//! BlurEffect against a Roblox 0.747 client's frames (fixtures/post-effects.luau; notes/render.md "Post
-//! effects"), on a scene under a flat Ambient alone.
+//! BlurEffect and SunRaysEffect against a Roblox 0.747 client's frames (fixtures/post-effects.luau;
+//! notes/render.md "Post effects"), on a scene under a flat Ambient alone.
 
 use super::*;
 use crate::scene::Environment;
@@ -84,4 +84,31 @@ fn the_blur_keeps_the_light_of_thin_lines_and_haloes_small_sizes_as_the_client_d
 	let (small, _) = draw(Some(4.0));
 	let halo = (middle - 20..middle + 20).map(|y| small[y * WIDTH + edge + 3]).sum::<f32>() / 40.0;
 	assert!((4.0..20.0).contains(&halo), "3 px past a white square's edge at Size 4: {halo}, the client 15");
+}
+
+/// A sun 30 degrees off the view's axis gives rays of cos 30 degrees beside it, whatever the field of view
+/// (the client: 0.866-0.869 through 50 and 90 degree views; ror's exp(-0.09 r²) of the sun's distance in
+/// half heights gave 0.871 and 0.970); past the view's edge they fade further.
+#[test]
+fn sun_rays_fade_by_the_sun_s_angle_from_the_view_s_axis() {
+	// a sun 40 degrees up (its rays' daytime colour) and a view turned from it by `degrees` sideways
+	let sun = Vec3::new(0.0, 40f32.to_radians().sin(), -40f32.to_radians().cos());
+	let fade = |degrees: f32, fov: f32| {
+		let across = sun.cross(Vec3::X).normalize();
+		let target = glam::Quat::from_axis_angle(across, degrees.to_radians()) * sun * 10.0;
+		let placed = CameraSpec::LookAt { eye: [0.0, 0.0, 0.0], target: target.into(), fov }.place(None, 1644, 1116);
+		let aspect = 1644.0 / 1116.0;
+		let uniform = super::post::sun_rays_uniform((0.05, 1.0), sun, placed.view_projection(aspect), placed.ray_unprojection(aspect), aspect).expect("rays");
+		// screen.z, after the 16 floats of the rays and the 4 of the sun
+		let floats: &[f32] = bytemuck::cast_slice(bytemuck::bytes_of(&uniform));
+		floats[22]
+	};
+	let cos30 = 30f32.to_radians().cos();
+	for fov in [50.0f32, 90.0] {
+		let faded = fade(30.0, fov);
+		assert!((faded - cos30).abs() < 0.005, "the sun 30 degrees off a {fov} degree view's axis: fade {faded}, the client 0.866-0.869");
+	}
+	// 40 degrees off a 50 degree view's axis lies past its edge (34.5 degrees across): under cos 40
+	let past = fade(40.0, 50.0);
+	assert!(past < 40f32.to_radians().cos() - 0.02 && past > 0.65, "a sun past the view's edge: fade {past}, the client 0.73-0.75");
 }

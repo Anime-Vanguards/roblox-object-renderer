@@ -84,11 +84,21 @@ const SUN_RAYS_LOW_BELOW: f32 = 14.3;
 const SUN_RAYS_DAY_ABOVE: f32 = 23.5;
 const SUN_RAYS_FADE_BELOW: f32 = 5.75;
 
-/// A sun away from the view's centre gives weaker rays, exp(-0.09 r²) with r its distance from the
-/// centre in half heights (post-sunrays-time edge-in, edge-out, post-sunrays-sky beside: 0.88, 0.71
-/// and 0.55 of them near the sun at r 1.18, 1.93 and 2.57; across the view they vary by ±15 % more,
-/// stronger away from the sun when it is in view, not drawn).
-const SUN_RAYS_OFF_CENTRE: f32 = 0.09;
+/// A sun away from the view's axis gives weaker rays and bends their profile (a Roblox client,
+/// fixtures/post-effects.luau "rays": the sun at 15 to 55 degrees off the axis, on the view and past its
+/// edges, at Spreads 0, 0.1, 0.25 and 1, through 50 and 90 degree fields of view). Beside the sun the rays
+/// are the open-sky profile times the cosine of the sun's angle from the axis, whatever the field of view
+/// (0.966 / 0.927 / 0.866 / 0.742 at 15 / 22 / 30 / 42 degrees); towards the view's centre the profile
+/// reads a smaller angle and away from it a larger one, θ (1 - SUN_RAYS_TOWARD α θ cos φ) with α the
+/// sun's angle from the axis, θ the pixel's from the sun (radians) and φ the angle on the view between
+/// the way to the pixel and the way to the centre from the sun (sun_rays.wgsl): 30 degrees off the axis a
+/// Spread 1 wash is 1.12 times as strong 55 degrees towards the centre as beside the sun. A sun past the
+/// view's edge loses SUN_RAYS_OFF_VIEW of its rays a half height it lies outside. Mean |log| error of the
+/// rays against the client's over the in-view suns: Spread 1 0.004-0.112 → 0.004-0.009, Spread 0.25
+/// 0.013-0.212 → 0.013-0.052, Spread 0.1 0.025-0.260 → 0.025-0.098 (ror faded by exp(-0.09 r²) with r
+/// the sun's distance from the centre in half heights, right at 50 degrees beside the sun alone).
+const SUN_RAYS_TOWARD: f32 = 0.221;
+const SUN_RAYS_OFF_VIEW: f32 = 0.285;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, Pod, Zeroable)]
@@ -99,7 +109,8 @@ struct PostUniform {
 	texels: [f32; 4],
 }
 
-/// shaders/sun_rays.wgsl's uniform.
+/// shaders/sun_rays.wgsl's uniform: `sun.w` the sun's angle from the view's axis (radians), `color.w`
+/// the view's aspect, `screen.z` the rays' fade, `screen.w` SUN_RAYS_TOWARD.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct SunRaysUniform {
@@ -251,16 +262,22 @@ pub fn sun_rays_uniform((intensity, spread): (f32, f32), sun: glam::Vec3, view_p
 		return None;
 	}
 	let ndc = glam::Vec2::new(clip.x, clip.y) / clip.w;
-	// how far from the view's centre the sun is, in half heights
-	let fade = (-SUN_RAYS_OFF_CENTRE * glam::Vec2::new(ndc.x * aspect, ndc.y).length_squared()).exp();
+	// clip.w is the sun's share along the view's axis: the cosine of its angle from it
+	let cos_alpha = clip.w.min(1.0);
+	// how far the sun lies past the view's edges, in half heights
+	let outside = glam::Vec2::new((ndc.x.abs() - 1.0).max(0.0) * aspect, (ndc.y.abs() - 1.0).max(0.0)).length();
+	let fade = cos_alpha * (1.0 - SUN_RAYS_OFF_VIEW * outside).max(0.0);
+	if fade <= 0.0 {
+		return None;
+	}
 	let profile = sun_rays_profile(spread);
 	// 22 values in 6 vec4s, the last two repeating the last
 	let rows = |values: &[f32; 22]| std::array::from_fn(|row| std::array::from_fn(|column| values[(row * 4 + column).min(21)]));
 	Some(SunRaysUniform {
 		rays: rays.to_cols_array_2d(),
-		sun: sun.extend(0.0).to_array(),
-		screen: [ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5, fade, 0.0],
-		color: color.extend(1.0).to_array(),
+		sun: sun.extend(cos_alpha.acos()).to_array(),
+		screen: [ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5, fade, SUN_RAYS_TOWARD],
+		color: color.extend(aspect).to_array(),
 		angles: rows(&SUN_RAYS_ANGLES),
 		profile: rows(&profile),
 	})

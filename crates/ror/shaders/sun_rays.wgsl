@@ -9,11 +9,12 @@ struct SunRays {
 	// the camera's rays: its rotation and projection inverted, the eye at the origin
 	// (render::camera::Camera::ray_unprojection)
 	rays: mat4x4<f32>,
-	// xyz towards the sun
+	// xyz towards the sun, w its angle from the view's axis (radians)
 	sun: vec4<f32>,
-	// xy the sun's place on the view (uv, may lie outside 0..1), z the fade for a sun off the view
+	// xy the sun's place on the view (uv, may lie outside 0..1), z the fade for a sun off the view's
+	// axis, w how much the profile bends towards the view's centre (render::post::SUN_RAYS_TOWARD)
 	screen: vec4<f32>,
-	// rgb Intensity times the rays' colour
+	// rgb Intensity times the rays' colour, w the view's aspect (width / height)
 	color: vec4<f32>,
 	// the open-sky profile: its angles (degrees) and values, 22 of each
 	angles: array<vec4<f32>, 6>,
@@ -53,7 +54,17 @@ fn open_sky(angle: f32) -> f32 {
 fn fs_sun_rays(input: FullscreenOutput) -> @location(0) vec4<f32> {
 	let point = rays.rays * vec4<f32>(input.ndc, 0.5, 1.0);
 	let direction = normalize(point.xyz / point.w);
-	let angle = degrees(acos(clamp(dot(direction, rays.sun.xyz), -1.0, 1.0)));
+	let theta = acos(clamp(dot(direction, rays.sun.xyz), -1.0, 1.0));
+	// with the sun off the view's axis the profile reads a smaller angle towards the view's centre and a
+	// larger one away from it (render::post::SUN_RAYS_TOWARD): φ between the ways from the sun to the
+	// pixel and to the centre, on the view in half heights
+	let sun_place = vec2<f32>((rays.screen.x * 2.0 - 1.0) * rays.color.w, 1.0 - rays.screen.y * 2.0);
+	let to_pixel = vec2<f32>(input.ndc.x * rays.color.w, input.ndc.y) - sun_place;
+	var toward = 0.0;
+	if (length(to_pixel) > 1e-6 && length(sun_place) > 1e-6) {
+		toward = dot(normalize(to_pixel), -normalize(sun_place));
+	}
+	let angle = degrees(max(theta * (1.0 - rays.screen.w * rays.sun.w * theta * toward), 0.0));
 	// the share of the path to the sun the opaque parts leave open; past the view's edge the edge
 	// stands in (post-sunrays-sky beside: a wall running off the view towards the sun stays dark)
 	let uv = vec2<f32>(input.ndc.x * 0.5 + 0.5, 0.5 - input.ndc.y * 0.5);
