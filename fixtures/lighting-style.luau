@@ -2,9 +2,11 @@
 -- over its own white SmoothPlastic floor 100 studs from the next (so no light reaches another case's
 -- floor), with or without Shadows, past plates of several transparencies and sizes, a MeshPart quad, a
 -- wall, a ball, a SpotLight and a SurfaceLight. Context.Phase "voxels": a dim shadowed PointLight at a
--- voxel's centre and one occluder a case filling a voxel round it. Context.Phase "day": one floor in the
--- sun with plates, a pole, balls of several materials, a roof and shadowed PointLights, for whatever else
--- the style changes.
+-- voxel's centre and one occluder a case filling a voxel round it; "occluders": the same light with more
+-- occluders round it. Context.Phase "shapes": unshadowed Spot- and SurfaceLights of several Angles and
+-- faces and PointLights off a voxel's centre, for their voxels' shape. Context.Phase "day": one floor in
+-- the sun with plates, a pole, balls of several materials, a roof and shadowed PointLights, for whatever
+-- else the style changes.
 --
 -- Measured in a Roblox client (0.747, quality level 21) in the dark (Brightness, Ambient, OutdoorAmbient
 -- and the environment scales 0) and under a lit Lighting, every case seen straight down from 40 studs
@@ -78,7 +80,93 @@ return function(Context)
 		return Light
 	end
 
+	-- a light on a carrier of `Size` at `Position` (`Kind`, `Face` an Enum.NormalId, `Angle`; `Opaque`: a
+	-- white carrier that casts shadows, else an invisible one that casts nothing)
+	local function Fixture(Name, Position, Size, Options)
+		local Carrier = Block(`{Name}-lamp`, Position, Size, if Options.Opaque then nil else { Transparency = 1, CastShadow = false })
+		Carrier.CastShadow = Options.Opaque == true and Options.CastShadow ~= false
+		local Light = Instance.new(Options.Kind or "PointLight")
+		Light.Range = Options.Range or 16
+		Light.Brightness = Options.Brightness or 2
+		Light.Color = Color3.new(1, 1, 1)
+		Light.Shadows = Options.Shadows == true
+		if Options.Kind and Options.Kind ~= "PointLight" then
+			Light.Face = Options.Face or Enum.NormalId.Bottom
+			Light.Angle = Options.Angle or 90
+		end
+		Light.Parent = Carrier
+		return Light
+	end
+
 	local Layout = {}
+	-- Context.Phase "occluders": Phase "voxels"' light (Brightness 0.5, Range 16, Shadows, at the centre of
+	-- the voxel (0..4, 8..12, 0..4)) with more occluders round it: blocks mirrored to -X and to either side
+	-- along Z, two voxels out and on the diagonal, half voxels, walls, a slab under it, a column, the light
+	-- on a voxel's corner and at Range 32
+	if Phase == "occluders" then
+		local OCCLUDER_CASES: { any } = {
+			{ Name = "o-level-negx", At = Vector3.new(-6, 10, 2) },
+			{ Name = "o-level-posz", At = Vector3.new(2, 10, 10) },
+			{ Name = "o-level-negz", At = Vector3.new(2, 10, -6) },
+			{ Name = "o-level-diag", At = Vector3.new(10, 10, 10) },
+			{ Name = "o-level2", At = Vector3.new(18, 10, 2) },
+			{ Name = "o-side-negx", At = Vector3.new(-6, 6, 2) },
+			{ Name = "o-side-negz", At = Vector3.new(2, 6, -6) },
+			{ Name = "o-half-near", At = Vector3.new(9, 10, 2), Size = Vector3.new(2, 4, 4) },
+			{ Name = "o-half-far", At = Vector3.new(11, 10, 2), Size = Vector3.new(2, 4, 4) },
+			{ Name = "o-wall-thin", At = Vector3.new(8.5, 8, 0), Size = Vector3.new(1, 16, 40) },
+			{ Name = "o-wall-far", At = Vector3.new(18, 8, 0), Size = Vector3.new(4, 16, 40) },
+			{ Name = "o-slab", At = Vector3.new(2, 6.5, 2), Size = Vector3.new(12, 1, 12) },
+			{ Name = "o-column", At = Vector3.new(10, 8, 2), Size = Vector3.new(4, 16, 4) },
+			{ Name = "o-corner-none", Light = Vector3.new(4, 8, 4) },
+			{ Name = "o-corner-level", Light = Vector3.new(4, 8, 4), At = Vector3.new(10, 10, 2) },
+			{ Name = "o-r32-none", Range = 32 },
+			{ Name = "o-r32-level", Range = 32, At = Vector3.new(10, 10, 2) },
+		}
+		for Index, Case in OCCLUDER_CASES do
+			local Origin = Vector3.new((Index - 1) * 100, 0, 0)
+			Block(`Floor-{Case.Name}`, Origin + Vector3.new(0, -0.5, 0), Vector3.new(60, 1, 60))
+			if Case.At then
+				Block(`Occluder-{Case.Name}`, Origin + Case.At, Case.Size or Vector3.new(4, 4, 4))
+			end
+			local At = Origin + (Case.Light or Vector3.new(2, 10, 2))
+			Lamp(Case.Name, At, { Brightness = 0.5, Range = Case.Range, Shadows = true })
+			table.insert(Layout, { name = Case.Name, x = Origin.X, y = Origin.Y, z = Origin.Z, lx = At.X, ly = At.Y, lz = At.Z, height = if Case.Range then 70 else 40 })
+		end
+		Root.Parent = workspace
+		return Layout
+	end
+
+	-- Context.Phase "shapes": unshadowed Spot- and SurfaceLights of several Angles and faces, a 12-stud face,
+	-- PointLights off a voxel's centre and of Range 8 and 32, each over its own floor, for the shape of
+	-- their voxels (LightingStyle Soft) and of their per-pixel light (Realistic). The sideways faces sit
+	-- with their centre 4 studs over the floor's middle, facing +X.
+	if Phase == "shapes" then
+		local SIDE = Vector3.new(-0.5, 4, 0)
+		local SHAPE_CASES: { any } = {
+			{ Name = "s-surface-side90", Kind = "SurfaceLight", At = SIDE, Size = Vector3.new(1, 4, 4), Face = Enum.NormalId.Right, Angle = 90 },
+			{ Name = "s-surface-side180", Kind = "SurfaceLight", At = SIDE, Size = Vector3.new(1, 4, 4), Face = Enum.NormalId.Right, Angle = 180 },
+			{ Name = "s-surface-side30", Kind = "SurfaceLight", At = SIDE, Size = Vector3.new(1, 4, 4), Face = Enum.NormalId.Right, Angle = 30 },
+			{ Name = "s-surface-big", Kind = "SurfaceLight", At = Vector3.new(0, 8.5, 0), Size = Vector3.new(12, 1, 12), Angle = 120 },
+			{ Name = "s-surface-down0", Kind = "SurfaceLight", At = Vector3.new(2, 8.5, 2), Size = Vector3.new(4, 1, 4), Angle = 0 },
+			{ Name = "s-spot-side60", Kind = "SpotLight", At = Vector3.new(0, 4, 0), Size = Vector3.new(0.2, 0.2, 0.2), Face = Enum.NormalId.Right, Angle = 60 },
+			{ Name = "s-spot-down60", Kind = "SpotLight", At = Vector3.new(2, 10, 2), Size = Vector3.new(0.2, 0.2, 0.2), Angle = 60 },
+			{ Name = "s-spot-down180", Kind = "SpotLight", At = Vector3.new(2, 10, 2), Size = Vector3.new(0.2, 0.2, 0.2), Angle = 180 },
+			{ Name = "s-point-corner", At = Vector3.new(4, 8, 4), Size = Vector3.new(0.2, 0.2, 0.2) },
+			{ Name = "s-point-r8", At = Vector3.new(2, 6, 2), Size = Vector3.new(0.2, 0.2, 0.2), Range = 8 },
+			{ Name = "s-point-r32", At = Vector3.new(2, 10, 2), Size = Vector3.new(0.2, 0.2, 0.2), Range = 32, Brightness = 0.5 },
+		}
+		for Index, Case in SHAPE_CASES do
+			local Origin = Vector3.new((Index - 1) * 100, 0, 0)
+			Block(`Floor-{Case.Name}`, Origin + Vector3.new(0, -0.5, 0), Vector3.new(80, 1, 80))
+			local At = Origin + Case.At
+			Fixture(Case.Name, At, Case.Size, { Kind = Case.Kind, Face = Case.Face, Angle = Case.Angle, Range = Case.Range, Brightness = Case.Brightness })
+			table.insert(Layout, { name = Case.Name, x = Origin.X, y = Origin.Y, z = Origin.Z, lx = At.X, ly = At.Y, lz = At.Z, height = if Case.Range == 32 then 70 else 44 })
+		end
+		Root.Parent = workspace
+		return Layout
+	end
+
 	if Phase == "day" then
 		-- a grey floor 120 studs across; plates 3 studs up in the sun, a pole, balls, a roof of Parts with a
 		-- shadowed PointLight under it (the light grid's terms and a local light beside the sun)
