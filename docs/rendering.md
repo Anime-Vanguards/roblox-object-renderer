@@ -13,9 +13,9 @@ Core modules: `crates/ror/src/scene/` (loading and extraction), `crates/ror/src/
 
 ## Supported scene features
 
-**Rendered:** All primitive shapes (including Studs and surface types), `MeshPart`s, `SpecialMesh`es, unions, 2022 and pre-2022 materials with `MaterialVariant`s, `SurfaceAppearance`, `Decal`s, `Texture`s, `Neon`, `ForceField`, transparency, `Glass`, `ParticleEmitter`s, `Beam`s, `Trail`s, legacy effects (`Fire`, `Smoke`, `Sparkles`, `ForceField` shield, `Explosion`), skinned meshes, R6/R15 characters (`BodyColors`, `Shirt`, `Pants`, `ShirtGraphic`, `CharacterMesh`), `Highlight`s, `SurfaceGui`s / `BillboardGui`s / `ScreenGui`s (via `rur`), `ViewportFrame`s, local lights with shadows, sun shadows, voxel light grid, SSAO, skybox (sun & moon), `Atmosphere`, fog, `Terrain.Clouds`, bloom, `ColorCorrection`, `ColorGrading`, `Blur`, `DepthOfField`, and `SunRays`.
+**Rendered:** All primitive shapes (including Studs and surface types), `MeshPart`s, `SpecialMesh`es, unions, 2022 and pre-2022 materials with `MaterialVariant`s, `SurfaceAppearance`, `Decal`s, `Texture`s, `Neon`, `ForceField`, transparency, `Glass`, `ParticleEmitter`s, `Beam`s, `Trail`s, legacy effects (`Fire`, `Smoke`, `Sparkles`, `ForceField` shield, `Explosion`), skinned meshes, R6/R15 characters (`BodyColors`, `Shirt`, `Pants`, `ShirtGraphic`, `CharacterMesh`), `Highlight`s, `SurfaceGui`s / `BillboardGui`s / `ScreenGui`s (via `rur`), `ViewportFrame`s, local lights with shadows, sun shadows, voxel light grid, SSAO, skybox (sun, moon & stars), `Atmosphere`, fog, `Terrain.Clouds`, bloom, `ColorCorrection`, `ColorGrading`, `Blur`, `DepthOfField`, and `SunRays`.
 
-**Not rendered:** `Workspace.Terrain` smooth terrain, water, and grass; skybox stars. Layered clothing renders as its raw authored mesh rather than fitted to the character.
+**Not rendered:** `Workspace.Terrain` smooth terrain, water, and grass. Layered clothing renders as its raw authored mesh rather than fitted to the character.
 
 ## Color and tone-mapping pipeline
 
@@ -47,6 +47,7 @@ Shared rules in `shaders/common.wgsl`:
 ## Sky, atmosphere, and fog
 
 - **Skybox (`roblox_sky_direction`):** `Ft` = `-Z`, `Bk` = `+Z`, `Lf` = `+X`, `Rt` = `-X`, with `Up` and `Dn` rotated 90°, further rotated by `SkyboxOrientation`. Displayed at full resolution via the tone curve of `1.935 * texel²`.
+- **Stars (`sky.wgsl` `stars`):** With `CelestialBodiesShown`, `StarCount` stars (at most 5,000; 3,000 without a `Sky`) strewn over the whole sky, 0.6 of them above the horizon, each a square one pixel across at any field of view in one of four colours, its light (a fitted distribution) spread over the pixels by the 4x multisampling points it covers. They dim towards the horizon, by the time of day (`render::environment::star_light`: full by night, a quarter to a half around sunrise and sunset, none from 7:15 to 16:45), slightly with `EnvironmentDiffuseScale`, and in steps under an `Atmosphere`'s haze. Roblox strews them anew whenever `StarCount` changes and redraws some of their brightness every ~0.7 s; ror's field is fixed, so only their statistics match.
 - **Atmosphere (`AtmosphereSky`):** Renders sky haze/glare and blends distant geometry into atmospheric scattering.
 - **Fog:** Given normalized distance `u` from `FogStart` to `FogEnd` (`0..1`), surfaces blend by `u * (1 + 0.325 * (1 - u))` toward `1.935 * FogColor²`.
 

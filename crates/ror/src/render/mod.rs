@@ -400,6 +400,26 @@ struct SkyUniform {
 	rays: [[f32; 4]; 4],
 	/// Terrain Clouds ([`clouds::uniform`])
 	clouds: [[f32; 4]; 6],
+	/// The stars ([`star_uniform`])
+	stars: [f32; 4],
+}
+
+/// The stars for the sky pass (shaders/sky.wgsl `stars`): x how many (StarCount up to
+/// [`environment::STARS_MAX`], 0 without), y their light as a share of midnight's
+/// ([`environment::star_light`]), z the side of a star in the target's pixels (the supersampling
+/// factor: Studio draws each star one pixel across, whatever the field of view), w unused. A Sky
+/// draws them only with CelestialBodiesShown, and the default sky without a Sky draws 3,000 (sim
+/// client: the same count as a Sky at StarCount 3,000); a ViewportFrame's sky draws none (not measured).
+fn star_uniform(environment: &crate::scene::Environment, supersample: u32) -> [f32; 4] {
+	let sky = environment.sky.clone().unwrap_or_default();
+	if !sky.celestial_bodies_shown || environment.viewport.is_some() || sky.star_count <= 0 {
+		return [0.0; 4];
+	}
+	let light = environment::star_light(environment.clock_time, environment.environment_diffuse_scale);
+	if light <= 0.0 {
+		return [0.0; 4];
+	}
+	[sky.star_count.min(environment::STARS_MAX) as f32, light, supersample as f32, 0.0]
 }
 
 /// The sun's and the moon's discs (sky-sun, sky-elements): their texture, a square of
@@ -5005,6 +5025,7 @@ impl Renderer {
 			uniform.moon = bodies.moon;
 			uniform.bodies = bodies.weights;
 			uniform.rays = camera.ray_unprojection(render_width as f32 / render_height as f32).to_cols_array_2d();
+			uniform.stars = star_uniform(environment, supersample);
 		});
 		if let Some(images) = &prepared.environment.images {
 			sky_uniform.images = [1.0, 0.0, SKY_RADIANCE, 0.0];
@@ -8223,5 +8244,77 @@ mod blend_order_tests {
 
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
+	}
+}
+
+#[cfg(test)]
+mod star_tests {
+	use super::*;
+
+	/// Stars over a black skybox at midnight, seen straight up (notes/render.md "Stars"): drawn only
+	/// with CelestialBodiesShown, about 0.6 · StarCount / 2π a steradian above the horizon, StarCount
+	/// past 5,000 drawing 5,000's, none at noon.
+	#[test]
+	fn stars_are_drawn_at_night_with_the_celestial_bodies() {
+		let state = std::env::temp_dir().join(format!("ror-star-test-{}", std::process::id()));
+		let content = state.join("content");
+		std::fs::create_dir_all(content.join("textures")).unwrap();
+		crate::output::write_png(&content.join("textures").join("black.png"), 1, 1, &[0, 0, 0, 255], true).unwrap();
+		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, studio_content: Some(content), ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let mut model = crate::scene::build::ModelBuilder::new("Plate");
+		model.part(&crate::scene::build::PartSpec { name: "Plate".into(), cframe: glam::Affine3A::from_translation(Vec3::new(0.0, -500.0, 0.0)), size: Vec3::new(1.0, 1.0, 1.0), ..Default::default() });
+		let world = crate::scene::extract::extract(&model.into_document());
+		let size = 256u32;
+		let request = ViewRequest { width: size, height: size, camera: CameraSpec::LookAt { eye: [0.0, 10.0, 0.0], target: [0.0, 110.0, 0.01], fov: 90.0 }, background: Background::Sky, bloom: false, ..Default::default() };
+		let lit = |clock_time: f32, shown: bool, star_count: i32| -> Vec<u8> {
+			let mut scene = world.clone();
+			scene.environment.clock_time = clock_time;
+			scene.environment.sky = Some(crate::scene::environment::Sky {
+				skybox: std::array::from_fn(|_| "rbxasset://textures/black.png".into()),
+				celestial_bodies_shown: shown,
+				sun_angular_size: 0.0,
+				moon_angular_size: 0.0,
+				star_count,
+				..Default::default()
+			});
+			let (images, stats) = renderer.render(&scene, std::slice::from_ref(&request)).unwrap();
+			assert!(stats.missing.is_empty(), "{:?}", stats.missing);
+			let rgba = &images[0].rgba;
+			(0..rgba.len()).step_by(4).map(|index| rgba[index].max(rgba[index + 1]).max(rgba[index + 2])).collect()
+		};
+		let count = |pixels: &[u8]| pixels.iter().filter(|&&value| value > 2).count();
+		let night = lit(0.0, true, 3000);
+		// 0.6 · 3000 / 2π stars a steradian over the view's 2.09 sr, most of them 2-3 pixels, the
+		// faintest under 3 of 255
+		let shown = count(&night);
+		assert!((600..2400).contains(&shown), "{shown} star pixels at midnight");
+		assert_eq!(count(&lit(0.0, false, 3000)), 0, "no stars without the celestial bodies");
+		assert_eq!(count(&lit(0.0, true, 0)), 0, "none at StarCount 0");
+		assert_eq!(count(&lit(12.0, true, 3000)), 0, "none at noon");
+		let most = lit(0.0, true, 5000);
+		assert_eq!(lit(0.0, true, 10000), most, "StarCount past 5,000 draws 5,000's");
+		assert!(count(&most) as f32 > 1.4 * shown as f32, "5,000 stars over 3,000: {} against {shown}", count(&most));
+		// in the day's hours a quarter of midnight's light: fewer pixels over 2 of 255
+		let dawn = count(&lit(5.5, true, 3000));
+		assert!(dawn > 0 && dawn < shown, "{dawn} star pixels at 5.5 against {shown}");
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	#[test]
+	fn star_light_follows_the_clock_and_the_diffuse_scale() {
+		use environment::star_light;
+		assert_eq!(star_light(0.0, 1.0), 1.0);
+		assert_eq!(star_light(12.0, 1.0), 0.0);
+		assert_eq!(star_light(7.3, 1.0), 0.0);
+		assert_eq!(star_light(16.7, 1.0), 0.0);
+		assert!((star_light(7.2, 1.0) - 0.453).abs() < 0.01 && (star_light(16.8, 1.0) - 0.456).abs() < 0.01);
+		// the night's stars against the day's either side of 5.165 and 18.835
+		assert!(star_light(5.16, 1.0) > 0.98 && (star_light(5.17, 1.0) - 0.235).abs() < 0.01);
+		assert!((star_light(18.83, 1.0) - 0.218).abs() < 0.01 && star_light(18.84, 1.0) > 0.92);
+		assert!((star_light(-0.5, 1.0) - star_light(23.5, 1.0)).abs() < 1e-6);
+		assert!((star_light(0.0, 0.0) - 0.89).abs() < 1e-6 && (star_light(0.0, 0.5) - 0.945).abs() < 1e-6);
 	}
 }

@@ -715,6 +715,70 @@ pub fn sky_tint(clock_time: f32, diffuse_scale: f32) -> Option<(Vec3, Vec3)> {
 	None
 }
 
+/// The most stars a Sky draws: StarCount above it draws as many as this (the Roblox client 0.747, a dark
+/// skybox at midnight seen straight up: 5,000, 6,000 and 10,000 drew the same 1,173 and 1,197 stars in two
+/// sessions, 4,000 drew 936 and 983).
+pub const STARS_MAX: i32 = 5000;
+
+/// How bright the stars are by ClockTime at EnvironmentDiffuseScale 1, as a share of midnight's (the
+/// client 0.747, a dark skybox seen straight up, two sessions of two frames each). By night, from 18.835
+/// to 5.165, the stars shine at 0.91-1 of midnight's (each star's light summed over its pixels against
+/// the same star at midnight, within 0.01 between sessions); in the day's hours, which draw every star
+/// anew, the upper quartile and decile of their light: a quarter, a third at 6.25, 0.46 from 6.5 and
+/// none from 7.25 to 16.75 (the switches each fall within 0.01 hours: 5.16 0.99, 5.17 0.23; 18.83
+/// 0.22, 18.84 0.98; 7.2 0.45, 7.3 none; 16.7 none, 16.8 0.46; the Sun- and MoonAngularSize change
+/// nothing; sky-elements stars-dusk, Studio's at 18.5, 0.19). Hours past midnight count on from 24.
+const STAR_TIME: [(f32, f32); 32] = [
+	(5.165, 0.234),
+	(5.25, 0.244),
+	(5.5, 0.249),
+	(6.0, 0.25),
+	(6.25, 0.342),
+	(6.5, 0.461),
+	(7.25, 0.452),
+	(7.251, 0.0),
+	(16.749, 0.0),
+	(16.75, 0.455),
+	(17.5, 0.463),
+	(17.75, 0.37),
+	(18.0, 0.263),
+	(18.25, 0.235),
+	(18.5, 0.215),
+	(18.835, 0.218),
+	(18.836, 0.925),
+	(19.0, 0.925),
+	(19.5, 0.93),
+	(20.0, 0.945),
+	(21.0, 0.95),
+	(22.0, 0.965),
+	(23.0, 0.98),
+	(24.0, 1.0),
+	(24.5, 0.985),
+	(25.0, 0.973),
+	(26.0, 0.95),
+	(27.0, 0.936),
+	(28.0, 0.914),
+	(28.5, 0.95),
+	(29.0, 0.98),
+	(29.164, 0.99),
+];
+
+/// What the stars keep at EnvironmentDiffuseScale 0, linear up to all of them at 1 (the upper quartile
+/// and decile of their light against the same at 1: midnight 0.875, 0.917, 0.942, 0.985 at 0, 0.25,
+/// 0.5, 0.75; 20 and 3 o'clock 0.91 and 0.90 at 0; 18.5 0.87).
+const STAR_DIFFUSE: f32 = 0.89;
+
+/// The stars' light at a ClockTime and EnvironmentDiffuseScale, as a share of midnight's at 1
+/// ([`STAR_TIME`], [`STAR_DIFFUSE`]): what the sky pass scales each star's light by (shaders/sky.wgsl
+/// `stars`). Brightness, ColorShift_Top, Ambient, OutdoorAmbient, EnvironmentSpecularScale,
+/// GeographicLatitude and SkyboxOrientation leave the stars as they are (each compared star by star
+/// in one session: the same to the pixel); ExposureCompensation scales them as it does the sky.
+pub fn star_light(clock_time: f32, diffuse_scale: f32) -> f32 {
+	let hours = clock_time.rem_euclid(24.0);
+	let since = if hours < STAR_TIME[0].0 { hours + 24.0 } else { hours };
+	table(&STAR_TIME, since) * (STAR_DIFFUSE + (1.0 - STAR_DIFFUSE) * diffuse_scale.clamp(0.0, 1.0))
+}
+
 /// The radiance tint along `direction`: the display tints above and below the horizon blend linearly
 /// on the sky's cube, by saturate(0.75 (1 - y / max(|x|, |z|))): all "above" from the side faces' top
 /// edge, all "below" a third of the way down them (sky-elements dim: the share in √ space follows
