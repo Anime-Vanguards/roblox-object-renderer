@@ -116,6 +116,9 @@ pub struct ParticleEmitter {
 	/// A legacy effect's rotation turns its texture within the quad, which keeps facing the camera
 	/// upright (the ForceField's rings spin flattened).
 	pub spin_texture: bool,
+	/// World studs per second its Drag pulls the particles' velocity towards: Workspace.GlobalWind with
+	/// WindAffectsDrag, else none (and none in a file without a Workspace).
+	pub wind: Vec3,
 }
 
 impl ParticleEmitter {
@@ -316,7 +319,14 @@ pub fn read(document: &Document, referent: Ref, instance: &Instance, _warnings: 
 		premultiplied: false,
 		alpha_ramp: (0.0, 0.0),
 		spin_texture: false,
+		wind: if props::bool(instance, "WindAffectsDrag", false) { global_wind(document) } else { Vec3::ZERO },
 	})
+}
+
+/// Workspace.GlobalWind of a place (a model file has no Workspace: no wind).
+fn global_wind(document: &Document) -> Vec3 {
+	let dom = &document.dom;
+	dom.root().children().iter().filter_map(|&child| dom.get_by_ref(child)).find(|instance| instance.class == "Workspace").map_or(Vec3::ZERO, |workspace| props::vec3(workspace, "GlobalWind", Vec3::ZERO))
 }
 
 #[cfg(test)]

@@ -517,6 +517,7 @@ fn emitter(document: &Document, referent: Ref, class: &str, system: System, plac
 		premultiplied: system.premultiplied,
 		alpha_ramp: system.alpha_ramp,
 		spin_texture: system.spin_texture,
+		wind: Vec3::ZERO,
 	}
 }
 

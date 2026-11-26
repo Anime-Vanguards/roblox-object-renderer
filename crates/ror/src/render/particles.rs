@@ -320,7 +320,15 @@ const DRAG_STEP: f32 = 1.0 / 60.0;
 /// at rest pulled up at 40 studs a second² rise 2.467 / 0.953 / 0.361 studs in 0.4 s at Drag 3 / 20 /
 /// 60, the smooth law's 2.470 / 0.947 / 0.362; stepped as their speed, 2.421 / 1.033 / 0.489). A
 /// legacy effect's systems (`stepped` false) keep the smooth decay their Drag was fitted with.
-fn motion(start: Vec3, velocity: Vec3, acceleration: Vec3, drag: f32, age: f32, stepped: bool) -> (Vec3, Vec3) {
+///
+/// With WindAffectsDrag the Drag pulls the velocity towards Workspace.GlobalWind (`wind`) instead of
+/// to rest: the velocity relative to the wind decays as the speed does, stepped alike (in a Roblox
+/// client, GlobalWind 20 studs a second along X: particles at rest drift 2.86 / 5.16 / 8.55 / 13.62
+/// studs in 0.969 s at Drag 0.5 / 1 / 2 / 5 and 10.88 / 17.96 / 25.98 / 33.70 in 1.985 s, this law's
+/// 2.87 / 5.19 / 8.61 / 13.67 and 10.91 / 18.01 / 26.03 / 33.77, the smooth law's 2.92 / 5.28 / 8.73 /
+/// 13.83; none at Drag 0 or without WindAffectsDrag; one leaving upwards at 5 studs a second and one
+/// pulled up at 4 studs a second² rise as without wind and drift as one at rest).
+fn motion(start: Vec3, velocity: Vec3, acceleration: Vec3, drag: f32, wind: Vec3, age: f32, stepped: bool) -> (Vec3, Vec3) {
 	let k = drag * std::f32::consts::LN_2;
 	if k.abs() < 1e-5 {
 		return (start + velocity * age + acceleration * (0.5 * age * age), velocity + acceleration * age);
@@ -328,8 +336,8 @@ fn motion(start: Vec3, velocity: Vec3, acceleration: Vec3, drag: f32, age: f32, 
 	let terminal = acceleration / k;
 	let decay = (-k * age).exp();
 	let steps = if stepped { k * DRAG_STEP / (1.0 - (-k * DRAG_STEP).exp()) } else { 1.0 };
-	let position = start + terminal * (age - (1.0 - decay) / k) + velocity * ((1.0 - decay) / k * steps);
-	(position, terminal + (velocity - terminal) * decay)
+	let position = start + wind * age + terminal * (age - (1.0 - decay) / k) + (velocity - wind) * ((1.0 - decay) / k * steps);
+	(position, wind + terminal + (velocity - wind - terminal) * decay)
 }
 
 /// The flipbook frame at `age` (of `lifetime`), the next one and the blend towards it.
@@ -402,8 +410,10 @@ fn particle(emitter: &ParticleEmitter, frame: &glam::Affine3A, size: Vec3, inher
 	// locked particles went 2.33 studs along -X, its free ones 2.34 up; the same in a turned part and
 	// with a dragon fire's turn, where Acceleration (0, 1000, 0) lays its flames along the flight)
 	let acceleration = if emitter.locked_to_part { Vec3::from(rotation * glam::Vec3A::from(emitter.acceleration)) } else { emitter.acceleration };
-	// a ParticleEmitter has no mount; a legacy effect's system does
-	let (position, velocity) = motion(start, velocity, acceleration, emitter.drag, age, emitter.mount.is_none());
+	// a ParticleEmitter has no mount; a legacy effect's system does. The wind stays the world's, locked
+	// or not (a Roblox client: a LockedToPart emitter on an attachment whose up is the world's -X drifts
+	// along GlobalWind as an unlocked one does)
+	let (position, velocity) = motion(start, velocity, acceleration, emitter.drag, emitter.wind, age, emitter.mount.is_none());
 	// RotSpeed turns a particle by the life it has left, by its own drawn values: born at Rotation +
 	// RotSpeed · Lifetime, it turns clockwise for a positive RotSpeed (Rotation turns counterclockwise)
 	// and lies at Rotation when it dies (measured in a client: RotSpeed 180 over a 1 s life born at -179°
@@ -1179,6 +1189,7 @@ mod tests {
 			premultiplied: false,
 			alpha_ramp: (0.0, 0.0),
 			spin_texture: false,
+			wind: Vec3::ZERO,
 		}
 	}
 
@@ -1251,13 +1262,13 @@ mod tests {
 
 	#[test]
 	fn drag_halves_the_speed_every_one_over_drag_seconds() {
-		let (_, velocity) = motion(Vec3::ZERO, Vec3::new(8.0, 0.0, 0.0), Vec3::ZERO, 2.0, 0.5, true);
+		let (_, velocity) = motion(Vec3::ZERO, Vec3::new(8.0, 0.0, 0.0), Vec3::ZERO, 2.0, Vec3::ZERO, 0.5, true);
 		assert!((velocity.x - 4.0).abs() < 1e-4, "{velocity}");
 		// with acceleration the velocity tends to Acceleration / (Drag · ln 2)
-		let (_, velocity) = motion(Vec3::ZERO, Vec3::ZERO, Vec3::new(0.0, -1.0, 0.0), 1.0, 100.0, true);
+		let (_, velocity) = motion(Vec3::ZERO, Vec3::ZERO, Vec3::new(0.0, -1.0, 0.0), 1.0, Vec3::ZERO, 100.0, true);
 		assert!((velocity.y + 1.0 / std::f32::consts::LN_2).abs() < 1e-3, "{velocity}");
 		// the distance as Studio's frames add it up: 24 steps of a sixtieth of a second at Drag 20
-		let (position, _) = motion(Vec3::ZERO, Vec3::new(20.0, 0.0, 0.0), Vec3::ZERO, 20.0, 0.4, true);
+		let (position, _) = motion(Vec3::ZERO, Vec3::new(20.0, 0.0, 0.0), Vec3::ZERO, 20.0, Vec3::ZERO, 0.4, true);
 		let step = (-20.0 * std::f32::consts::LN_2 / 60.0).exp();
 		let frames: f32 = (0..24).map(|frame| 20.0 / 60.0 * step.powi(frame)).sum();
 		assert!((position.x - frames).abs() < 1e-3, "{position} against {frames}");
@@ -1341,6 +1352,51 @@ mod tests {
 			}
 		}
 		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	/// WindAffectsDrag: Drag pulls the velocity towards Workspace.GlobalWind, the velocity relative to it
+	/// decaying as the speed does (a Roblox client's particles at rest under GlobalWind 20 studs a second
+	/// along X, measured at 0.969 and 1.985 s; fixtures/particle-probes.luau "wind")
+	#[test]
+	fn wind_pulls_particles_by_the_stepped_drag() {
+		let wind = Vec3::new(20.0, 0.0, 0.0);
+		for (drag, age, client) in [(0.5, 0.969, 2.86), (1.0, 0.969, 5.16), (2.0, 0.969, 8.55), (5.0, 0.969, 13.62), (0.5, 1.985, 10.88), (1.0, 1.985, 17.96), (2.0, 1.985, 25.98), (5.0, 1.985, 33.70)] {
+			let (position, _) = motion(Vec3::ZERO, Vec3::ZERO, Vec3::ZERO, drag, wind, age, true);
+			assert!((position.x - client).abs() < 0.08, "Drag {drag} at {age} s: {} against the client's {client}", position.x);
+			assert_eq!((position.y, position.z), (0.0, 0.0));
+		}
+		// none without Drag; a particle leaving upwards rises as without wind and drifts as one at rest
+		assert_eq!(motion(Vec3::ZERO, Vec3::ZERO, Vec3::ZERO, 0.0, wind, 1.0, true).0, Vec3::ZERO);
+		let (rising, _) = motion(Vec3::ZERO, Vec3::new(0.0, 5.0, 0.0), Vec3::ZERO, 1.0, wind, 0.969, true);
+		let (still, _) = motion(Vec3::ZERO, Vec3::new(0.0, 5.0, 0.0), Vec3::ZERO, 1.0, Vec3::ZERO, 0.969, true);
+		assert!((rising.y - still.y).abs() < 1e-4 && (rising.y - 3.545).abs() < 0.02, "{rising}");
+		assert!((rising.x - 5.16).abs() < 0.08, "{rising}");
+		// the velocity tends to the wind
+		let (_, velocity) = motion(Vec3::ZERO, Vec3::ZERO, Vec3::ZERO, 2.0, wind, 20.0, true);
+		assert!((velocity - wind).length() < 1e-3, "{velocity}");
+	}
+
+	/// The wind is Workspace.GlobalWind of the place, for emitters with WindAffectsDrag only; a model file
+	/// has none
+	#[test]
+	fn global_wind_reaches_wind_affected_emitters() {
+		use rbx_dom_weak::InstanceBuilder;
+		let place = |wind_affects: bool, with_workspace: bool| {
+			let emitter = InstanceBuilder::new("ParticleEmitter").with_name("E").with_property("WindAffectsDrag", wind_affects).with_property("Drag", 1.0f32);
+			let part = InstanceBuilder::new("Part").with_name("P").with_child(emitter);
+			let root = if with_workspace {
+				InstanceBuilder::new("DataModel").with_child(InstanceBuilder::new("Workspace").with_property("GlobalWind", rbx_dom_weak::types::Vector3::new(20.0, 0.0, -5.0)).with_child(part))
+			} else {
+				InstanceBuilder::new("DataModel").with_child(part)
+			};
+			let document = crate::scene::load::Document::new(rbx_dom_weak::WeakDom::new(root));
+			let emitter = document.dom.descendants().find(|instance| instance.class == "ParticleEmitter").map(|instance| instance.referent()).unwrap();
+			let instance = document.dom.get_by_ref(emitter).unwrap();
+			crate::scene::particles::read(&document, emitter, instance, &mut Vec::new()).unwrap().wind
+		};
+		assert_eq!(place(true, true), Vec3::new(20.0, 0.0, -5.0));
+		assert_eq!(place(false, true), Vec3::ZERO);
+		assert_eq!(place(true, false), Vec3::ZERO);
 	}
 
 	#[test]

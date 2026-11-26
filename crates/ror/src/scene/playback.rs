@@ -1307,7 +1307,8 @@ impl Timeline {
 fn reach_terms(emitter: &super::particles::ParticleEmitter) -> (f32, f32, f32) {
 	let life = emitter.lifetime.0.max(emitter.lifetime.1).max(0.0);
 	let speed = emitter.speed.0.abs().max(emitter.speed.1.abs());
-	let flight = if emitter.drag > 0.0 { (speed / (emitter.drag * std::f32::consts::LN_2)).min(speed * life) } else { speed * life };
+	// the wind carries a particle at most its own speed for its life (WindAffectsDrag: render::particles::motion)
+	let flight = if emitter.drag > 0.0 { (speed / (emitter.drag * std::f32::consts::LN_2)).min(speed * life) + emitter.wind.length() * life } else { speed * life };
 	let pull = 0.5 * emitter.acceleration.length() * life * life;
 	let largest = emitter.size_keys.iter().map(|&(_, value, envelope)| value + envelope.abs()).fold(0.0f32, f32::max);
 	let stretch = 1.0 + emitter.squash.iter().map(|&(_, value, envelope)| value.abs() + envelope.abs()).fold(0.0f32, f32::max);
