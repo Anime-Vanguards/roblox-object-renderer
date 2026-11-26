@@ -36,6 +36,16 @@ impl Sun {
 		scene
 	}
 
+	/// A Sky of the test's own black images with no sun or moon drawn, for a test that checks every asset
+	/// loaded: a scene without a Sky draws Studio's default sky, whose textures are read from a Roblox
+	/// install and missing on a machine without one (CI). The sky lights nothing under [`Sun::lit`], and
+	/// the views draw a background colour.
+	fn black_sky(&self) -> crate::scene::environment::Sky {
+		let path = self.state.join("black-sky.png");
+		crate::output::write_png(&path, 8, 8, &[0, 0, 0, 255].repeat(64), false).unwrap();
+		crate::scene::environment::Sky { skybox: std::array::from_fn(|_| Self::uri(&path)), celestial_bodies_shown: false, ..Default::default() }
+	}
+
 	/// The mean level (0-255) of the `side` x `side` pixels round `at` in `image` seen by `view`.
 	fn level(image: &ViewImage, view: &ViewRequest, at: Vec3, side: i32) -> f32 {
 		let camera = view.camera.place(None, view.width, view.height);
@@ -113,6 +123,7 @@ fn a_cut_out_checkerboard_shadows_as_one_built_from_parts() {
 	std::fs::write(&mesh_path, super::vertex_colour_tests::quad_mesh([255; 4])).unwrap();
 	let mesh = Sun::uri(&mesh_path);
 	let card = Vec3::new(0.0, 3.0, 0.0);
+	let sky = sun.black_sky();
 	// `count` x `count` squares on a 6-stud card, the opaque ones where (column + row) is even
 	let square = |count: u32, index: u32| card + Vec3::new(((index % count) as f32 + 0.5) * 6.0 / count as f32 - 3.0, 0.0, ((index / count) as f32 + 0.5) * 6.0 / count as f32 - 3.0);
 	let scene = |count: u32, alpha: bool| {
@@ -148,7 +159,9 @@ fn a_cut_out_checkerboard_shadows_as_one_built_from_parts() {
 				emissive_tint: Vec3::ONE,
 			});
 		}
-		Sun::lit(scene)
+		let mut scene = Sun::lit(scene);
+		scene.environment.sky = Some(sky.clone());
+		scene
 	};
 	// straight down from 150 studs over the shadow's middle: the third cascade (texels of 0.14 studs)
 	let middle = card - SUN * (card.y / SUN.y);
