@@ -718,9 +718,9 @@ struct VideoArgs {
 	#[arg(long, value_name = "DIR", conflicts_with_all = ["frame", "focus", "camera"])]
 	camera_from: Option<PathBuf>,
 	/// A moving camera in place of the view: a JSON file of keys [{"at": s, "cframe": [12 numbers],
-	/// "fov": deg}], each held from its moment until the next (a recording's camera.json). A leading
-	/// engine-default (0, 20, 20) key at t=0 is skipped when a later key exists unless
-	/// --keep-default-camera is passed
+	/// "fov": deg}], each held from its moment until the frame before the next, then moving on to it as
+	/// a part's motion does, but for a cut (a recording's camera.json). A leading engine-default
+	/// (0, 20, 20) key at t=0 is skipped when a later key exists unless --keep-default-camera is passed
 	#[arg(long, value_name = "FILE", conflicts_with_all = ["camera", "yaw", "camera_from", "frame", "focus"])]
 	camera_track: Option<PathBuf>,
 	/// With --camera-track: keep a leading engine-default (0, 20, 20) camera key at t=0

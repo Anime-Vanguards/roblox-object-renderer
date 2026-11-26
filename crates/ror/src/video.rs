@@ -157,8 +157,9 @@ pub struct VideoJob {
 	/// absent, an animated PNG when there is none.
 	#[serde(default)]
 	pub ffmpeg: Option<PathBuf>,
-	/// A moving camera, in place of the view's: each key from its moment until the next (the first
-	/// before its own), as a recording's game camera moved (ree's `camera.json`).
+	/// A moving camera, in place of the view's: each key from its moment until the update before the
+	/// next, then on to it as a part's motion goes (the first before its own: [`track_camera`]), as a
+	/// recording's game camera moved (ree's `camera.json`).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub camera_track: Option<Vec<CameraKey>>,
 	/// Keep a leading engine-default camera key at `t = 0` in `camera_track` (by default it is
@@ -287,10 +288,71 @@ fn watched_with(job: &VideoJob, track: Option<&[CameraKey]>) -> Result<Playback>
 	Ok(playback)
 }
 
-/// The track's camera at a moment: the latest key at or before it, else the first.
-fn track_camera(track: &[CameraKey], time: f32) -> CameraSpec {
-	let key = track.iter().filter(|key| key.at <= time + 1e-4).max_by(|a, b| a.at.total_cmp(&b.at)).unwrap_or(&track[0]);
-	CameraSpec::CFrame { components: key.cframe, fov: key.fov, near: None }
+/// The track's camera at a moment, and the moment the world is drawn at with it (`time` itself but at a
+/// cut). A recording keys the game camera on the frames it moved in (ree's camera.json) and a moving
+/// part on the same frames, and a part's motion is drawn lerped between its keys (scene::playback). So a
+/// key holds until the world update before the next one (`frames`, the playback's, else every 1/60 s),
+/// and over that update the camera goes on to the next key as a part does: position lerped, rotation
+/// slerped ([`scene::playback::between`]), field of view lerped. A camera a script puts at a part every
+/// frame (a cutscene's camera rig, `CurrentCamera.CFrame = Rig.Camera.CFrame`) then stays inside the part
+/// at a moment between two recorded frames too, where Roblox draws none of the part (its faces turn their
+/// backs to the camera). Held there while the part went on, it was drawn up to a frame behind the part: a
+/// clip whose frames fell 0.33 ms before the recording's (its start trimmed to 0.683 s) showed a 1-stud
+/// camera part moving 3 studs a frame as a grey square over a third of the view.
+///
+/// A cut ([`cuts_to`]: a change of shot, the game's camera given back after a cutscene) is not lerped
+/// through: over the update before it the camera holds its key and the world is drawn at that update, the
+/// frame Roblox showed then. Lerped, the view between two shots met the world of the frame before (the
+/// next shot early, under the Lighting of the one it left); held over a world drawn at `time`, the camera
+/// rig's part, gone on with the cut, could show in the shot it left.
+/// Before the first key, the first; after the last, the last; keys in any order.
+pub fn track_camera(track: &[CameraKey], time: f32, frames: Option<&[f32]>) -> (CameraSpec, f32) {
+	let held = |key: &CameraKey| CameraSpec::CFrame { components: key.cframe, fov: key.fov, near: None };
+	let mut keys: Vec<&CameraKey> = track.iter().collect();
+	keys.sort_by(|a, b| a.at.total_cmp(&b.at));
+	let next = keys.partition_point(|key| key.at <= time + 1e-4);
+	if next == 0 || next == keys.len() {
+		return (held(keys[next.saturating_sub(1)]), time);
+	}
+	let (before, after) = (keys[next - 1], keys[next]);
+	let from = scene::playback::update_before(frames, after.at).max(before.at);
+	if time <= from || after.at - from <= 1e-6 || (before.cframe == after.cframe && before.fov == after.fov) {
+		return (held(before), time);
+	}
+	if cuts_to(&keys, next, frames) {
+		return (held(before), from);
+	}
+	let alpha = (time - from) / (after.at - from);
+	let pose = scene::playback::between(&scene::playback::cframe_transform(&before.cframe), &scene::playback::cframe_transform(&after.cframe), alpha);
+	(CameraSpec::CFrame { components: scene::playback::transform_cframe(&pose), fov: before.fov + (after.fov - before.fov) * alpha, near: None }, time)
+}
+
+/// How far a camera must jump in one update, and how many times further than it moves in the updates on
+/// either side, to cut: in studs, and in degrees turned. A cutscene's shots change by 27 to 104 studs
+/// with the camera still on both sides; its camera moves up to 17 studs an update with 8 the next. A
+/// cut found where there is none draws that update's frame as recorded, as Roblox showed it.
+const CUT_STUDS: f32 = 1.0;
+const CUT_DEGREES: f32 = 10.0;
+const CUT_RATIO: f32 = 4.0;
+
+/// Whether the camera cuts to `keys[index]` (keys in time order): it gets there from the key before in
+/// one update by more than [`CUT_STUDS`] or [`CUT_DEGREES`], and by more than [`CUT_RATIO`] times what
+/// it moved or turned in the update before and the one after.
+fn cuts_to(keys: &[&CameraKey], index: usize, frames: Option<&[f32]>) -> bool {
+	let step = |a: &CameraKey, b: &CameraKey| {
+		let (a, b) = (scene::playback::cframe_transform(&a.cframe), scene::playback::cframe_transform(&b.cframe));
+		let (ra, rb) = (glam::Quat::from_mat3a(&a.matrix3).normalize(), glam::Quat::from_mat3a(&b.matrix3).normalize());
+		(Vec3::from(a.translation).distance(Vec3::from(b.translation)), ra.angle_between(rb).to_degrees())
+	};
+	let (before, after) = (keys[index - 1], keys[index]);
+	let (moved, turned) = step(before, after);
+	let from = scene::playback::update_before(frames, after.at);
+	// a key is where the camera got to in the update before it: it moved in the update before the cut's
+	// only when the key before ends that update, and in the one after only when the next key ends it
+	let ahead = keys.get(index + 1).filter(|next| scene::playback::update_before(frames, next.at) <= after.at + 1e-4);
+	let around = [(index >= 2 && (before.at - from).abs() <= 1e-4).then(|| step(keys[index - 2], before)), ahead.map(|next| step(after, next))];
+	let (most_moved, most_turned) = around.into_iter().flatten().fold((0.0f32, 0.0f32), |(m, t), (moved, turned)| (m.max(moved), t.max(turned)));
+	(moved > CUT_STUDS && moved > CUT_RATIO * most_moved) || (turned > CUT_DEGREES && turned > CUT_RATIO * most_turned)
 }
 
 /// A moment on the contact sheet.
@@ -1703,7 +1765,8 @@ type Framing = (Vec<CameraSpec>, Option<(Vec3, Vec3)>);
 /// any other camera as given. Also the box framed.
 fn cameras<'s>(renderer: &Renderer, builder: &'s Builder, times: &[f32], job: &VideoJob, track: Option<&[CameraKey]>, held: &Mutex<Vec<Kept<'s>>>) -> Result<Framing> {
 	if let Some(track) = track.filter(|track| !track.is_empty()) {
-		return Ok((times.iter().map(|&time| track_camera(track, time)).collect(), None));
+		let frames = builder.playback.frames.as_deref();
+		return Ok((times.iter().map(|&time| track_camera(track, time, frames).0).collect(), None));
 	}
 	let (width, height) = (job.view.width.max(1), job.view.height.max(1));
 	let CameraSpec::Orbit { yaw, pitch, distance, padding, target, fov } = job.view.camera else {
@@ -2527,6 +2590,12 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 		keys
 	});
 	let playback = watched_with(job, camera_track.as_deref())?;
+	// over the update before a camera track's cut the world is drawn at that update, as the camera is
+	// ([`track_camera`]): those frames' moments are that update's
+	let times: Vec<f32> = match camera_track.as_deref() {
+		Some(track) => times.iter().map(|&time| track_camera(track, time, playback.frames.as_deref()).1).collect(),
+		None => times,
+	};
 	let builder = Builder::with_playback(|| input_bytes(renderer, &job.input), job, playback, scenes)?;
 	// the document the clip's moments are made on, with its playback resolved, from the framing on
 	let held = Mutex::new(Vec::new());
@@ -3584,20 +3653,128 @@ mod tests {
 	}
 
 	#[test]
-	fn a_camera_track_holds_each_key_until_the_next() {
+	fn a_camera_track_holds_each_key_until_the_update_before_the_next() {
 		// a recording keys the game camera whenever it moves; ree writes them in time order but a
 		// track read from anywhere may not be
 		let key = |at: f32, x: f32| CameraKey { at, cframe: [x, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], fov: 70.0 };
-		let track = vec![key(0.5, 2.0), key(0.0, 1.0), key(1.0, 3.0)];
-		let x = |time: f32| match track_camera(&track, time) {
-			CameraSpec::CFrame { components, .. } => components[0],
+		let x = |track: &[CameraKey], time: f32, frames: Option<&[f32]>| match track_camera(track, time, frames) {
+			(CameraSpec::CFrame { components, .. }, moment) => ((components[0] * 1e4).round() / 1e4, (moment * 1e4).round() / 1e4),
 			other => panic!("a track draws CFrame cameras, not {other:?}"),
 		};
-		assert_eq!([x(0.0), x(0.49), x(0.5), x(0.99), x(1.0), x(4.0)], [1.0, 1.0, 2.0, 2.0, 3.0, 3.0]);
+		let track = vec![key(0.5, 1.5), key(0.0, 1.0), key(1.0, 2.0)];
+		// held until the 1/60 s update before the next key (0.4833 s), then on to it over that update
+		let at = |times: [f32; 7], frames: Option<&[f32]>| times.map(|time| x(&track, time, frames).0);
+		assert_eq!(at([0.0, 0.48, 0.49, 0.5, 0.99, 1.0, 4.0], None), [1.0, 1.0, 1.2, 1.5, 1.7, 2.0, 2.0]);
+		// a recording's own frames (one made at 20 a second) set the update
+		let frames: Vec<f32> = (0..=20).map(|frame| frame as f32 / 20.0).collect();
+		assert_eq!(at([0.0, 0.44, 0.475, 0.5, 0.9, 0.975, 1.0], Some(&frames)), [1.0, 1.0, 1.25, 1.5, 1.5, 1.75, 2.0]);
+		assert_eq!(x(&track, 0.49, None).1, 0.49, "the world is drawn at the moment itself");
 		let late = vec![key(0.3, 5.0)];
-		assert!(matches!(track_camera(&late, 0.0), CameraSpec::CFrame { components, fov, near: None } if components == late[0].cframe && fov == 70.0), "before its first key a track holds that key");
+		assert!(matches!(track_camera(&late, 0.0, None), (CameraSpec::CFrame { components, fov, near: None }, moment) if components == late[0].cframe && fov == 70.0 && moment == 0.0), "before its first key a track holds that key");
+		// the rotation slerped and the field of view lerped with it: turning 30 degrees an update
+		let turning: Vec<CameraKey> = (0..3)
+			.map(|frame| {
+				let (sin, cos) = (frame as f32 * 30.0).to_radians().sin_cos();
+				CameraKey { at: frame as f32 / 60.0, cframe: [0.0, 0.0, 0.0, cos, 0.0, sin, 0.0, 1.0, 0.0, -sin, 0.0, cos], fov: 70.0 - 20.0 * frame as f32 }
+			})
+			.collect();
+		let (CameraSpec::CFrame { components, fov, .. }, _) = track_camera(&turning, 1.5 / 60.0, None) else { panic!() };
+		let (sin, cos) = 45f32.to_radians().sin_cos();
+		assert!((fov - 40.0).abs() < 1e-3 && (components[3] - cos).abs() < 1e-4 && (components[5] - sin).abs() < 1e-4 && (components[9] + sin).abs() < 1e-4, "{components:?} {fov}");
+		// a cut is not lerped through: over the update before it the camera and the world are that update's
+		let cut = vec![key(0.0, 0.0), key(0.5, 40.0), key(0.55, 40.0)];
+		let before_cut = 0.5f32 - 1.0 / 60.0;
+		assert_eq!(x(&cut, 0.49, None), (0.0, (before_cut * 1e4).round() / 1e4));
+		assert_eq!(x(&cut, 0.5, None), (40.0, 0.5));
+		// 3 studs an update all along is no cut, nor 12 among them; 13 is
+		let moving = |jump: f32| -> Vec<CameraKey> { (0..=6).map(|frame| key(frame as f32 / 60.0, 3.0 * frame as f32 + if frame >= 4 { jump - 3.0 } else { 0.0 })).collect() };
+		assert_eq!(x(&moving(3.0), 2.5 / 60.0, None).0, 7.5);
+		assert_eq!(x(&moving(12.0), 3.5 / 60.0, None), (15.0, (3.5f32 / 60.0 * 1e4).round() / 1e4));
+		assert_eq!(x(&moving(13.0), 3.5 / 60.0, None), (9.0, (3.0f32 / 60.0 * 1e4).round() / 1e4));
 		let parsed: Vec<CameraKey> = serde_json::from_str(r#"[{"at": 0.25, "cframe": [0,20,20,1,0,0,0,0.7,0.7,0,-0.7,0.7]}]"#).unwrap();
 		assert_eq!(parsed[0].fov, 70.0, "fov defaults as a camera's does");
+	}
+
+	/// A camera a script puts at a moving part every frame (a cutscene's camera rig:
+	/// `CurrentCamera.CFrame = Rig.Camera.CFrame` each RenderStep) is inside that part at every moment
+	/// a clip draws, between two recorded frames too, so none of the part shows: in Roblox (the engine
+	/// 0.747, roblox-sim's rendered client at 1920x1080) a camera at the centre of an opaque 1 x 1 x 1
+	/// SmoothPlastic part with a Decal on its front draws the frame the scene draws without the part, to
+	/// the pixel, and 3.17 studs behind it the part's back face as a grey square. A clip whose frames
+	/// fell 0.33 ms before the recording's drew the held camera a frame behind the part, which moved on
+	/// with its motion: the square over a third of the view. At a cut (here 18 studs ahead in one update)
+	/// the update before is drawn as recorded, the part and all, never a view between the two shots.
+	#[test]
+	fn a_camera_riding_a_moving_part_draws_none_of_it_between_recorded_frames() {
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use glam::{Affine3A, Quat};
+		let state = std::env::temp_dir().join(format!("ror-camera-rides-part-{}", std::process::id()));
+		std::fs::create_dir_all(&state).unwrap();
+		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let mut model = ModelBuilder::new("Scene");
+		// the rig's camera part, and a wall of tiles ahead of where it goes
+		model.part(&PartSpec { name: "Rig".into(), size: Vec3::ONE, cast_shadow: false, ..Default::default() });
+		for (index, color) in [[40, 160, 70], [230, 200, 60], [60, 90, 220]].into_iter().enumerate() {
+			let x = index as f32 * 8.0 - 8.0;
+			model.part(&PartSpec { name: format!("Tile{index}"), size: Vec3::new(8.0, 30.0, 1.0), cframe: Affine3A::from_translation(Vec3::new(x, 0.0, -80.0)), color, ..Default::default() });
+		}
+		let input = state.join("scene.rbxm");
+		std::fs::write(&input, model.to_rbxm().unwrap()).unwrap();
+		// the part goes 3 studs a frame towards the wall, turning a little, and jumps 15 studs more (a cut)
+		// at frame 13; the camera is put at it every frame: one key each for both, as a recording keys them
+		let pose = |frame: usize| Affine3A::from_rotation_translation(Quat::from_rotation_y(frame as f32 * 0.02), Vec3::new(0.0, 0.0, 20.0 - 3.0 * frame as f32 - if frame >= 13 { 15.0 } else { 0.0 }));
+		let keys: Vec<(f32, [f32; 12])> = (0..=16).map(|frame| ((frame as f32 / 60.0 * 1e5).round() / 1e5, scene::playback::transform_cframe(&pose(frame)))).collect();
+		let motion = serde_json::json!([{ "target": "Scene.Rig", "keys": keys.iter().map(|(at, cframe)| serde_json::json!({ "at": at, "cframe": cframe })).collect::<Vec<_>>() }]);
+		let track: Vec<CameraKey> = keys.iter().map(|&(at, cframe)| CameraKey { at, cframe, fov: 30.45 }).collect();
+		let job = |out: &str, hidden: bool| VideoJob {
+			input: input.display().to_string(),
+			select: None,
+			out: Some(state.join(out)),
+			view: ViewRequest { width: 96, height: 64, ..Default::default() },
+			name: default_name(),
+			playback: Some(serde_json::from_value(serde_json::json!({
+				"motion": motion,
+				"actions": if hidden { serde_json::json!([{ "at": 0, "target": "Scene.Rig", "set": { "Transparency": 1 } }]) } else { serde_json::json!([]) },
+			})).unwrap()),
+			playback_file: None,
+			playback_overlay: None,
+			start: 0.0,
+			duration: 0.0,
+			fps: 60.0,
+			speed: 1.0,
+			// a recorded frame, moments 0.33 ms and half a frame before the next ones, 0.33 ms before the cut
+			// and the recorded frame before it
+			times: Some(vec![5.0 / 60.0, 7.0 / 60.0 - 0.00033, 9.5 / 60.0, 13.0 / 60.0 - 0.00033, 12.0 / 60.0]),
+			orbit: 0.0,
+			format: VideoFormat::Png,
+			sheet: 0,
+			materials_from: None,
+			lighting_from: None,
+			map: None,
+			frame: None,
+			focus: None,
+			ffmpeg: None,
+			camera_track: Some(track.clone()),
+			keep_default_camera: false,
+			sheet_first: false,
+			copies: Vec::new(),
+			relative_to: None,
+			nvenc: None,
+		};
+		let scenes = SceneCache::default();
+		let (with, without) = (run(&renderer, &scenes, &job("with", false), None).unwrap(), run(&renderer, &scenes, &job("without", true), None).unwrap());
+		assert_eq!((with.frames, without.frames), (5, 5));
+		let read = |dir: &str, frame: usize| output::decode_png(&state.join(dir).join(format!("frames/{frame:04}.png"))).unwrap().2;
+		let differ = |a: &[u8], b: &[u8]| (0..a.len().min(b.len()) / 4).filter(|pixel| (pixel * 4..pixel * 4 + 4).any(|byte| a[byte].abs_diff(b[byte]) > 2)).count();
+		for frame in 0..5 {
+			let (shown, bare) = (read("with", frame), read("without", frame));
+			assert_eq!(differ(&shown, &bare), 0, "frame {frame}: {} of {} pixels show the part the camera is in", differ(&shown, &bare), shown.len() / 4);
+		}
+		assert_eq!(differ(&read("with", 3), &read("with", 4)), 0, "just before the cut: the frame before it as recorded");
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
 	}
 
 	#[test]
@@ -3615,7 +3792,7 @@ mod tests {
 		assert!(skipped, "leading engine-default key at t=0 must be skipped when a later key exists");
 		assert_eq!(normalized.len(), 2);
 		assert_eq!(normalized[0], real_key);
-		assert!(matches!(track_camera(&normalized, 0.0), CameraSpec::CFrame { components, fov, .. } if components == real_key.cframe && fov == real_key.fov));
+		assert!(matches!(track_camera(&normalized, 0.0, None).0, CameraSpec::CFrame { components, fov, .. } if components == real_key.cframe && fov == real_key.fov));
 		// Idempotent: normalizing the already-normalized track does not strip again.
 		let (again, skipped_again) = normalize_camera_track(normalized.clone(), false);
 		assert!(!skipped_again);

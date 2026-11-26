@@ -301,13 +301,6 @@ fn round6(value: f64) -> f64 {
 	(value * 1e6).round() / 1e6
 }
 
-/// The camera track's camera at `time`: the latest key at or before `time + 1e-4`, else the first
-/// (matches `video.rs::track_camera`).
-pub fn track_camera(track: &[CameraKey], time: f32) -> CameraSpec {
-	let key = track.iter().filter(|key| key.at <= time + 1e-4).max_by(|a, b| a.at.total_cmp(&b.at)).unwrap_or(&track[0]);
-	CameraSpec::CFrame { components: key.cframe, fov: key.fov, near: None }
-}
-
 /// Builds the rounded sample moments `(times, start, duration, fps_opt)` using a precomputed
 /// [`crate::scene::playback::NaturalEnd`].
 pub fn sample_times_with_info(opts: &TimelineOptions, info: &crate::scene::playback::NaturalEnd) -> (Vec<f64>, f64, f64, Option<f64>) {
@@ -669,7 +662,15 @@ pub fn run(
 	let mut first_scene_counts = SceneCounts::default();
 
 	for (frame_idx, &t) in times.iter().enumerate() {
-		let t_f32 = t as f32;
+		// a camera track's camera, and at a cut the world drawn at the update before it, as a clip draws
+		// them (video::track_camera)
+		let (track_spec, t_f32) = match normalized_track.as_deref() {
+			Some(track) => {
+				let (spec, moment) = crate::video::track_camera(track, t as f32, owned_playback.frames.as_deref());
+				(Some(spec), moment)
+			}
+			None => (None, t as f32),
+		};
 		if !resolved.at(t_f32) {
 			resolved = owned_playback.resolve_at(document, t_f32)?;
 		}
@@ -679,11 +680,7 @@ pub fn run(
 			resolved.apply_history(document, &mut scene);
 			lend(&mut scene)?;
 
-			let mut spec = if let Some(track) = normalized_track.as_deref() {
-				track_camera(track, t_f32)
-			} else {
-				base_camera.clone()
-			};
+			let mut spec = track_spec.clone().unwrap_or_else(|| base_camera.clone());
 			if !has_track {
 				let framed = match (frame_box, focus) {
 					(Some([min, max]), _) => Some((Vec3::from(min).min(Vec3::from(max)), Vec3::from(min).max(Vec3::from(max)))),

@@ -457,13 +457,21 @@ fn descendants(document: &Document, referent: Ref) -> Vec<Ref> {
 fn affine(components: &[f32], rest: Affine3A) -> Result<Affine3A> {
 	match components.len() {
 		3 => Ok(Affine3A::from_mat3_translation(rest.matrix3.into(), Vec3::new(components[0], components[1], components[2]))),
-		12 => {
-			let c = components;
-			let matrix = glam::Mat3::from_cols(Vec3::new(c[3], c[6], c[9]), Vec3::new(c[4], c[7], c[10]), Vec3::new(c[5], c[8], c[11]));
-			Ok(Affine3A::from_mat3_translation(matrix, Vec3::new(c[0], c[1], c[2])))
-		}
+		12 => Ok(cframe_transform(components.try_into()?)),
 		count => bail!("playback: a CFrame has 3 or 12 numbers, not {count}"),
 	}
+}
+
+/// A Roblox CFrame's 12 numbers (position, then the rotation by rows) as a transform.
+pub fn cframe_transform(c: &[f32; 12]) -> Affine3A {
+	let matrix = glam::Mat3::from_cols(Vec3::new(c[3], c[6], c[9]), Vec3::new(c[4], c[7], c[10]), Vec3::new(c[5], c[8], c[11]));
+	Affine3A::from_mat3_translation(matrix, Vec3::new(c[0], c[1], c[2]))
+}
+
+/// A transform as a Roblox CFrame's 12 numbers (position, then the rotation by rows).
+pub fn transform_cframe(transform: &Affine3A) -> [f32; 12] {
+	let (m, p) = (transform.matrix3, transform.translation);
+	[p.x, p.y, p.z, m.x_axis.x, m.y_axis.x, m.z_axis.x, m.x_axis.y, m.y_axis.y, m.z_axis.y, m.x_axis.z, m.y_axis.z, m.z_axis.z]
 }
 
 /// A rotation without scale (an odd CFrame may carry some), for slerping.
@@ -473,6 +481,27 @@ fn rotation(transform: &Affine3A) -> Quat {
 	let y = Vec3::from(m.y_axis);
 	let z = x.cross(y).normalize_or(Vec3::Z);
 	Quat::from_mat3(&glam::Mat3::from_cols(x, z.cross(x), z))
+}
+
+/// `alpha` of the way from `a` to `b`: the position lerped, the rotation slerped. What a motion draws
+/// between two keys, and a camera track ([`crate::video::track_camera`]) the same way, so a camera that
+/// rides a moving part stays where it is on the part.
+pub fn between(a: &Affine3A, b: &Affine3A, alpha: f32) -> Affine3A {
+	let position = Vec3::from(a.translation).lerp(Vec3::from(b.translation), alpha);
+	Affine3A::from_rotation_translation(rotation(a).slerp(rotation(b), alpha), position)
+}
+
+/// The last world update before `time`: the playback's frames, else the 1/60 s grid ([`frame_times`]);
+/// `time` itself when there is none. A recorded key at `time` held its value up to this update.
+pub fn update_before(frames: Option<&[f32]>, time: f32) -> f32 {
+	match frames {
+		Some(frames) => match frames.partition_point(|&frame| frame < time - 1e-5) {
+			0 => time,
+			index => frames[index - 1],
+		},
+		// in f64: a key minutes in is closer to its update than f32 tells apart
+		None => (((f64::from(time) - 1e-5) * f64::from(FRAME_RATE)).floor() / f64::from(FRAME_RATE)) as f32,
+	}
 }
 
 /// A target's resolved motion: its keys as world transforms and its pose at rest.
@@ -509,8 +538,7 @@ impl Track {
 			return *a;
 		}
 		let alpha = if t1 - t0 > 1e-6 { ease((t - t0) / (t1 - t0), easing.as_deref(), direction.as_deref()) } else { 1.0 };
-		let position = Vec3::from(a.translation).lerp(Vec3::from(b.translation), alpha);
-		Affine3A::from_rotation_translation(rotation(a).slerp(rotation(b), alpha), position)
+		between(a, b, alpha)
 	}
 
 	/// What the motion does to everything under the target at `t` (its pose over its rest).
