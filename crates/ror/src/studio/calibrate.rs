@@ -2743,7 +2743,9 @@ pub fn tintmask_ramp() -> Result<Experiment> {
 	];
 	let cases: [(&str, [u8; 3], [f32; 3]); 2] = [("warm", [204, 128, 77], [0.3, 0.6, 0.9]), ("dark", [56, 43, 31], [0.25, 0.2, 0.22])];
 	const STEPS: usize = 8;
-	let images = output::state_dir().join("inputs").join("tintmask-ramp");
+	// in an editable-images folder: ror decodes them as the EditableImages Studio and the client draw (with the
+	// square, render::is_editable_image_uri), not as uploaded maps
+	let images = output::state_dir().join("inputs").join("editable-images").join("tintmask-ramp");
 	let mut model = ModelBuilder::new("TintMaskRamp");
 	let mut probes = Vec::new();
 	let mut row = 0.0f32;
@@ -2812,7 +2814,9 @@ pub fn tintmask_emission() -> Result<Experiment> {
 	use rbx_dom_weak::InstanceBuilder;
 	use rbx_dom_weak::types::{Color3, ContentId, Enum};
 
-	let images = output::state_dir().join("inputs").join("tintmask-emission");
+	// in an editable-images folder: ror decodes them as the EditableImages Studio and the client draw (with the
+	// square, render::is_editable_image_uri), not as uploaded maps
+	let images = output::state_dir().join("inputs").join("editable-images").join("tintmask-emission");
 	let mut model = ModelBuilder::new("TintMaskEmission");
 	let mut probes = Vec::new();
 	let strengths = [0.0f32, 1.0, 2.0, 4.0];
@@ -2852,7 +2856,9 @@ pub fn tintmask_emission() -> Result<Experiment> {
 					InstanceBuilder::new("SurfaceAppearance")
 						.with_name(format!("RorTexel_{}_{}_{}_{}_{}_{}_{}", texel[0], texel[1], texel[2], alpha, mask[0], mask[1], mask[2]))
 						.with_property("ColorMap", ContentId::from(map.clone()))
-						.with_property("EmissiveMask", ContentId::from(mask_uri.clone()))
+						// (SurfaceAppearance has no EmissiveMask: a model written with that name carries no mask, and only
+						// Studio's setup, which reads the name, made the cells glow)
+						.with_property("EmissiveMaskContent", rbx_dom_weak::types::Content::from_uri(mask_uri.clone()))
 						.with_property("AlphaMode", Enum::from_u32(2))
 						.with_property("Color", Color3::new(sa_color[0], sa_color[1], sa_color[2]))
 						.with_property("EmissiveStrength", *strength)
