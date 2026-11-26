@@ -1651,6 +1651,14 @@ const LOCAL_LIGHT_FAR_END: f32 = 600.0;
 /// From this distance surfaces start taking the lights' voxels (common.wgsl LOCAL_LIGHT_FAR_START)
 const LOCAL_LIGHT_FAR_START: f32 = 580.0;
 
+/// Whether every surface takes its local light from the lights' voxels, near and far, as under
+/// LightingStyle Soft (mesh.wgsl `lights_from_voxels`, frame.counts.w): then no light gets shadow maps,
+/// a light's clusters reach its voxels' reach, and the view's baked field holds the voxels where
+/// surfaces read them ([`voxel_field::surfaces`]).
+fn lights_from_voxels(environment: &crate::scene::Environment) -> bool {
+	environment.soft_lighting()
+}
+
 /// The most local lights a view shades with: every pixel loops over them, so this bounds its cost.
 const MAX_VIEW_LIGHTS: usize = 1024;
 
@@ -4670,9 +4678,9 @@ impl Renderer {
 		let visible_draws: Vec<&DrawItem> = prepared.draws.iter().filter(|draw| draw.in_frustum(&frustum)).collect();
 		let environment = &scene.environment;
 		// the lights this view reaches, nearest first; the nearest MAX_SHADOW_LIGHTS with Shadows get
-		// shadow maps, of a size for how many there are (none under LightingStyle Soft, where every
-		// surface takes the lights' voxels: Environment::soft_lighting)
-		let soft = environment.soft_lighting();
+		// shadow maps, of a size for how many there are (none where every surface takes the lights'
+		// voxels: lights_from_voxels)
+		let soft = lights_from_voxels(environment);
 		let (places, mut lights): (Vec<usize>, Vec<LightData>) = view_lights(&prepared.lights, camera.view_projection(width as f32 / height as f32), camera.eye).into_iter().unzip();
 		let casts = |light: &LightData| {
 			let position = Vec3::new(light.position[0], light.position[1], light.position[2]);
@@ -4813,12 +4821,17 @@ impl Renderer {
 			let reach = Vec3::splat(voxel_field::LIGHT_REACH + voxel_field::PARTICLE_READ);
 			(low.max(camera.eye - reach), high.min(camera.eye + reach))
 		});
-		let extent = lit.zip(lights_buffer.as_ref()).and_then(|(lit, _)| {
-			voxel_field::Extent::of(
-				lit,
-				lights.iter().map(|light| (Vec3::new(light.position[0], light.position[1], light.position[2]), light.voxel_color[3] + light.right[3] + light.up[3])),
-			)
-		});
+		// and where surfaces read them when every surface takes them (6 studs out along their normal,
+		// short of the far surfaces' distance: mesh.wgsl `local_lights`), as far out as one field holds
+		// them (voxel_field::view_extent)
+		let surfaces_lit = soft.then(|| voxel_field::surfaces(visible_draws.iter().map(|draw| draw.bound), camera.eye)).flatten();
+		let reaches = || lights.iter().map(|light| (Vec3::new(light.position[0], light.position[1], light.position[2]), light.voxel_color[3] + light.right[3] + light.up[3]));
+		let aspect = width as f32 / height as f32;
+		let extent = lights_buffer.as_ref().and_then(|_| voxel_field::view_extent(lit, surfaces_lit, |depth| {
+			// grown by the read's offset: a surface at its edge reads 6 studs out of it
+			let (low, high) = voxel_field::frustum_box(&camera, aspect, depth);
+			(low - voxel_field::SURFACE_READ, high + voxel_field::SURFACE_READ)
+		}, reaches));
 		let baked = extent.zip(lights_buffer.as_ref()).map(|(extent, lights_buffer)| {
 			let baker = self.voxel_field.get_or_init(|| {
 				let baker = voxel_field::Baker::new(device, self.gpu.pipeline_cache.as_ref());

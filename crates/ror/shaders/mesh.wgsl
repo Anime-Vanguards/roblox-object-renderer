@@ -561,11 +561,17 @@ fn light_cluster(world_position: vec3<f32>, pixel: vec2<f32>) -> u32 {
 	return (slice * u32(grid.z) + tile.y) * u32(grid.y) + tile.x;
 }
 
+// Whether every surface takes its local light from the lights' voxels, near and far (LightingStyle
+// Soft; render::lights_from_voxels decides it, frame.counts.w)
+fn lights_from_voxels() -> bool {
+	return frame.counts.w == 1u;
+}
+
 // What one light adds at a surface point, into the light's own share (`sum`) and the far surfaces'
 // voxels (`voxels`); nothing at all beyond its Range and its voxels' reach
 fn local_light(index: u32, surface: Surface, world_position: vec3<f32>, n: vec3<f32>, v: vec3<f32>, geometric_normal: vec3<f32>, far: f32, read_at: vec3<f32>, sum: ptr<function, vec3<f32>>, voxels: ptr<function, vec3<f32>>) {
 	let light = lights[index];
-	if (frame.counts.w == 1u) {
+	if (lights_from_voxels()) {
 		// LightingStyle Soft: the voxels alone, near and far; a light placed with a playback lights the
 		// near surfaces only, as it lights particles near the camera at once (light-latency)
 		*voxels += voxel_light(light, read_at) * select(1.0 - far, 1.0, light.extra.x > 0.0);
@@ -634,6 +640,15 @@ fn local_lights(surface: Surface, world_position: vec3<f32>, n: vec3<f32>, v: ve
 	// nothing stands near the light; no shadow maps, no n·l, no specular)
 	let far = saturate((distance(world_position, frame.camera_position.xyz) - LOCAL_LIGHT_FAR_START) / (LOCAL_LIGHT_FAR_END - LOCAL_LIGHT_FAR_START));
 	let read_at = world_position + geometric_normal * 6.0;
+	// from the voxels, short of the far surfaces' distance (where a light placed with a playback still
+	// counts in full), the view's baked field holds them all in one sample (render::voxel_field;
+	// voxel_read.wgsl) where it holds the point; the lights' own voxels below otherwise
+	if (lights_from_voxels() && far <= 0.0) {
+		let field = voxel_field_light(read_at);
+		if (field.w > 0.0) {
+			return surface.diffuse_weight * surface.albedo * field.rgb * VOXEL_LIGHT_SURFACES;
+		}
+	}
 	var sum = vec3<f32>(0.0);
 	var voxels = vec3<f32>(0.0);
 	// the cluster's lights, lowest first: the view's own order; a view without clusters walks every
@@ -651,7 +666,7 @@ fn local_lights(surface: Surface, world_position: vec3<f32>, n: vec3<f32>, v: ve
 			local_light(i, surface, world_position, n, v, geometric_normal, far, read_at, &sum, &voxels);
 		}
 	}
-	return sum * (1.0 - far) + surface.diffuse_weight * surface.albedo * voxels * (VOXEL_LIGHT_SURFACES * select(far, 1.0, frame.counts.w == 1u));
+	return sum * (1.0 - far) + surface.diffuse_weight * surface.albedo * voxels * (VOXEL_LIGHT_SURFACES * select(far, 1.0, lights_from_voxels()));
 }
 
 // ForceField (notes/render.md "ForceField"): unlit, radiance `radiance` · c² (albedo is c²), blended

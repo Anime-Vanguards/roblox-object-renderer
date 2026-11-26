@@ -11,7 +11,8 @@ pub const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 pub(super) const COMMON: &str = include_str!("../../shaders/common.wgsl");
 const MESH: &str = include_str!("../../shaders/mesh.wgsl");
-/// The lights' voxels read from the view's field (render::voxel_field), for particles, beams and trails
+/// The lights' voxels read from the view's field (render::voxel_field), for particles, beams and trails,
+/// and surfaces under LightingStyle Soft
 pub(super) const VOXEL_READ: &str = include_str!("../../shaders/voxel_read.wgsl");
 pub(super) const SHADOW: &str = include_str!("../../shaders/shadow.wgsl");
 const SHADOW_BLUR: &str = include_str!("../../shaders/shadow_blur.wgsl");
@@ -257,7 +258,7 @@ impl Pipelines {
 
 		let mesh_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
 			label: Some("mesh"),
-			source: wgpu::ShaderSource::Wgsl(format!("{COMMON}\n{SHADOW}\n{MESH}").into()),
+			source: wgpu::ShaderSource::Wgsl(format!("{COMMON}\n{SHADOW}\n{MESH}\n{VOXEL_READ}").into()),
 		});
 		let sky_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
 			label: Some("sky"),

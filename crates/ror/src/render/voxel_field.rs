@@ -8,7 +8,10 @@
 //! them: the same sum whatever the lights (shaders/voxel_read.wgsl; 8 loads of a buffer instead cost
 //! that effect 8-10 ms more).
 //! A point outside the field, or a view whose lit effects span more than [`MOST_VOXELS`], reads the
-//! lights' voxels as before.
+//! lights' voxels as before. Under LightingStyle Soft every surface reads them too (64 voxels for each
+//! light a pixel made a large place's opaque pass 2.3-5.9 ms slower than under Realistic): the field
+//! then also covers the surfaces the view draws, out from the camera as far as it holds them
+//! ([`view_extent`]), the farther ones reading the lights' voxels.
 
 use glam::{IVec3, Vec3};
 
@@ -45,6 +48,11 @@ impl Extent {
 	/// extents added for a SurfaceLight): None when no light reaches the effects or the box would
 	/// hold more than [`MOST_VOXELS`].
 	pub fn of(lit: (Vec3, Vec3), lights: impl Iterator<Item = (Vec3, f32)>) -> Option<Extent> {
+		Extent::spanning(lit, lights)?.ok()
+	}
+
+	/// [`Extent::of`] telling apart a box no light reaches (None) and one too large (Some(Err)).
+	fn spanning(lit: (Vec3, Vec3), lights: impl Iterator<Item = (Vec3, f32)>) -> Option<Result<Extent, ()>> {
 		let reached = lights.fold(None, |reached: Option<(Vec3, Vec3)>, (centre, reach)| {
 			let (low, high) = (centre - Vec3::splat(reach), centre + Vec3::splat(reach));
 			Some(reached.map_or((low, high), |(min, max)| (min.min(low), max.max(high))))
@@ -57,10 +65,10 @@ impl Extent {
 		let last = ((high - 2.0) * 0.25).floor() + 1.0;
 		let count = last - first + 1.0;
 		if (count.x as f64) * (count.y as f64) * (count.z as f64) > MOST_VOXELS as f64 {
-			return None;
+			return Some(Err(()));
 		}
 		let size = (count.as_ivec3() + (ROUND - 1)) / ROUND * ROUND;
-		(size.x as u64 * size.y as u64 * size.z as u64 <= MOST_VOXELS).then_some(Extent { origin: first.as_ivec3(), size })
+		Some((size.x as u64 * size.y as u64 * size.z as u64 <= MOST_VOXELS).then_some(Extent { origin: first.as_ivec3(), size }).ok_or(()))
 	}
 
 	fn voxels(&self) -> u32 {
@@ -130,6 +138,74 @@ impl Baker {
 	}
 }
 
+/// How far out along its geometric normal a surface reads the voxels (mesh.wgsl `local_lights`), studs.
+pub const SURFACE_READ: f32 = 6.0;
+
+/// The box where surfaces read the voxels when every surface takes them (LightingStyle Soft), from the
+/// spheres round what the view draws: grown by the read's offset, and within the distance where they
+/// read the field ([`super::LOCAL_LIGHT_FAR_START`]: past it a light placed with a playback fades out of
+/// their light, which the field doesn't tell apart) of the camera at `eye`. None without any.
+pub(super) fn surfaces(spheres: impl Iterator<Item = (Vec3, f32)>, eye: Vec3) -> Option<(Vec3, Vec3)> {
+	let (low, high) = spheres.fold(None, |spanned: Option<(Vec3, Vec3)>, (centre, radius)| {
+		let (low, high) = (centre - Vec3::splat(radius), centre + Vec3::splat(radius));
+		Some(spanned.map_or((low, high), |(min, max)| (min.min(low), max.max(high))))
+	})?;
+	let reach = Vec3::splat(super::LOCAL_LIGHT_FAR_START + SURFACE_READ);
+	let (low, high) = ((low - SURFACE_READ).max(eye - reach), (high + SURFACE_READ).min(eye + reach));
+	low.cmple(high).all().then_some((low, high))
+}
+
+/// What a view shows out to `depth` studs from its camera: the box round the eye and its frustum's
+/// corners at that depth.
+pub(super) fn frustum_box(camera: &super::camera::Camera, aspect: f32, depth: f32) -> (Vec3, Vec3) {
+	let axes = camera.world.matrix3;
+	let (right, up, forward) = (Vec3::from(axes.x_axis).normalize(), Vec3::from(axes.y_axis).normalize(), -Vec3::from(axes.z_axis).normalize());
+	let tan = (camera.fov.to_radians() * 0.5).tan();
+	[(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)].into_iter().fold((camera.eye, camera.eye), |(low, high), (x, y)| {
+		let corner = camera.eye + (forward + right * (x * tan * aspect) + up * (y * tan)) * depth;
+		(low.min(corner), high.max(corner))
+	})
+}
+
+/// The view's field: the box where its effects read the voxels (`effects`), and when surfaces take
+/// them too ([`surfaces`]) those the view shows (`visible`, boxed by `frustum` out to a distance) as far
+/// from the camera as the one field still holds them, the farther ones reading the lights' voxels: a
+/// wide view over lights hundreds of studs apart (a large place's) spans more voxels than
+/// [`MOST_VOXELS`], and its near surfaces fill most of its pixels. None when no light reaches them.
+pub(super) fn view_extent<I: Iterator<Item = (Vec3, f32)>>(effects: Option<(Vec3, Vec3)>, visible: Option<(Vec3, Vec3)>, frustum: impl Fn(f32) -> (Vec3, Vec3), lights: impl Fn() -> I) -> Option<Extent> {
+	// effects spread too far for one field read the lights as before, the surfaces still get theirs
+	let effects = effects.filter(|lit| visible.is_none() || !matches!(Extent::spanning(*lit, lights()), Some(Err(()))));
+	let with = |depth: f32| {
+		let shown = visible.and_then(|(low, high)| {
+			let (near_low, near_high) = frustum(depth);
+			let (low, high) = (low.max(near_low), high.min(near_high));
+			low.cmple(high).all().then_some((low, high))
+		});
+		union(effects, shown).and_then(|lit| Extent::spanning(lit, lights()))
+	};
+	let effects_alone = || effects.and_then(|lit| Extent::of(lit, lights()));
+	let deepest = super::LOCAL_LIGHT_FAR_START + SURFACE_READ;
+	if visible.is_none() {
+		return effects_alone();
+	}
+	match with(deepest) {
+		Some(Ok(extent)) => return Some(extent),
+		None => return None,
+		Some(Err(())) => {}
+	}
+	// the deepest distance whose box fits, to a stud (nearer boxes no light reaches fit too)
+	let (mut fits, mut over) = (0.0f32, deepest);
+	while over - fits > 1.0 {
+		let middle = (fits + over) * 0.5;
+		if matches!(with(middle), Some(Err(()))) {
+			over = middle;
+		} else {
+			fits = middle;
+		}
+	}
+	with(fits).and_then(Result::ok).or_else(effects_alone)
+}
+
 /// The box `points` span, grown by `margin` (None without any).
 pub(super) fn bounds(points: impl Iterator<Item = Vec3>, margin: f32) -> Option<(Vec3, Vec3)> {
 	points.fold(None, |bounds: Option<(Vec3, Vec3)>, point| Some(bounds.map_or((point, point), |(low, high)| (low.min(point), high.max(point))))).map(|(low, high)| (low - Vec3::splat(margin), high + Vec3::splat(margin)))
@@ -161,6 +237,42 @@ mod tests {
 	fn effects_no_light_reaches_need_none() {
 		assert_eq!(Extent::of((Vec3::splat(100.0), Vec3::splat(110.0)), [(Vec3::ZERO, 20.0)].into_iter()), None);
 		assert_eq!(Extent::of((Vec3::ZERO, Vec3::ONE), std::iter::empty()), None);
+	}
+
+	#[test]
+	fn surfaces_read_the_field_within_the_near_distance() {
+		let eye = Vec3::new(0.0, 10.0, 0.0);
+		// a floor's sphere and a ball's: grown by the read's offset
+		let (low, high) = surfaces([(Vec3::ZERO, 30.0), (Vec3::new(50.0, 2.0, 0.0), 2.0)].into_iter(), eye).expect("spanned");
+		assert_eq!((low, high), (Vec3::splat(-36.0), Vec3::new(58.0, 36.0, 36.0)));
+		// a huge baseplate stops at the distance where surfaces read the field
+		let (low, high) = surfaces([(Vec3::ZERO, 5000.0)].into_iter(), eye).expect("spanned");
+		assert_eq!((low, high), (eye - 586.0, eye + 586.0));
+		// nothing drawn, or all of it out of reach
+		assert_eq!(surfaces(std::iter::empty(), eye), None);
+		assert_eq!(surfaces([(Vec3::splat(2000.0), 10.0)].into_iter(), eye), None);
+	}
+
+	#[test]
+	fn a_wide_view_holds_its_near_surfaces() {
+		// lights 1,000 studs apart over a floor the view sees out to its far end
+		let lights = || [(Vec3::new(-500.0, 0.0, 0.0), 120.0), (Vec3::new(500.0, 0.0, 0.0), 120.0), (Vec3::ZERO, 120.0)].into_iter();
+		let visible = Some((Vec3::new(-600.0, -10.0, -600.0), Vec3::new(600.0, 10.0, 600.0)));
+		// a box from the camera at the origin out to `depth` along +X, as wide as deep
+		let frustum = |depth: f32| (Vec3::new(0.0, -depth, -depth), Vec3::new(depth, depth, depth));
+		let extent = view_extent(None, visible, frustum, lights).expect("the near part fits");
+		let voxels = extent.size.x as u64 * extent.size.y as u64 * extent.size.z as u64;
+		assert!(voxels <= MOST_VOXELS, "{extent:?}");
+		// and holds the surfaces well out from the camera
+		let far = (extent.origin.x + extent.size.x) * 4;
+		assert!(far > 100, "{extent:?}");
+		// effects alone, as before
+		let effects = (Vec3::splat(-5.0), Vec3::splat(5.0));
+		assert_eq!(view_extent(Some(effects), None, frustum, lights), Extent::of(effects, lights()));
+		// effects spread over more than one field holds leave it to the surfaces
+		let spread = Some((Vec3::splat(-600.0), Vec3::splat(600.0)));
+		assert_eq!(view_extent(spread, None, frustum, lights), None);
+		assert_eq!(view_extent(spread, visible, frustum, lights), Some(extent));
 	}
 
 	#[test]
