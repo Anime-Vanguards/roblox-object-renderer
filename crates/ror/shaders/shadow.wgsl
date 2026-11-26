@@ -23,13 +23,13 @@ fn sun_moments_at(region: vec4<f32>, uv: vec2<f32>) -> vec4<f32> {
 }
 
 // Chebyshev's bound on the lit share of a receiver at warped depth `depth` behind the moments (mean,
-// mean square); the variance is at least frame.shadow.z of the depth squared (Studio's leak near
-// occluders, shadow-gap)
-fn chebyshev(moments: vec2<f32>, depth: f32) -> f32 {
+// mean square); the variance is at least `least` of the depth squared (Studio's leak near occluders,
+// shadow-gap; the cascade's own: render::SunCascade::least_variance)
+fn chebyshev(moments: vec2<f32>, depth: f32, least: f32) -> f32 {
 	if (depth <= moments.x) {
 		return 1.0;
 	}
-	let variance = max(moments.y - moments.x * moments.x, frame.shadow.z * depth * depth);
+	let variance = max(moments.y - moments.x * moments.x, least * depth * depth);
 	let d = depth - moments.x;
 	return variance / (variance + d * d);
 }
@@ -55,14 +55,19 @@ fn shadow_factor(world_position: vec3<f32>, normal: vec3<f32>) -> f32 {
 	if (cascade < 0) {
 		return 1.0;
 	}
+	let region = frame.shadow_regions[cascade];
+	// nothing further from the camera than the shadows' reach (render::SunShadowQuality::reach)
+	if (distance(world_position, frame.camera_position.xyz) > region.z) {
+		return 1.0;
+	}
 	let sphere = frame.shadow_spheres[cascade];
 	let clip = frame.shadow_cascades[cascade] * vec4<f32>(world_position, 1.0);
 	let uv = vec2<f32>(clip.x * 0.5 + 0.5, 0.5 - clip.y * 0.5);
-	let moments = sun_moments_at(frame.shadow_regions[cascade], uv);
+	let moments = sun_moments_at(region, uv);
 	// the receiver's depth as the moments warp it: -1 at the sphere's sunward side, +1 at the far one
 	let z = clamp(-dot(world_position - sphere.xyz, frame.sun_direction.xyz) / sphere.w, -1.0, 1.0);
 	let exponent = frame.shadow.y;
-	let lit = min(chebyshev(moments.xy, exp(exponent * z)), chebyshev(moments.zw, -exp(-exponent * z)));
+	let lit = min(chebyshev(moments.xy, exp(exponent * z), region.w), chebyshev(moments.zw, -exp(-exponent * z), region.w));
 	// Studio darkens what the bound lets through (its leak reduction): lit shares up to frame.shadow.w
 	// go black, the rest rescaled
 	return clamp((lit - frame.shadow.w) / (1.0 - frame.shadow.w), 0.0, 1.0);

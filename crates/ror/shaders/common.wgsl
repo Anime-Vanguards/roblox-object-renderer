@@ -20,8 +20,8 @@ struct Frame {
 	sky_cube: array<vec4<f32>, 6>,
 	// x EnvironmentDiffuseScale, y EnvironmentSpecularScale, z exposure multiplier, w specular cube max mip
 	environment: vec4<f32>,
-	// the sun's shadow (shadow.wgsl): x cascades, y the moments' warp exponent, z their least variance
-	// (of the warped depth squared), w the darkening of what the bound lets through
+	// the sun's shadow (shadow.wgsl): x cascades, y the moments' warp exponent, z unused, w the darkening
+	// of what the bound lets through
 	shadow: vec4<f32>,
 	// xyz fog colour (linear), w unused
 	fog_color: vec4<f32>,
@@ -38,7 +38,9 @@ struct Frame {
 	// xyz 1 / its size in studs, w OutdoorAmbient's factor where the sky is open
 	light_grid_scale: vec4<f32>,
 	// the sun's shadow cascades (shadow.wgsl): each one's depth pass view-projection, its sphere (xyz
-	// centre, w radius, 0 unused) and its square in the moment atlas (x column, y side, in texels)
+	// centre, w radius, 0 unused) and its square in the moment atlas (x column, y side, in texels), z how
+	// far from the camera a surface takes its shadow, w the moments' least variance (of the warped depth
+	// squared) in it
 	shadow_cascades: array<mat4x4<f32>, 4>,
 	shadow_spheres: array<vec4<f32>, 4>,
 	shadow_regions: array<vec4<f32>, 4>,

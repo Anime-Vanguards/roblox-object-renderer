@@ -278,7 +278,7 @@ impl Renderer {
 		}
 		let sun = prepared.sun_direction;
 		let cascades = match (prepared.sun_shadows, prepared.bounds) {
-			(true, Some(bounds)) => super::sun_cascades(camera, aspect, sun, bounds, scene.environment.shadow_softness),
+			(true, Some(bounds)) => super::sun_cascades(camera, aspect, sun, bounds, scene.environment.shadow_softness, &super::SUN_SHADOWS),
 			_ => Vec::new(),
 		};
 		let lights: Vec<super::ShadowLight> = prepared.lights.iter().filter(|light| light.shadow[1] > 0.0).map(super::shadow_light).collect();

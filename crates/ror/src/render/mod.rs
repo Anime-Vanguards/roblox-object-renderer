@@ -35,6 +35,8 @@ pub mod composite;
 mod culling;
 #[cfg(test)]
 mod cutout_depth_tests;
+#[cfg(test)]
+mod sun_shadow_tests;
 pub mod environment;
 pub mod geometry;
 pub mod gpu;
@@ -562,21 +564,41 @@ mod bloom_tests {
 	}
 }
 
-/// Studio's sun shadow cascades (notes/render.md "Shadows"; shadow-cascade-map, shadow-cascade-down):
-/// slices of the view's depth ending at these distances, each covered by a sphere centred on the
-/// view axis at the slice's far end, through its far corners or its near ones (whichever are
-/// further); a point takes the first sphere holding it, and has no shadow beyond the last.
-const SUN_CASCADE_SPLITS: [f32; 4] = [19.6, 45.3, 131.8, 400.0];
-/// Texels across each cascade's diameter: the filter follows the sphere's radius by these (39 edges
-/// of shadow-cascades, -cascade-map, -cascade-down and -softness over 3 cascades and fields of view
-/// 30-70: rms 4 %).
-const SUN_CASCADE_TEXELS: [u32; 4] = [512, 1024, 1280, 1280];
-/// The filter in texels: a Gaussian of sigma 1.605 · √(ShadowSoftness / texel in studs) between 0.83
-/// and 4.56 (shadow-softness: 0.5, 0.75 and 1 alike in the finest cascade, 0 and 0.05 alike in a
-/// coarse one), with Studio's 4x MSAA resolve (0.091 texel² more); bilinear sampling adds 1/6. The
-/// edge profiles alone fit 8 % narrower under a darkening of 0.17; the images (shadow-gap, -contact,
-/// -softness, -cascades, -edge, -steps, R15's sun alone) prefer this with SUN_DARKEN.
-const SUN_FILTER: (f32, f32, f32) = (1.605, 0.832, 4.560);
+/// How the sun's shadow maps are drawn at a graphics quality (notes/render.md "Shadows"): what of them
+/// changes with the level. `SUN_SHADOWS` is quality 21's, which every picture draws at.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SunShadowQuality {
+	/// Slices of the view's depth ending at these distances (studs), one cascade each: each covered by
+	/// a sphere centred on the view axis at the slice's far end, through its far corners or its near
+	/// ones (whichever are further); a point takes the first sphere holding it, and has no shadow beyond
+	/// the last
+	pub splits: &'static [f32],
+	/// Texels across each cascade's diameter: the filter follows the sphere's radius by these
+	pub texels: &'static [u32],
+	/// The filter in texels: a Gaussian of sigma `filter.0` · √(ShadowSoftness / texel in studs) between
+	/// `filter.1` and `filter.2`
+	pub filter: (f32, f32, f32),
+	/// How far from the camera a surface takes the sun's shadow at all (studs)
+	pub reach: f32,
+}
+
+/// Quality 21's sun shadows. Cascades: shadow-cascade-map, shadow-cascade-down (the first three; the
+/// fourth's 400 studs is assumed: moving it changed little against the engine). Texels: 39 edges of
+/// shadow-cascades, -cascade-map, -cascade-down and -softness over 3 cascades and fields of view 30-70
+/// (rms 4 %). Filter: shadow-softness (0.5, 0.75 and 1 alike in the finest cascade, 0 and 0.05 alike in
+/// a coarse one), with Studio's 4x MSAA resolve (SUN_MSAA_VARIANCE) and bilinear sampling's 1/6 on top;
+/// the edge profiles alone fit 8 % narrower under a darkening of 0.17, the images (shadow-gap, -contact,
+/// -softness, -cascades, -edge, -steps, R15's sun alone) prefer this with SUN_DARKEN. Reach: the Roblox
+/// client (0.747, quality 21, fixtures/sun-shadows.luau "plates") shadows the floor under 6-stud plates
+/// to 587.4 studs from the camera and none from 587.7, the same in every view (fields of view 40-70,
+/// 1600 x 900, 900 x 1600 and 1644 x 1116, the camera 120-600 studs up): a distance from the camera,
+/// not a depth along its axis or a cascade's sphere. ror's spheres shadowed to 700-1,000 studs.
+pub(crate) const SUN_SHADOWS: SunShadowQuality = SunShadowQuality {
+	splits: &[19.6, 45.3, 131.8, 400.0],
+	texels: &[512, 1024, 1280, 1280],
+	filter: (1.605, 0.832, 4.560),
+	reach: 587.5,
+};
 const SUN_MSAA_VARIANCE: f32 = 0.091;
 /// The moments' warp over a cascade's depth (-1..1 across its sphere) and their least variance (of
 /// the warped depth squared): an occluder Δ studs in front of a receiver lets 1 / (1 + (Δ / L)²)
@@ -586,8 +608,15 @@ const SUN_MSAA_VARIANCE: f32 = 0.091;
 /// (wider filters over the plates' narrow bands) Studio lets more through than a strong one does.
 const SUN_WARP: f32 = 1.0;
 const SUN_LEAST_VARIANCE: f32 = 0.000356;
+/// L grows with the cascade's radius up to this many studs (SunCascade::least_variance): the Roblox
+/// client (0.747, quality 21, fixtures/sun-shadows.luau "leaks" and "plates") lets nothing under plates
+/// 3 to 8 studs over a floor (Δ 6.8-18.2) in any cascade, out to its shadows' reach, at fields of view
+/// 40-70, 1600 x 900 and 900 x 1600, so L is at most 3.6 there; growing on, it was 5.6 to 11 in the
+/// last cascade and let 0.2-0.6 of the light through (the near cascades' patterns still prefer the
+/// growth below the cap).
+const SUN_LEAK_MOST: f32 = 3.6;
 /// Lit shares up to this go black, the rest rescaled (Studio's leak reduction: shadow-cascades' edge
-/// profiles are a Gaussian's CDF rescaled from 0.16-0.18 up; see SUN_FILTER)
+/// profiles are a Gaussian's CDF rescaled from 0.16-0.18 up; see SUN_SHADOWS' filter)
 const SUN_DARKEN: f32 = 0.22;
 
 /// One cascade of a view's sun shadow.
@@ -612,6 +641,14 @@ impl SunCascade {
 		2.0 * self.radius / self.texels as f32
 	}
 
+	/// The moments' least variance in it (of the warped depth squared): the leak length L =
+	/// √variance · radius / warp grows with the radius from the finest cascade's 0.37 studs at 19.6, up
+	/// to SUN_LEAK_MOST studs.
+	fn least_variance(&self) -> f32 {
+		let leak = SUN_LEAST_VARIANCE.sqrt() * self.radius / SUN_WARP;
+		if leak > SUN_LEAK_MOST { SUN_LEAST_VARIANCE * (SUN_LEAK_MOST / leak).powi(2) } else { SUN_LEAST_VARIANCE }
+	}
+
 	/// Whether a caster's sphere reaches its square, from beyond the sun side of its sphere (twice the
 	/// sphere: a posed skinned mesh keeps its bind pose's bounds): what its depth pass draws.
 	fn reaches(&self, draw: &DrawItem, sun: Vec3) -> bool {
@@ -622,8 +659,8 @@ impl SunCascade {
 	}
 }
 
-/// The sun's cascades for a camera whose spheres reach the scene's bounds.
-fn sun_cascades(camera: &Camera, aspect: f32, sun: Vec3, bounds: (Vec3, Vec3), softness: f32) -> Vec<SunCascade> {
+/// The sun's cascades at `quality` for a camera whose spheres reach the scene's bounds.
+fn sun_cascades(camera: &Camera, aspect: f32, sun: Vec3, bounds: (Vec3, Vec3), softness: f32, quality: &SunShadowQuality) -> Vec<SunCascade> {
 	let forward = -Vec3::from(camera.world.matrix3.z_axis).normalize();
 	// the frustum's corner: tan of the half field of view (vertical) times the diagonal
 	let corner = (camera.fov.to_radians() * 0.5).tan() * (1.0 + aspect * aspect).sqrt();
@@ -634,7 +671,7 @@ fn sun_cascades(camera: &Camera, aspect: f32, sun: Vec3, bounds: (Vec3, Vec3), s
 	let up = if sun.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
 	let mut near = 0.0;
 	let mut cascades: Vec<SunCascade> = Vec::new();
-	for (index, &far) in SUN_CASCADE_SPLITS.iter().enumerate() {
+	for (index, &far) in quality.splits.iter().enumerate() {
 		let radius = (far * corner).max(Vec2::new(far - near, near * corner).length());
 		let center = camera.eye + forward * far;
 		near = far;
@@ -645,7 +682,7 @@ fn sun_cascades(camera: &Camera, aspect: f32, sun: Vec3, bounds: (Vec3, Vec3), s
 		if cascades.iter().any(|earlier| corners.iter().all(|point| point.distance(earlier.center) < earlier.radius)) {
 			break;
 		}
-		let texels = SUN_CASCADE_TEXELS[index];
+		let texels = quality.texels[index];
 		let texel = 2.0 * radius / texels as f32;
 		// the depth pass's square moves over the scene a whole texel at a time (centred on the sphere's
 		// centre snapped across the sun's view), so a caster lands in the same texels from frame to
@@ -655,7 +692,7 @@ fn sun_cascades(camera: &Camera, aspect: f32, sun: Vec3, bounds: (Vec3, Vec3), s
 		let axes = Mat4::look_at_rh(Vec3::ZERO, -sun, up);
 		let across = axes.transform_vector3(center);
 		let snapped = axes.inverse().transform_vector3(Vec3::new((across.x / texel).round() * texel, (across.y / texel).round() * texel, across.z));
-		let (scale, least, most) = SUN_FILTER;
+		let (scale, least, most) = quality.filter;
 		let filter = (scale * (softness.max(0.0) / texel).sqrt()).clamp(least, most);
 		// the depth pass starts beyond every caster towards the sun
 		let reach = corners.iter().map(|point| (*point - center).dot(sun)).fold(radius, f32::max) + 1.0;
@@ -4784,7 +4821,7 @@ impl Renderer {
 		let sun = prepared.sun_direction;
 		// the sun's cascades for this camera (notes/render.md "Shadows")
 		let sun_cascades = match (prepared.sun_shadows, prepared.bounds) {
-			(true, Some(bounds)) => sun_cascades(&camera, width as f32 / height as f32, sun, bounds, environment.shadow_softness),
+			(true, Some(bounds)) => sun_cascades(&camera, width as f32 / height as f32, sun, bounds, environment.shadow_softness, &SUN_SHADOWS),
 			_ => Vec::new(),
 		};
 		let shadow_start = Instant::now();
@@ -4836,10 +4873,10 @@ impl Renderer {
 			for (cascade, column) in sun_cascades.iter().zip(columns) {
 				frame.shadow_cascades[cascade.index] = cascade.view_proj.to_cols_array_2d();
 				frame.shadow_spheres[cascade.index] = [cascade.center.x, cascade.center.y, cascade.center.z, cascade.radius];
-				frame.shadow_regions[cascade.index] = [*column as f32, cascade.texels as f32, 0.0, 0.0];
+				frame.shadow_regions[cascade.index] = [*column as f32, cascade.texels as f32, SUN_SHADOWS.reach, cascade.least_variance()];
 			}
 		}
-		frame.shadow = [sun_cascades.len() as f32, SUN_WARP, SUN_LEAST_VARIANCE, SUN_DARKEN];
+		frame.shadow = [sun_cascades.len() as f32, SUN_WARP, 0.0, SUN_DARKEN];
 		// Lighting's fog, also at the default FogEnd of 100000 (atmosphere-explore: black tiles 1024-4096
 		// studs away read 6.6 / 13 / 25 of 255 without an Atmosphere); its colour shows like a sky texel,
 		// 1.935 · FogColor² (fog). The sky is not fogged.
