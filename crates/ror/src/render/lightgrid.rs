@@ -5,11 +5,11 @@
 //! neighbours one layer up (not the one straight above) of the light entering them times their
 //! transmission, 1 above everything and outside the grid; it stores 1 - (1 - L)^4. A part fills a
 //! voxel by the share of the voxel's horizontal cross-section it covers inside the voxel's layer
-//! (any thickness; an upright sheet across its thickness too) for blocks, by volume for balls,
-//! cylinders and wedges, times 1 - Transparency;
-//! parts side by side add up (their union, kept per stud of the cross-section). MeshParts, FileMesh
-//! SpecialMeshes, unions and parts without CastShadow do not count. Surfaces read it trilinearly between voxel centres 6
-//! studs along their normal (shaders/mesh.wgsl).
+//! (any thickness) for blocks, by volume for balls, cylinders and wedges, times 1 - Transparency; an
+//! upright sheet by the share of the voxel's side it covers (`Filler::sheet_share`); a SpecialMesh as
+//! the shape it draws in its mesh's box. Parts side by side add up (their union, kept per stud of the
+//! cross-section). MeshParts, FileMesh SpecialMeshes, unions and parts without CastShadow do not count.
+//! Surfaces read it trilinearly between voxel centres 6 studs along their normal (shaders/mesh.wgsl).
 
 use glam::{Mat3A, Vec3, Vec3A};
 use rayon::prelude::*;
@@ -30,6 +30,8 @@ const CELLS: usize = 4;
 /// The volume shares of balls, cylinders and wedges sample each cell this many times finer along
 /// each axis.
 const SPLIT: usize = 2;
+/// What an upright sheet across a whole voxel's side fills of the voxel its top edge stands in ([`Filler::sheet_share`]).
+const SHEET: f32 = 0.67;
 
 pub struct LightGrid {
 	/// World position of the grid's minimum corner (a multiple of 4).
@@ -47,6 +49,9 @@ enum Fill {
 	Box,
 	/// Volume share inside the shape, times a factor fitted per shape (lg-shapes).
 	Volume(Shape, f32),
+	/// Horizontal coverage of the disc a cylinder standing along Y covers (a SpecialMesh head), any thickness inside
+	/// the voxel's layer counting in full as a block's does.
+	Disc,
 }
 
 #[derive(Clone, Copy)]
@@ -74,13 +79,18 @@ fn fill(part: &Part) -> Option<Fill> {
 	// horizontal coverage; a head MeshPart 24 x 4 x 24 not at all (nor do a character's MeshParts darken
 	// a character: ao-model)
 	match &part.geometry {
-		// lg-shapes: a 24 x 4 x 24 block drawn as the head FileMesh leaves the floor open, drawn as a
-		// SpecialMesh sphere it closes it as 0.89 of the ellipsoid's volume share would; other
-		// SpecialMesh types are taken as their box (not measured)
+		// lg-shapes: a 24 x 4 x 24 block drawn as the head FileMesh leaves the floor open
 		Geometry::Special { mesh_type: mesh_type::FILE_MESH, .. } => None,
-		// (the sphere's box is the mesh's Scale and Offset on the part: those must be numbers too)
-		Geometry::Special { mesh_type: mesh_type::SPHERE, scale, offset, .. } if !scale.is_finite() || !offset.is_finite() => None,
+		// (a SpecialMesh fills the mesh's box, the part's size times Scale moved by Offset: those must be numbers too)
+		Geometry::Special { scale, offset, .. } if !scale.is_finite() || !offset.is_finite() => None,
+		// lg-shapes: a SpecialMesh sphere closes the floor as 0.89 of its ellipsoid's volume share would; the light-grid
+		// fixture's "shapes" in the engine (0.747): a Wedge, Cylinder and Head SpecialMesh as the shape they draw, a
+		// Brick by its mesh's box (Scale 0.5 leaves the floor under a 24-stud part nearly open), Torso and the other
+		// types as their box
 		Geometry::Special { mesh_type: mesh_type::SPHERE, .. } => Some(Fill::Volume(Shape::Ellipsoid, 0.89)),
+		Geometry::Special { mesh_type: mesh_type::WEDGE, .. } => Some(Fill::Volume(Shape::Wedge, 1.0)),
+		Geometry::Special { mesh_type: mesh_type::CYLINDER, .. } => Some(Fill::Volume(Shape::Cylinder, 0.93)),
+		Geometry::Special { mesh_type: mesh_type::HEAD, .. } => Some(Fill::Disc),
 		Geometry::Block | Geometry::Truss { .. } | Geometry::Special { .. } => Some(Fill::Box),
 		Geometry::Ball => Some(Fill::Volume(Shape::Ball, 0.79)),
 		Geometry::Cylinder => Some(Fill::Volume(Shape::Cylinder, 0.93)),
@@ -127,20 +137,56 @@ struct Filler {
 	extent: Vec3A,
 	/// A box whose axes lie along the world's: its world box is exact.
 	aligned: bool,
+	/// A box standing as an upright sheet: thinner than a voxel across one horizontal axis and taller than it is
+	/// thick (its height's world span, its middle line's ends in X and Z).
+	sheet: Option<Sheet>,
+}
+
+/// An upright sheet as the grid sees it ([`Filler::sheet_share`]).
+#[derive(Clone, Copy)]
+struct Sheet {
+	bottom: f32,
+	top: f32,
+	from: [f32; 2],
+	to: [f32; 2],
 }
 
 impl Filler {
 	fn new(part: &Part, fill: Fill) -> Self {
 		let rotation = part.cframe.matrix3;
-		// a SpecialMesh sphere is the mesh's box: the part's size times abs(Scale), moved by Offset
-		// (Roblox applies abs(Scale) to primitive SpecialMeshes, matching render::mod)
+		// a SpecialMesh fills the box of the mesh it draws: the part's size times abs(Scale), moved by Offset
+		// (Roblox applies abs(Scale) to primitive SpecialMeshes, matching render::mod); a head the cylinder standing
+		// in it on its smaller horizontal extent (in the engine it closes the floor under a 24-stud one's middle,
+		// which the drawn mesh, 0.797 of that across, would leave at 0.1)
 		let (size, center) = match &part.geometry {
-			Geometry::Special { mesh_type: mesh_type::SPHERE, scale, offset, .. } => (part.size * scale.abs(), part.cframe.translation + rotation * Vec3A::from(*offset)),
+			Geometry::Special { mesh_type, scale, offset, .. } => {
+				let size = part.size * scale.abs();
+				let size = if *mesh_type == mesh_type::HEAD {
+					let horizontal = size.x.min(size.z);
+					Vec3::new(horizontal, size.y, horizontal)
+				} else {
+					size
+				};
+				(size, part.cframe.translation + rotation * Vec3A::from(*offset))
+			}
 			_ => (part.size, part.cframe.translation),
 		};
 		let half = Vec3A::from(size * 0.5);
+		// a box with one axis upright: the thinner of its two others across, the longer along
+		let sheet = matches!(fill, Fill::Box)
+			.then(|| (0..3).find(|&axis| rotation.col(axis).y.abs() > 0.9999))
+			.flatten()
+			.and_then(|up| {
+				let (a, b) = ((up + 1) % 3, (up + 2) % 3);
+				let (across, along) = if size[a] <= size[b] { (a, b) } else { (b, a) };
+				(size[across] < VOXEL && size[up] > size[across]).then(|| {
+					let reach = rotation.col(along) * half[along];
+					Sheet { bottom: center.y - half[up], top: center.y + half[up], from: [center.x - reach.x, center.z - reach.z], to: [center.x + reach.x, center.z + reach.z] }
+				})
+			});
 		Filler {
 			fill,
+			sheet,
 			opacity: 1.0 - part.transparency.clamp(0.0, 1.0),
 			size,
 			center,
@@ -158,27 +204,10 @@ impl Filler {
 		let cell = VOXEL / CELLS as f32;
 		match self.fill {
 			Fill::Box if self.aligned => {
-				let (mut lo, mut hi) = (self.center - self.extent, self.center + self.extent);
+				let (lo, hi) = (self.center - self.extent, self.center + self.extent);
 				// any thickness inside the layer counts in full (lg-occupancy t0.2-t4)
 				if hi.y.min(corner.y + VOXEL) - lo.y.max(corner.y) <= 1e-3 {
 					return cells;
-				}
-				// an upright sheet (thinner than a voxel across x or z, at least a voxel long along the
-				// other, through the layer's whole height) fills the voxels it passes through across
-				// its thickness, as any thickness does along y (lg-specular: 6 studs in front of an 80 x
-				// 40 x 0.5-stud wall OutdoorAmbient and the sky specular fall to 0.87 of the open 40
-				// studs down, as an opaque wall's voxels give; its 0.125 share left them open; lg-walls'
-				// walls 2 studs long, lg-occupancy's slats 1 stud tall and lg-edge's roof edges keep their
-				// share)
-				if hi.y >= corner.y + VOXEL - 1e-3 && lo.y <= corner.y + 1e-3 {
-					for (axis, other) in [(0, 2), (2, 0)] {
-						let inside = hi[axis].min(corner[axis] + VOXEL) - lo[axis].max(corner[axis]) > 1e-3;
-						if hi[other] - lo[other] < VOXEL || hi[axis] - lo[axis] >= VOXEL || !inside {
-							continue;
-						}
-						lo[axis] = corner[axis];
-						hi[axis] = corner[axis] + VOXEL;
-					}
 				}
 				let overlap = |lo: f32, hi: f32, start: f32| (hi.min(start + cell) - lo.max(start)).clamp(0.0, cell) / cell;
 				for k in 0..CELLS {
@@ -216,6 +245,30 @@ impl Filler {
 					}
 				}
 			}
+			Fill::Disc => {
+				// the head's height inside the layer, then points half a stud apart across each cell
+				let reach = self.extent.y;
+				if (self.center.y + reach).min(corner.y + VOXEL) - (self.center.y - reach).max(corner.y) <= 1e-3 {
+					return cells;
+				}
+				let step = VOXEL / (CELLS * SPLIT) as f32;
+				for k in 0..CELLS {
+					for i in 0..CELLS {
+						let mut count = 0;
+						for b in 0..SPLIT {
+							for a in 0..SPLIT {
+								let offset = Vec3A::new((i * SPLIT + a) as f32 + 0.5, 0.0, (k * SPLIT + b) as f32 + 0.5) * step;
+								let mut u = self.inverse * (corner + offset - self.center) / self.half;
+								u.y = 0.0;
+								if u.x * u.x + u.z * u.z <= 1.0 {
+									count += 1;
+								}
+							}
+						}
+						cells[i + CELLS * k] = count as f32 / (SPLIT * SPLIT) as f32;
+					}
+				}
+			}
 			Fill::Volume(shape, factor) => {
 				// points half a stud apart through each cell (the factors' fit samples so)
 				let step = VOXEL / (CELLS * SPLIT) as f32;
@@ -237,23 +290,94 @@ impl Filler {
 				}
 			}
 		}
+		// an upright sheet's share where it is more than its coverage, over the whole cross-section
+		let sheet = self.sheet_share(corner);
+		if sheet > cells.iter().sum::<f32>() / (CELLS * CELLS) as f32 {
+			cells = [sheet; CELLS * CELLS];
+		}
 		cells
+	}
+
+	/// What an upright sheet fills of the voxel at `corner` across the whole cross-section: the share of the voxel's side
+	/// its middle line and height cover, SHEET of it in the voxel its top edge stands in. The light-grid fixture's
+	/// "shapes" in the engine (0.747): sheets 0.5 thick and 4 tall through one layer, one in each column of voxels,
+	/// darken the floor under them as voxels 0.67 full would, alike turned 30 or 45 degrees and from a voxel's length
+	/// up; 3 studs long about 0.45 (2 long or 2 tall 0.3: the floor all but open); sheets as tall across two layers as
+	/// the one-layer ones (horizontal coverage alone, 0.125, left the floor open; filling the voxels across the sheet's
+	/// thickness closed it). Its "walls" and lg-specular: down the face of an 80 x 40 x 0.5-stud wall (0.5 to 2 thick,
+	/// 20 or 40 tall) OutdoorAmbient falls as in front of a wall whose voxels are full.
+	fn sheet_share(&self, corner: Vec3A) -> f32 {
+		let Some(sheet) = self.sheet else {
+			return 0.0;
+		};
+		let height = (sheet.top.min(corner.y + VOXEL) - sheet.bottom.max(corner.y)).clamp(0.0, VOXEL) / VOXEL;
+		if height <= 0.0 {
+			return 0.0;
+		}
+		// the middle line clipped to the voxel's square (Liang-Barsky)
+		let (mut t0, mut t1) = (0.0f32, 1.0f32);
+		for (axis, low) in [(0, corner.x), (1, corner.z)] {
+			let (start, delta) = (sheet.from[axis], sheet.to[axis] - sheet.from[axis]);
+			if delta.abs() < 1e-6 {
+				if start < low || start > low + VOXEL {
+					return 0.0;
+				}
+				continue;
+			}
+			let a = (low - start) / delta;
+			let b = (low + VOXEL - start) / delta;
+			t0 = t0.max(a.min(b));
+			t1 = t1.min(a.max(b));
+		}
+		if t1 <= t0 {
+			return 0.0;
+		}
+		let length = (t1 - t0) * (sheet.to[0] - sheet.from[0]).hypot(sheet.to[1] - sheet.from[1]);
+		// the voxel its top edge stands in SHEET full, those it rises through above whole
+		let fill = if sheet.top <= corner.y + VOXEL + 1e-3 { tune().sheet } else { 1.0 };
+		fill * (length / VOXEL).min(1.0) * height
 	}
 }
 
+/// The grid's fitted constants: `ROR_TUNE_GRID="sheet=0.6"` overrides them (the fits' renders).
+struct Tune {
+	sheet: f32,
+}
+
+fn tune() -> &'static Tune {
+	static TUNE: std::sync::OnceLock<Tune> = std::sync::OnceLock::new();
+	TUNE.get_or_init(|| {
+		let mut tune = Tune { sheet: SHEET };
+		for pair in std::env::var("ROR_TUNE_GRID").unwrap_or_default().split(',') {
+			let Some((key, value)) = pair.split_once('=') else {
+				continue;
+			};
+			let Ok(value) = value.trim().parse::<f32>() else {
+				continue;
+			};
+			if key.trim() == "sheet" {
+				tune.sheet = value;
+			}
+		}
+		tune
+	})
+}
+
 /// Everything a filler's voxels read of its part: its fill, frame, size, transparency and a
-/// SpecialMesh sphere's Scale and Offset.
+/// SpecialMesh's type, Scale and Offset.
 fn encode(part: &Part, fill: Fill, key: &mut Vec<u8>) {
 	let floats = |key: &mut Vec<u8>, values: &[f32]| key.extend_from_slice(bytemuck::cast_slice(values));
 	let (tag, factor) = match fill {
 		Fill::Box => (0u8, 0.0),
-		Fill::Volume(shape, factor) => (1 + shape as u8, factor),
+		Fill::Disc => (1, 0.0),
+		Fill::Volume(shape, factor) => (2 + shape as u8, factor),
 	};
 	key.push(tag);
 	floats(key, &[factor, part.transparency]);
 	floats(key, &part.size.to_array());
 	floats(key, &part.cframe.to_cols_array());
-	if let Geometry::Special { mesh_type: mesh_type::SPHERE, scale, offset, .. } = &part.geometry {
+	if let Geometry::Special { mesh_type, scale, offset, .. } = &part.geometry {
+		key.extend_from_slice(&mesh_type.to_le_bytes());
 		floats(key, &scale.abs().to_array());
 		floats(key, &offset.to_array());
 	}
@@ -749,16 +873,74 @@ mod tests {
 	}
 
 	#[test]
-	fn an_upright_sheet_closes_its_voxels() {
-		// lg-specular: an 80 x 40 x 0.5-stud wall darkens the open grid in front of it, as a wall
-		// filling its voxels does; slats (parts_side_by_side_fill_a_voxel_together) and a wall only 2
-		// studs long keep their share
+	fn an_upright_sheet_fills_part_of_its_voxels() {
+		// lg-specular: an 80 x 40 x 0.5-stud wall darkens the open grid in front of it; slats
+		// (parts_side_by_side_fill_a_voxel_together) keep their share
 		let wall = block(Vec3::new(-40.0, -20.0, 6.25), Vec3::new(40.0, 20.0, 6.75));
 		let grid = build(&Scene { parts: vec![Arc::new(wall)], ..Default::default() }).unwrap();
 		assert!(at(&grid, Vec3::new(0.0, -10.0, 2.0)) < 0.95);
-		let short = block(Vec3::new(-1.0, -20.0, 6.25), Vec3::new(1.0, 20.0, 6.75));
-		let grid = build(&Scene { parts: vec![Arc::new(short)], ..Default::default() }).unwrap();
-		assert!(at(&grid, Vec3::new(0.0, -10.0, 2.0)) > 0.999);
+		// the light-grid fixture's "shapes" in the engine: a roof of sheets 0.5 thick, 4 tall through the layer from 8 to
+		// 12, one in the middle of each column of voxels, leaves the voxels below SHEET of the light (the sheets'
+		// coverage alone, 0.125, left them open; filling the voxels across their thickness closed them); turned 45
+		// degrees alike, sheets 2 studs long one in each voxel half as much
+		let sheets = |length: f32, turn: f32| -> Vec<Arc<Part>> {
+			let mut parts = Vec::new();
+			for i in -3..3 {
+				for k in -3..3 {
+					if length < 24.0 || k == 0 {
+						let centre = Vec3::new(4.0 * i as f32 + 2.0, 10.0, if length < 24.0 { 4.0 * k as f32 + 2.0 } else { 0.0 });
+						let mut sheet = block(Vec3::new(-0.25, -2.0, -length / 2.0), Vec3::new(0.25, 2.0, length / 2.0));
+						sheet.cframe = Affine3A::from_rotation_translation(glam::Quat::from_rotation_y(turn.to_radians()), centre);
+						parts.push(Arc::new(sheet));
+					}
+				}
+			}
+			parts
+		};
+		let below = |parts: Vec<Arc<Part>>| at(&build(&Scene { parts, ..Default::default() }).unwrap(), Vec3::new(2.0, 6.0, 2.0));
+		let full = 1.0 - SHEET.powi(4);
+		let long = below(sheets(24.0, 0.0));
+		assert!((long - full).abs() < 0.01, "a roof of sheets: {long} below, {full} for voxels {SHEET} full");
+		let turned = below(sheets(24.0, 45.0));
+		assert!((turned - full).abs() < 0.1, "turned 45 degrees: {turned} below");
+		let short = below(sheets(2.0, 0.0));
+		let half = 1.0 - (SHEET / 2.0).powi(4);
+		assert!((short - half).abs() < 0.01, "sheets 2 studs long: {short} below, {half} for voxels {} full", SHEET / 2.0);
+		// a sheet fills the voxels it rises through above whole ("walls": down a tall wall's face as in front of full
+		// voxels): sheets from 4 to 12 close the layer under their top one
+		let tall: Vec<Arc<Part>> = sheets(24.0, 0.0)
+			.into_iter()
+			.map(|sheet| {
+				let mut sheet = (*sheet).clone();
+				sheet.size.y = 8.0;
+				sheet.cframe.translation.y = 8.0;
+				Arc::new(sheet)
+			})
+			.collect();
+		assert_eq!(at(&build(&Scene { parts: tall, ..Default::default() }).unwrap(), Vec3::new(2.0, 2.0, 2.0)), 0.0, "under sheets rising through two layers");
+	}
+
+	/// The light-grid fixture's "shapes" in the engine (0.747), floors under 24 x 4 x 24 parts drawn by SpecialMeshes, 10 studs
+	/// up: a Brick at Scale 0.5 across leaves the floor nearly open (the part's box closed it), a Cylinder (along X,
+	/// 4 across) leaves it open, a Wedge closes the floor under its high side and not its low one, a Head closes a disc.
+	#[test]
+	fn special_meshes_fill_the_shapes_they_draw() {
+		let special = |mesh_type: u32, size: Vec3, scale: Vec3| {
+			let mut part = block(-size / 2.0 + Vec3::new(0.0, 10.0, 0.0), size / 2.0 + Vec3::new(0.0, 10.0, 0.0));
+			part.geometry = Geometry::Special { mesh_type, mesh: None, scale, offset: Vec3::ZERO };
+			build(&Scene { parts: vec![Arc::new(part)], ..Default::default() }).unwrap()
+		};
+		let slab = Vec3::new(24.0, 4.0, 24.0);
+		assert_eq!(at(&special(mesh_type::BRICK, slab, Vec3::ONE), Vec3::new(2.0, 6.0, 2.0)), 0.0, "a Brick fills its box");
+		assert!(at(&special(mesh_type::BRICK, slab, Vec3::new(0.5, 1.0, 0.5)), Vec3::new(2.0, 6.0, 2.0)) > 0.5, "a Brick at Scale 0.5 fills half its part across");
+		assert!(at(&special(mesh_type::CYLINDER, slab, Vec3::ONE), Vec3::new(2.0, 6.0, 2.0)) > 0.99, "a Cylinder 4 across along X");
+		let wedge = special(mesh_type::WEDGE, Vec3::new(24.0, 12.0, 24.0), Vec3::ONE);
+		assert!(at(&wedge, Vec3::new(2.0, 2.0, 6.0)) < at(&wedge, Vec3::new(2.0, 2.0, -10.0)), "a Wedge rises towards +Z");
+		let head = special(mesh_type::HEAD, slab, Vec3::ONE);
+		assert_eq!(at(&head, Vec3::new(2.0, 6.0, 2.0)), 0.0, "a Head closes the floor under its middle");
+		let block_roof = build(&Scene { parts: vec![Arc::new(block(Vec3::new(-12.0, 8.0, -12.0), Vec3::new(12.0, 12.0, 12.0)))], ..Default::default() }).unwrap();
+		let open = |grid: &LightGrid| grid.values.iter().map(|&value| value as u32).sum::<u32>();
+		assert!(open(&head) > open(&block_roof), "a Head's disc leaves its box's corners open");
 	}
 
 	#[test]

@@ -7352,6 +7352,31 @@ mod lighting_style_tests {
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
 	}
+
+	/// A white floor under a 48-stud roof whose bottom is 8 studs up, lit by the sky's specular light alone at EV +2,
+	/// seen straight down from under the roof's middle. The light-grid fixture's "sky" in the engine (0.747): it reflects
+	/// the closed grid's warm grey ((9.6, 9.6, 8.8) of 255 against the open floor's blue sky (16, 37, 59)), where ror kept
+	/// 0.12 of the blue sky ((2, 5, 9)).
+	#[test]
+	fn the_closed_grid_reflects_a_grey_sky() {
+		let state = std::env::temp_dir().join(format!("ror-closed-specular-test-{}", std::process::id()));
+		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let mut model = ModelBuilder::new("Roofed");
+		model.part(&PartSpec { name: "Floor".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, -0.5, 0.0)), size: Vec3::new(64.0, 1.0, 64.0), color: [255; 3], material: 272, ..Default::default() });
+		model.part(&PartSpec { name: "Roof".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, 10.0, 0.0)), size: Vec3::new(48.0, 4.0, 48.0), color: [255; 3], material: 272, ..Default::default() });
+		let mut scene = crate::scene::extract::extract(&model.into_document());
+		let environment = &mut scene.environment;
+		(environment.ambient, environment.outdoor_ambient, environment.environment_diffuse_scale, environment.environment_specular_scale, environment.brightness, environment.exposure_compensation) = (Vec3::ZERO, Vec3::ZERO, 0.0, 1.0, 0.0, 2.0);
+		let views = [ViewRequest { width: 32, height: 32, camera: CameraSpec::LookAt { eye: [0.0, 7.5, -0.05], target: [0.0; 3], fov: 10.0 }, background: Background::Color([0.0, 0.0, 1.0]), bloom: false, ..Default::default() }];
+		let (images, _) = renderer.render(&scene, &views).unwrap();
+		let mean = |channel: usize| images[0].rgba.chunks(4).map(|pixel| pixel[channel] as f32).sum::<f32>() / (images[0].rgba.len() / 4) as f32;
+		let [red, green, blue] = [mean(0), mean(1), mean(2)];
+		assert!(green > 5.0 && red >= blue - 0.5 && green >= blue - 0.5, "a grey under the roof, not the blue sky: ({red}, {green}, {blue})");
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+	}
 }
 
 #[cfg(test)]

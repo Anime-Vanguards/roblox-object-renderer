@@ -45,9 +45,11 @@ var<private> glass_sky_diffuse: vec3<f32>;
 // (lg-sky: on a white floor under a 48-stud roof the same for skies dark, white, default, white in
 // the Up or the Dn image only and at midnight, half at EnvironmentDiffuseScale 0.5)
 const LIGHT_GRID_SKY_CLOSED: vec3<f32> = vec3<f32>(0.104, 0.100, 0.092);
-// what of the sky specular the closed grid leaves (lg-terms: 0.13; Studio's own reading under the roof
-// changes between capture sessions, lg-sky)
+// what of the open sky's specular the grid's share takes from 0 (lg-terms: 0.13 under a roof; Studio's own reading
+// under the roof changed between capture sessions, lg-sky), and the sky a surface reflects where the grid is closed
+// (the light-grid fixture's "sky": the engine's is the closed grid's grey, LIGHT_GRID_SKY_CLOSED's colour)
 const LIGHT_GRID_SPECULAR_FLOOR: f32 = 0.12;
+const LIGHT_GRID_SPECULAR_CLOSED: vec3<f32> = LIGHT_GRID_SKY_CLOSED * 1.4;
 // how far along the normal a surface reads the grid (lg-height, lg-walls: 6 studs)
 const LIGHT_GRID_OFFSET: f32 = 6.0;
 
@@ -1053,6 +1055,11 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 	// closed grid leaves 0.12 of it (lg-terms)
 	let prefiltered = textureSampleLevel(environment_map, linear_sampler, r, lod).rgb;
 	color += prefiltered * frame.sky_specular_colour.rgb * sky_fresnel * sky_specular * sky_reach;
+	// where the grid is closed the sky the surface reflects is the closed grid's grey, as its diffuse light is (the
+	// light-grid fixture's "sky" in the engine, 0.747: under a roof a white floor reflects (1.01, 1, 0.92) times
+	// 1.4 LIGHT_GRID_SKY_CLOSED in green, the same in two sessions; ror kept 0.12 of the blue sky): linear in v from the
+	// open sky's share above (nothing changes where the grid is open)
+	color += (LIGHT_GRID_SPECULAR_CLOSED - LIGHT_GRID_SPECULAR_FLOOR * prefiltered * frame.sky_specular_colour.rgb) * (sky_fresnel * sky_specular * (1.0 - sky_open));
 	if (shading == SHADING_GLASS) {
 		glass_normal = n;
 		glass_facing = n_dot_v;
