@@ -10,8 +10,9 @@
 //! the shape it draws in its mesh's box. Parts side by side add up (their union, kept per stud of the
 //! cross-section). MeshParts, FileMesh SpecialMeshes, unions and parts without CastShadow do not count.
 //! Surfaces read it trilinearly between voxel centres 6 studs along their normal (shaders/mesh.wgsl).
-//! Where the sun's shadow maps are not drawn a second channel carries the sun's light down along its
-//! direction ([`propagate_sun`]).
+//! A second channel carries the sun's light down along its direction ([`propagate_sun`]): what shades the sun
+//! where a view's shadow maps do not reach (past their reach from the camera at every graphics quality level, and
+//! everywhere below the levels that draw them: crate::quality).
 
 use glam::{Mat3A, Vec3, Vec3A};
 use rayon::prelude::*;
@@ -42,7 +43,7 @@ pub struct LightGrid {
 	pub dims: [usize; 3],
 	/// Visibility 0..255, X fastest, then Y, then Z (a 3D texture's layout).
 	pub values: Vec<u8>,
-	/// The sun's light through the grid where its shadow maps are not drawn ([`grid_sun`]), as `values`.
+	/// The sun's light through the grid ([`grid_sun`]), as `values`.
 	pub sun: Option<Vec<u8>>,
 }
 
@@ -387,11 +388,11 @@ fn encode(part: &Part, fill: Fill, key: &mut Vec<u8>) {
 	}
 }
 
-/// Everything [`build`] reads, in order: the parts that fill the grid ([`encode`]). Equal keys
-/// build equal grids.
-pub fn key(scene: &Scene) -> Vec<u8> {
+/// Everything [`build_from`] reads, in order: the sun it carries and the parts that fill the grid ([`encode`]).
+/// Equal keys build equal grids.
+pub fn key(scene: &Scene, sun: Option<Vec3>) -> Vec<u8> {
 	let mut key = Vec::new();
-	if let Some(sun) = grid_sun(scene) {
+	if let Some(sun) = sun {
 		key.extend_from_slice(bytemuck::cast_slice(&sun.to_array()));
 	}
 	for part in &scene.parts {
@@ -407,16 +408,18 @@ pub fn filler_count(scene: &Scene) -> usize {
 	scene.parts.iter().filter(|part| fill(part).is_some()).count()
 }
 
+/// The scene's grid, carrying the sun while it is up ([`grid_sun`]).
 pub fn build(scene: &Scene) -> Option<LightGrid> {
-	build_from(scene, None, false).map(|state| LightGrid { origin: state.origin, dims: state.dims, values: state.values, sun: state.sun })
+	build_from(scene, None, false, grid_sun(scene)).map(|state| LightGrid { origin: state.origin, dims: state.dims, values: state.values, sun: state.sun })
 }
 
-/// The direction the grid's sun light comes from where the sun's shadow maps are not drawn
-/// (`Environment::sun_shadow_maps` off: `RorNoSunShadowMaps`, the low graphics quality levels) and the sun or
-/// moon is up; `None` otherwise.
+/// The direction the grid's sun light comes from while the sun or moon is up; `None` otherwise and in a
+/// ViewportFrame's world. A view reads it where its shadow maps do not reach: past their reach from the camera at
+/// every graphics quality level (the client's `voxsun` from 900 studs up is the same at levels 3-21), everywhere at
+/// a level without them or under `RorNoSunShadowMaps` (crate::quality, render::view_sun_cascades).
 pub fn grid_sun(scene: &Scene) -> Option<Vec3> {
 	let environment = &scene.environment;
-	if environment.sun_shadow_maps || environment.viewport.is_some() {
+	if environment.viewport.is_some() {
 		return None;
 	}
 	let direct = super::environment::direct_light(environment.clock_time, environment.geographic_latitude, environment.environment_diffuse_scale);
@@ -469,11 +472,11 @@ impl GridState {
 	}
 }
 
-/// The scene's grid, exactly as [`build`] makes it. From `previous` (a state kept from a scene with
-/// as many fillers in the same grid) only the voxels the changed fillers filled or fill now are
-/// combined again, and the light below them propagated again; otherwise it is built anew. `keep`
-/// keeps what the next update needs.
-pub fn build_from(scene: &Scene, previous: Option<GridState>, keep: bool) -> Option<GridState> {
+/// The scene's grid, carrying `sun`'s light if given ([`grid_sun`]; only a view that sees past its sun shadow maps
+/// reads it, render::grid_sun_for). From `previous` (a state kept from a scene with as many fillers in the same
+/// grid) only the voxels the changed fillers filled or fill now are combined again, and the light below them
+/// propagated again; otherwise it is built anew. `keep` keeps what the next update needs.
+pub fn build_from(scene: &Scene, previous: Option<GridState>, keep: bool, sun: Option<Vec3>) -> Option<GridState> {
 	let mut keys = Vec::new();
 	let mut ranges = Vec::new();
 	let mut fillers = Vec::new();
@@ -489,7 +492,6 @@ pub fn build_from(scene: &Scene, previous: Option<GridState>, keep: bool) -> Opt
 		return None;
 	}
 	let (min, dims) = frame(&fillers);
-	let sun = grid_sun(scene);
 	if let Some(GridState { origin, dims: kept_dims, values, detail: Some(detail), .. }) = previous
 		&& origin == min
 		&& kept_dims == dims
@@ -794,7 +796,7 @@ fn propagate(transmission: &[f32], dims: [usize; 3], mut kept: Option<&mut [f32]
 	values
 }
 
-/// The sun's light per voxel (0..255 linear, X fastest, then Y, then Z) where its shadow maps are not drawn: each
+/// The sun's light per voxel (0..255 linear, X fastest, then Y, then Z): each
 /// layer's light is the light of the layer above passed through its voxels, spread as the sky's (the mean of the 8
 /// horizontal neighbours) and read a voxel's height up towards the sun (bilinearly, sun.xz / sun.y voxels off); 1
 /// above everything and outside the grid. The light-grid fixture's "roof" at graphics quality 1 and 6 in the engine
@@ -1035,18 +1037,20 @@ mod tests {
 		assert!(open(&head) > open(&block_roof), "a Head's disc leaves its box's corners open");
 	}
 
-	/// The sun's light without its shadow maps (render::lightgrid propagate_sun): a 48 x 1 x 48 roof 16 studs up, the sun
+	/// The sun's light through the grid (render::lightgrid propagate_sun): a 48 x 1 x 48 roof 16 studs up, the sun
 	/// 46.7 degrees up towards -X (ClockTime 14.667 at the default latitude). The floor's voxel under the roof's side away
 	/// from the sun is in its shade, under its edge towards the sun lit (the light-grid fixture's "roof" at graphics
-	/// quality 1 in the engine), where the sky's visibility is closed on both; with the maps there is no sun channel.
+	/// quality 1 in the engine), where the sky's visibility is closed on both. The channel is there whether the scene
+	/// draws the shadow maps or not (past their reach the client shades the sun by it at every level).
 	#[test]
-	fn without_the_suns_shadow_maps_the_grid_passes_the_sun_along_its_direction() {
+	fn the_grid_passes_the_sun_along_its_direction() {
 		let roof = block(Vec3::new(-24.0, 16.0, -24.0), Vec3::new(24.0, 17.0, 24.0));
 		let mut scene = Scene { parts: vec![Arc::new(roof)], ..Default::default() };
 		(scene.environment.clock_time, scene.environment.geographic_latitude) = (14.667, 41.733);
-		assert!(build(&scene).unwrap().sun.is_none(), "the shadow maps draw the sun");
+		let with_maps = build(&scene).unwrap().sun.expect("a sun channel with the shadow maps too");
 		scene.environment.sun_shadow_maps = false;
 		let grid = build(&scene).unwrap();
+		assert_eq!(grid.sun.as_ref(), Some(&with_maps), "the same channel without the maps");
 		let sun = |point: Vec3| {
 			let v = ((point - grid.origin) / VOXEL).floor();
 			let [nx, ny, _] = grid.dims;
@@ -1131,7 +1135,7 @@ mod tests {
 			parts.push(part);
 		}
 		let mut scene = Scene { parts: parts.into_iter().map(Arc::new).collect(), ..Default::default() };
-		let mut state = build_from(&scene, None, true).unwrap();
+		let mut state = build_from(&scene, None, true, grid_sun(&scene)).unwrap();
 		let mut updated = 0;
 		for step in 0..40 {
 			// limbs swinging: a few parts move a little, turn, fade or stop filling (CastShadow)
@@ -1153,7 +1157,7 @@ mod tests {
 			let fillers = filler_count(&scene);
 			let previous = Some(state).filter(|state| state.fillers() == fillers);
 			updated += usize::from(previous.as_ref().is_some_and(|previous| previous.origin == expected.origin && previous.dims == expected.dims));
-			state = build_from(&scene, previous, true).unwrap();
+			state = build_from(&scene, previous, true, grid_sun(&scene)).unwrap();
 			assert_eq!((state.origin, state.dims), (expected.origin, expected.dims), "step {step}");
 			assert!(state.values == expected.values, "step {step}: {} voxels differ", state.values.iter().zip(&expected.values).filter(|(a, b)| a != b).count());
 		}
@@ -1199,7 +1203,7 @@ mod tests {
 		};
 		let pos = make(Vec3::new(1.0, 1.0, 1.0));
 		let pos_grid = build(&pos).expect("positive sphere grid");
-		let pos_key = key(&pos);
+		let pos_key = key(&pos, grid_sun(&pos));
 		let empty = Scene { parts: vec![pos.parts[0].clone()], ..Default::default() };
 		let empty_grid = build(&empty).expect("floor-only grid");
 		assert_ne!(pos_grid.values, empty_grid.values, "positive sphere must darken the light grid");
@@ -1207,7 +1211,7 @@ mod tests {
 		for scale in [Vec3::new(-1.0, 1.0, 1.0), Vec3::new(1.0, -1.0, 1.0), Vec3::new(-1.0, -1.0, -1.0)] {
 			let neg = make(scale);
 			let neg_grid = build(&neg).expect("mirrored sphere grid");
-			assert_eq!(key(&neg), pos_key, "mirrored sphere {scale:?} must share light-grid key");
+			assert_eq!(key(&neg, grid_sun(&neg)), pos_key, "mirrored sphere {scale:?} must share light-grid key");
 			assert_eq!((neg_grid.origin, neg_grid.dims, &neg_grid.values), (pos_grid.origin, pos_grid.dims, &pos_grid.values), "mirrored sphere {scale:?} must fill light grid identically to positive scale");
 		}
 	}

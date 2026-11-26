@@ -52,6 +52,8 @@ pub(super) struct PreparedGrid {
 	pub view: wgpu::TextureView,
 	pub origin: Vec3,
 	pub size: Vec3,
+	/// The sun's direction its second channel carries (render::lightgrid::grid_sun), none without one
+	pub sun: Option<Vec3>,
 	pub bytes: u64,
 }
 
@@ -88,7 +90,8 @@ pub(super) struct PreparedGeometry {
 	pub draws: Vec<DrawItem>,
 	pub instances: wgpu::Buffer,
 	pub no_lights: wgpu::Buffer,
-	pub light_grid: Option<(wgpu::TextureView, Vec3, Vec3)>,
+	/// The light grid's view, minimum corner, size and the sun its second channel carries ([`PreparedGrid`])
+	pub light_grid: Option<(wgpu::TextureView, Vec3, Vec3, Option<Vec3>)>,
 	pub light_grid_texture: Option<wgpu::Texture>,
 	pub bounds: Option<(Vec3, Vec3)>,
 	pub organic_noise: Option<Arc<GpuTexture>>,
@@ -119,12 +122,22 @@ impl PreparedGeometry {
 	/// detail, render::levels); never kept, so nothing made for it (shadow maps) outlives the view.
 	pub fn with_draws(&self, draws: Vec<DrawItem>) -> Self {
 		debug_assert_eq!(draws.len(), self.draws.len());
+		self.with(draws, self.light_grid.clone(), self.light_grid_texture.clone())
+	}
+
+	/// The same preparation drawing another light grid (a kept one's parts under another sun: the grid's
+	/// sun channel follows the sun, render::lightgrid::grid_sun); never kept.
+	pub fn with_grid(&self, grid: &PreparedGrid) -> Self {
+		self.with(self.draws.clone(), Some((grid.view.clone(), grid.origin, grid.size, grid.sun)), Some(grid.texture.clone()))
+	}
+
+	fn with(&self, draws: Vec<DrawItem>, light_grid: Option<(wgpu::TextureView, Vec3, Vec3, Option<Vec3>)>, light_grid_texture: Option<wgpu::Texture>) -> Self {
 		Self {
 			draws,
 			instances: self.instances.clone(),
 			no_lights: self.no_lights.clone(),
-			light_grid: self.light_grid.clone(),
-			light_grid_texture: self.light_grid_texture.clone(),
+			light_grid,
+			light_grid_texture,
 			bounds: self.bounds,
 			organic_noise: self.organic_noise.clone(),
 			surface_maps: self.surface_maps.clone(),

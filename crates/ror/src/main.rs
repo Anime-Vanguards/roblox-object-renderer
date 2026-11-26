@@ -555,6 +555,13 @@ struct RenderArgs {
 	/// render at full detail). Without it every mesh draws at full detail and every part is drawn
 	#[arg(long, value_name = "roblox[:QUALITY]|levels")]
 	lod: Option<String>,
+	/// Draw what a Roblox client draws at a graphics quality level, 1-21 (notes/render.md "Graphics
+	/// quality levels", under the scene's LightingStyle and PrioritizeLightingQuality): the sun's shadow maps
+	/// to the level's reach and the light grid's voxel sun past it, the share of the emitters' Rate it makes
+	/// and, without --lod, the meshes' levels of detail and the level's view distance and size cull (a
+	/// client's, not Studio's edit quality's). Without it every view draws level 21, every part at full detail
+	#[arg(long, value_name = "1-21", value_parser = clap::value_parser!(u32).range(1..=21))]
+	quality: Option<u32>,
 	/// Draw what the parts collide with, not what they show: each MeshPart and union as its saved
 	/// collision data (every hull its own colour; Box fidelity a warm grey box), Parts as their shape,
 	/// invisible parts too. Which parts: collide (CanCollide, the default), query, touch or all
@@ -758,6 +765,13 @@ struct VideoArgs {
 	/// render at full detail). Without it every mesh draws at full detail and every part is drawn
 	#[arg(long, value_name = "roblox[:QUALITY]|levels")]
 	lod: Option<String>,
+	/// Draw what a Roblox client draws at a graphics quality level, 1-21 (notes/render.md "Graphics
+	/// quality levels", under the scene's LightingStyle and PrioritizeLightingQuality): the sun's shadow maps
+	/// to the level's reach and the light grid's voxel sun past it, the share of the emitters' Rate it makes
+	/// and, without --lod, the meshes' levels of detail and the level's view distance and size cull (a
+	/// client's, not Studio's edit quality's). Without it every frame draws level 21, every part at full detail
+	#[arg(long, value_name = "1-21", value_parser = clap::value_parser!(u32).range(1..=21))]
+	quality: Option<u32>,
 	/// MSAA samples (1 or 4)
 	#[arg(long, default_value_t = 4)]
 	msaa: u32,
@@ -1097,6 +1111,7 @@ fn render(mut args: RenderArgs) -> Result<()> {
 		view.view.bloom = !args.no_bloom;
 		view.view.ids = args.ids;
 		view.view.lod = lod;
+		view.view.quality = args.quality;
 	}
 	let playback = playback_args(&TimelineArgs { playback: args.playback.as_deref(), time: args.time, emit: &args.emit, enable: &args.enable, disable: &args.disable, changes: Some(&args.changes) })?;
 	let job = Job {
@@ -1261,7 +1276,7 @@ fn video(mut args: VideoArgs) -> Result<()> {
 		bail!("--orbit turns an orbit camera (--view, --yaw); this one is fixed (--camera, or --camera-from a render)");
 	}
 	let lod = args.lod.as_deref().map(ror::lod::Lod::parse).transpose()?;
-	let view = ror::render::ViewRequest { width, height, camera, background, msaa: args.msaa, bloom: !args.no_bloom, lod, ..Default::default() };
+	let view = ror::render::ViewRequest { width, height, camera, background, msaa: args.msaa, bloom: !args.no_bloom, lod, quality: args.quality, ..Default::default() };
 	let mut playback = playback_args(&TimelineArgs { playback: args.playback.as_deref(), time: None, emit: &args.emit, enable: &args.enable, disable: &args.disable, changes: Some(&args.changes) })?;
 	// an effect plays by its emitters' attributes at 0 (`--emit =attributes`),
 	// unless told what it emits (its Lighting's changes or a property's say nothing of that)

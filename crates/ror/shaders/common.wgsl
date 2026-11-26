@@ -20,8 +20,9 @@ struct Frame {
 	sky_cube: array<vec4<f32>, 6>,
 	// x EnvironmentDiffuseScale, y EnvironmentSpecularScale, z exposure multiplier, w specular cube max mip
 	environment: vec4<f32>,
-	// the sun's shadow (shadow.wgsl): x cascades, y the moments' warp exponent, z unused, w the darkening
-	// of what the bound lets through
+	// the sun's shadow (shadow.wgsl): x and z where the shadow maps start fading into the light grid's voxel
+	// sun and where they end, from the camera (mesh.wgsl sun_shade; both 0 at a graphics quality without the
+	// maps), y the moments' warp exponent, w the darkening of what the bound lets through
 	shadow: vec4<f32>,
 	// xyz fog colour (linear), w unused
 	fog_color: vec4<f32>,
@@ -33,7 +34,7 @@ struct Frame {
 	// viewport size in pixels, 1 / size
 	viewport: vec4<f32>,
 	// the light grid (notes/render.md "Light grid"): xyz its minimum corner, w 1 when there is one, 2
-	// when it stops the sun as well (no shadow maps: scene::NO_SUN_SHADOW_MAPS)
+	// when it carries the sun's light too (render::lightgrid::grid_sun: the sun past the shadow maps)
 	light_grid: vec4<f32>,
 	// xyz 1 / its size in studs, w OutdoorAmbient's factor where the sky is open
 	light_grid_scale: vec4<f32>,

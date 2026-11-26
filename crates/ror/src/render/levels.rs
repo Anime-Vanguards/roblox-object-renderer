@@ -1,6 +1,7 @@
-//! A view's draws as Roblox draws them from its camera (`ViewRequest::lod`, crate::lod): each MeshPart
-//! at the level of its chain its distance and fidelity give, and the parts the quality's view distance
-//! and size cull leave out drawing nothing. The preparation is shared by every view and kept between
+//! A view's draws as Roblox draws them from its camera (`ViewRequest::lod`, crate::lod; or a client's
+//! graphics quality level, `ViewRequest::quality`, crate::quality): each MeshPart at the level of its chain its
+//! distance and fidelity give, and the parts the quality's view distance and size cull leave out drawing
+//! nothing. The preparation is shared by every view and kept between
 //! renders, so a view under levels of detail draws a copy of its draw list (the same draws in the same
 //! order, only their index ranges changed): its own shadow maps, ids and Highlights follow it.
 
@@ -13,6 +14,7 @@ use super::DrawItem;
 use super::camera::Camera;
 use super::prepared::PreparedGeometry;
 use crate::lod::{self, Lod};
+use crate::quality::Quality;
 use crate::scene::{Geometry, Scene};
 
 /// What a view drew under levels of detail (in summary.json, each view's `lod`).
@@ -23,6 +25,10 @@ pub struct LodView {
 	pub quality: u32,
 	/// Whether what the quality culls was left out (`--lod roblox`; `levels`: the levels alone)
 	pub cull: bool,
+	/// Culled by the Roblox client's view distance and size cull at the level (`--quality`), not Studio's
+	/// edit quality's (`--lod`)
+	#[serde(skip_serializing_if = "std::ops::Not::not")]
+	pub client: bool,
 	/// MeshParts whose fidelity steps (Performance, Automatic with more than one high-quality level)
 	/// at each level of their chain (0: full detail), those the view leaves out not counted
 	pub levels: [usize; 5],
@@ -43,9 +49,10 @@ enum Shown {
 }
 
 /// `geometry`'s draws as `lod` has Roblox draw them from `camera`, and what they were; `None` when
-/// every draw shows as prepared (all at full detail, nothing left out).
-pub(super) fn for_view(scene: &Scene, geometry: &PreparedGeometry, camera: &Camera, lod: Lod) -> (Option<PreparedGeometry>, LodView) {
-	let mut report = LodView { quality: lod.quality, cull: lod.cull, ..Default::default() };
+/// every draw shows as prepared (all at full detail, nothing left out). With `client`, the parts that
+/// level's view distance and size cull leave out are left out instead of Studio's edit quality's.
+pub(super) fn for_view(scene: &Scene, geometry: &PreparedGeometry, camera: &Camera, lod: Lod, client: Option<&Quality>) -> (Option<PreparedGeometry>, LodView) {
+	let mut report = LodView { quality: lod.quality, cull: lod.cull, client: client.is_some(), ..Default::default() };
 	let eye = camera.eye;
 	let mut shown: Vec<Option<Shown>> = vec![None; scene.parts.len()];
 	let mut changed = false;
@@ -60,7 +67,10 @@ pub(super) fn for_view(scene: &Scene, geometry: &PreparedGeometry, camera: &Came
 			}
 			let bounds = lod::world_box(&part.cframe, part.size);
 			let center = Vec3::from(part.cframe.translation);
-			let drawn = lod.drawn(eye, camera.fov, bounds, center, part.size.length());
+			let drawn = match client {
+				Some(quality) => quality.drawn(eye, camera.fov, bounds, center, part.size.length()),
+				None => lod.drawn(eye, camera.fov, bounds, center, part.size.length()),
+			};
 			let stepping = match &part.geometry {
 				Geometry::MeshPart { mesh, fidelity, .. } if part.class == "MeshPart" && draw.mesh.bind.is_none() => {
 					let levels = draw.mesh.lods.len();

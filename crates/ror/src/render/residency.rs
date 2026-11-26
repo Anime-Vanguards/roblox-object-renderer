@@ -193,7 +193,7 @@ pub(super) struct Report {
 /// of their own: 40-60 MB more).
 pub(super) fn worth_feedback(draws: &[DrawItem], instances: &[super::InstanceData], views: &[ViewRequest], bounds: Option<(glam::Vec3, glam::Vec3)>, from: u64) -> bool {
 	// views under levels of detail draw other triangles than a feedback would see: maps whole
-	if !enabled() || views.is_empty() || views.iter().any(|view| view.lod.is_some()) {
+	if !enabled() || views.is_empty() || views.iter().any(|view| view.lod.is_some() || view.quality.is_some()) {
 		return false;
 	}
 	// per map: its whole bytes, coarsest allowed level and the finest level estimated
@@ -262,7 +262,7 @@ impl Renderer {
 			rasters.push(Raster { width: render.0, height: render.1, samples: 1, draws: by_texels });
 		}
 		rasters.push(Raster { width: render.0, height: render.1, samples, draws });
-		let shadows = self.shadow_texels(scene, prepared, &camera, width as f32 / height as f32);
+		let shadows = self.shadow_texels(scene, prepared, &camera, width as f32 / height as f32, &super::view_quality(request, &scene.environment));
 		ViewPlan { camera, render, rasters, shadows }
 	}
 
@@ -271,16 +271,13 @@ impl Renderer {
 	/// of the sun's cascades reaching it, a shadowed light's face at its near side. Their colour maps are
 	/// read for those maps whether the view shows them or not, from the level those texels pick (a
 	/// part out of view still shadows what it does).
-	fn shadow_texels<'a>(&self, scene: &Scene, prepared: &'a Prepared, camera: &Camera, aspect: f32) -> Vec<(&'a DrawItem, f32)> {
+	fn shadow_texels<'a>(&self, scene: &Scene, prepared: &'a Prepared, camera: &Camera, aspect: f32, quality: &crate::quality::Quality) -> Vec<(&'a DrawItem, f32)> {
 		let cutouts: Vec<&DrawItem> = prepared.casters().draws.iter().filter(|draw| draw.shadow_cutout && !draw.decal).collect();
 		if cutouts.is_empty() {
 			return Vec::new();
 		}
 		let sun = prepared.sun_direction;
-		let cascades = match (prepared.sun_shadows, prepared.bounds) {
-			(true, Some(bounds)) => super::sun_cascades(camera, aspect, sun, bounds, scene.environment.shadow_softness, &super::SUN_SHADOWS),
-			_ => Vec::new(),
-		};
+		let cascades = super::view_sun_cascades(camera, aspect, prepared, &scene.environment, quality);
 		let lights: Vec<super::ShadowLight> = prepared.lights.iter().filter(|light| light.shadow[1] > 0.0).map(super::shadow_light).collect();
 		let size = super::light_shadow_size(lights.len().min(super::MAX_SHADOW_LIGHTS)) as f32;
 		let mut texels = Vec::new();

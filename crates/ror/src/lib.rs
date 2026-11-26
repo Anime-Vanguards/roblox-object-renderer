@@ -10,6 +10,7 @@
 //! - [`inspect`]: what a render shows, read back as text (parts by coverage, a pixel's part, two
 //!   renders compared)
 //! - [`lod`]: Roblox's levels of detail and distance culling for a camera (`--lod roblox`)
+//! - [`quality`]: what a Roblox client draws at each graphics quality level (`--quality`)
 //! - [`lint`]: authoring lints over what a render or a video draws (weightless particles; over a
 //!   video, linear fades, restraint within a form, frozen clouds, refused images, rigid beams, counts
 //!   per effect)
@@ -25,6 +26,7 @@ pub mod mp4;
 pub mod nvenc;
 pub mod output;
 pub(crate) mod par;
+pub mod quality;
 pub mod render;
 pub mod scene;
 pub mod script;

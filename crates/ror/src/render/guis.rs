@@ -1452,6 +1452,7 @@ impl Renderer {
 					opaque_share: false,
 					// a ViewportFrame's world at full detail (not measured)
 					lod: None,
+					quality: None,
 				};
 				match self.render(&viewport.scene, std::slice::from_ref(&picture)) {
 					Ok((mut images, stats)) => {
@@ -1493,6 +1494,7 @@ impl Renderer {
 				opaque_share: true,
 				// a ViewportFrame's world at full detail (not measured)
 				lod: None,
+				quality: None,
 			};
 			// ROR_WINDOWS_DEBUG=<dir>: each window's world as an image too
 			if let Some(directory) = std::env::var_os("ROR_WINDOWS_DEBUG") {

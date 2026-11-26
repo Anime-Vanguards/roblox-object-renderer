@@ -1,5 +1,5 @@
 //! The sun's shadow maps far from the camera and under cut-outs, against a Roblox 0.747 client's
-//! frames (fixtures/sun-shadows.luau; notes/render.md "Shadows"): no shadow further than
+//! frames (fixtures/sun-shadows.luau; notes/render.md "Shadows"): no shadow map further than
 //! `SUN_SHADOWS.reach` from the camera, no leak under a plate 3 studs over a floor in the last cascade,
 //! and an alpha checkerboard's holes as open as the same pattern built from parts.
 
@@ -70,8 +70,9 @@ impl Drop for Sun {
 
 /// A 2,000-stud floor and, when `height` is given, a 60 x 0.4 x 60 plate that far over it whose shadow
 /// falls on `target` in the band it throws beside itself (+X, across the sun), where a camera looking
-/// along +Z sees the floor past the plate.
-fn far_scene(target: Vec3, height: Option<f32>) -> Scene {
+/// along +Z sees the floor past the plate; `maps` off draws it without the sun's shadow maps
+/// (`RorNoSunShadowMaps`: the light grid's sun alone).
+fn far_scene(target: Vec3, height: Option<f32>, maps: bool) -> Scene {
 	let mut model = ModelBuilder::new("Far");
 	model.part(&PartSpec { name: "Floor".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, -0.5, 0.0)), size: Vec3::new(2000.0, 1.0, 2000.0), color: [255; 3], material: 272, ..Default::default() });
 	if let Some(height) = height {
@@ -80,24 +81,29 @@ fn far_scene(target: Vec3, height: Option<f32>) -> Scene {
 		let middle = target - offset + Vec3::new(offset.x / 2.0 - 30.0, 0.2, 0.0);
 		model.part(&PartSpec { name: "Plate".into(), cframe: Affine3A::from_translation(middle), size: Vec3::new(60.0, 0.4, 60.0), color: [40; 3], material: 272, ..Default::default() });
 	}
-	Sun::lit(crate::scene::extract::extract(&model.into_document()))
+	let mut scene = Sun::lit(crate::scene::extract::extract(&model.into_document()));
+	scene.environment.sun_shadow_maps = maps;
+	scene
 }
 
 /// The engine (fixtures/sun-shadows.luau "plates" and "leaks"): a plate 3 studs over the floor (Δ 6.8
 /// studs along the sun) shadows it fully in the last cascade, 443 studs from the camera, and not at all
-/// 670 studs away, beyond the shadows' reach of 587.5 (a field of view of 70, its last sphere reaching
-/// 796 studs). ror let 0.2-0.6 of the light under such plates there and shadowed to the sphere's end.
+/// 670 studs away, beyond the shadow maps' reach of 587.5 (a field of view of 70, its last sphere reaching
+/// 796 studs), where only the light grid's sun shades the floor (at every graphics quality level: the
+/// floor there reads as it does without the maps). ror let 0.2-0.6 of the light under such plates there and
+/// shadowed to the sphere's end.
 #[test]
 fn the_suns_shadow_ends_at_its_reach_and_leaks_nothing_far_out() {
 	let sun = Sun::new();
 	for (target, back, shadowed) in [(Vec3::ZERO, 395.0, true), (Vec3::new(0.0, 0.0, 300.0), 640.0, false)] {
 		let eye = target + Vec3::new(0.0, 200.0, -back);
 		let view = ViewRequest { width: 512, height: 512, camera: CameraSpec::LookAt { eye: eye.into(), target: target.into(), fov: 70.0 }, background: Background::Color([0.0, 0.0, 1.0]), bloom: false, ..Default::default() };
-		let level = |height: Option<f32>| {
-			let (images, _) = sun.renderer.render(&far_scene(target, height), std::slice::from_ref(&view)).unwrap();
+		let level_with = |height: Option<f32>, maps: bool| {
+			let (images, _) = sun.renderer.render(&far_scene(target, height, maps), std::slice::from_ref(&view)).unwrap();
 			// (the band beside a plate 3 studs up is 5.9 studs wide: 5 pixels here 443 studs out, 3 at 670)
 			Sun::level(&images[0], &view, target, 1)
 		};
+		let level = |height: Option<f32>| level_with(height, true);
 		// what a plate 30 studs up takes off (no cascade leaks under it), and one 3 studs up
 		let (open, deep, near) = (level(None), level(Some(30.0)), level(Some(3.0)));
 		let distance = eye.distance(target);
@@ -106,7 +112,8 @@ fn the_suns_shadow_ends_at_its_reach_and_leaks_nothing_far_out() {
 			let share = (open - near) / (open - deep);
 			assert!(share > 0.95, "{distance:.0} studs out: a plate 3 studs up takes {share} of the light a plate 30 studs up does, all of it expected");
 		} else {
-			assert!((open - near).abs() < 0.03 * open && (open - deep).abs() < 0.03 * open, "{distance:.0} studs out: no shadow beyond the reach ({open} open, {near} and {deep} under plates 3 and 30 studs up)");
+			let (grid_near, grid_deep) = (level_with(Some(3.0), false), level_with(Some(30.0), false));
+			assert!((near - grid_near).abs() < 0.03 * open && (deep - grid_deep).abs() < 0.03 * open, "{distance:.0} studs out: no shadow map beyond the reach ({open} open; under plates 3 and 30 studs up {near} and {deep}, the light grid's sun alone {grid_near} and {grid_deep})");
 		}
 	}
 }

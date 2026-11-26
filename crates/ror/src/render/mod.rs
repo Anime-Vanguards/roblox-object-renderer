@@ -166,6 +166,13 @@ pub struct ViewRequest {
 	/// out (crate::lod; `"roblox:<quality>"`); `None`: every mesh at full detail, every part drawn.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub lod: Option<crate::lod::Lod>,
+	/// Draw what a Roblox client draws at this graphics quality level (1-21, crate::quality, under the
+	/// scene's LightingStyle and PrioritizeLightingQuality): the sun's shadow maps to the level's reach and
+	/// the light grid's voxel sun past it, the share of the emitters' Rate it makes, and (without `lod`)
+	/// each MeshPart at its level of detail and none of the parts the level's view distance and size cull
+	/// leave out. `None`: level 21, every mesh at full detail and every part drawn.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub quality: Option<u32>,
 }
 
 fn default_bloom() -> bool {
@@ -182,7 +189,7 @@ fn default_supersample() -> u32 {
 
 impl Default for ViewRequest {
 	fn default() -> Self {
-		Self { width: 1024, height: 1024, camera: CameraSpec::default(), background: Background::Sky, msaa: 4, supersample: 1, bloom: true, ids: false, layers: false, gui_scale: None, linear_scale: None, texture: false, opaque_share: false, lod: None }
+		Self { width: 1024, height: 1024, camera: CameraSpec::default(), background: Background::Sky, msaa: 4, supersample: 1, bloom: true, ids: false, layers: false, gui_scale: None, linear_scale: None, texture: false, opaque_share: false, lod: None, quality: None }
 	}
 }
 
@@ -462,7 +469,8 @@ struct BloomUniform {
 const FOG_END_LIMIT: f32 = 100000.0;
 
 /// How the sun's shadow maps are drawn at a graphics quality (notes/render.md "Shadows"): what of them
-/// changes with the level. `SUN_SHADOWS` is quality 21's, which every picture draws at.
+/// changes with the level. `SUN_SHADOWS` is quality 21's; a view at a lower level (`ViewRequest::quality`)
+/// draws 21's cascades to its own reach (crate::quality::Quality::sun_shadows: [`view_sun_cascades`]).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SunShadowQuality {
 	/// Slices of the view's depth ending at these distances (studs), one cascade each: each covered by
@@ -475,7 +483,8 @@ pub(crate) struct SunShadowQuality {
 	/// The filter in texels: a Gaussian of sigma `filter.0` · √(ShadowSoftness / texel in studs) between
 	/// `filter.1` and `filter.2`
 	pub filter: (f32, f32, f32),
-	/// How far from the camera a surface takes the sun's shadow at all (studs)
+	/// How far from the camera a surface takes the sun's shadow maps at all (studs); past it the light
+	/// grid's voxel sun (lightgrid::propagate_sun)
 	pub reach: f32,
 }
 
@@ -554,6 +563,50 @@ impl SunCascade {
 		let along = offset.dot(sun);
 		along >= -(self.radius + radius) && (offset - sun * along).length() <= self.radius * std::f32::consts::SQRT_2 + radius
 	}
+}
+
+/// A view's sun cascades at its graphics quality (crate::quality): none where the level draws no shadow maps
+/// (or `RorNoSunShadowMaps` says so), else 21's (splits, texels and filter below 21 not measured: the client's
+/// edges within the reach read as 21's) less those whose sphere lies wholly past the level's reach, which no
+/// point takes.
+fn view_sun_cascades(camera: &Camera, aspect: f32, prepared: &Prepared, environment: &crate::scene::Environment, quality: &crate::quality::Quality) -> Vec<SunCascade> {
+	let (Some(reach), true, Some(bounds)) = (sun_reach(quality, environment), prepared.sun_shadows, prepared.bounds) else {
+		return Vec::new();
+	};
+	let mut cascades = sun_cascades(camera, aspect, prepared.sun_direction, bounds, environment.shadow_softness, &SUN_SHADOWS);
+	cascades.retain(|cascade| cascade.center.distance(camera.eye) - cascade.radius < reach.gone);
+	cascades
+}
+
+/// Where a view's sun shadow maps reach ([`view_sun_cascades`]): its quality's, none under `RorNoSunShadowMaps`.
+fn sun_reach(quality: &crate::quality::Quality, environment: &crate::scene::Environment) -> Option<crate::quality::SunReach> {
+	quality.sun_shadows.filter(|_| environment.sun_shadow_maps)
+}
+
+/// The sun the light grid carries for `views` (lightgrid::grid_sun): only when one of them can see past its sun
+/// shadow maps (a level without them, or a camera farther than their reach from a corner of the scene's `bounds`),
+/// where it shades the sun. Carrying it doubled the grid's build on 30,000 blocks over 1,536 x 324 x 1,536 studs,
+/// for views that never read it.
+fn grid_sun_for(scene: &Scene, views: &[ViewRequest], bounds: Option<(Vec3, Vec3)>) -> Option<Vec3> {
+	let sun = lightgrid::grid_sun(scene)?;
+	let (min, max) = bounds?;
+	let environment = &scene.environment;
+	let past = |view: &ViewRequest| match sun_reach(&view_quality(view, environment), environment) {
+		None => true,
+		Some(reach) => {
+			let eye = view.camera.place(bounds, view.width.max(1), view.height.max(1)).eye;
+			(0..8).any(|corner| {
+				let point = Vec3::new(if corner & 1 == 0 { min.x } else { max.x }, if corner & 2 == 0 { min.y } else { max.y }, if corner & 4 == 0 { min.z } else { max.z });
+				point.distance(eye) > reach.full
+			})
+		}
+	};
+	views.iter().any(past).then_some(sun)
+}
+
+/// The graphics quality a view draws at: its `quality` level under the scene's Lighting, level 21 without one.
+pub(crate) fn view_quality(request: &ViewRequest, environment: &crate::scene::Environment) -> crate::quality::Quality {
+	request.quality.map_or_else(crate::quality::Quality::top, |level| crate::quality::Quality::for_environment(level, environment))
 }
 
 /// The sun's cascades at `quality` for a camera whose spheres reach the scene's bounds.
@@ -2523,7 +2576,7 @@ impl Renderer {
 			let plans: Vec<residency::ViewPlan> = views.iter().map(|view| self.residency_plan(scene, &prepared, view)).collect();
 			let mut report = residency::Report::default();
 			// views under levels of detail draw other triangles than the feedback would: their maps whole
-			let whole = views.iter().any(|view| view.lod.is_some());
+			let whole = views.iter().any(|view| view.lod.is_some() || view.quality.is_some());
 			let groups = self.view_groups(&prepared, &plans, &mut report, residency, whole)?;
 			(stats.residency_total_ms, stats.residency_ms, stats.residency_reads, stats.residency_read_bytes) = (report.ms, report.feedback_ms, report.read, report.read_bytes);
 			groups
@@ -2551,10 +2604,12 @@ impl Renderer {
 				}
 			}
 			stats.guis += view_guis.draws.len();
-			// Roblox's levels of detail from this view's camera: its own copy of the draws while it draws
-			let lod = view.lod.map(|lod| {
+			// Roblox's levels of detail from this view's camera: its own copy of the draws while it draws. A
+			// graphics quality level without `lod` culls by the client's view distance and size cull at it
+			let client = view.quality.filter(|_| view.lod.is_none()).map(|_| view_quality(view, &scene.environment));
+			let lod = view.lod.or(client.map(|quality| crate::lod::Lod { quality: quality.level, cull: true })).map(|lod| {
 				let camera = view.camera.place(prepared.bounds, view.width.max(1), view.height.max(1));
-				let (geometry, report) = levels::for_view(scene, &prepared.geometry, &camera, lod);
+				let (geometry, report) = levels::for_view(scene, &prepared.geometry, &camera, lod, client.as_ref());
 				if let Some(geometry) = geometry {
 					prepared.casters = Some(std::mem::replace(&mut prepared.geometry, Arc::new(geometry)));
 				}
@@ -3439,7 +3494,7 @@ impl Renderer {
 					last.moving = false;
 					*clip.last.lock() = Some(last);
 				}
-				geometry
+				self.under_this_sun(scene, geometry, views, lease)
 			}
 			None => {
 				let failures = self.failures(offline_view);
@@ -3807,7 +3862,7 @@ impl Renderer {
 		// floor fully without them)
 		self.memory_checkpoint("parts prepared");
 		let light_grid_start = Instant::now();
-		let grid = (scene.environment.global_shadows && light_grid_enabled()).then(|| self.light_grid(scene, lease)).flatten();
+		let grid = (scene.environment.global_shadows && light_grid_enabled()).then(|| self.light_grid(scene, lease, grid_sun_for(scene, views, bounds))).flatten();
 		self.memory_checkpoint("light grid");
 		stats.light_grid_ms = light_grid_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -3820,7 +3875,7 @@ impl Renderer {
 			draws,
 			instances: instance_buffer,
 			no_lights,
-			light_grid: grid.as_ref().map(|grid| (grid.view.clone(), grid.origin, grid.size)),
+			light_grid: grid.as_ref().map(|grid| (grid.view.clone(), grid.origin, grid.size, grid.sun)),
 			light_grid_texture: grid.as_ref().map(|grid| grid.texture.clone()),
 			bounds,
 			organic_noise,
@@ -3863,19 +3918,36 @@ impl Renderer {
 		self.meshes.dropped_failures_for(offline_view) + self.textures.dropped_failures_for(offline_view) + self.packs.dropped_failures_for(offline_view)
 	}
 
+	/// A kept preparation whose light grid lacks the sun these views read ([`grid_sun_for`]: made for views that saw
+	/// nothing past their sun shadow maps, or under another sun, a clip's ClockTime moving) draws the grid made for
+	/// this sun (kept by its own key); the preparation stays as kept.
+	fn under_this_sun(&self, scene: &Scene, geometry: Arc<prepared::PreparedGeometry>, views: &[ViewRequest], lease: &reuse::Lease) -> Arc<prepared::PreparedGeometry> {
+		let Some((_, _, _, sun)) = &geometry.light_grid else {
+			return geometry;
+		};
+		let wanted = grid_sun_for(scene, views, geometry.bounds);
+		if wanted.is_none() || *sun == wanted {
+			return geometry;
+		}
+		match self.light_grid(scene, lease, wanted) {
+			Some(grid) => Arc::new(geometry.with_grid(&grid)),
+			None => geometry,
+		}
+	}
+
 	/// The light grid (`lightgrid::build`), kept by the parts that fill it: a clip whose moving parts
 	/// do not fill it (meshes, invisible or shadowless parts) builds it once. A scene following one
 	/// with as many fillers (a clip's next frame, its limbs moved) is updated from that one's grid
 	/// where they differ (`lightgrid::build_from`, exactly the grid built anew); a scene's first grid
 	/// keeps only what tells the next one so.
-	fn light_grid(&self, scene: &Scene, lease: &reuse::Lease) -> Option<Arc<prepared::PreparedGrid>> {
-		let key = lightgrid::key(scene);
+	fn light_grid(&self, scene: &Scene, lease: &reuse::Lease, sun: Option<Vec3>) -> Option<Arc<prepared::PreparedGrid>> {
+		let key = lightgrid::key(scene, sun);
 		if let Some(grid) = self.preparations.grid(&key) {
 			return Some(grid);
 		}
 		let previous = self.preparations.take_grid_state(lightgrid::filler_count(scene));
 		let moving = previous.is_some();
-		let mut state = lightgrid::build_from(scene, previous, moving)?;
+		let mut state = lightgrid::build_from(scene, previous, moving, sun)?;
 		let dims = [state.dims[0] as u32, state.dims[1] as u32, state.dims[2] as u32];
 		let size = Vec3::new(dims[0] as f32, dims[1] as f32, dims[2] as f32) * lightgrid::VOXEL;
 		let mut texture = None;
@@ -3884,7 +3956,7 @@ impl Renderer {
 			texture = Some(made.clone());
 			made
 		}, dims, &state.values, state.sun.as_deref());
-		let prepared = Arc::new(prepared::PreparedGrid { texture: texture?, view, origin: state.origin, size, bytes: state.values.len() as u64 * 2 });
+		let prepared = Arc::new(prepared::PreparedGrid { texture: texture?, view, origin: state.origin, size, sun: state.sun.as_ref().and(sun), bytes: state.values.len() as u64 * 2 });
 		// a moving scene's grid is drawn once: its texture goes back to the pool with the lease
 		if !moving && self.preparations.keep_grid(key, prepared.clone()) {
 			lease.hand_out(&prepared.texture);
@@ -4628,7 +4700,7 @@ impl Renderer {
 				wgpu::BindGroupEntry { binding: 14, resource: lights.shadow_matrices.as_entire_binding() },
 				wgpu::BindGroupEntry {
 					binding: 15,
-					resource: wgpu::BindingResource::TextureView(prepared.light_grid.as_ref().map(|(view, _, _)| view).unwrap_or(&self.defaults.no_light_grid)),
+					resource: wgpu::BindingResource::TextureView(prepared.light_grid.as_ref().map(|(view, _, _, _)| view).unwrap_or(&self.defaults.no_light_grid)),
 				},
 				wgpu::BindGroupEntry { binding: 16, resource: wgpu::BindingResource::TextureView(occlusion) },
 				wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::TextureView(scene_color) },
@@ -4756,11 +4828,10 @@ impl Renderer {
 			lease.buffer("light clusters", wgpu::BufferUsages::STORAGE, bytemuck::cast_slice(&clusters.masks))
 		});
 		let sun = prepared.sun_direction;
-		// the sun's cascades for this camera (notes/render.md "Shadows")
-		let sun_cascades = match (prepared.sun_shadows, prepared.bounds) {
-			(true, Some(bounds)) => sun_cascades(&camera, width as f32 / height as f32, sun, bounds, environment.shadow_softness, &SUN_SHADOWS),
-			_ => Vec::new(),
-		};
+		// the sun's cascades for this camera at the view's graphics quality (notes/render.md "Shadows",
+		// "Graphics quality levels")
+		let quality = view_quality(request, environment);
+		let sun_cascades = view_sun_cascades(&camera, width as f32 / height as f32, prepared, environment, &quality);
 		let shadow_start = Instant::now();
 		let sun_atlas = (!sun_cascades.is_empty()).then(|| self.render_sun_shadows(prepared, &sun_cascades, groups, lease, &profile, &mut encoder, &mut publish));
 		stats.sun_shadow_ms += shadow_start.elapsed().as_secs_f64() * 1000.0;
@@ -4799,21 +4870,25 @@ impl Renderer {
 		];
 		// with GlobalShadows on, open OutdoorAmbient reads 0.986 of what it does with them off
 		// (lg-terms: 0.953 / 0.967 open, roofed and not)
-		if let Some((_, origin, size)) = &prepared.light_grid {
-			// (2: without the sun's shadow maps the grid's sky visibility stops the sun too, scene::NO_SUN_SHADOW_MAPS)
-			frame.light_grid = [origin.x, origin.y, origin.z, if environment.sun_shadow_maps { 1.0 } else { 2.0 }];
+		if let Some((_, origin, size, sun)) = &prepared.light_grid {
+			// (2: the grid carries the sun's light along its direction, which stops the sun past the view's
+			// shadow maps: lightgrid::grid_sun)
+			frame.light_grid = [origin.x, origin.y, origin.z, if sun.is_some() && *sun == lightgrid::grid_sun(scene) { 2.0 } else { 1.0 }];
 			frame.light_grid_scale = [1.0 / size.x, 1.0 / size.y, 1.0 / size.z, LIGHT_GRID_OPEN];
 		} else {
 			frame.light_grid_scale = [0.0, 0.0, 0.0, if environment.global_shadows { LIGHT_GRID_OPEN } else { 1.0 }];
 		}
+		let reach = sun_reach(&quality, environment).unwrap_or(crate::quality::SunReach { full: 0.0, gone: 0.0 });
 		if let Some((_, columns)) = &sun_atlas {
 			for (cascade, column) in sun_cascades.iter().zip(columns) {
 				frame.shadow_cascades[cascade.index] = cascade.view_proj.to_cols_array_2d();
 				frame.shadow_spheres[cascade.index] = [cascade.center.x, cascade.center.y, cascade.center.z, cascade.radius];
-				frame.shadow_regions[cascade.index] = [*column as f32, cascade.texels as f32, SUN_SHADOWS.reach, cascade.least_variance()];
+				frame.shadow_regions[cascade.index] = [*column as f32, cascade.texels as f32, reach.gone, cascade.least_variance()];
 			}
 		}
-		frame.shadow = [sun_cascades.len() as f32, SUN_WARP, 0.0, SUN_DARKEN];
+		// the shadow maps reach to `gone` from the camera, fading into the light grid's voxel sun from `full`
+		// (mesh.wgsl sun_shade; both 0 at a level without the maps: the voxels everywhere)
+		frame.shadow = [reach.full, SUN_WARP, reach.gone, SUN_DARKEN];
 		// Lighting's fog, also at the default FogEnd of 100000 (atmosphere-explore: black tiles 1024-4096
 		// studs away read 6.6 / 13 / 25 of 255 without an Atmosphere); its colour shows like a sky texel,
 		// 1.935 · FogColor² (fog). The sky is not fogged.
@@ -4835,7 +4910,7 @@ impl Renderer {
 
 		// the effects this view shows (the particles' notes kept for where they were made before)
 		let mut particle_missing = Vec::new();
-		let particle_view = self.particle_geometry(scene, &prepared.particles, &camera, width as f32 / height as f32, &mut particle_missing, lease);
+		let particle_view = self.particle_geometry(scene, &prepared.particles, &camera, width as f32 / height as f32, quality.particle_rate, &mut particle_missing, lease);
 		let beam_view = self.beam_geometry(scene, &camera, lease);
 		let trail_view = self.trail_geometry(scene, &camera, lease);
 		// the lights' voxels where those with LightInfluence read them, baked once (voxel_field), as far

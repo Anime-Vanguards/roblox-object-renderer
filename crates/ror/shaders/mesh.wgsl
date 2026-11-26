@@ -69,14 +69,32 @@ fn light_grid_visibility(position: vec3<f32>, normal: vec3<f32>) -> f32 {
 	return textureSampleLevel(light_grid, linear_sampler, uvw, 0.0).r;
 }
 
-// the sun's light through the grid where its shadow maps are not drawn (frame.light_grid.w 2; render::lightgrid
-// propagate_sun), read as the sky's visibility is; 1 without a grid
+// the sun's light through the grid (frame.light_grid.w 2; render::lightgrid propagate_sun), read as the sky's
+// visibility is; 1 without a grid or its sun channel
 fn light_grid_sun(position: vec3<f32>, normal: vec3<f32>) -> f32 {
 	if (frame.light_grid.w < 1.5) {
 		return 1.0;
 	}
 	let uvw = (position + normal * LIGHT_GRID_OFFSET - frame.light_grid.xyz) * frame.light_grid_scale.xyz;
 	return textureSampleLevel(light_grid, linear_sampler, uvw, 0.0).g;
+}
+
+// what of the sun reaches a surface: the shadow maps within the view's graphics quality's reach of the camera,
+// the grid's voxel sun past it, the one fading into the other between frame.shadow.x and frame.shadow.z studs
+// from the camera (crate::quality::SunReach; both 0 at a level without the maps: the voxels everywhere). The
+// client's rails 6 studs up cast their strips to 587.5 studs at level 21 and none past, fading out over the last
+// ~14 studs below 19; past them its floors take the voxel sun at every level (notes/render.md "Graphics quality
+// levels")
+fn sun_shade(position: vec3<f32>, normal: vec3<f32>) -> f32 {
+	let from_camera = distance(position, frame.camera_position.xyz);
+	if (from_camera <= frame.shadow.x) {
+		return shadow_factor(position, normal);
+	}
+	let voxels = light_grid_sun(position, normal);
+	if (from_camera >= frame.shadow.z) {
+		return voxels;
+	}
+	return mix(shadow_factor(position, normal), voxels, (from_camera - frame.shadow.x) / (frame.shadow.z - frame.shadow.x));
 }
 
 @group(1) @binding(0) var color_map: texture_2d<f32>;
@@ -1043,8 +1061,8 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 	let geometric_normal = normalize(input.world_normal) * select(-1.0, 1.0, front_facing);
 	// OutdoorAmbient only as far as the light grid sees the sky (Ambient everywhere: lightgrid)
 	let sky_open = light_grid_visibility(input.world_position, geometric_normal);
-	// without the sun's shadow maps (frame.light_grid.w 2) the sun reaches as far as the grid lets it through
-	let shadow = shadow_factor(input.world_position, geometric_normal) * cloud_sun(input.world_position) * light_grid_sun(input.world_position, geometric_normal);
+	// past the sun's shadow maps the sun reaches as far as the grid lets it through
+	let shadow = sun_shade(input.world_position, geometric_normal) * cloud_sun(input.world_position);
 	var color = direct_light(surface, n, v, frame.sun_direction.xyz, frame.sun_color.rgb * shadow, 0.0);
 	color += local_lights(surface, input.world_position, n, v, geometric_normal, input.clip.xy);
 

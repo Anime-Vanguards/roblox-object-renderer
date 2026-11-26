@@ -51,6 +51,16 @@ By default, `ror` renders every part and every mesh at full detail (LOD 0). Pass
 
 `summary.json` records per-view LOD counts under `lod` (`levels`, per-mesh `meshes`, `culled` count, and `unchained` count for `Performance` meshes lacking a stored LOD chain, which `ror` renders at full detail). `ror video`, `ror compare`, and render jobs (`"lod": "roblox:21"`) accept `--lod` as well.
 
+## Graphics quality levels (`--quality`)
+
+By default every view draws what a Roblox client draws at its highest graphics quality level, 21. `--quality <1-21>` (`ror render` and `ror video`; `"quality": N` in a view of a render job or a service request) draws what a client draws at a lower level, under the scene's `LightingStyle` and `PrioritizeLightingQuality` (measured in the Roblox engine 0.747 with `fixtures/quality-levels.luau`; [rendering.md](rendering.md), "Graphics quality levels"):
+
+- the sun's shadow maps only within the level's distance of the camera, the voxel light grid's softer sun past it (none of the maps below level 8);
+- the share of each `ParticleEmitter`'s `Rate` the level makes (`max(level, 2) / 21`; `Emit` bursts in full);
+- without `--lod`: each `MeshPart` at its level of detail, as `--lod` draws it, and none of the parts the client's view distance and size cull at that level leave out (490 studs at level 1, 1,600 at 4 to 12, 10,000 at 17). `summary.json`'s `lod` says `"client": true`. With `--lod roblox:N` the cull is Studio's edit quality's instead.
+
+Level 21 with `--quality 21` differs from the default only in the levels of detail and the cull. Not yet followed by level: local lights per pixel, the specular and shading model, the built-in glow and post effects, ambient occlusion, anti-aliasing, Glass refraction and clouds (`ror::quality::Quality` holds the client's numbers for them).
+
 ## Lighting, materials, and map backdrops
 
 - `--lighting-from <place>`: borrow `Lighting` (properties, `Sky`, `Atmosphere`, post effects) from another place file. Without it, `ror` uses Roblox default lighting.

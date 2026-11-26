@@ -769,16 +769,18 @@ impl super::Renderer {
 		PreparedParticles { particles, groups: groups.iter().map(|(group, _)| group.clone()).collect() }
 	}
 
-	/// The particles' quads seen from `camera` (a view of `aspect` width / height). Particles that
-	/// would cover more than [`MAX_OVERDRAW`] viewports are thinned evenly, noted in `missing`.
-	pub(super) fn particle_geometry(&self, scene: &Scene, prepared: &PreparedParticles, camera: &Camera, aspect: f32, missing: &mut Vec<String>, lease: &super::reuse::Lease) -> ViewParticles {
+	/// The particles' quads seen from `camera` (a view of `aspect` width / height), the emitters making `rate`
+	/// of what their Rate emits (the view's graphics quality). Particles that would cover more than
+	/// [`MAX_OVERDRAW`] viewports are thinned evenly, noted in `missing`.
+	#[allow(clippy::too_many_arguments)]
+	pub(super) fn particle_geometry(&self, scene: &Scene, prepared: &PreparedParticles, camera: &Camera, aspect: f32, rate: f32, missing: &mut Vec<String>, lease: &super::reuse::Lease) -> ViewParticles {
 		// emitters on parts following the camera stand under this one (`followed`)
 		let moved: Vec<Option<(ParticleEmitter, Vec<Particle>)>> = scene.particles.iter().zip(&prepared.particles).map(|(emitter, particles)| followed(emitter, particles, camera)).collect();
 		let emitters = || scene.particles.iter().zip(&prepared.particles).zip(&moved).map(|((emitter, particles), moved)| match moved {
 			Some((emitter, particles)) => (emitter, particles.as_slice()),
 			None => (emitter, particles.as_slice()),
 		});
-		let covered: f32 = emitters().map(|(emitter, particles)| coverage(emitter, particles, camera, aspect)).sum();
+		let covered: f32 = emitters().map(|(emitter, particles)| coverage(emitter, particles, camera, aspect, rate)).sum();
 		let keep = if covered > MAX_OVERDRAW { MAX_OVERDRAW / covered } else { 1.0 };
 		if keep < 1.0 {
 			missing.push(format!("particles: they would cover the view {covered:.0} times over; drawing {:.1} % of each emitter's", keep * 100.0));
@@ -790,7 +792,7 @@ impl super::Renderer {
 		let view_proj = camera.view_projection(aspect);
 		for (index, (emitter, particles)) in emitters().enumerate() {
 			let start = vertices.len() as u32;
-			quads(emitter, particles, camera, keep, Some(&view_proj), &mut vertices);
+			quads_at(emitter, particles, camera, rate, keep, Some(&view_proj), &mut vertices);
 			if vertices.len() as u32 > start {
 				let moved = particles.iter().map(|particle| particle.moved.dot(forward)).sum::<f32>() / particles.len().max(1) as f32;
 				let cross_fades = vertices[start as usize..].iter().any(|vertex| vertex.params[3] != 0.0);
@@ -838,12 +840,14 @@ fn cell(frame: u32, (columns, rows): (u32, u32)) -> [f32; 4] {
 /// most one): the size of the blended work they make. A quad counts the part of it on screen (a map's
 /// mist, beside and behind a first-person camera as much as before it, counted 160-345 views where
 /// the view showed a fraction of that), less what the far Rate thins.
-pub(crate) fn coverage(emitter: &ParticleEmitter, particles: &[Particle], camera: &Camera, aspect: f32) -> f32 {
+/// The emitter makes `rate` of what its Rate emits (a graphics quality level's share,
+/// crate::quality::Quality::particle_rate).
+pub(crate) fn coverage(emitter: &ParticleEmitter, particles: &[Particle], camera: &Camera, aspect: f32, rate: f32) -> f32 {
 	let m = camera.world.matrix3;
 	let (right, up, forward) = (Vec3::from(m.x_axis), Vec3::from(m.y_axis), -Vec3::from(m.z_axis));
 	let tan = (camera.fov.to_radians() * 0.5).tan();
 	let aspect = aspect.max(1e-3);
-	let rate_share = super::distance_lod(camera.eye.distance(Vec3::from(emitter.cframe.translation)));
+	let rate_share = super::distance_lod(camera.eye.distance(Vec3::from(emitter.cframe.translation))) * rate;
 	particles
 		.iter()
 		.map(|particle| {
@@ -957,6 +961,14 @@ fn thinned(share: f32, draw: f32) -> f32 {
 /// The particles' quads seen from `camera`, as two triangles each, in their order; with `view` (the
 /// frame's view-projection) leaving out those no pixel of the view can show ([`off_view`]).
 pub fn quads(emitter: &ParticleEmitter, particles: &[Particle], camera: &Camera, keep: f32, view: Option<&Mat4>, out: &mut Vec<ParticleVertex>) {
+	quads_at(emitter, particles, camera, 1.0, keep, view, out);
+}
+
+/// [`quads`] where the emitter makes `rate` of what its Rate emits: a graphics quality level's share
+/// (crate::quality::Quality::particle_rate: the client's Rate 300 emitter made 0.100 of level 21's at levels 1
+/// and 2, 0.240 at 5, 0.480 at 10, 0.765 at 16, within 1 % of max(level, 2) / 21, and `Emit(300)` 300 at every
+/// level), thinned as the far Rate is (by each particle's fixed draw, bursts kept whole).
+pub fn quads_at(emitter: &ParticleEmitter, particles: &[Particle], camera: &Camera, rate: f32, keep: f32, view: Option<&Mat4>, out: &mut Vec<ParticleVertex>) {
 	let m = camera.world.matrix3;
 	let (camera_right, camera_up, camera_back) = (Vec3::from(m.x_axis), Vec3::from(m.y_axis), Vec3::from(m.z_axis));
 	let grid = emitter.flipbook_grid();
@@ -975,7 +987,7 @@ pub fn quads(emitter: &ParticleEmitter, particles: &[Particle], camera: &Camera,
 	// among the living: as the oldest die each frame that place shifts, and picking by it swapped which
 	// particles showed from frame to frame (a turning video's mist, vapor and far emitters flickering);
 	// nor every 1 / share-th emitted, which swaps neighbours as the share moves with the camera
-	let rate_share = super::distance_lod(camera.eye.distance(Vec3::from(emitter.cframe.translation)));
+	let rate_share = super::distance_lod(camera.eye.distance(Vec3::from(emitter.cframe.translation))) * rate;
 	for particle in particles {
 		let rate = if particle.rate { thinned(rate_share, draw(emitter, RATE_SEED, particle)) } else { 1.0 };
 		let fade = huge_fade(particle.size) * rate * thinned(keep, draw(emitter, OVERDRAW_SEED, particle));
@@ -1383,7 +1395,7 @@ mod tests {
 		let emitter = ParticleEmitter { size_keys: vec![(0.0, 50.0, 0.0), (1.0, 50.0, 0.0)], bursts: vec![(0.0, 20000)], ..emitter() };
 		let camera = super::super::camera::CameraSpec::LookAt { eye: [0.0, 0.0, -40.0], target: [0.0, 0.0, 0.0], fov: 20.0 }.place(None, 100, 100);
 		let particles = simulate(&emitter);
-		let covered = coverage(&emitter, &particles, &camera, 1.0);
+		let covered = coverage(&emitter, &particles, &camera, 1.0, 1.0);
 		assert!((covered - 20000.0).abs() < 1e-2, "{covered}");
 		let mut vertices = Vec::new();
 		quads(&emitter, &particles, &camera, MAX_OVERDRAW / covered, None, &mut vertices);
@@ -1399,7 +1411,7 @@ mod tests {
 		let camera = super::super::camera::CameraSpec::LookAt { eye: [0.0, 0.0, -40.0], target: [0.0, 0.0, 0.0], fov: 20.0 }.place(None, 100, 100);
 		let at = |x: f32, z: f32, size: f32| {
 			let emitter = ParticleEmitter { cframe: glam::Affine3A::from_translation(Vec3::new(x, 0.0, z)), size_keys: vec![(0.0, size, 0.0), (1.0, size, 0.0)], bursts: vec![(0.0, 10)], ..emitter() };
-			coverage(&emitter, &simulate(&emitter), &camera, 1.0)
+			coverage(&emitter, &simulate(&emitter), &camera, 1.0, 1.0)
 		};
 		// in the middle of the view, 40 studs off: 10 quads a quarter of its height across
 		let tan = 10f32.to_radians().tan();
