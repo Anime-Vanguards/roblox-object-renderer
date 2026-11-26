@@ -20,13 +20,12 @@ from PIL import Image
 from scipy.optimize import least_squares
 
 ROOT = os.path.join("out", "calibrate")
-A, C, D = 2.725891, 2.307040, 1.951868
-TOE, SCALE = 0.00329, 1.0098
+from tone import A, B as TOE, C, D, E, SCALE
 
 
 def curve(x, b=TOE, k=SCALE):
 	x = np.maximum(np.asarray(x, dtype=np.float64) * k, 0)
-	return np.minimum(x * (A * x + b) / (x * (C * x + D) + 1), 1)
+	return np.minimum(x * (A * x + b + E * x * x) / (x * (C * x + D) + 1), 1)
 
 
 _xs = np.concatenate([np.linspace(0, 1, 200001), np.linspace(1, 6, 100001)[1:]])

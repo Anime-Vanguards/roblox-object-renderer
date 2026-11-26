@@ -49,22 +49,30 @@ const END_CAP: f32 = 2.5;
 
 // Studio's default tone curve (shaders/resolve.wgsl `tonemap`, tools/analysis/tone.py; notes/render.md
 // "Colour pipeline and tone curve"): the rational fit up to x = 2.1313, above it a shoulder
-// approaching its ceiling as a power of the distance, past 1 (255 of 255) from x = 12.67.
-const TONE_TOE: f32 = 0.00329;
+// approaching its ceiling as a power of the distance, past 1 (255 of 255) from x = 12.73.
+const TONE_A: f64 = 2.86323;
+const TONE_C: f64 = 1.98625;
+const TONE_D: f64 = 2.29460;
+const TONE_E: f64 = -0.12587;
 const TONE_SCALE: f32 = 1.0098;
 const TONE_SHOULDER_X: f32 = 2.1313;
-const TONE_SHOULDER_START: f32 = 0.795199;
+const TONE_SHOULDER_START: f32 = 0.793171;
 const TONE_CEILING: f32 = 1.00999;
 const TONE_SHOULDER_K: f32 = 0.32012;
 const TONE_SHOULDER_POWER: f32 = 2.07968;
+
+/// The curve's rational part of y (the scaled input)
+fn rational(y: f64) -> f64 {
+	y * y * (TONE_A + TONE_E * y) / (y * (TONE_C * y + TONE_D) + 1.0)
+}
 
 fn tone(x: f32) -> f32 {
 	let x = x.max(0.0);
 	if x > TONE_SHOULDER_X {
 		return TONE_CEILING - (TONE_CEILING - TONE_SHOULDER_START) * (1.0 + TONE_SHOULDER_K * (x - TONE_SHOULDER_X)).powf(-TONE_SHOULDER_POWER);
 	}
-	let y = x * TONE_SCALE;
-	(y * (2.725891 * y + TONE_TOE)) / (y * (2.307040 * y + 1.951868) + 1.0)
+	let y = (x * TONE_SCALE) as f64;
+	rational(y) as f32
 }
 
 /// The displayed value (0-1) of a tone curve input: its square root, clipped at 1.
@@ -73,7 +81,7 @@ fn display(x: f32) -> f32 {
 }
 
 /// The tone curve's input a displayed value (0-1) shows; 1 (255, every input from 10.7 up) reads as
-/// where the curve reaches 1, x = 12.67 (tone.py's `radiance(255)`).
+/// where the curve reaches 1, x = 12.73 (tone.py's `radiance(255)`).
 fn linear(shown: f64) -> f32 {
 	let t = (shown * shown).min(1.0);
 	if t > TONE_SHOULDER_START as f64 {
@@ -81,11 +89,17 @@ fn linear(shown: f64) -> f32 {
 		let distance = ((ceiling - t) / (ceiling - start)).powf(-1.0 / TONE_SHOULDER_POWER as f64) - 1.0;
 		return (TONE_SHOULDER_X as f64 + distance / TONE_SHOULDER_K as f64) as f32;
 	}
-	// T = y (a y + toe) / (y (b y + c) + 1): (a - T b) y² + (toe - T c) y - T = 0
-	let (a, b, c, toe) = (2.725891f64, 2.307040f64, 1.951868f64, TONE_TOE as f64);
-	let (qa, qb) = (a - t * b, toe - t * c);
-	let y = (-qb + (qb * qb + 4.0 * qa * t).sqrt()) / (2.0 * qa);
-	(y / TONE_SCALE as f64) as f32
+	// the rational part rises through [0, its end]: bisect for the input that gives t
+	let (mut low, mut high) = (0.0f64, TONE_SHOULDER_X as f64 * TONE_SCALE as f64);
+	for _ in 0..60 {
+		let middle = 0.5 * (low + high);
+		if rational(middle) < t {
+			low = middle;
+		} else {
+			high = middle;
+		}
+	}
+	(0.5 * (low + high) / TONE_SCALE as f64) as f32
 }
 
 /// Every display level's tone curve input.
@@ -767,7 +781,7 @@ mod tests {
 		}
 		// a white surface under a Brightness-1 sun shows 184; 255 reads as where the curve reaches 1
 		assert_eq!((display(1.0) * 255.0).round(), 184.0);
-		assert!((linear(1.0) - 12.67).abs() < 0.01, "{}", linear(1.0));
+		assert!((linear(1.0) - 12.73).abs() < 0.01, "{}", linear(1.0));
 		assert!((tone(linear(1.0)) - 1.0).abs() < 1e-4);
 	}
 

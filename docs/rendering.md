@@ -25,8 +25,8 @@ Shared rules in `shaders/common.wgsl`:
 - **Lighting:** Linear in `Lighting.Brightness`. Diffuse is Lambertian: `x = Brightness * albedo * (n · l) + specular`.
 - **Exposure:** Multiplies radiance by `2^ExposureCompensation` prior to tone mapping.
 - **Tone curve & encode:** Display output is `√T(x)` per channel, where `y = 1.0098 * x`:
-  - For `x <= 2.1313`: `T(x) = y * (2.725891*y + 0.00329) / (y * (2.307040*y + 1.951868) + 1)`
-  - For `x > 2.1313`: `T(x) = 1.00999 - 0.214791 * (1 + 0.32012 * (x - 2.1313))^-2.07968`
+  - For `x <= 2.1313`: `T(x) = y² * (2.86323 - 0.12587*y) / (y * (1.98625*y + 2.29460) + 1)`
+  - For `x > 2.1313`: `T(x) = 1.00999 - 0.216819 * (1 + 0.32012 * (x - 2.1313))^-2.07968`
   - Reference check: a white surface facing a `Brightness = 1` sun has `x = 1` → `184/255`.
 - **Clamping & blending:** Exposed radiance clamps at `7.84` per channel before blending and MSAA resolve. The scene render target stores `√x` so alpha blending operates in square-root space to match Studio.
 

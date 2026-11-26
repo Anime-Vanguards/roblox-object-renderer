@@ -27,19 +27,25 @@ fn finite(value: vec4<f32>) -> bool {
 // SunRaysEffect's radiance at a quarter of the resolution (shaders/sun_rays.wgsl)
 @group(0) @binding(6) var sun_rays: texture_2d<f32>;
 
-// Studio's default tone curve, per channel (notes/render.md "Tone curve"); its input is the scene
-// radiance in Roblox's units (a white surface facing a Brightness-1 sun is 1). Up to x = 2.13 the
-// rational fit of sun-lit tiles (sun-board), its linear term (the toe) and the input's scale refitted
-// to tone-toe's gray tiles under flat light without fog (sun-board's tiles stood in 190 studs of the
-// default fog, which had raised the toe to 0.022270; the scale keeps its bright end within 0.2 of
-// 255); above, continuous with it, a shoulder approaching its ceiling as a power of the distance,
-// T = C - (C - start) (1 + k (x - 2.1313))^-q: 253 of 255 from x 7.1, 254 from 8.4, 255 from 10.7 and
-// past 1 from 12.7 (tone-retro: Neon tiles under a ColorCorrection of Brightness -0.4 and -0.8, which
-// acts before the shown value clips, and inside glowing tiles, x 2-21).
-const TONE_TOE: f32 = 0.00329;
+// Studio's default tone curve, per channel (notes/render.md "Colour pipeline and tone curve"); its input
+// is the scene radiance in Roblox's units (a white surface facing a Brightness-1 sun is 1). Up to x =
+// 2.1313, T = y² (A + E y) / (y (C y + D) + 1) with y = 1.0098 x (the scale from sun-board's sun-lit tiles
+// in Studio): fitted to where a Roblox client's display crosses each half level on gray tiles under flat
+// light and on Neon tiles without fog (fixtures/tone-bloom.luau: 384 crossings at 0.5-253.5 of 255,
+// every band within 0.06 of 255), with no linear term (the toe of 0.00329 fitted before came from fog in
+// runs meant to have none: Roblox holds FogEnd to 100000, render/mod.rs FOG_END_LIMIT). Above,
+// continuous with it, a shoulder approaching its ceiling as a power of the distance, T = C - (C - start)
+// (1 + k (x - 2.1313))^-q: 253 of 255 from x 7.1, 254 from 8.4, 255 from 10.7 and past 1 from 12.7
+// (tone-retro: Neon tiles under a ColorCorrection of Brightness -0.4 and -0.8, which acts before the
+// shown value clips, and inside glowing tiles, x 2-21).
+const TONE_A: f32 = 2.86323;
+const TONE_C: f32 = 1.98625;
+const TONE_D: f32 = 2.29460;
+const TONE_E: f32 = -0.12587;
 const TONE_SCALE: f32 = 1.0098;
 const TONE_SHOULDER_X: f32 = 2.1313;
-const TONE_SHOULDER_START: f32 = 0.795199;
+// the rational curve's value at TONE_SHOULDER_X
+const TONE_SHOULDER_START: f32 = 0.793171;
 const TONE_CEILING: f32 = 1.00999;
 const TONE_SHOULDER_K: f32 = 0.32012;
 const TONE_SHOULDER_POWER: f32 = 2.07968;
@@ -71,7 +77,7 @@ fn tonemap(color: vec3<f32>, mode: f32) -> vec3<f32> {
 		return vec3<f32>(retro(x.r), retro(x.g), retro(x.b));
 	}
 	let scaled = x * TONE_SCALE;
-	let rational = (scaled * (2.725891 * scaled + TONE_TOE)) / (scaled * (2.307040 * scaled + 1.951868) + 1.0);
+	let rational = scaled * scaled * (TONE_A + TONE_E * scaled) / (scaled * (TONE_C * scaled + TONE_D) + 1.0);
 	let shoulder = TONE_CEILING - (TONE_CEILING - TONE_SHOULDER_START) * pow(1.0 + TONE_SHOULDER_K * max(x - TONE_SHOULDER_X, vec3<f32>(0.0)), vec3<f32>(-TONE_SHOULDER_POWER));
 	return select(rational, shoulder, x > vec3<f32>(TONE_SHOULDER_X));
 }

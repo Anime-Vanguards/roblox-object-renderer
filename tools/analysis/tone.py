@@ -14,12 +14,15 @@ added), clipped at 1 after ColorCorrection.
 
 import numpy as np
 
-# Up to x = 2.1313 the rational curve of y = SCALE x, fitted on sun-board's tiles; its linear term
-# (the toe) and the input's scale refitted on tone-toe's gray tiles without fog.
-A, B, C, D, SCALE = 2.725891, 0.00329, 2.307040, 1.951868, 1.0098
+# Up to x = 2.1313 the rational curve of y = SCALE x, T = y (A y + B + E y²) / (y (C y + D) + 1): the
+# input's scale from sun-board's tiles (Studio); A, C, D and E from a Roblox client's gray and Neon tiles
+# without fog (fixtures/tone-bloom.luau: where its display crosses each half level), with no linear term
+# B (the toe of 0.00329 fitted on tone-toe was the default fog, which Roblox draws at any FogEnd over
+# 100000).
+A, B, C, D, E, SCALE = 2.86323, 0.0, 1.98625, 2.29460, -0.12587, 1.0098
 # Above, continuous with it, a shoulder approaching its ceiling as a power of the distance (tone-retro):
 # T = CEILING - (CEILING - SHOULDER_START) (1 + SHOULDER_K (x - SHOULDER_X))^-SHOULDER_POWER.
-SHOULDER_X, SHOULDER_START, CEILING, SHOULDER_K, SHOULDER_POWER = 2.1313, 0.795199, 1.00999, 0.32012, 2.07968
+SHOULDER_X, SHOULDER_START, CEILING, SHOULDER_K, SHOULDER_POWER = 2.1313, 0.793171, 1.00999, 0.32012, 2.07968
 # Retro: log2 of the shown value at log2 x = -10, -9.5, ..., 4, linear in between and past the ends
 # (tone-retro).
 RETRO_LOG2_SHOWN = np.array([
@@ -32,7 +35,7 @@ RETRO_LOG2_SHOWN = np.array([
 def tone(x):
 	x = np.maximum(np.asarray(x, float), 0)
 	y = SCALE * x
-	rational = y * (A * y + B) / (y * (C * y + D) + 1)
+	rational = y * (A * y + B + E * y * y) / (y * (C * y + D) + 1)
 	shoulder = CEILING - (CEILING - SHOULDER_START) * (1 + SHOULDER_K * np.maximum(x - SHOULDER_X, 0)) ** -SHOULDER_POWER
 	return np.where(x > SHOULDER_X, shoulder, rational)
 

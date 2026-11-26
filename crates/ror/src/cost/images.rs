@@ -139,6 +139,7 @@ pub fn scene(scene: &Scene, analysis: &Analysis, view: &ViewCost, heat: bool) ->
 	environment.effects.clear();
 	environment.atmosphere = None;
 	environment.clouds = None;
+	// held to 100000 as Roblox holds it (render/mod.rs FOG_END_LIMIT): the fog is 1.5 % 1,000 studs out
 	environment.fog_end = 1.0e6;
 	environment.exposure_compensation = 0.0;
 	environment.ambient = Vec3::splat(0.45);

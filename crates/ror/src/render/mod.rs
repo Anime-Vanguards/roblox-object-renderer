@@ -37,6 +37,8 @@ mod culling;
 mod cutout_depth_tests;
 #[cfg(test)]
 mod sun_shadow_tests;
+#[cfg(test)]
+mod tone_tests;
 pub mod environment;
 pub mod geometry;
 pub mod gpu;
@@ -583,6 +585,12 @@ mod bloom_tests {
 		assert_eq!(bloom_of(vec![bloom(0.0, 24.0, 2.0)]).levels, [0.0; 5], "Intensity 0 removes every halo");
 	}
 }
+
+/// Roblox holds Lighting.FogEnd to 100000: a client draws FogEnd 200000, 500000, 10⁶, 10⁷ and 10⁸ as
+/// 100000, to the pixel (fixtures/tone-bloom.luau: black panels 60-2,000 studs away under each, and
+/// FogStart 1000 with FogEnd 10⁸ fogging as (d - 1000) / (100000 - 1000)), so a FogEnd meant to switch
+/// the fog off still leaves the default fog: x 0.0009 60 studs away, 2 of 255 on black at +2 EV.
+const FOG_END_LIMIT: f32 = 100000.0;
 
 /// How the sun's shadow maps are drawn at a graphics quality (notes/render.md "Shadows"): what of them
 /// changes with the level. `SUN_SHADOWS` is quality 21's, which every picture draws at.
@@ -4911,7 +4919,7 @@ impl Renderer {
 		// 1.935 · FogColor² (fog). The sky is not fogged.
 		let fog = linear(environment.fog_color) * SKY_RADIANCE;
 		frame.fog_color = [fog.x, fog.y, fog.z, 0.0];
-		frame.fog = [environment.fog_start, environment.fog_end, if environment.viewport.is_some() { 0.0 } else { 1.0 }, 0.0];
+		frame.fog = [environment.fog_start, environment.fog_end.min(FOG_END_LIMIT), if environment.viewport.is_some() { 0.0 } else { 1.0 }, 0.0];
 		// an Atmosphere with Density replaces the fog; one of Density 0 leaves it (fog: FogEnd 100 with an
 		// Atmosphere of Density 0 fogs as without one, with Density 0.5 not at all)
 		if let Some(atmosphere) = environment.atmosphere.filter(|atmosphere| atmosphere.density > 0.0) {
