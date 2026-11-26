@@ -1,18 +1,18 @@
-// Studio's built-in bloom (notes/render.md "Bloom"), as measured on lines and dots at every phase of
-// the pixel grid: the exposed scene (each sample clamped before the MSAA resolve, mesh.wgsl) clamped
-// again, then a chain of half-resolution levels down and back up. Going down, each level texel weighs
-// the 4 x 4 finer texels around its centre, the outer ring more than the inner and each the less the
-// brighter it is; the first level keeps only its brightest channel's excess over the threshold. Going
-// up, each level adds the coarser one, upsampled bilinearly and blurred by a tent. Every level is
-// stored as Studio stores it, in R11G11B10 floats. The resolve samples the first level bilinearly.
-// The chain runs on a working grid 1116 pixels tall (the capture viewport's), so the halo keeps its
-// size relative to the image.
+// Studio's built-in bloom (notes/render.md "Bloom"; its parameters: render/bloom.rs), as measured
+// on lines and dots at every phase of the pixel grid: the exposed scene (each sample clamped before
+// the MSAA resolve, mesh.wgsl) clamped again, then a chain of half-resolution levels down and back
+// up. Going down, each level texel weighs the 4 x 4 finer texels around its centre, the outer ring
+// more than the inner and each the less the brighter it is; the first level keeps only its
+// brightest channel's excess over the threshold. Going up, each level adds the coarser one,
+// upsampled bilinearly and blurred by a tent. Every level is stored as Studio stores it, in
+// R11G11B10 floats. The resolve samples the first level bilinearly. The chain runs on a working
+// grid 1116 pixels tall (the capture viewport's), so the halo keeps its size relative to the image.
 
 struct BloomParams {
 	// x exposure multiplier, y threshold, z cap, w 1: keep only the excess over the threshold
 	source: vec4<f32>,
-	// x, y render pixels per working pixel (fs_extract's footprint), z the threshold's soft knee,
-	// w how much fs_down lowers a texel's weight with its brightness
+	// x, y render pixels per working pixel (fs_extract's footprint), z unused, w how much fs_down lowers
+	// a texel's weight with its brightness
 	footprint: vec4<f32>,
 	// x tent radius in texels, y direction (0 horizontal, 1 vertical), z weight of the added level
 	// (fs_blur_add) or of the upsampled one (fs_up); w (fs_down) the weight of the outer two of the
@@ -84,15 +84,11 @@ fn fs_down(input_position: FullscreenOutput) -> @location(0) vec4<f32> {
 	}
 	color /= total;
 	if (bloom.source.w > 0.5) {
-		// the brightest channel's excess over the threshold, with a soft knee, the colour's ratios kept
-		// (an orange source's halo keeps the clamped colour's ratios: bloom-colors)
+		// the brightest channel's excess over the threshold, the colour's ratios kept (an orange source's
+		// halo keeps the clamped colour's ratios: bloom-colors); no knee: nothing under the threshold
+		// glows (render/bloom.rs BLOOM_THRESHOLD)
 		let peak = max(color.r, max(color.g, color.b));
-		let knee = bloom.footprint.z;
-		var excess = max(peak - bloom.source.y, 0.0);
-		if (knee > 0.0) {
-			let soft = clamp(peak - bloom.source.y + knee, 0.0, 2.0 * knee);
-			excess = max(excess, soft * soft / (4.0 * knee));
-		}
+		let excess = max(peak - bloom.source.y, 0.0);
 		color = select(vec3<f32>(0.0), color * (excess / peak), peak > 1e-5);
 	}
 	return stored(color);

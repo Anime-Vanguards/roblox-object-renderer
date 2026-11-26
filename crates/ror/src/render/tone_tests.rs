@@ -1,6 +1,7 @@
-//! The tone curve's dark end and the fog Roblox keeps at any FogEnd, against a Roblox 0.747 client's
-//! frames (fixtures/tone-bloom.luau; notes/render.md "Colour pipeline and tone curve", "Fog"): gray
-//! SmoothPlastic tiles under a flat Ambient of 1 alone, and a black wall 60 studs away.
+//! The tone curve's dark end, the fog Roblox keeps at any FogEnd, and the bloom's threshold, against a
+//! Roblox 0.747 client's frames (fixtures/tone-bloom.luau; notes/render.md "Colour pipeline and tone
+//! curve", "Fog", "Bloom"): gray SmoothPlastic tiles under a flat Ambient of 1 alone, a black wall 60
+//! studs away, and squares just under the built-in bloom's threshold.
 
 use super::*;
 use crate::scene::build::{ModelBuilder, PartSpec};
@@ -122,4 +123,38 @@ fn fog_end_is_held_to_100000() {
 	assert_eq!(held, default, "FogEnd 10⁸ fogs as FogEnd 100000");
 	assert!((held - 4.0).abs() <= 1.0, "the default fog 66 studs out at EV +3: {held}, the client 4");
 	assert_eq!(level(1.0e8, Vec3::ZERO), 0.0, "a black fog leaves black");
+}
+
+/// The built-in bloom has no knee: in the client 3-stud squares at x 3.869 (and Studio's ladder tiles
+/// at 3.87) leave no halo 4-10 px out, where ror's soft knee from 3.825 left 0.0025 (1 of 255 over black
+/// at EV 0); at 3.93 they glow.
+#[test]
+fn nothing_under_the_bloom_threshold_glows() {
+	let mut tone = Tone::new();
+	// a white 3-stud square under an Ambient giving x = 1.98 a² (fog off: black around it)
+	let mut model = ModelBuilder::new("Square");
+	model.part(&PartSpec { name: "Backdrop".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, 0.0, 6.0)), size: Vec3::new(160.0, 100.0, 1.0), color: [0; 3], material: 288, cast_shadow: false, ..Default::default() });
+	model.part(&PartSpec { name: "Square".into(), cframe: Affine3A::from_translation(Vec3::ZERO), size: Vec3::new(3.0, 3.0, 0.2), color: [255; 3], material: 272, cast_shadow: false, ..Default::default() });
+	let mut scene = crate::scene::extract::extract(&model.into_document());
+	// 25.5 px a stud: 7 px outside the square's edge
+	let ring = [Vec3::new(1.5 + 7.0 / 25.5, 0.0, -0.1), Vec3::new(-1.5 - 7.0 / 25.5, 0.0, -0.1), Vec3::new(0.0, 1.5 + 7.0 / 25.5, -0.1), Vec3::new(0.0, -1.5 - 7.0 / 25.5, -0.1)];
+	let mut halo = |x: f32| {
+		scene.environment = Environment { fog_color: Vec3::ZERO, ..flat((x / 1.98).sqrt(), 0.0) };
+		tone.levels(&scene, Vec3::ZERO, &ring, 5).iter().sum::<f32>() / 4.0
+	};
+	assert_eq!(halo(3.87), 0.0, "x 3.87, under the threshold, glows");
+	assert!(halo(3.93) >= 2.0, "x 3.93 glows in the client (7.7 of 255 4-10 px out)");
+}
+
+/// A BloomEffect at Threshold 0 lets a uniform area glow by 3.42 (x - 0.001) in the client: gray 16
+/// tiles at EV -2 (x 0.0019) under Intensity 1, Size 24 show 2.3 of 255 (2 without the effect, which
+/// rounds 1.9), where ror's threshold of 0 made them 4.
+#[test]
+fn a_bloom_effect_at_threshold_0_spares_faint_areas() {
+	let mut tone = Tone::new();
+	let (mut scene, points) = tiles(&[16, 32]);
+	scene.environment = Environment { fog_color: Vec3::ZERO, effects: vec![PostEffect::Bloom { intensity: 1.0, size: 24.0, threshold: 0.0 }], ..flat(1.0, -2.0) };
+	let levels = tone.levels(&scene, Vec3::ZERO, &points, 9);
+	assert!(levels[0] <= 3.0, "gray 16 at EV -2: {}, the client 2.3", levels[0]);
+	assert!((levels[1] - 12.6).abs() <= 1.0, "gray 32 at EV -2: {}, the client 12.6", levels[1]);
 }

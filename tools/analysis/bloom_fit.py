@@ -15,7 +15,7 @@ ror's render, each sample clamped as Studio clamps it: run the experiment with
     python tools/analysis/bloom_fit.py halos <experiment> ...  # halo pixels within 2 / 8 of 255
     python tools/analysis/bloom_fit.py fov         # halos through 20, 40 and 70 degree views
 
-The model (render/mod.rs, shaders/bloom.wgsl): x clamped at CAP, a half float (`half`); level 1 at half
+The model (render/bloom.rs, shaders/bloom.wgsl): x clamped at CAP, a half float (`half`); level 1 at half
 resolution, each texel the 4 x 4 pixels around its centre (a pixel corner) weighted per axis (a, 0.5 -
 a, 0.5 - a, a), a LEVEL_TAPS[0], and by 1 / (1 + s m), m a pixel's brightest channel (normalised: a
 weighted Karis average, s WEIGHTING[0]), then its brightest channel's excess over the threshold (soft
@@ -39,14 +39,14 @@ from tone import display, radiance
 
 ROOT = "out/calibrate"
 
-# the ror constants (render/mod.rs, shaders/bloom.wgsl); the built-in's fourth weight is the level's
+# the ror constants (render/bloom.rs, shaders/bloom.wgsl); the built-in's fourth weight is the level's
 # full weight times the 0.685 of it the built-in keeps
 TAPS = np.array([0.3103, 0.1897, 0.1897, 0.3103])
 # each level's outer tap weight a, the first level's first (BLOOM_TAPS)
 LEVEL_TAPS = [0.3103, 0.3103, 0.125, 0.125, 0.125]
 CAP = 7.75
 WEIGHTING = (0.016, 0.010)
-BUILT_IN = {"threshold": 3.885, "knee": 0.06, "tents": [3.44, 4.00, 4.11], "weights": [0.986, 1.010, 1.037, 0.723]}
+BUILT_IN = {"threshold": 3.885, "knee": 0.0, "tents": [3.44, 4.00, 4.11], "weights": [0.986, 1.010, 1.037, 0.723]}
 
 
 def image(path):

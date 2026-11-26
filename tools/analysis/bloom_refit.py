@@ -1,10 +1,10 @@
-"""Refit the bloom's constants (render/mod.rs: threshold, knee, tents, level weights, BloomEffect's
+"""Refit the bloom's constants (render/bloom.rs: threshold, knee, tents, level weights, BloomEffect's
 threshold scale) against ror's own images, scored as the halo metric scores them (notes/render.md
 "Bloom"). A delta proxy of each run,
 
     shown(p) = round(display(radiance(v + u) + glow(p) - glow(P0))),
 
-v ror's displayed value (the run's ror.png, rendered with P0, the constants render/mod.rs holds), u a
+v ror's displayed value (the run's ror.png, rendered with P0, the constants render/bloom.rs holds), u a
 fixed dither within its rounding cell, glow(p) the chain as ror computes it at the run's pixels, each
 level's chain alone so that the level weights act linearly. ror's storage counts: the scene target's
 √x and the bloom's working grid are half floats, which this GPU writes rounded toward zero (white
@@ -46,10 +46,10 @@ from tone import display, radiance
 
 ROOT = "out/calibrate"
 EXPERIMENTS = ["bloom-colors", "bloom-effect", "bloom-effect-size", "bloom-kernel", "bloom-threshold", "bloom-phase", "bloom-lines", "bloom-probe", "neon-colors", "neon-rows", "bloom-size", "bloom-wide", "bloom-dots", "bloom-pairs", "neon-slabs-bloom"]
-# render/mod.rs: BLOOM_THRESHOLD, BLOOM_KNEE, BLOOM_CAP, BLOOM_TAPS (each level's outer tap weight),
+# render/bloom.rs: BLOOM_THRESHOLD, BLOOM_CAP, BLOOM_TAPS (each level's outer tap weight),
 # BLOOM_TENTS, BLOOM_LEVEL_WEIGHTS (each level's full weight; the built-in keeps log2(24) - 0.9 levels),
-# BloomEffect's threshold per unit Threshold
-P0 = {"threshold": 3.885, "knee": 0.06, "cap": 7.75, "taps": [0.3103, 0.3103, 0.125, 0.125, 0.125], "tents": [3.44, 4.00, 4.11, 4.11], "weights": [0.986, 1.010, 1.037, 1.056, 1.073], "effect_scale": 1.951}
+# BloomEffect's threshold per unit Threshold and its offset (BLOOM_EFFECT_THRESHOLD_OFFSET)
+P0 = {"threshold": 3.885, "knee": 0.0, "cap": 7.75, "taps": [0.3103, 0.3103, 0.125, 0.125, 0.125], "tents": [3.44, 4.00, 4.11, 4.11], "weights": [0.986, 1.010, 1.037, 1.056, 1.073], "effect_scale": 1.951, "effect_offset": 0.001}
 STEP = 4
 REACH = 40
 F_SCALE = 1.75
@@ -71,7 +71,7 @@ def scene_source(directory, environment):
 
 
 def level_factors(size, amplitude):
-	"""Each level's share of its weight for a bloom of BloomEffect.Size `size` (render/mod.rs
+	"""Each level's share of its weight for a bloom of BloomEffect.Size `size` (render/bloom.rs
 	bloom_levels)."""
 	if size <= 0:
 		return np.zeros(5)
@@ -80,12 +80,12 @@ def level_factors(size, amplitude):
 
 
 def factors(environment, p):
-	"""A run's threshold, knee and level shares (render/mod.rs bloom_parameters)."""
+	"""A run's threshold, knee and level shares (render/bloom.rs bloom_parameters)."""
 	for effect in environment.get("effects", []):
 		m = re.match(r"Bloom \{ intensity: ([-\d.e]+), size: ([-\d.e]+), threshold: ([-\d.e]+) \}", effect)
 		if m:
 			intensity, size, threshold = (float(v) for v in m.groups())
-			t = p["effect_scale"] * max(threshold, 0.0)
+			t = p["effect_scale"] * max(threshold, 0.0) + p.get("effect_offset", 0.0)
 			return t, p["knee"] * t / p["threshold"], level_factors(size, max(intensity, 0.0))
 	return p["threshold"], p["knee"], level_factors(24.0, 1.0)
 
