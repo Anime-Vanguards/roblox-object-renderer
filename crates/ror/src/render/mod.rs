@@ -1686,13 +1686,29 @@ fn view_lights(lights: &[LightData], view_projection: Mat4, eye: Vec3) -> Vec<(u
 
 /// Where a shadowed light's maps are drawn from: its origin (a SurfaceLight's apex behind its face),
 /// how far they reach, and for a SurfaceLight of Angle up to 120 the one face aimed down its normal:
-/// (direction, the frustum's half-angle tangent; 0 for six faces) and its near plane.
+/// (direction, the frustum's half-angle tangent; 0 for six faces) and its near plane; `face`: how far
+/// along that direction a SurfaceLight's face lies from the origin (0 for other lights), behind which
+/// nothing casts its shadow.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ShadowLight {
 	origin: Vec3,
 	reach: f32,
 	aim: Vec4,
 	near: f32,
+	face: f32,
+}
+
+impl ShadowLight {
+	/// The plane behind which nothing casts its shadow (xyz its normal, w its offset: what is behind
+	/// has dot(p, xyz) + w < 0), for a SurfaceLight drawn with six faces; its aimed face's near plane
+	/// lies on the face instead.
+	fn clip_plane(&self) -> Option<Vec4> {
+		let direction = self.aim.truncate();
+		(self.face > 0.0 && self.aim.w <= 0.0).then(|| {
+			let centre = self.origin + direction * self.face;
+			Vec4::from((direction, -direction.dot(centre)))
+		})
+	}
 }
 
 /// The view-projections of a light's six shadow faces (+X, -X, +Y, -Y, +Z, -Z, the order the mesh
@@ -1780,9 +1796,11 @@ fn light_data(light: &crate::scene::Light) -> LightData {
 fn shadow_light(light: &LightData) -> ShadowLight {
 	let direction = Vec3::new(light.direction[0], light.direction[1], light.direction[2]);
 	let origin = Vec3::new(light.position[0], light.position[1], light.position[2]) - direction * light.shadow[2];
-	// (nothing behind the face can come between it and what it lights)
-	let near = (light.shadow[2] * 0.5).max(0.05);
-	ShadowLight { origin, reach: light.color[3] + light.shadow[2], aim: Vec4::from((direction, light.extra[2])), near }
+	// nothing behind the face casts (fixtures/local-lights.luau "carriers": an opaque carrier, or a plate
+	// between the face and this point, shadows nothing in a Roblox client): the aimed face's near plane
+	// lies on the face, six faces cut it in the shadow pass (ShadowLight::clip_plane)
+	let near = light.shadow[2].max(0.05);
+	ShadowLight { origin, reach: light.color[3] + light.shadow[2], aim: Vec4::from((direction, light.extra[2])), near, face: light.shadow[2] }
 }
 
 /// A shadowed light's grazing darkening (mesh.wgsl `light_graze`) goes by the longest Range of the
@@ -4315,6 +4333,10 @@ impl Renderer {
 				});
 				let mut frame = self.frame_uniform(None, 1, 1, 0);
 				frame.shadow_view_proj = matrix.to_cols_array_2d();
+				// a SurfaceLight's six faces: the plane behind which nothing casts (mesh.wgsl fs_shadow_clip)
+				if let Some(plane) = lights[layer / 6].clip_plane() {
+					frame.camera_position = plane.into();
+				}
 				let frame_buffer = lease.buffer("light shadow frame", wgpu::BufferUsages::UNIFORM, bytemuck::bytes_of(&frame));
 				(view, self.frame_bind_group(prepared, &frame_buffer, &self.no_light_bindings(prepared), &self.defaults.empty_moments, &self.defaults.empty_shadow, &self.defaults.white.view, &self.defaults.black.view))
 			})
@@ -4363,7 +4385,8 @@ impl Renderer {
 					let half = (radius / distance).asin();
 					cos_center >= (face_cos.acos() + half).min(std::f32::consts::PI).cos()
 				};
-				for (double_sided, pipeline) in [(false, &self.pipelines.light_shadow), (true, &self.pipelines.shadow)] {
+				let [single, double] = if shadow.clip_plane().is_some() { self.pipelines.light_shadow_clip(&self.gpu.device) } else { [&self.pipelines.light_shadow, &self.pipelines.shadow] };
+				for (double_sided, pipeline) in [(false, single), (true, double)] {
 					pass.set_pipeline(pipeline);
 					let mut runs = runs::Runs::new(1);
 					for draw in casters.iter().filter(|draw| !draw.shadow_cutout && draw.double_sided == double_sided).filter(|draw| draw.in_frustum(&frustum)).filter(in_face) {
@@ -7316,6 +7339,86 @@ mod lighting_style_tests {
 		let mean = |channel: usize| images[0].rgba.chunks(4).map(|pixel| pixel[channel] as f32).sum::<f32>() / (images[0].rgba.len() / 4) as f32;
 		let [red, green, blue] = [mean(0), mean(1), mean(2)];
 		assert!(green > 5.0 && red >= blue - 0.5 && green >= blue - 0.5, "a grey under the roof, not the blue sky: ({red}, {green}, {blue})");
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+}
+
+#[cfg(test)]
+mod surface_light_shadow_tests {
+	use super::*;
+	use crate::scene::build::{ModelBuilder, PartSpec};
+	use rbx_dom_weak::types::Enum;
+
+	/// A shadowed SurfaceLight (Brightness 2) on a carrier, its shadows as a Roblox client draws them in
+	/// the dark (notes/render.md "Local lights", fixtures/local-lights.luau).
+	struct Lamp {
+		/// The carrier's centre and size, opaque or not
+		at: Vec3,
+		size: Vec3,
+		opaque: bool,
+		face: u32,
+		angle: f32,
+		range: f32,
+		shadows: bool,
+	}
+
+	fn scene(lamp: &Lamp, extra: &[(Vec3, Vec3)], floor: bool) -> Scene {
+		let mut model = ModelBuilder::new("SurfaceShadows");
+		if floor {
+			model.part(&PartSpec { name: "Floor".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, -0.5, 0.0)), size: Vec3::new(80.0, 1.0, 80.0), color: [255; 3], material: 272, ..Default::default() });
+		}
+		for (index, (at, size)) in extra.iter().enumerate() {
+			model.part(&PartSpec { name: format!("Block{index}"), cframe: Affine3A::from_translation(*at), size: *size, color: [255; 3], material: 272, ..Default::default() });
+		}
+		let (transparency, cast_shadow) = if lamp.opaque { (0.0, true) } else { (1.0, false) };
+		let carrier = model.part(&PartSpec { name: "Lamp".into(), cframe: Affine3A::from_translation(lamp.at), size: lamp.size, color: [255; 3], material: 272, transparency, cast_shadow, ..Default::default() });
+		model.child(
+			carrier,
+			rbx_dom_weak::InstanceBuilder::new("SurfaceLight")
+				.with_property("Face", Enum::from_u32(lamp.face))
+				.with_property("Angle", lamp.angle)
+				.with_property("Shadows", lamp.shadows)
+				.with_property("Range", lamp.range)
+				.with_property("Brightness", 2.0f32),
+		);
+		let mut scene = crate::scene::extract::extract(&model.into_document());
+		let environment = &mut scene.environment;
+		(environment.ambient, environment.outdoor_ambient, environment.environment_diffuse_scale, environment.environment_specular_scale, environment.brightness) = (Vec3::ZERO, Vec3::ZERO, 0.0, 0.0, 0.0);
+		scene
+	}
+
+	/// The mean level of a small view from `eye` at `target`.
+	fn level(renderer: &Renderer, scene: &Scene, eye: [f32; 3], target: [f32; 3]) -> f32 {
+		let view = ViewRequest { width: 16, height: 16, camera: CameraSpec::LookAt { eye, target, fov: 3.0 }, background: Background::Color([0.0, 0.0, 1.0]), bloom: false, ..Default::default() };
+		let (images, _) = renderer.render(scene, &[view]).unwrap();
+		let image = &images[0];
+		image.rgba.chunks(4).map(|pixel| pixel[..3].iter().map(|&channel| channel as f32).sum::<f32>() / 3.0).sum::<f32>() / (image.rgba.len() / 4) as f32
+	}
+
+	#[test]
+	fn surface_light_shadows() {
+		let state = std::env::temp_dir().join(format!("ror-surface-shadow-test-{}", std::process::id()));
+		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		// nothing behind the face casts: a face down from the underside of a carrier 8 studs up (Bottom),
+		// opaque or with a plate between the face and its shadow's point (Angle 60: one aimed face, its
+		// near plane on the face; 180: six faces, cut at the face), lights the floor under it as an
+		// invisible carrier does (the client: 4.02-4.27 against 4.14 in every case; ror shadowed it whole)
+		let under = |angle: f32, opaque: bool, plate: bool| {
+			let lamp = Lamp { at: Vec3::new(0.0, 8.5, 0.0), size: Vec3::new(4.0, 1.0, 4.0), opaque, face: 4, angle, range: 16.0, shadows: true };
+			let plate = if plate { vec![(Vec3::new(0.0, 9.0, 0.0), Vec3::new(6.0, 0.2, 6.0))] } else { Vec::new() };
+			level(&renderer, &scene(&lamp, &plate, true), [0.0, 5.0, -12.0], [0.0, 0.0, 0.0])
+		};
+		for angle in [60.0, 180.0] {
+			let open = under(angle, false, false);
+			assert!(open > 100.0, "Angle {angle}: the floor under an invisible carrier is lit ({open})");
+			for (opaque, plate) in [(true, false), (false, true)] {
+				let shut = under(angle, opaque, plate);
+				assert!((shut - open).abs() < 2.0, "Angle {angle}, opaque carrier {opaque}, plate behind the face {plate}: {shut} against {open}");
+			}
+		}
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
 	}

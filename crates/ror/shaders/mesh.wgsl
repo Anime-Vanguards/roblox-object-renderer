@@ -1490,20 +1490,50 @@ fn vs_shadow(input: VertexInput, @builtin(instance_index) instance_index: u32) -
 	return frame.shadow_view_proj * world;
 }
 
+// A SurfaceLight's six shadow faces, drawn from its point behind the face (render::light_shadow_matrices_at):
+// nothing behind the face's plane casts, frame.camera_position holding that plane in these passes (xyz
+// the face's normal, w its offset). fixtures/local-lights.luau "carriers" in a Roblox client: an opaque
+// carrier, at Angle 30 to 180, and a plate between the face and that point light the floor as an
+// invisible carrier does, where ror had shadowed it whole. (A SurfaceLight of Angle up to 120 draws its
+// one aimed face with its near plane at the face instead.)
+struct ShadowClipOutput {
+	@builtin(position) clip: vec4<f32>,
+	@location(0) world: vec3<f32>,
+}
+
+@vertex
+fn vs_shadow_clip(input: VertexInput, @builtin(instance_index) instance_index: u32) -> ShadowClipOutput {
+	let world = instances[instance_index].model * vec4<f32>(input.position, 1.0);
+	var output: ShadowClipOutput;
+	output.clip = frame.shadow_view_proj * world;
+	output.world = world.xyz;
+	return output;
+}
+
+@fragment
+fn fs_shadow_clip(input: ShadowClipOutput) {
+	if (dot(input.world, frame.camera_position.xyz) + frame.camera_position.w < 0.0) {
+		discard;
+	}
+}
+
 // The same for a part whose colour map's alpha cuts its shadow (render::DrawItem::shadow_cutout): its
 // texture coordinate too
 struct ShadowCutoutOutput {
 	@builtin(position) clip: vec4<f32>,
 	@location(0) uv: vec2<f32>,
 	@location(1) @interpolate(flat) instance: u32,
+	@location(2) world: vec3<f32>,
 }
 
 @vertex
 fn vs_shadow_cutout(input: VertexInput, @builtin(instance_index) instance_index: u32) -> ShadowCutoutOutput {
 	var output: ShadowCutoutOutput;
-	output.clip = frame.shadow_view_proj * (instances[instance_index].model * vec4<f32>(input.position, 1.0));
+	let world = instances[instance_index].model * vec4<f32>(input.position, 1.0);
+	output.clip = frame.shadow_view_proj * world;
 	output.uv = input.uv;
 	output.instance = instance_index;
+	output.world = world.xyz;
 	return output;
 }
 
@@ -1523,6 +1553,10 @@ const SHADOW_CUT_SHARPEN: f32 = 0.25;
 
 @fragment
 fn fs_shadow_cutout(input: ShadowCutoutOutput) {
+	// nothing behind a SurfaceLight's face casts (fs_shadow_clip; the plane is 0 in other shadow passes)
+	if (dot(input.world, frame.camera_position.xyz) + frame.camera_position.w < 0.0) {
+		discard;
+	}
 	let dx = dpdx(input.uv) * SHADOW_CUT_SHARPEN;
 	let dy = dpdy(input.uv) * SHADOW_CUT_SHARPEN;
 	let alpha = studio_mips(color_map, material_info.sizes[0].xy, input.uv, dx, dy).a;

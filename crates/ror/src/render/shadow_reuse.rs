@@ -148,7 +148,7 @@ pub(super) fn local_key(lights: &[super::ShadowLight], size: u32) -> Vec<u8> {
 	key.extend_from_slice(&size.to_le_bytes());
 	for light in lights {
 		let (origin, aim) = (light.origin, light.aim);
-		key.extend_from_slice(bytemuck::cast_slice(&[origin.x, origin.y, origin.z, light.reach, aim.x, aim.y, aim.z, aim.w, light.near]));
+		key.extend_from_slice(bytemuck::cast_slice(&[origin.x, origin.y, origin.z, light.reach, aim.x, aim.y, aim.z, aim.w, light.near, light.face]));
 	}
 	key
 }
@@ -173,7 +173,7 @@ mod tests {
 
 	#[test]
 	fn local_maps_follow_order_origin_reach_aim_and_resolution() {
-		let light = |origin: Vec3, reach: f32| super::super::ShadowLight { origin, reach, aim: glam::Vec4::ZERO, near: 0.05 };
+		let light = |origin: Vec3, reach: f32| super::super::ShadowLight { origin, reach, aim: glam::Vec4::ZERO, near: 0.05, face: 0.0 };
 		let lights = [light(Vec3::ZERO, 10.0), light(Vec3::X, 20.0)];
 		let key = local_key(&lights, 128);
 		assert_ne!(key, local_key(&[lights[1], lights[0]], 128));

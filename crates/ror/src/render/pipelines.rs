@@ -87,6 +87,11 @@ pub struct Pipelines {
 	pub sun_blur: wgpu::RenderPipeline,
 	/// The shadow pass culling back faces (local lights)
 	pub light_shadow: wgpu::RenderPipeline,
+	/// `light_shadow` and `shadow` for a SurfaceLight's six faces, leaving out what is behind its face
+	/// (`fs_shadow_clip`), made the first time one casts
+	light_shadow_clip: std::sync::OnceLock<[wgpu::RenderPipeline; 2]>,
+	/// The frame's bind group alone (the shadow passes' layout)
+	shadow_pipeline_layout: wgpu::PipelineLayout,
 	/// The same four for parts whose colour map's alpha cuts their shadow (`fs_shadow_cutout`), made the
 	/// first time one casts: the sun's single- and double-sided, local lights' single- and double-sided
 	shadow_cutout: std::sync::OnceLock<[wgpu::RenderPipeline; 4]>,
@@ -828,6 +833,8 @@ impl Pipelines {
 			residency_layout,
 			residency_pipeline_layout,
 			shadow_cutout: Default::default(),
+			light_shadow_clip: Default::default(),
+			shadow_pipeline_layout: shadow_layout,
 			mesh_pipeline_layout: mesh_layout,
 			mesh_module,
 			cache: cache.cloned(),
@@ -917,6 +924,35 @@ impl Pipelines {
 				pipeline(None, light_bias),
 			]
 		})
+	}
+
+	/// The local lights' shadow passes (`light_shadow`, then `shadow` for double-sided casters) leaving out
+	/// what is behind a SurfaceLight's face, whose plane the pass's frame holds (`vs_shadow_clip`,
+	/// `fs_shadow_clip`): [single-sided, double-sided].
+	pub fn light_shadow_clip(&self, device: &wgpu::Device) -> [&wgpu::RenderPipeline; 2] {
+		let [single, double] = self.light_shadow_clip.get_or_init(|| {
+			let pipeline = |cull: Option<wgpu::Face>| {
+				device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+					label: Some("light shadow clip"),
+					layout: Some(&self.shadow_pipeline_layout),
+					vertex: wgpu::VertexState { module: &self.mesh_module, entry_point: Some("vs_shadow_clip"), buffers: &[Vertex::layout()], compilation_options: Default::default() },
+					primitive: wgpu::PrimitiveState { cull_mode: cull, ..Default::default() },
+					depth_stencil: Some(wgpu::DepthStencilState {
+						format: SHADOW_FORMAT,
+						depth_write_enabled: true,
+						depth_compare: wgpu::CompareFunction::LessEqual,
+						stencil: Default::default(),
+						bias: wgpu::DepthBiasState { constant: 2, slope_scale: 2.0, clamp: 0.0 },
+					}),
+					multisample: Default::default(),
+					fragment: Some(wgpu::FragmentState { module: &self.mesh_module, entry_point: Some("fs_shadow_clip"), targets: &[], compilation_options: Default::default() }),
+					multiview: None,
+					cache: self.cache.as_ref(),
+				})
+			};
+			[pipeline(Some(wgpu::Face::Back)), pipeline(None)]
+		});
+		[single, double]
 	}
 
 	/// Transparent Glass (`fs_glass`), written over what is behind it with its depth.
