@@ -78,14 +78,13 @@ pub const DIRECT_METAL: [f32; 4] = [0.2414, 0.8079, 1.0181, 1.0];
 /// fade slower, as 1600 and 1000 (notes/render.md "Specular fade").
 pub const SPECULAR_FADE: [f32; 4] = [1214.0, 1214.0, 1.0, 1.0];
 
-/// The sky specular's colour against the prefiltered sky's: Studio's reflections read less blue than
-/// red and green at the same shown level, 1-1.2 % on gray metals whatever their roughness (lod 1.7 and
-/// 3) and the exposure (`sky-tint` at -2, 0 and +2 EV) and on the ship's panels, ~0.7 % on walls
-/// under the default sky (`ibl-walls`); not the chain's storage, an extra storage of the sky, its
-/// prefilter's colour, a Fresnel or F0 tint or ColorShift (notes/render.md "Specular fade"). Half the
-/// metals' 1.2 %: the ship close-up 94.14 → 94.29 % within 2 (the full 1.2 %: 94.33, but
-/// `ibl-panels` -6.7 and `ibl-walls` -1.7 against -2.0 and -0.4).
-pub const SKY_SPECULAR_COLOUR: [f32; 3] = [1.0, 1.0, 0.994];
+/// The sky specular's colour against the prefiltered sky's: none. Through the tone curve before the client's
+/// (a toe of 0.00329) Studio's reflections read 1-1.2 % less blue than ror's, and ror took half (blue x 0.994);
+/// through the client's curve every sky experiment scores higher without it (within 2 of 255: `ibl-walls` 98.36 →
+/// 98.78 %, `ibl-panels` 89.29 → 89.62, `ibl-spheres` 97.98 → 98.02, `sky-reflection` 96.19 → 96.23; blue x 0.988
+/// lost on all of them), the ship close-up 95.27 → 95.23 and the survey within 0.03; the client draws these
+/// experiments as Studio did to the pixel (notes/render.md "Specular fade").
+pub const SKY_SPECULAR_COLOUR: [f32; 3] = [1.0, 1.0, 1.0];
 
 /// The direct specular's visibility term (MaterialParams::visibility).
 const VISIBILITY: u32 = 4;
@@ -599,6 +598,13 @@ mod tests {
 		for material in [256, 1056, 1088, 800] {
 			assert_eq!(lobe(material, true).1, 0.0);
 		}
+	}
+
+	/// The sky specular reflects the sky in its own colour: through the client's tone curve the stored Studio
+	/// runs (which the client draws to the pixel) score higher without the blue cut ror took before.
+	#[test]
+	fn the_sky_specular_keeps_the_sky_colour() {
+		assert_eq!(SKY_SPECULAR_COLOUR, [1.0; 3]);
 	}
 
 	/// 2022 Fabric, Salt and Cobblestone blend into 0.6 x tiles over Granite's depth, pre-2022 Salt as 2022 Salt, pre-2022

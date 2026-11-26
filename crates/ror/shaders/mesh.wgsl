@@ -1154,7 +1154,7 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 	}
 	// the sky specular: the prefiltered sky (render::environment::prefilter_specular) times its Fresnel,
 	// s and the fade (ibl-spheres at 150 studs: a white mirror metal shows the default sky at 0.76, a
-	// dielectric head-on at 0.034), a little less blue than the sky (frame.sky_specular_colour); the
+	// dielectric head-on at 0.034) in the sky's colour (frame.sky_specular_colour, for fits); the
 	// closed grid leaves 0.12 of it (lg-terms)
 	let prefiltered = textureSampleLevel(environment_map, linear_sampler, r, lod).rgb;
 	color += prefiltered * frame.sky_specular_colour.rgb * sky_fresnel * sky_specular * sky_reach;
