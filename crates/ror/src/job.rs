@@ -445,13 +445,14 @@ impl SceneCache {
 	}
 
 	/// The places that lend the scene its MaterialService and Lighting: those named, else the map's
-	/// own when it has one.
+	/// own when it has one. A map place without a MaterialService lends its materials too: the
+	/// pre-2022 set the engine loads such a place with ([`scene::extract::materials`]).
 	pub(crate) fn lenders<'a>(&self, map: Option<&'a MapSetting>, materials_from: Option<&'a str>, lighting_from: Option<&'a str>) -> Result<(Option<&'a str>, Option<&'a str>)> {
 		let Some(map) = map else {
 			return Ok((materials_from, lighting_from));
 		};
 		let (world, _) = self.map_document(Path::new(&map.file))?;
-		let materials = materials_from.or_else(|| world.material_service.map(|_| map.file.as_str()));
+		let materials = materials_from.or_else(|| (world.material_service.is_some() || world.is_place).then_some(map.file.as_str()));
 		let lighting = lighting_from.or_else(|| world.lighting.map(|_| map.file.as_str()));
 		Ok((materials, lighting))
 	}
@@ -1049,6 +1050,34 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 mod tests {
 	use super::*;
 	use std::time::SystemTime;
+
+	/// A map lends the model the materials it is drawn in: a place's MaterialService, else, for a place
+	/// without one, the pre-2022 set the engine loads it with; a map model has none to lend.
+	#[test]
+	fn a_map_place_without_a_material_service_lends_the_pre_2022_materials() {
+		let state = std::env::temp_dir().join(format!("ror-map-materials-{}", std::process::id()));
+		std::fs::create_dir_all(&state).unwrap();
+		let part = r#"<Item class="Part" referent="P"><Properties><string name="Name">Ground</string></Properties></Item>"#;
+		let service = |on: bool| format!(r#"<Item class="MaterialService" referent="MS"><Properties><string name="Name">MaterialService</string><bool name="Use2022MaterialsXml">{on}</bool></Properties></Item>"#);
+		let place = |extra: &str| format!(r#"<roblox version="4"><Item class="Workspace" referent="W"><Properties><string name="Name">Workspace</string></Properties>{part}</Item>{extra}</roblox>"#);
+		let scenes = SceneCache::default();
+		for (name, text, lends, use_2022) in [
+			("bare.rbxlx", place(""), true, false),
+			("on.rbxlx", place(&service(true)), true, true),
+			("off.rbxlx", place(&service(false)), true, false),
+			("model.rbxmx", format!(r#"<roblox version="4">{part}</roblox>"#), false, true),
+		] {
+			let path = state.join(name);
+			std::fs::write(&path, text).unwrap();
+			let map = MapSetting { file: path.display().to_string(), origin: None };
+			let (materials, _) = scenes.lenders(Some(&map), None, None).unwrap();
+			assert_eq!(materials.is_some(), lends, "{name} lends its materials");
+			let mut scene = Scene::default();
+			scenes.lend(&mut scene, materials, None).unwrap();
+			assert_eq!(scene.materials.use_2022, use_2022, "{name}: the 2022 materials");
+		}
+		let _ = std::fs::remove_dir_all(&state);
+	}
 
 	/// A job's relative local paths are read from the folder it names (its caller's working directory,
 	/// which the CLI sends to a service running in its state dir), whatever the process's own: a

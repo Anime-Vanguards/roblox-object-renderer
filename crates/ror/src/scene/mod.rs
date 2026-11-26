@@ -338,8 +338,9 @@ pub struct Highlight {
 /// `MaterialService`: which built-in material textures apply and the place's MaterialVariants.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Materials {
-	/// `MaterialService.Use2022Materials` (true for places without a MaterialService: every place
-	/// made since 2022 uses them).
+	/// `MaterialService.Use2022Materials`. A place file without a MaterialService loads with the
+	/// pre-2022 materials, as the engine reads it (false); a model or a script's scene, which has no
+	/// place of its own, the 2022 ones every new place uses (true, the default).
 	pub use_2022: bool,
 	pub variants: Vec<MaterialVariant>,
 	/// `MaterialService.<Material>Name`: the variant a base material uses unless a part names one.

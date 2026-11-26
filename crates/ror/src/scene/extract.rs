@@ -263,9 +263,10 @@ fn extract_with(document: &Document, roots: &[Ref], reuse: Option<(&mut RootReus
 	let unchanged: Signature = Vec::new();
 	let signature_of = |index: usize| signatures.get(&index).unwrap_or(&unchanged);
 	let mut scene = Scene { environment: environment(document).unwrap_or_default(), setting: document.setting.as_deref().map(super::load::path_segment), play: document.play, ..Default::default() };
-	if let Some(service) = document.material_service.and_then(|service| document.dom.get_by_ref(service)) {
-		scene.materials = read_material_service(document, service);
-	}
+	scene.materials = match document.material_service.and_then(|service| document.dom.get_by_ref(service)) {
+		Some(service) => read_material_service(document, service),
+		None => without_material_service(document),
+	};
 	let mut skeletons = Skeletons::default();
 	let mut characters = Characters::default();
 	// each drawn part's index by its referent, and the Highlights met on the way (the enabled ones,
@@ -475,6 +476,11 @@ fn finish_walk(document: &Document, scene: &mut Scene, mut part_indices: std::co
 				}
 			}
 		}
+	}
+	// (tools that write places from scratch often leave the service out, and their parts then look older than in
+	// a place Studio made)
+	if document.is_place && document.material_service.is_none() && !scene.parts.is_empty() {
+		scene.warnings.push("the place has no MaterialService: its parts draw with the pre-2022 materials, as Roblox loads such a file (a MaterialService with Use2022Materials on draws the 2022 ones)".into());
 	}
 	scene.highlights = highlights.into_iter().filter_map(|referent| read_highlight(document, referent, &part_indices, &scene.parts)).collect();
 	if scene.highlights.len() > MAX_HIGHLIGHTS {
@@ -817,7 +823,7 @@ pub fn materials(document: &Document) -> Materials {
 	if let Some(service) = document.material_service.and_then(|service| document.dom.get_by_ref(service)) {
 		return read_material_service(document, service);
 	}
-	let mut materials = Materials::default();
+	let mut materials = without_material_service(document);
 	let mut stack = vec![document.dom.root_ref()];
 	while let Some(referent) = stack.pop() {
 		let Some(instance) = document.dom.get_by_ref(referent) else {
@@ -838,6 +844,17 @@ pub fn environment(document: &Document) -> Option<Environment> {
 	// the Terrain's Clouds belong to the place's look too
 	environment.clouds = document.clouds().and_then(|clouds| document.dom.get_by_ref(clouds)).and_then(crate::scene::environment::Clouds::read);
 	Some(environment)
+}
+
+/// The materials of a document without a MaterialService: a place gets the pre-2022 set, as the engine
+/// loads it (materials-generation, the engine 0.747 on places written without the service: a PointLight's
+/// mirror image 13 studs over a Metal floor 228 on 53 of 255, 347 x 180 px, against 224 on 53, 363 x 184
+/// with the pre-2022 packs and 255 on 66, 274 x 134 with the 2022 ones; Ice 255 on 82, 250 x 125 against
+/// 255 on 81, 233 x 134 and 224 on 83, 320 x 192; the fixture's 36 views within 2 / 8 of 255 on 56.9 /
+/// 69.7 % of pixels with the 2022 packs, 66.0 / 80.7 % with the pre-2022 ones); a model or a script's
+/// scene, which has no place of its own, the 2022 set every new place uses.
+fn without_material_service(document: &Document) -> Materials {
+	Materials { use_2022: !document.is_place, ..Materials::default() }
 }
 
 /// `MaterialService`: the generation, its MaterialVariants and the base material overrides.
@@ -935,6 +952,33 @@ fn read_light(document: &Document, referent: Ref, light: &Instance, cframe: Affi
 mod tests {
 	use rbx_dom_weak::InstanceBuilder;
 	use rbx_dom_weak::types::{Content, NetAssetRef, SharedString, Variant};
+
+	/// A place without a MaterialService draws the pre-2022 materials, as the engine loads it; one whose
+	/// service says so, and a model, the 2022 ones.
+	#[test]
+	fn a_place_without_a_material_service_uses_the_pre_2022_materials() {
+		let place = |service: Option<bool>| {
+			let mut dom = rbx_dom_weak::WeakDom::new(InstanceBuilder::new("DataModel"));
+			let root = dom.root_ref();
+			let workspace = dom.insert(root, InstanceBuilder::new("Workspace"));
+			dom.insert(workspace, InstanceBuilder::new("Part"));
+			if let Some(use_2022) = service {
+				dom.insert(root, InstanceBuilder::new("MaterialService").with_property("Use2022MaterialsXml", use_2022));
+			}
+			super::super::load::Document::new(dom)
+		};
+		for (service, use_2022) in [(None, false), (Some(true), true), (Some(false), false)] {
+			let document = place(service);
+			assert!(document.is_place);
+			assert_eq!(super::extract(&document).materials.use_2022, use_2022, "a place, MaterialService.Use2022Materials {service:?}");
+			assert_eq!(super::materials(&document).use_2022, use_2022, "lending its materials, MaterialService.Use2022Materials {service:?}");
+		}
+		let mut dom = rbx_dom_weak::WeakDom::new(InstanceBuilder::new("Folder"));
+		let root = dom.root_ref();
+		dom.insert(root, InstanceBuilder::new("Part"));
+		let model = super::super::load::Document::new(dom);
+		assert!(!model.is_place && super::extract(&model).materials.use_2022 && super::materials(&model).use_2022, "a model keeps the 2022 materials");
+	}
 
 	use crate::scene::Geometry;
 	use crate::scene::build::ModelBuilder;

@@ -6,7 +6,8 @@ Implementation: `crates/ror/src/render/materials.rs`, `render/texels.rs`, and `s
 
 ## Built-in materials
 
-- **Material generations:** `ror` supports both 2022 and pre-2022 materials, controlled by `MaterialService.Use2022Materials` (load a place's setting and `MaterialVariant`s with `--materials-from <place>`; defaults to 2022).
+- **Material generations:** `ror` supports both 2022 and pre-2022 materials, controlled by `MaterialService.Use2022Materials` (load a place's setting and `MaterialVariant`s with `--materials-from <place>`). A place file without a `MaterialService` draws the pre-2022 materials, as Roblox loads such a file, and `ror` says so in its warnings; a model, a script's scene and a place whose service has `Use2022Materials` on draw the 2022 ones. Pre-2022 packs are listed in `render::materials::PACKS_PRE2022`.
+  - *Verification:* Measured in a Roblox 0.747 client with `fixtures/materials-generation.luau` (floors under a `PointLight`, slabs under the sun and the sky, large slabs at several distances, other shapes), in places written with and without the service.
 - **Texture packs:** Built-in materials, `SurfaceAppearance.TexturePack`, and `MaterialVariant.TexturePack` are defined by XML texture pack assets containing `texturepack_version`, `usage`, `alphamode`, `tiling`, and optional asset IDs for `color`, `normal`, `metalness`, `roughness`, and `emissive`. Built-in 2022 packs are listed in `render::materials::PACKS_2022`.
 - **KTX2 transcodes:** Like Studio, `ror` renders Roblox's KTX2 transcodes (BC1/BC3 with Roblox mips) rather than raw uploaded PNGs (`ROR_TRANSCODES=0` forces raw uploads).
 - **Textureless materials:** `SmoothPlastic`, `Neon`, and `ForceField` use no texture maps; `Plastic` and `Foil` use only a normal map.

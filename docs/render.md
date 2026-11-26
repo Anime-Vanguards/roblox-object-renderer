@@ -54,8 +54,8 @@ By default, `ror` renders every part and every mesh at full detail (LOD 0). Pass
 ## Lighting, materials, and map backdrops
 
 - `--lighting-from <place>`: borrow `Lighting` (properties, `Sky`, `Atmosphere`, post effects) from another place file. Without it, `ror` uses Roblox default lighting.
-- `--materials-from <place>`: borrow `MaterialService` (`Use2022Materials` and `MaterialVariant`s). Defaults to 2022 materials.
-- `--map <file>`: render another place's `Workspace` (or a model's top-level instances) around your input inside a root `Map` folder (`Map (setting)` if your input already has a `Map`), adopting that file's lighting and materials unless `--lighting-from` / `--materials-from` override them. Orbit framing, `stats.framed`, and authoring lints still target only your input (`Scene::framing_subject`).
+- `--materials-from <place>`: borrow `MaterialService` (`Use2022Materials` and `MaterialVariant`s); a place without one lends the pre-2022 materials, as Roblox loads it. Without it a model draws the 2022 materials and a place its own.
+- `--map <file>`: render another place's `Workspace` (or a model's top-level instances) around your input inside a root `Map` folder (`Map (setting)` if your input already has a `Map`), adopting that file's lighting and materials (a map place without a `MaterialService`: the pre-2022 materials) unless `--lighting-from` / `--materials-from` override them. Orbit framing, `stats.framed`, and authoring lints still target only your input (`Scene::framing_subject`).
 - `--map-origin x,y,z[,yaw]`: offset and rotate the backdrop map so `(x, y, z)` aligns with your input's origin (e.g., placing an attack effect where a character stands). Both `render` and `video` support `--map` and `--map-origin`.
 
 ## Collision view (`--collision`)
