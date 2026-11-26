@@ -7428,6 +7428,16 @@ mod surface_light_shadow_tests {
 		};
 		let (lit, shadowed) = (back(false), back(true));
 		assert!(lit > 50.0 && shadowed < 0.1 * lit, "the board's far side: {shadowed} with Shadows, {lit} without");
+		// a 2-stud face of Angle 180 along a floor (Front) with its centre 0.5 studs up, so that its
+		// shadow's point lies 1 stud behind it at that height: 13 studs out the floor keeps 0.93 of the
+		// unshadowed light in Studio (light-graze-kinds), as the grazing rule from that point gives at a
+		// quarter of a PointLight's u; ror had darkened nothing
+		let graze = |shadows: bool| {
+			let lamp = Lamp { at: Vec3::new(0.0, 0.5, 0.0), size: Vec3::new(2.0, 2.0, 0.2), opaque: false, face: 5, angle: 180.0, range: 16.0, shadows };
+			level(&renderer, &scene(&lamp, &[], true), [0.0, 20.0, -13.05], [0.0, 0.0, -13.0])
+		};
+		let (lit, shadowed) = (graze(false), graze(true));
+		assert!(lit > 30.0 && shadowed < 0.985 * lit && shadowed > 0.9 * lit, "the grazed floor 13 studs out: {shadowed} with Shadows, {lit} without");
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
 	}

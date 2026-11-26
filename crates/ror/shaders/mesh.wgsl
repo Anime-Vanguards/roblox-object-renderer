@@ -539,11 +539,14 @@ fn light_shadow(light: Light, world_position: vec3<f32>, geometric_normal: vec3<
 // 0.59, 0) / 7.96 (rms 0.008 over 660 rings, Brightness 1-100 alike; whole to u 0.6, 0.95 at 4.4,
 // 0.86 at 9, 0.78 at 20). `range` is the longest of the shadowed lights at the light's position
 // (render::shared_graze_ranges). A SpotLight's u is 1.63 times a PointLight's (light-graze-kinds:
-// Angle 90 and 150 along a floor 0.5 and 2 studs up, rms 0.037 -> 0.014); a SurfaceLight darkens
-// nothing so (2-stud faces of Angle 180 along the floor: 0.98-0.99 of the unshadowed out to 14 studs
-// 2 studs up, 0.86-0.98 from 8 to 14 with the face half under the floor, where the rule at its
-// nearest point gave 0.74).
+// Angle 90 and 150 along a floor 0.5 and 2 studs up, rms 0.037 -> 0.014). A SurfaceLight's goes by
+// the point its shadow is cast from, behind the face (render::light_data), its u 0.26 times a
+// PointLight's (light-graze-kinds: 2-stud faces of Angle 180 along a floor with their centre 0.5 and 2
+// studs up, the first's face crossing the floor: 0.98 of the unshadowed 8 studs out to 0.90 at 15,
+// rms 0.058 -> 0.027 over its floor, 0.012 -> 0.011 at 2 up; facing down 0.5 and 2 up, 0.0015 and
+// 0.006 either way; the rule at the face's nearest point gave 0.74 everywhere).
 const LIGHT_GRAZE_SPOT: f32 = 1.63;
+const LIGHT_GRAZE_SURFACE: f32 = 0.26;
 
 fn light_graze(range: f32, distance: f32, n_dot_l: f32, scale: f32) -> f32 {
 	let c = max(n_dot_l, 1e-3);
@@ -613,7 +616,14 @@ fn local_light(index: u32, surface: Surface, world_position: vec3<f32>, n: vec3<
 	}
 	if (light.shadow.x >= 0.0 && strength > 0.0) {
 		strength *= light_shadow(light, world_position, geometric_normal);
-		if (kind != 2u) {
+		if (kind == 2u) {
+			// (a surface turned away from that point casts nothing there to shadow itself with: the size
+			// term lights it whole, light-attack's floor-level face of Angle 180 over a unit)
+			let to_apex = light.position.xyz - light.direction.xyz * light.shadow.z - world_position;
+			let apart = max(length(to_apex), 1e-4);
+			let facing = dot(geometric_normal, to_apex / apart);
+			strength *= select(1.0, light_graze(light.extra.y, apart, facing, LIGHT_GRAZE_SURFACE), facing > 0.0);
+		} else {
 			strength *= light_graze(light.extra.y, distance, dot(geometric_normal, l), select(1.0, LIGHT_GRAZE_SPOT, kind == 1u));
 		}
 	}
