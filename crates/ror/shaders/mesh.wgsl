@@ -592,23 +592,33 @@ fn light_cluster(world_position: vec3<f32>, pixel: vec2<f32>) -> u32 {
 }
 
 // Whether every surface takes its local light from the lights' voxels, near and far (LightingStyle
-// Soft; render::lights_from_voxels decides it, frame.counts.w)
+// Soft, a graphics quality level lighting none per pixel; render::lights_from_voxels decides it,
+// frame.counts.w bit 1)
 fn lights_from_voxels() -> bool {
-	return frame.counts.w == 1u;
+	return (frame.counts.w & 1u) != 0u;
 }
 
 // What one light adds at a surface point, into the light's own share (`sum`) and the far surfaces'
-// voxels (`voxels`); nothing at all beyond its Range and its voxels' reach
-fn local_light(index: u32, surface: Surface, world_position: vec3<f32>, n: vec3<f32>, v: vec3<f32>, geometric_normal: vec3<f32>, far: f32, read_at: vec3<f32>, sum: ptr<function, vec3<f32>>, voxels: ptr<function, vec3<f32>>) {
+// voxels (`voxels`); nothing at all beyond its Range and its voxels' reach. `far`: how far the surface is
+// into the voxels' handover (at 580-600 studs from the camera, a graphics quality level's own nearer);
+// `distant`: into 580-600 studs, past which a light placed with a playback lights nothing (light-latency)
+fn local_light(index: u32, surface: Surface, world_position: vec3<f32>, n: vec3<f32>, v: vec3<f32>, geometric_normal: vec3<f32>, far: f32, distant: f32, read_at: vec3<f32>, sum: ptr<function, vec3<f32>>, voxels: ptr<function, vec3<f32>>) {
 	let light = lights[index];
 	if (lights_from_voxels()) {
-		// LightingStyle Soft: the voxels alone, near and far; a light placed with a playback lights the
-		// near surfaces only, as it lights particles near the camera at once (light-latency)
-		*voxels += voxel_light(light, read_at) * select(1.0 - far, 1.0, light.extra.x > 0.0);
+		// LightingStyle Soft, a level lighting none per pixel: the voxels alone, near and far; a light
+		// placed with a playback lights the near surfaces only, as it lights particles near the camera at
+		// once (light-latency)
+		*voxels += voxel_light(light, read_at) * select(1.0 - distant, 1.0, light.extra.x > 0.0);
 		return;
 	}
-	if (far > 0.0 && light.extra.x > 0.0) {
-		*voxels += voxel_light(light, read_at);
+	if (far > 0.0) {
+		if (light.extra.x > 0.0) {
+			*voxels += voxel_light(light, read_at);
+		} else if (frame.local_light_far.y > 0.0 && distant < 1.0) {
+			// past a lower level's per-pixel reach a placed light's voxels light what is short of 580-600
+			// studs (the client's `lightline` at levels 13-18: a script's lamps lit along the whole rail)
+			*voxels += voxel_light(light, read_at) * (1.0 - distant);
+		}
 	}
 	if (far >= 1.0) {
 		return;
@@ -675,7 +685,12 @@ fn local_lights(surface: Surface, world_position: vec3<f32>, n: vec3<f32>, v: ve
 	// frames of Point-, Spot- and SurfaceLights over floors, walls and a ball 40 studs from the camera,
 	// with Shadows or not, 89-98 % of the lit pixels within 2 of 255 and 99.8-100 % within 8 where
 	// nothing stands near the light; no shadow maps, no n·l, no specular)
-	let far = saturate((distance(world_position, frame.camera_position.xyz) - LOCAL_LIGHT_FAR_START) / (LOCAL_LIGHT_FAR_END - LOCAL_LIGHT_FAR_START));
+	let distant = saturate((distance(world_position, frame.camera_position.xyz) - LOCAL_LIGHT_FAR_START) / (LOCAL_LIGHT_FAR_END - LOCAL_LIGHT_FAR_START));
+	var far = distant;
+	if (frame.local_light_far.y > 0.0) {
+		// a graphics quality level lighting them per pixel nearer (render::local_light_far)
+		far = saturate((distance(world_position, frame.camera_position.xyz) - frame.local_light_far.x) / (frame.local_light_far.y - frame.local_light_far.x));
+	}
 	let read_at = world_position + geometric_normal * 6.0;
 	// from the voxels, short of the far surfaces' distance (where a light placed with a playback still
 	// counts in full), the view's baked field holds them all in one sample (render::voxel_field;
@@ -700,7 +715,7 @@ fn local_lights(surface: Surface, world_position: vec3<f32>, n: vec3<f32>, v: ve
 		while (bits != 0u) {
 			let i = word * 32u + firstTrailingBit(bits);
 			bits &= bits - 1u;
-			local_light(i, surface, world_position, n, v, geometric_normal, far, read_at, &sum, &voxels);
+			local_light(i, surface, world_position, n, v, geometric_normal, far, distant, read_at, &sum, &voxels);
 		}
 	}
 	return sum * (1.0 - far) + surface.diffuse_weight * surface.albedo * voxels * (VOXEL_LIGHT_SURFACES * select(far, 1.0, lights_from_voxels()));
@@ -1085,9 +1100,9 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 	if (occluded && shading != SHADING_GLASS) {
 		occlusion = textureSampleLevel(ambient_occlusion, linear_sampler, input.clip.xy * frame.viewport.zw, 0.0).r;
 		sky_occlusion = occlusion;
-		// LightingStyle Soft (frame.counts.w 1) darkens by less: SOFT_OCCLUSION of Realistic's darkening of the flat
+		// LightingStyle Soft (frame.counts.w bit 2) darkens by less: SOFT_OCCLUSION of Realistic's darkening of the flat
 		// ambient, SOFT_SKY_OCCLUSION of the sky's light
-		if (frame.counts.w == 1u) {
+		if ((frame.counts.w & 2u) != 0u) {
 			sky_occlusion = 1.0 - SOFT_SKY_OCCLUSION * (1.0 - occlusion);
 			occlusion = 1.0 - SOFT_OCCLUSION * (1.0 - occlusion);
 		}

@@ -83,6 +83,9 @@ struct Frame {
 	// xyz the camera's forward axis, w the depth slices per unit of ln(depth)
 	light_clusters: vec4<f32>,
 	light_cluster_view: vec4<f32>,
+	// where surfaces start taking the local lights' voxels and take them alone at the view's graphics quality
+	// (render::local_light_far); both 0: LOCAL_LIGHT_FAR_START and _END
+	local_light_far: vec4<f32>,
 }
 
 
@@ -149,7 +152,7 @@ const VOXEL_LIGHT_REACH: f32 = 493.0;
 
 // Surfaces from these distances to the camera take their local light from the lights' voxels
 // instead of per pixel, all of it from the second (mesh.wgsl `local_lights`, light-far; mirrored by
-// render::LOCAL_LIGHT_FAR_END)
+// render::LOCAL_LIGHT_FAR_END), at graphics quality 19-21; a lower level's own (frame.local_light_far)
 const LOCAL_LIGHT_FAR_START: f32 = 580.0;
 const LOCAL_LIGHT_FAR_END: f32 = 600.0;
 

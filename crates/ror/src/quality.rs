@@ -5,9 +5,9 @@
 //!
 //! A view asks for a level with `ViewRequest::quality` (`--quality`); without one it draws as level 21,
 //! everything at its best and nothing culled. [`Quality`] holds every switch the level moves. The renderer
-//! follows the sun's shadow maps' reach and the voxel sun past it, the view distance and size cull
-//! (`crate::lod`) and the particles' Rate; the others are kept here, measured, for the passes that do not
-//! follow them yet (their fields say so).
+//! follows the sun's shadow maps' reach and the voxel sun past it, local lights' per-pixel reach, the view
+//! distance and size cull (`crate::lod`) and the particles' Rate; the others are kept here, measured, for
+//! the passes that do not follow them yet (their fields say so).
 //!
 //! Studio's edit quality is not the client's run-time level: `ror cost` and `ror cost --check` keep Studio's
 //! edit table (`crate::lod::Lod::view_distance`, notes/cost.md "Quality").
@@ -39,7 +39,7 @@ pub struct Quality {
 	pub sun_shadows: Option<SunReach>,
 	/// Local lights per pixel, with their shadows, within this distance of the camera; through the light
 	/// grid's voxels past it and everywhere at 0 (below 14, 17 under PrioritizeLightingQuality false, every
-	/// level under Soft). Infinite: as level 21 (ror's own handover at 580-600 studs). Not followed yet.
+	/// level under Soft). Infinite: as level 21 (ror's own handover at 580-600 studs).
 	pub light_reach: f32,
 	/// The high-quality shading's radius (metals' and Foil's reflections, the sky's specular on
 	/// SmoothPlastic, textures' detail), halfway through its blend of about a quarter of it each way: 0
@@ -142,7 +142,8 @@ fn size_cull(level: u32) -> f32 {
 }
 
 /// Per-pixel local lights' reach under PrioritizeLightingQuality true (`lightline`: 22 shadowed lights 20
-/// studs apart along a rail, ±10 studs): ~55 at 14, 104, 175, 275, 410 at 15-18; ror's 580-600 from 19.
+/// studs apart along a rail, ±10 studs): ~55 at 14, 104, 175, 275, 410 at 15-18; ror's 580-600 from 19
+/// (render::local_light_far starts the handover to the voxels 5 studs short of it).
 const LIGHT_REACH: [f32; 5] = [55.0, 104.0, 175.0, 275.0, 410.0];
 /// Under false: ~93 at 17, ~170 at 18, ~284 from 19.
 const LIGHT_REACH_UNPRIORITIZED: [f32; 3] = [93.0, 170.0, 284.0];

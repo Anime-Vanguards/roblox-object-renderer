@@ -337,6 +337,10 @@ struct FrameUniform {
 	/// cluster (0: none); the camera's forward axis and the slices per unit of ln(depth)
 	light_clusters: [f32; 4],
 	light_cluster_view: [f32; 4],
+	/// Where surfaces start taking the local lights' voxels instead of per pixel and where they take
+	/// them alone, from the camera, at the view's graphics quality ([`local_light_far`]); both 0: level
+	/// 21's 580 and 600 studs (common.wgsl LOCAL_LIGHT_FAR_START, LOCAL_LIGHT_FAR_END)
+	local_light_far: [f32; 4],
 }
 
 #[repr(C)]
@@ -1705,11 +1709,28 @@ const LOCAL_LIGHT_FAR_END: f32 = 600.0;
 const LOCAL_LIGHT_FAR_START: f32 = 580.0;
 
 /// Whether every surface takes its local light from the lights' voxels, near and far, as under
-/// LightingStyle Soft (mesh.wgsl `lights_from_voxels`, frame.counts.w): then no light gets shadow maps,
-/// a light's clusters reach its voxels' reach, and the view's baked field holds the voxels where
-/// surfaces read them ([`voxel_field::surfaces`]).
-fn lights_from_voxels(environment: &crate::scene::Environment) -> bool {
-	environment.soft_lighting()
+/// LightingStyle Soft and at a graphics quality level that lights none per pixel (below 14, 17 under
+/// PrioritizeLightingQuality false: crate::quality::Quality::light_reach; mesh.wgsl `lights_from_voxels`,
+/// frame.counts.w bit 1): then no light gets shadow maps, a light's clusters reach its voxels' reach, and
+/// the view's baked field holds the voxels where surfaces read them ([`voxel_field::surfaces`]).
+fn lights_from_voxels(environment: &crate::scene::Environment, quality: &crate::quality::Quality) -> bool {
+	environment.soft_lighting() || quality.light_reach <= 0.0
+}
+
+/// Where a view's surfaces start taking the local lights' voxels and where they take them alone, from the
+/// camera: LOCAL_LIGHT_FAR_START and _END at a level lighting them per pixel to level 21's reach (and at one
+/// lighting none per pixel, where every surface takes the voxels: [`lights_from_voxels`]), else a handover as
+/// wide from 5 studs short of the level's reach (the client's `lightline`: a rail's shadow from lamps every 20
+/// studs ends ~55 studs out at level 14, 104, 175, 275 and 410 at 15-18, the lamps' voxels lighting the rail
+/// past it; crate::quality::Quality::light_reach). Handovers centred on the reach ended the shadow 5-8 studs
+/// short of the client's, ending there 10-17 (with the voxels' light past it).
+fn local_light_far(quality: &crate::quality::Quality) -> (f32, f32) {
+	if quality.light_reach.is_finite() && quality.light_reach > 0.0 {
+		let width = LOCAL_LIGHT_FAR_END - LOCAL_LIGHT_FAR_START;
+		((quality.light_reach - 0.25 * width).max(0.0), quality.light_reach + 0.75 * width)
+	} else {
+		(LOCAL_LIGHT_FAR_START, LOCAL_LIGHT_FAR_END)
+	}
 }
 
 /// The most local lights a view shades with: every pixel loops over them, so this bounds its cost.
@@ -4772,14 +4793,17 @@ impl Renderer {
 		let frustum = culling::Frustum::new(camera.view_projection(width as f32 / height as f32));
 		let visible_draws: Vec<&DrawItem> = prepared.draws.iter().filter(|draw| draw.in_frustum(&frustum)).collect();
 		let environment = &scene.environment;
-		// the lights this view reaches, nearest first; the nearest MAX_SHADOW_LIGHTS with Shadows get
-		// shadow maps, of a size for how many there are (none where every surface takes the lights'
-		// voxels: lights_from_voxels)
-		let soft = lights_from_voxels(environment);
+		// what the view's graphics quality level draws (crate::quality; level 21 without one)
+		let quality = view_quality(request, environment);
+		// the lights this view reaches, nearest first; the nearest MAX_SHADOW_LIGHTS with Shadows within the
+		// level's per-pixel reach get shadow maps, of a size for how many there are (none where every surface
+		// takes the lights' voxels: lights_from_voxels)
+		let soft = lights_from_voxels(environment, &quality);
+		let (far_start, far_end) = local_light_far(&quality);
 		let (places, mut lights): (Vec<usize>, Vec<LightData>) = view_lights(&prepared.lights, camera.view_projection(width as f32 / height as f32), camera.eye).into_iter().unzip();
 		let casts = |light: &LightData| {
 			let position = Vec3::new(light.position[0], light.position[1], light.position[2]);
-			!soft && light.shadow[1] > 0.0 && position.distance(camera.eye) - light.color[3] - light.shadow[2] - light.right[3].max(light.up[3]) < LOCAL_LIGHT_FAR_END
+			!soft && light.shadow[1] > 0.0 && position.distance(camera.eye) - light.color[3] - light.shadow[2] - light.right[3].max(light.up[3]) < far_end
 		};
 		// six array layers a light: as many as the device holds (any GPU holds 42)
 		let most = MAX_SHADOW_LIGHTS.min(self.gpu.device.limits().max_texture_array_layers as usize / 6);
@@ -4808,20 +4832,26 @@ impl Renderer {
 		});
 
 		let mut frame = self.frame_uniform(Some(&camera), render_width, render_height, lights.len() as u32);
-		frame.counts[3] = u32::from(soft);
+		// bit 1: every surface from the voxels; bit 2: LightingStyle Soft's ambient occlusion (mesh.wgsl)
+		frame.counts[3] = u32::from(soft) | u32::from(environment.soft_lighting()) << 1;
+		if (far_start, far_end) != (LOCAL_LIGHT_FAR_START, LOCAL_LIGHT_FAR_END) {
+			frame.local_light_far = [far_start, far_end, 0.0, 0.0];
+		}
 		// which of them each cluster of the view's pixels can be lit by: the light within its Range (past
 		// a SurfaceLight's face), the far surfaces' voxels 6 studs out within their reach (under Soft the
-		// near surfaces' too, a light placed with a playback's as well)
+		// near surfaces' too, a light placed with a playback's as well, and past a lower level's per-pixel
+		// reach, where it lights up to 580-600 studs)
+		let placed_far = frame.local_light_far[1] > 0.0;
 		let forward = -Vec3::from(camera.world.matrix3.z_axis).normalize();
 		let reaches: Vec<light_clusters::Reach> = lights
 			.iter()
 			.map(|light| {
 				let face = glam::Vec2::new(light.right[3], light.up[3]).length();
 				let voxels = light.voxel_color[3] + 6.0 + face;
-				light_clusters::Reach { centre: Vec3::new(light.position[0], light.position[1], light.position[2]), near: if soft { voxels } else { light.color[3] + face }, far: (light.extra[0] > 0.0).then_some(voxels) }
+				light_clusters::Reach { centre: Vec3::new(light.position[0], light.position[1], light.position[2]), near: if soft { voxels } else { light.color[3] + face }, far: (light.extra[0] > 0.0 || placed_far).then_some(voxels) }
 			})
 			.collect();
-		let clusters = light_clusters::build(&reaches, camera.view(), camera.projection(width as f32 / height as f32), camera.eye, forward, camera.fov.to_radians(), render_width, render_height, LOCAL_LIGHT_FAR_END, LOCAL_LIGHT_FAR_START);
+		let clusters = light_clusters::build(&reaches, camera.view(), camera.projection(width as f32 / height as f32), camera.eye, forward, camera.fov.to_radians(), render_width, render_height, far_end, far_start);
 		let clusters_buffer = clusters.as_ref().map(|clusters| {
 			frame.light_clusters = clusters.grid;
 			frame.light_cluster_view = clusters.view;
@@ -4830,7 +4860,6 @@ impl Renderer {
 		let sun = prepared.sun_direction;
 		// the sun's cascades for this camera at the view's graphics quality (notes/render.md "Shadows",
 		// "Graphics quality levels")
-		let quality = view_quality(request, environment);
 		let sun_cascades = view_sun_cascades(&camera, width as f32 / height as f32, prepared, environment, &quality);
 		let shadow_start = Instant::now();
 		let sun_atlas = (!sun_cascades.is_empty()).then(|| self.render_sun_shadows(prepared, &sun_cascades, groups, lease, &profile, &mut encoder, &mut publish));
@@ -7344,6 +7373,42 @@ mod lighting_style_tests {
 		for (shadows, placed) in [(false, false), (true, true)] {
 			let other = draw(true, shadows, placed);
 			assert!(other.iter().zip([shade, open, past]).all(|(a, b)| (a - b).abs() < 1.0), "Soft, Shadows {shadows}, placed with a playback {placed}: {other:?} as {:?}", [shade, open, past]);
+		}
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	/// A graphics quality level's per-pixel reach for local lights (crate::quality::Quality::light_reach; the
+	/// client's `lightline`): the same shadowed PointLight and plate under Realistic, seen from 100 studs up.
+	/// Without a level and at 17 (per pixel to 275 studs) the plate's shadow is dark; at 14 (per pixel to ~55)
+	/// the floor 100 studs off takes the lights' voxels, the shadow lit like the other side, and at 13 (none
+	/// per pixel) every surface does, as under Soft.
+	#[test]
+	fn a_quality_level_lights_per_pixel_only_to_its_reach() {
+		let state = std::env::temp_dir().join(format!("ror-quality-lights-test-{}", std::process::id()));
+		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let mut model = ModelBuilder::new("Reach");
+		model.part(&PartSpec { name: "Floor".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, -0.5, 0.0)), size: Vec3::new(60.0, 1.0, 60.0), color: [255; 3], material: 272, ..Default::default() });
+		model.part(&PartSpec { name: "Plate".into(), cframe: Affine3A::from_translation(Vec3::new(5.0, 4.0, 0.0)), size: Vec3::new(6.0, 0.4, 6.0), color: [255; 3], material: 272, ..Default::default() });
+		let carrier = model.part(&PartSpec { name: "Lamp".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, 8.0, 0.0)), size: Vec3::splat(0.2), transparency: 1.0, cast_shadow: false, ..Default::default() });
+		model.child(carrier, rbx_dom_weak::InstanceBuilder::new("PointLight").with_property("Shadows", true).with_property("Range", 16.0f32).with_property("Brightness", 2.0f32));
+		let mut scene = crate::scene::extract::extract(&model.into_document());
+		let environment = &mut scene.environment;
+		(environment.ambient, environment.outdoor_ambient, environment.environment_diffuse_scale, environment.environment_specular_scale, environment.brightness) = (Vec3::ZERO, Vec3::ZERO, 0.0, 0.0, 0.0);
+		// the floor straight under each camera: in the plate's shadow, the other side
+		let view = |x: f32, quality: Option<u32>| ViewRequest { width: 16, height: 16, camera: CameraSpec::LookAt { eye: [x, 100.0, -0.05], target: [x, 0.0, 0.0], fov: 1.6 }, background: Background::Color([0.0, 0.0, 1.0]), bloom: false, quality, ..Default::default() };
+		for (quality, shadowed) in [(None, true), (Some(17), true), (Some(14), false), (Some(13), false)] {
+			let (images, _) = renderer.render(&scene, &[view(10.0, quality), view(-10.0, quality)]).unwrap();
+			let level = |image: &ViewImage| image.rgba.chunks(4).map(|pixel| pixel[..3].iter().map(|&channel| channel as f32).sum::<f32>() / 3.0).sum::<f32>() / (image.rgba.len() / 4) as f32;
+			let (shade, open) = (level(&images[0]), level(&images[1]));
+			assert!(open > 40.0, "level {quality:?}: the floor beside the light is lit ({open})");
+			if shadowed {
+				assert!(shade < 0.15 * open, "level {quality:?}: per pixel, the plate shadows the floor ({shade} in its shadow, {open} on the other side)");
+			} else {
+				assert!(shade > 0.9 * open, "level {quality:?}: from the voxels, the plate's shadow is lit like the other side ({shade} and {open})");
+			}
 		}
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
