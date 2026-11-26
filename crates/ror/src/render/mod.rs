@@ -7358,6 +7358,50 @@ mod lighting_style_tests {
 		let _ = std::fs::remove_dir_all(&state);
 	}
 
+	/// A white cube on a white floor under Ambient alone, seen straight down. The light-grid
+	/// fixture's "contacts" in the engine (0.747): LightingStyle Soft darkens it by 0.874 of Realistic's darkening.
+	#[test]
+	fn soft_lighting_style_darkens_contacts_less() {
+		let state = std::env::temp_dir().join(format!("ror-soft-occlusion-test-{}", std::process::id()));
+		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let scene = |soft: bool, cube: bool| {
+			let mut model = ModelBuilder::new("Contact");
+			model.part(&PartSpec { name: "Floor".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, -0.5, 0.0)), size: Vec3::new(40.0, 1.0, 40.0), color: [255; 3], material: 272, ..Default::default() });
+			if cube {
+				model.part(&PartSpec { name: "Cube".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, 2.0, 0.0)), size: Vec3::splat(4.0), color: [255; 3], material: 272, ..Default::default() });
+			}
+			let mut scene = crate::scene::extract::extract(&model.into_document());
+			let environment = &mut scene.environment;
+			(environment.ambient, environment.outdoor_ambient, environment.environment_diffuse_scale, environment.environment_specular_scale, environment.brightness) = (Vec3::splat(0.5), Vec3::ZERO, 0.0, 0.0, 0.0);
+			environment.global_shadows = false;
+			environment.lighting_style = if soft { crate::scene::environment::LIGHTING_STYLE_SOFT } else { 0 };
+			scene
+		};
+		// straight down over the cube: the floor round it and its top, as lit as the open floor but for the occlusion
+		let views = [ViewRequest { width: 64, height: 64, camera: CameraSpec::LookAt { eye: [0.0, 12.0, -0.05], target: [0.0; 3], fov: 40.0 }, background: Background::Color([0.0, 0.0, 1.0]), bloom: false, ..Default::default() }];
+		let draw = |soft: bool, cube: bool| -> Vec<f32> {
+			let (images, _) = renderer.render(&scene(soft, cube), &views).unwrap();
+			images[0].rgba.chunks(4).map(|pixel| (pixel[1] as f32 / 255.0).powf(2.2)).collect()
+		};
+		let (open, realistic, soft) = (draw(false, false), draw(false, true), draw(true, true));
+		// over the pixels Realistic's occlusion darkens by 2 % or more
+		let (mut darkened, mut by_realistic, mut by_soft) = (0, 0.0, 0.0);
+		for ((open, realistic), soft) in open.iter().zip(&realistic).zip(&soft) {
+			if open - realistic > 0.02 * open {
+				darkened += 1;
+				by_realistic += open - realistic;
+				by_soft += open - soft;
+			}
+		}
+		assert!(darkened > 20, "Realistic darkens the cube's foot ({darkened} pixels)");
+		let ratio = by_soft / by_realistic;
+		assert!((0.8..0.95).contains(&ratio), "Soft darkens it {ratio} as much");
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
 	/// A white floor under a 48-stud roof whose bottom is 8 studs up, lit by the sky's specular light alone at EV +2,
 	/// seen straight down from under the roof's middle. The light-grid fixture's "sky" in the engine (0.747): it reflects
 	/// the closed grid's warm grey ((9.6, 9.6, 8.8) of 255 against the open floor's blue sky (16, 37, 59)), where ror kept

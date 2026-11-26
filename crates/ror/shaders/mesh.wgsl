@@ -52,6 +52,12 @@ const LIGHT_GRID_SPECULAR_FLOOR: f32 = 0.12;
 const LIGHT_GRID_SPECULAR_CLOSED: vec3<f32> = LIGHT_GRID_SKY_CLOSED * 1.4;
 // how far along the normal a surface reads the grid (lg-height, lg-walls: 6 studs)
 const LIGHT_GRID_OFFSET: f32 = 6.0;
+// how much of Realistic's ambient occlusion LightingStyle Soft keeps (the light-grid fixture's "contacts" in the
+// engine, 0.747, a ball, a cube, a plate and a wall's foot on a floor under each style: the darkening's ratio in
+// radiance 0.874 under Ambient alone and OutdoorAmbient alone at every depth of it; the sky's light alone 0.88 / 0.80 /
+// 0.74 in red / green / blue under the default sky, green's taken)
+const SOFT_OCCLUSION: f32 = 0.874;
+const SOFT_SKY_OCCLUSION: f32 = 0.80;
 
 // the light grid at a surface: trilinear between voxel centres, 6 studs along the normal; 1 without
 // a grid
@@ -1016,8 +1022,16 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 	// Transparency 0 but takes none itself (ao-sees: a bar half a stud in front of a Glass tile leaves
 	// it at 1.01 of its unoccluded light where ror's halo dimmed it to 0.76)
 	var occlusion = 1.0;
+	var sky_occlusion = 1.0;
 	if (occluded && shading != SHADING_GLASS) {
 		occlusion = textureSampleLevel(ambient_occlusion, linear_sampler, input.clip.xy * frame.viewport.zw, 0.0).r;
+		sky_occlusion = occlusion;
+		// LightingStyle Soft (frame.counts.w 1) darkens by less: SOFT_OCCLUSION of Realistic's darkening of the flat
+		// ambient, SOFT_SKY_OCCLUSION of the sky's light
+		if (frame.counts.w == 1u) {
+			sky_occlusion = 1.0 - SOFT_SKY_OCCLUSION * (1.0 - occlusion);
+			occlusion = 1.0 - SOFT_OCCLUSION * (1.0 - occlusion);
+		}
 	}
 	color += surface.albedo * flat_ambient * occlusion;
 	// the sky specular keeps 0.12 of itself where the grid is closed; with GlobalShadows on the open grid
@@ -1040,7 +1054,7 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 	// visibility (lg-edge: Studio's light across a roof's edge is grey + (sky - grey) v, rms 0.002-0.005)
 	let sky_irradiance = mix(LIGHT_GRID_SKY_CLOSED, sky_light(frame, n), sky_open);
 	let sky_kd = (1.0 - surface.metalness) * (vec3<f32>(1.0) - sky_specular * sky_fresnel);
-	let sky_diffuse = sky_kd * surface.albedo * sky_irradiance * (frame.environment.x * occlusion);
+	let sky_diffuse = sky_kd * surface.albedo * sky_irradiance * (frame.environment.x * sky_occlusion);
 	color += sky_diffuse;
 
 	let r = reflect(-v, n);

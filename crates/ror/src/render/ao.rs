@@ -14,14 +14,16 @@ use super::camera::Camera;
 use super::pipelines::{AO_BLURRED_FORMAT, AO_DEPTH_FORMAT, AO_FORMAT, AO_NORMAL_FORMAT, AO_SURFACE_FORMAT, AO_SAMPLES, DEPTH_FORMAT, Pipelines};
 use super::reuse::Lease;
 
-/// The disk's radius at a 1116 px tall view (it scales with the view's height: the same in pixels at
-/// every distance and field of view, ao-distance from 12.5 to 100 studs, ao-depth through 88 to 3.3
-/// degrees, ao-relief's strips from 15 to 80 studs).
+/// The disk's radius in pixels of the render, whatever its size: the same in pixels at every distance and
+/// field of view (ao-distance from 12.5 to 100 studs, ao-depth through 88 to 3.3 degrees, ao-relief's
+/// strips from 15 to 80 studs, all at 1116 px tall) and at every render size (the light-grid fixture's
+/// crease in the engine, 0.747, at 450, 900 and 1800 px tall: the darkening beside the crease spans 0.0135,
+/// 0.0066 and 0.0034 of the picture's height, where a disk scaled with the height spanned 0.0055 at each).
 const RADIUS: f32 = 34.3;
-const REFERENCE_HEIGHT: f32 = 1116.0;
 /// The AO runs at about this many pixels tall (an integer fraction of the render), whatever the
 /// render's size: every pixel of the capture's view (ao-thin: Studio's lines along slots a fifth of
-/// a pixel wide are continuous where a half-resolution prepass drew them in dashes on its own grid).
+/// a pixel wide are continuous where a half-resolution prepass drew them in dashes on its own grid);
+/// the disk and the blur keep their size in the render's pixels.
 const WORKING_HEIGHT: f32 = 1116.0;
 /// A = max(0, 1 - SIGMA mean(max(0, v^.n - BIAS) (1 - |P - C|^2 / RANGE^2)^2))^CONTRAST, v = P - n t - C
 /// in studs, t the depth tolerance (fitted by rendering the ao-* experiments and two models,
@@ -45,7 +47,7 @@ const POWER: f32 = 1.88;
 const FADE_DEPTH: f32 = 127.5;
 const FADE_WIDTH: f32 = 4.1;
 const SAMPLES: f32 = 16.0;
-/// The blur: a (2 BLUR + 1)^2 box among the neighbours whose view depth is within BLUR_TOLERANCE
+/// The blur: a (2 BLUR + 1)^2 box (in the render's pixels) among the neighbours whose view depth is within BLUR_TOLERANCE
 /// (depth / 50)^BLUR_POWER studs of the pixel's (ao-relief: Studio's occlusion runs 6-9 px onto a strip
 /// standing 1-2 studs out at 80 studs, 1-4 px at 40 and none at 15; ao-thin: a slot's darkness spreads
 /// 6-10 px onto the plate around it at 80 studs).
@@ -234,8 +236,9 @@ pub struct AoTargets<'a> {
 	textures: Vec<wgpu::Texture>,
 	/// The targets' size
 	size: (u32, u32),
-	/// The disk's radius in AO pixels, the view's aspect
+	/// The disk's radius and the blur's half size in AO pixels, the view's aspect
 	radius: f32,
+	blur: f32,
 	aspect: f32,
 	/// The clip's kept occlusion, `occlusion` its texture
 	history: Option<HistoryUse<'a>>,
@@ -285,6 +288,13 @@ fn fullscreen(encoder: &mut wgpu::CommandEncoder, profile: &super::profile::Prof
 	pass.draw(0..3, 0..1);
 }
 
+/// The disk's radius and the blur's half size in AO pixels for an AO `factor` times smaller than the render: their
+/// size in the render's pixels kept (the blur's in whole AO pixels, at least one)
+fn reach(tune: &Tune, factor: f32) -> (f32, f32) {
+	let blur = if factor <= 1.0 { tune.blur } else { (tune.blur / factor).round().max(1.0) };
+	(tune.radius / factor, blur)
+}
+
 /// Whether the blur runs as the compute pass (`cs_ao_blur`)
 fn tile_blur(tune: &Tune) -> bool {
 	tune.blur_depth > 0.5 && tune.blur.trunc() <= TILE_BLUR_MAX && std::env::var("ROR_AO_BLUR").map_or(true, |value| value != "fragment")
@@ -330,15 +340,15 @@ impl<'a> AoTargets<'a> {
 			view
 		};
 		let blurred = tile_blur(&tune).then(|| stored(&mut textures, "ao blurred", AO_BLURRED_FORMAT));
-		let radius = tune.radius * render_height as f32 / REFERENCE_HEIGHT / factor;
+		let (radius, blur) = reach(&tune, factor);
 		// read by the main pass: not released; a clip's kept one when it keeps its occlusion (only with
 		// the compute blur, which its tiles run)
 		let history = history.filter(|_| blurred.is_some() && AoHistory::enabled());
 		let occlusion = match history {
-			Some(HistoryUse { history, .. }) => history.occlusion(lease.device(), (width, height), radius, &tune),
+			Some(HistoryUse { history, .. }) => history.occlusion(lease.device(), (width, height), radius, blur),
 			None => target(lease, &mut Vec::new(), "ao", width, height, AO_FORMAT, 1),
 		};
-		Self { surfaces, normals, depth, raw, view_depths, occlusion, blurred, size: (width, height), samples, samples_depth, textures, radius, aspect: render_width as f32 / render_height as f32, history }
+		Self { surfaces, normals, depth, raw, view_depths, occlusion, blurred, size: (width, height), samples, samples_depth, textures, radius, blur, aspect: render_width as f32 / render_height as f32, history }
 	}
 
 	/// The multisampled prepass's depth once [`AoTargets::encode`] drew it: each sample's frontmost
@@ -381,7 +391,7 @@ impl<'a> AoTargets<'a> {
 			eye: [camera.eye.x, camera.eye.y, camera.eye.z, tune.tolerance * 50f32.powf(2.0 - tune.power)],
 			forward: [forward.x, forward.y, forward.z, tune.power],
 			params: [self.radius, tune.sigma, tune.contrast, tune.bias],
-			extra: [tune.range, SAMPLES, tune.blur_plane, tune.blur],
+			extra: [tune.range, SAMPLES, tune.blur_plane, self.blur],
 			fade: [tune.fade_depth, tune.fade_width, tune.blur_power, tune.blur_depth],
 			unprojection: camera.ray_unprojection(self.aspect).to_cols_array_2d(),
 		};
@@ -664,7 +674,7 @@ impl<'a> AoTargets<'a> {
 impl AoHistory {
 	/// The kept occlusion's texture for AO targets of `size` (made, or made again for another size),
 	/// with the tiles' reaches for a disk of `radius` AO pixels.
-	fn occlusion(&self, device: &wgpu::Device, size: (u32, u32), radius: f32, tune: &Tune) -> wgpu::TextureView {
+	fn occlusion(&self, device: &wgpu::Device, size: (u32, u32), radius: f32, blur: f32) -> wgpu::TextureView {
 		let mut kept = self.kept.lock();
 		if kept.as_ref().is_none_or(|kept| kept.size != size) {
 			let (width, height) = size;
@@ -673,7 +683,7 @@ impl AoHistory {
 			// a pixel's occlusion reads the depths within the disk's reach (its samples' offsets round to
 			// at most ceil(radius)) and the blur's; a tile k tiles off another is at least (k - 1) 16 + 1
 			// pixels off it
-			let reach = radius.max(0.0).ceil() as u32 + 1 + tune.blur.max(0.0) as u32;
+			let reach = radius.max(0.0).ceil() as u32 + 1 + blur.max(0.0) as u32;
 			let blur_reach = (reach - 1) / HISTORY_TILE + 1;
 			// the disk's tiles: those the blur reads round its own (its reach under a tile)
 			let disk_reach = blur_reach + 1;
