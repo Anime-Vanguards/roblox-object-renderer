@@ -27,7 +27,8 @@ struct Frame {
 	fog_color: vec4<f32>,
 	// x fog start, y fog end, z fog enabled, w unused
 	fog: vec4<f32>,
-	// x light count, y debug mode, z output alpha mode, w unused
+	// x light count, y debug mode, z output alpha mode, w 1 under LightingStyle Soft (mesh.wgsl
+	// `local_lights`: every surface takes the lights' voxels)
 	counts: vec4<u32>,
 	// viewport size in pixels, 1 / size
 	viewport: vec4<f32>,

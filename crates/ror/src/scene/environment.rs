@@ -14,7 +14,7 @@ pub struct Environment {
 	/// `Enum.Technology`; Studio no longer exposes it to scripts (`LightingStyle` replaced it), kept
 	/// for files that still carry it.
 	pub technology: u32,
-	/// `Enum.LightingStyle`: 0 Realistic, 1 Soft.
+	/// `Enum.LightingStyle`: 0 Realistic, 1 Soft ([`Environment::soft_lighting`]).
 	pub lighting_style: u32,
 	pub prioritize_lighting_quality: bool,
 	pub ambient: Vec3,
@@ -56,7 +56,18 @@ pub struct ViewportLighting {
 	pub sky: Option<Sky>,
 }
 
+/// `Enum.LightingStyle.Soft`'s value.
+pub const LIGHTING_STYLE_SOFT: u32 = 1;
+
 impl Environment {
+	/// `LightingStyle` Soft: every surface takes its local light from the lights' 4-stud voxels, as
+	/// surfaces 600 studs and more from the camera do under Realistic (no shadow maps, no n·l, no
+	/// specular; notes/render.md "Lighting style"). The sun, the sky and everything else are drawn as
+	/// under Realistic.
+	pub fn soft_lighting(&self) -> bool {
+		self.lighting_style == LIGHTING_STYLE_SOFT
+	}
+
 	/// What a ViewportFrame draws: one directional light (`LightColor` along `LightDirection`), a flat
 	/// `Ambient`, no sky light (EnvironmentDiffuseScale and EnvironmentSpecularScale 0, Roblox's
 	/// ViewportFrame reference) unless the frame holds a Sky, no shadows, fog, Atmosphere, clouds or

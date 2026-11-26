@@ -547,6 +547,12 @@ fn light_cluster(world_position: vec3<f32>, pixel: vec2<f32>) -> u32 {
 // voxels (`voxels`); nothing at all beyond its Range and its voxels' reach
 fn local_light(index: u32, surface: Surface, world_position: vec3<f32>, n: vec3<f32>, v: vec3<f32>, geometric_normal: vec3<f32>, far: f32, read_at: vec3<f32>, sum: ptr<function, vec3<f32>>, voxels: ptr<function, vec3<f32>>) {
 	let light = lights[index];
+	if (frame.counts.w == 1u) {
+		// LightingStyle Soft: the voxels alone, near and far; a light placed with a playback lights the
+		// near surfaces only, as it lights particles near the camera at once (light-latency)
+		*voxels += voxel_light(light, read_at) * select(1.0 - far, 1.0, light.extra.x > 0.0);
+		return;
+	}
 	if (far > 0.0 && light.extra.x > 0.0) {
 		*voxels += voxel_light(light, read_at);
 	}
@@ -603,7 +609,11 @@ fn local_lights(surface: Surface, world_position: vec3<f32>, n: vec3<f32>, v: ve
 	// the camera (light-far switch, straddle: halfway at 590 whatever the light's own distance). A
 	// light placed with a playback never gets there (light-latency: a wall 1,000 studs off stays dark
 	// 0.1-4 s after its light is placed, while particles near the camera take theirs at once; the
-	// benchmark's sky dome as drawn with no light)
+	// benchmark's sky dome as drawn with no light). Under LightingStyle Soft (frame.counts.w 1) every
+	// surface takes them the same way, whatever its distance (fixtures/lighting-style.luau: the engine's
+	// frames of Point-, Spot- and SurfaceLights over floors, walls and a ball 40 studs from the camera,
+	// with Shadows or not, 89-98 % of the lit pixels within 2 of 255 and 99.8-100 % within 8 where
+	// nothing stands near the light; no shadow maps, no n·l, no specular)
 	let far = saturate((distance(world_position, frame.camera_position.xyz) - LOCAL_LIGHT_FAR_START) / (LOCAL_LIGHT_FAR_END - LOCAL_LIGHT_FAR_START));
 	let read_at = world_position + geometric_normal * 6.0;
 	var sum = vec3<f32>(0.0);
@@ -623,7 +633,7 @@ fn local_lights(surface: Surface, world_position: vec3<f32>, n: vec3<f32>, v: ve
 			local_light(i, surface, world_position, n, v, geometric_normal, far, read_at, &sum, &voxels);
 		}
 	}
-	return sum * (1.0 - far) + surface.diffuse_weight * surface.albedo * voxels * (VOXEL_LIGHT_SURFACES * far);
+	return sum * (1.0 - far) + surface.diffuse_weight * surface.albedo * voxels * (VOXEL_LIGHT_SURFACES * select(far, 1.0, frame.counts.w == 1u));
 }
 
 // ForceField (notes/render.md "ForceField"): unlit, radiance `radiance` · c² (albedo is c²), blended

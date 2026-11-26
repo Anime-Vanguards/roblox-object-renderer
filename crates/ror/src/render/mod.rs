@@ -4727,11 +4727,13 @@ impl Renderer {
 		let visible_draws: Vec<&DrawItem> = prepared.draws.iter().filter(|draw| draw.in_frustum(&frustum)).collect();
 		let environment = &scene.environment;
 		// the lights this view reaches, nearest first; the nearest MAX_SHADOW_LIGHTS with Shadows get
-		// shadow maps, of a size for how many there are
+		// shadow maps, of a size for how many there are (none under LightingStyle Soft, where every
+		// surface takes the lights' voxels: Environment::soft_lighting)
+		let soft = environment.soft_lighting();
 		let (places, mut lights): (Vec<usize>, Vec<LightData>) = view_lights(&prepared.lights, camera.view_projection(width as f32 / height as f32), camera.eye).into_iter().unzip();
 		let casts = |light: &LightData| {
 			let position = Vec3::new(light.position[0], light.position[1], light.position[2]);
-			light.shadow[1] > 0.0 && position.distance(camera.eye) - light.color[3] - light.shadow[2] - light.right[3].max(light.up[3]) < LOCAL_LIGHT_FAR_END
+			!soft && light.shadow[1] > 0.0 && position.distance(camera.eye) - light.color[3] - light.shadow[2] - light.right[3].max(light.up[3]) < LOCAL_LIGHT_FAR_END
 		};
 		// six array layers a light: as many as the device holds (any GPU holds 42)
 		let most = MAX_SHADOW_LIGHTS.min(self.gpu.device.limits().max_texture_array_layers as usize / 6);
@@ -4760,14 +4762,17 @@ impl Renderer {
 		});
 
 		let mut frame = self.frame_uniform(Some(&camera), render_width, render_height, lights.len() as u32);
+		frame.counts[3] = u32::from(soft);
 		// which of them each cluster of the view's pixels can be lit by: the light within its Range (past
-		// a SurfaceLight's face), the far surfaces' voxels 6 studs out within their reach
+		// a SurfaceLight's face), the far surfaces' voxels 6 studs out within their reach (under Soft the
+		// near surfaces' too, a light placed with a playback's as well)
 		let forward = -Vec3::from(camera.world.matrix3.z_axis).normalize();
 		let reaches: Vec<light_clusters::Reach> = lights
 			.iter()
 			.map(|light| {
 				let face = glam::Vec2::new(light.right[3], light.up[3]).length();
-				light_clusters::Reach { centre: Vec3::new(light.position[0], light.position[1], light.position[2]), near: light.color[3] + face, far: (light.extra[0] > 0.0).then(|| light.voxel_color[3] + 6.0 + face) }
+				let voxels = light.voxel_color[3] + 6.0 + face;
+				light_clusters::Reach { centre: Vec3::new(light.position[0], light.position[1], light.position[2]), near: if soft { voxels } else { light.color[3] + face }, far: (light.extra[0] > 0.0).then_some(voxels) }
 			})
 			.collect();
 		let clusters = light_clusters::build(&reaches, camera.view(), camera.projection(width as f32 / height as f32), camera.eye, forward, camera.fov.to_radians(), render_width, render_height, LOCAL_LIGHT_FAR_END, LOCAL_LIGHT_FAR_START);
@@ -7227,6 +7232,62 @@ mod shadow_caster_tests {
 		for (roof, maps, shades) in [(Some(3.0), true, true), (None, false, false), (Some(20.0), false, true), (Some(3.0), false, false)] {
 			let share = (lit - draw(roof, maps)) / (lit - dark);
 			assert!(if shades { share > 0.9 } else { share < 0.1 }, "roof {roof:?}, shadow maps {maps}: {share} of a roof's shadow on the floor");
+		}
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+}
+
+#[cfg(test)]
+mod lighting_style_tests {
+	use super::*;
+	use crate::scene::build::{ModelBuilder, PartSpec};
+
+	/// A shadowed PointLight (Range 16, Brightness 2) 8 studs over a white floor with an opaque 6 x 0.4
+	/// x 6 plate beside and under it, no other light, seen straight down at three points of the floor:
+	/// in the plate's shadow, as far from the light on the other side, and 17.5 studs from the light,
+	/// past its Range. Under Realistic the shadow is dark and past the Range nothing is lit; under Soft
+	/// (the engine's frames, fixtures/lighting-style.luau) the floor takes the lights' voxels: no shadow
+	/// map, the shadow lit like the other side, light past the Range, Shadows or not, and a light placed
+	/// with a playback lights the floor near the camera too.
+	#[test]
+	fn soft_lighting_style_lights_surfaces_from_the_voxels() {
+		let state = std::env::temp_dir().join(format!("ror-lighting-style-test-{}", std::process::id()));
+		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let scene = |soft: bool, shadows: bool, placed: bool| {
+			let mut model = ModelBuilder::new("Style");
+			model.part(&PartSpec { name: "Floor".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, -0.5, 0.0)), size: Vec3::new(60.0, 1.0, 60.0), color: [255; 3], material: 272, ..Default::default() });
+			model.part(&PartSpec { name: "Plate".into(), cframe: Affine3A::from_translation(Vec3::new(5.0, 4.0, 0.0)), size: Vec3::new(6.0, 0.4, 6.0), color: [255; 3], material: 272, ..Default::default() });
+			let carrier = model.part(&PartSpec { name: "Lamp".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, 8.0, 0.0)), size: Vec3::splat(0.2), transparency: 1.0, cast_shadow: false, ..Default::default() });
+			model.child(carrier, rbx_dom_weak::InstanceBuilder::new("PointLight").with_property("Shadows", shadows).with_property("Range", 16.0f32).with_property("Brightness", 2.0f32));
+			let mut scene = crate::scene::extract::extract(&model.into_document());
+			for light in &mut scene.lights {
+				light.placed = placed;
+			}
+			let environment = &mut scene.environment;
+			(environment.ambient, environment.outdoor_ambient, environment.environment_diffuse_scale, environment.environment_specular_scale, environment.brightness) = (Vec3::ZERO, Vec3::ZERO, 0.0, 0.0, 0.0);
+			environment.lighting_style = if soft { crate::scene::environment::LIGHTING_STYLE_SOFT } else { 0 };
+			scene
+		};
+		// the floor straight under each camera: in the plate's shadow, the other side, past the Range
+		let view = |x: f32, z: f32| ViewRequest { width: 16, height: 16, camera: CameraSpec::LookAt { eye: [x, 40.0, z - 0.05], target: [x, 0.0, z], fov: 4.0 }, background: Background::Color([0.0, 0.0, 1.0]), bloom: false, ..Default::default() };
+		let views = [view(10.0, 0.0), view(-10.0, 0.0), view(0.0, 17.5)];
+		let draw = |soft: bool, shadows: bool, placed: bool| -> [f32; 3] {
+			let (images, _) = renderer.render(&scene(soft, shadows, placed), &views).unwrap();
+			let level = |image: &ViewImage| image.rgba.chunks(4).map(|pixel| pixel[..3].iter().map(|&channel| channel as f32).sum::<f32>() / 3.0).sum::<f32>() / (image.rgba.len() / 4) as f32;
+			[level(&images[0]), level(&images[1]), level(&images[2])]
+		};
+		let [shade, open, past] = draw(false, true, false);
+		assert!(open > 150.0 && shade < 0.15 * open, "Realistic: the plate shadows the floor ({shade} in its shadow, {open} on the other side)");
+		assert!(past < 3.0, "Realistic: nothing lit past the Range ({past})");
+		let [shade, open, past] = draw(true, true, false);
+		assert!(open > 150.0 && shade > 0.9 * open, "Soft: the plate's shadow is lit like the other side ({shade} and {open})");
+		assert!(past > 40.0, "Soft: the voxels light the floor past the Range ({past})");
+		for (shadows, placed) in [(false, false), (true, true)] {
+			let other = draw(true, shadows, placed);
+			assert!(other.iter().zip([shade, open, past]).all(|(a, b)| (a - b).abs() < 1.0), "Soft, Shadows {shadows}, placed with a playback {placed}: {other:?} as {:?}", [shade, open, past]);
 		}
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
