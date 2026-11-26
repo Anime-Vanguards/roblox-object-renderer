@@ -199,6 +199,20 @@ const FOIL_NORMAL_STRENGTH: f32 = 2.0;
 /// 82 / 87 / 89 % (material-swatches; surfaces' Glass block from 40 studs alike, 23 / 82 / 86 / 89 %).
 const GLASS_NORMAL_STRENGTH: f32 = 0.05;
 
+/// Pre-2022 Glass (its pack 7547304948 at 4 studs per tile) shows a tenth of its normal map's relief, as 2022
+/// Glass shows little of its own: the sun-lit swatch's contrast 7.5 x Studio's at 1, 1.10 / 1.00 / 0.91 at 0.12
+/// / 0.1 / 0.08 (material-swatches, the pre-2022 capture Studio), 0.98 and 1.02 at 12 and 120 studs
+/// (material-depths); in the engine a PointLight's mirror image 1.5 studs over a Glass floor within 8 of 255 on
+/// 91 % of pixels at 0.1, 74 % at 1 (materials-generation).
+const GLASS_PRE2022_NORMAL_STRENGTH: f32 = 0.1;
+
+/// Pre-2022 Foil (its pack 7546645012, a normal map on white) tilts less than its normal map says, and less the
+/// farther it is, like 2022 Foil: the sun-lit contrast matches Studio's at about 0.85 from 12 studs, 0.77 from 60
+/// (the swatch: 1.40 x at 1, 0.99 at 0.77) and 0.68 from 120 (material-depths, the pre-2022 capture Studio),
+/// and the engine's at 0.65 from 200 (materials-generation "sun": 0.91 / 1.09 x at 0.6 / 0.7); 0.73 is their
+/// geometric mean.
+const FOIL_PRE2022_NORMAL_STRENGTH: f32 = 0.73;
+
 /// Materials whose texture Studio shifts by a random offset per part (material-offsets: Marble,
 /// CrackedLava, Pavement, Pebble, Cobblestone, Salt, Glass, Fabric and Metal changed phase between
 /// two captures of the same slabs, high-passed NCC -0.13-0.06 against 0.998-1.000 for Brick,
@@ -368,7 +382,7 @@ const PACKS_PRE2022: [(u32, BuiltInTextures); 39] = [
 	(912, pre_organic("9873521380", 0.03)),                 // Sandstone
 	(1040, pre_far("7547184629", 10.0, 0.5, 115.0)),        // CorrodedMetal
 	(1056, pre("7547162198", 5.0)),                         // DiamondPlate
-	(1072, pre("7546645012", 10.0)),                        // Foil (a normal map; white colour)
+	(1072, BuiltInTextures { normal_strength: FOIL_PRE2022_NORMAL_STRENGTH, ..pre("7546645012", 10.0) }), // Foil (a normal map; white colour)
 	(1088, pre("7547288171", 5.0)),                         // Metal
 	(1280, pre_wang("7547169285", 400.0 / 39.0)),           // Grass
 	(1284, pre_organic("9873288083", 0.05)),                // LeafyGrass
@@ -381,7 +395,7 @@ const PACKS_PRE2022: [(u32, BuiltInTextures); 39] = [
 	(1392, pre("9439566986", 8.0)),                         // Salt
 	(1536, pre("7547171356", 10.0)),                        // Ice (a normal map; white colour)
 	(1552, pre_organic("9438851661", 0.03)),                // Glacier
-	(1568, pre("7547304948", 4.0)),                         // Glass
+	(1568, BuiltInTextures { normal_strength: GLASS_PRE2022_NORMAL_STRENGTH, ..pre("7547304948", 4.0) }), // Glass
 	(2304, pack_2022(2304, "14108654559", 0.0)),            // Cardboard
 	(2305, pack_2022(2305, "14108663921", 0.0)),            // Carpet
 	(2306, pack_2022(2306, "17429458668", 0.0)),            // CeramicTiles
@@ -466,5 +480,13 @@ mod tests {
 		assert_eq!(built_in_textures(800, false).and_then(|slate| slate.far).map(|far| far.scale), Some(0.25));
 		// pre-2022 DiamondPlate keeps its colour map
 		assert_eq!(built_in_textures(1056, false).map(|textures| textures.skip_color), Some(false));
+	}
+
+	/// Pre-2022 Glass and Foil show less relief than their normal maps hold, as the engine draws them
+	/// (materials-generation); DiamondPlate, which matches at 1, keeps its map's.
+	#[test]
+	fn pre2022_glass_and_foil_flatten_their_normal_maps() {
+		let strength = |material| built_in_textures(material, false).unwrap().normal_strength;
+		assert_eq!((strength(1568), strength(1072), strength(1056)), (0.1, 0.73, 1.0));
 	}
 }
