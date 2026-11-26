@@ -1712,24 +1712,29 @@ fn scene_key(scene: &Scene) -> Option<Arc<prepared::SceneKey>> {
 /// against 0.967 with GlobalShadows off or under Ambient).
 const LIGHT_GRID_OPEN: f32 = 0.986;
 
-/// The light grid's visibility as a 3D texture (R8, X fastest, then Y, then Z), sampled trilinearly.
-/// The light grid's voxels in a texture `make` gives (a render's lease's, or a new one).
-fn light_grid_texture(gpu: &Gpu, make: impl FnOnce(&wgpu::TextureDescriptor) -> wgpu::Texture, dims: [u32; 3], values: &[u8]) -> wgpu::TextureView {
+/// The light grid's voxels as a 3D texture (RG8: the sky's visibility, the sun's light where its shadow maps are not
+/// drawn or 1; X fastest, then Y, then Z), sampled trilinearly, in a texture `make` gives (a render's lease's, or a
+/// new one).
+fn light_grid_texture(gpu: &Gpu, make: impl FnOnce(&wgpu::TextureDescriptor) -> wgpu::Texture, dims: [u32; 3], values: &[u8], sun: Option<&[u8]>) -> wgpu::TextureView {
 	let size = wgpu::Extent3d { width: dims[0], height: dims[1], depth_or_array_layers: dims[2] };
+	let texels: Vec<u8> = match sun {
+		Some(sun) => values.iter().zip(sun).flat_map(|(&sky, &sun)| [sky, sun]).collect(),
+		None => values.iter().flat_map(|&sky| [sky, 255]).collect(),
+	};
 	let texture = make(&wgpu::TextureDescriptor {
 		label: Some("light grid"),
 		size,
 		mip_level_count: 1,
 		sample_count: 1,
 		dimension: wgpu::TextureDimension::D3,
-		format: wgpu::TextureFormat::R8Unorm,
+		format: wgpu::TextureFormat::Rg8Unorm,
 		usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
 		view_formats: &[],
 	});
 	gpu.queue.write_texture(
 		texture.as_image_copy(),
-		values,
-		wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(dims[0]), rows_per_image: Some(dims[1]) },
+		&texels,
+		wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(dims[0] * 2), rows_per_image: Some(dims[1]) },
 		size,
 	);
 	texture.create_view(&Default::default())
@@ -2073,7 +2078,7 @@ impl Renderer {
 				usage: wgpu::BufferUsages::STORAGE,
 			}),
 			no_light_clusters: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("no light clusters"), contents: &[0; 16], usage: wgpu::BufferUsages::STORAGE }),
-			no_light_grid: light_grid_texture(&gpu, |desc| gpu.device.create_texture(desc), [1, 1, 1], &[255]),
+			no_light_grid: light_grid_texture(&gpu, |desc| gpu.device.create_texture(desc), [1, 1, 1], &[255], None),
 			no_clouds: clouds::empty(&gpu),
 			cloud_sampler: device.create_sampler(&wgpu::SamplerDescriptor {
 				label: Some("clouds"),
@@ -3973,8 +3978,8 @@ impl Renderer {
 			let made = lease.texture(desc);
 			texture = Some(made.clone());
 			made
-		}, dims, &state.values);
-		let prepared = Arc::new(prepared::PreparedGrid { texture: texture?, view, origin: state.origin, size, bytes: state.values.len() as u64 });
+		}, dims, &state.values, state.sun.as_deref());
+		let prepared = Arc::new(prepared::PreparedGrid { texture: texture?, view, origin: state.origin, size, bytes: state.values.len() as u64 * 2 });
 		// a moving scene's grid is drawn once: its texture goes back to the pool with the lease
 		if !moving && self.preparations.keep_grid(key, prepared.clone()) {
 			lease.hand_out(&prepared.texture);

@@ -10,6 +10,8 @@
 //! the shape it draws in its mesh's box. Parts side by side add up (their union, kept per stud of the
 //! cross-section). MeshParts, FileMesh SpecialMeshes, unions and parts without CastShadow do not count.
 //! Surfaces read it trilinearly between voxel centres 6 studs along their normal (shaders/mesh.wgsl).
+//! Where the sun's shadow maps are not drawn a second channel carries the sun's light down along its
+//! direction ([`propagate_sun`]).
 
 use glam::{Mat3A, Vec3, Vec3A};
 use rayon::prelude::*;
@@ -40,6 +42,8 @@ pub struct LightGrid {
 	pub dims: [usize; 3],
 	/// Visibility 0..255, X fastest, then Y, then Z (a 3D texture's layout).
 	pub values: Vec<u8>,
+	/// The sun's light through the grid where its shadow maps are not drawn ([`grid_sun`]), as `values`.
+	pub sun: Option<Vec<u8>>,
 }
 
 /// How a part fills voxels.
@@ -387,6 +391,9 @@ fn encode(part: &Part, fill: Fill, key: &mut Vec<u8>) {
 /// build equal grids.
 pub fn key(scene: &Scene) -> Vec<u8> {
 	let mut key = Vec::new();
+	if let Some(sun) = grid_sun(scene) {
+		key.extend_from_slice(bytemuck::cast_slice(&sun.to_array()));
+	}
 	for part in &scene.parts {
 		if let Some(fill) = fill(part) {
 			encode(part, fill, &mut key);
@@ -401,7 +408,19 @@ pub fn filler_count(scene: &Scene) -> usize {
 }
 
 pub fn build(scene: &Scene) -> Option<LightGrid> {
-	build_from(scene, None, false).map(|state| LightGrid { origin: state.origin, dims: state.dims, values: state.values })
+	build_from(scene, None, false).map(|state| LightGrid { origin: state.origin, dims: state.dims, values: state.values, sun: state.sun })
+}
+
+/// The direction the grid's sun light comes from where the sun's shadow maps are not drawn
+/// (`Environment::sun_shadow_maps` off: `RorNoSunShadowMaps`, the low graphics quality levels) and the sun or
+/// moon is up; `None` otherwise.
+pub fn grid_sun(scene: &Scene) -> Option<Vec3> {
+	let environment = &scene.environment;
+	if environment.sun_shadow_maps || environment.viewport.is_some() {
+		return None;
+	}
+	let direct = super::environment::direct_light(environment.clock_time, environment.geographic_latitude, environment.environment_diffuse_scale);
+	(direct.direction.y > 0.0 && direct.strength.max_element() > 0.0).then_some(direct.direction)
 }
 
 /// What a build keeps for the next one's update: each filler's key and voxels, the voxels'
@@ -420,6 +439,8 @@ pub struct GridState {
 	pub dims: [usize; 3],
 	/// Its visibility per voxel, as [`LightGrid::values`]
 	pub values: Vec<u8>,
+	/// The sun's light per voxel, as [`LightGrid::sun`]
+	pub sun: Option<Vec<u8>>,
 	fillers: usize,
 	detail: Option<Detail>,
 }
@@ -437,13 +458,14 @@ impl GridState {
 	pub fn forget(&mut self) {
 		self.detail = None;
 		self.values = Vec::new();
+		self.sun = None;
 	}
 
 	pub fn bytes(&self) -> u64 {
 		let detail = self.detail.as_ref().map_or(0, |detail| {
 			detail.keys.len() + detail.ranges.len() * 16 + detail.filled.iter().map(|voxels| voxels.len() * 8 + 24).sum::<usize>() + (detail.transmission.len() + detail.entering.len()) * 4
 		});
-		(self.values.len() + detail) as u64
+		(self.values.len() + self.sun.as_ref().map_or(0, Vec::len) + detail) as u64
 	}
 }
 
@@ -467,15 +489,16 @@ pub fn build_from(scene: &Scene, previous: Option<GridState>, keep: bool) -> Opt
 		return None;
 	}
 	let (min, dims) = frame(&fillers);
+	let sun = grid_sun(scene);
 	if let Some(GridState { origin, dims: kept_dims, values, detail: Some(detail), .. }) = previous
 		&& origin == min
 		&& kept_dims == dims
 		&& detail.ranges.len() == ranges.len()
-		&& let Some(state) = update(&fillers, (&keys, &ranges), (min, dims), values, detail, keep)
+		&& let Some(state) = update(&fillers, (&keys, &ranges), (min, dims), values, detail, keep, sun)
 	{
 		return Some(state);
 	}
-	Some(full(&fillers, (keys, ranges), (min, dims), keep))
+	Some(full(&fillers, (keys, ranges), (min, dims), keep, sun))
 }
 
 /// The grid's minimum corner and its voxels along X, Y and Z around `fillers`.
@@ -550,7 +573,7 @@ fn partial_cover(voxel: usize, group: impl Iterator<Item = usize>, fillers: &[Fi
 	cells.iter().sum::<f32>() / (CELLS * CELLS) as f32
 }
 
-fn full(fillers: &[Filler], (keys, ranges): (Vec<u8>, Vec<std::ops::Range<usize>>), (min, dims): (Vec3, [usize; 3]), keep: bool) -> GridState {
+fn full(fillers: &[Filler], (keys, ranges): (Vec<u8>, Vec<std::ops::Range<usize>>), (min, dims): (Vec3, [usize; 3]), keep: bool, sun: Option<Vec3>) -> GridState {
 	let [nx, ny, nz] = dims;
 	// transmission per voxel, 1 open; index x + nx (z + nz y) (layer-major for the propagation)
 	let mut transmission = vec![1.0f32; nx * ny * nz];
@@ -580,8 +603,9 @@ fn full(fillers: &[Filler], (keys, ranges): (Vec<u8>, Vec<std::ops::Range<usize>
 	}
 	let mut entering = keep.then(|| vec![0.0f32; nx * ny * nz]);
 	let values = propagate(&transmission, dims, entering.as_deref_mut());
+	let sun = sun.map(|sun| propagate_sun(&transmission, dims, sun));
 	let detail = filled.zip(entering).map(|(filled, entering)| Detail { keys, ranges, filled, transmission, entering });
-	GridState { origin: min, dims, values, fillers: fillers.len(), detail }
+	GridState { origin: min, dims, values, sun, fillers: fillers.len(), detail }
 }
 
 /// The transmission [`full`] gives one voxel: the parts covering all of it in their order, then
@@ -649,7 +673,7 @@ impl Columns {
 /// and where one changed, the light below it is propagated again over the columns it can reach (a
 /// voxel's light reads the 3 x 3 columns above it: one more column on each side per layer down).
 /// `None` when the changes cover more than a layer's voxels: building anew is then as quick.
-fn update(fillers: &[Filler], (keys, ranges): (&[u8], &[std::ops::Range<usize>]), (min, dims): (Vec3, [usize; 3]), mut values: Vec<u8>, mut detail: Detail, keep: bool) -> Option<GridState> {
+fn update(fillers: &[Filler], (keys, ranges): (&[u8], &[std::ops::Range<usize>]), (min, dims): (Vec3, [usize; 3]), mut values: Vec<u8>, mut detail: Detail, keep: bool, sun: Option<Vec3>) -> Option<GridState> {
 	let [nx, ny, nz] = dims;
 	let changed: Vec<usize> = (0..fillers.len()).filter(|&number| keys[ranges[number].clone()] != detail.keys[detail.ranges[number].clone()]).collect();
 	let fresh: Vec<Vec<(u32, f32)>> = changed.par_iter().map(|&number| voxels(&fillers[number], min, dims)).collect();
@@ -696,7 +720,9 @@ fn update(fillers: &[Filler], (keys, ranges): (&[u8], &[std::ops::Range<usize>])
 		detail.keys = keys.to_vec();
 		detail.ranges = ranges.to_vec();
 	}
-	Some(GridState { origin: min, dims, values, fillers: fillers.len(), detail: keep.then_some(detail) })
+	// (the sun's light is propagated anew: its shifted reads reach further than the sky's columns)
+	let sun = sun.map(|sun| propagate_sun(&detail.transmission, dims, sun));
+	Some(GridState { origin: min, dims, values, sun, fillers: fillers.len(), detail: keep.then_some(detail) })
 }
 
 /// The light entering voxel column (x, z) of a layer from the one above it (its entering light and
@@ -764,6 +790,72 @@ fn propagate(transmission: &[f32], dims: [usize; 3], mut kept: Option<&mut [f32]
 		if let Some(kept) = kept.as_deref_mut() {
 			kept[nx * nz * y..nx * nz * (y + 1)].copy_from_slice(&entering);
 		}
+	}
+	values
+}
+
+/// The sun's light per voxel (0..255 linear, X fastest, then Y, then Z) where its shadow maps are not drawn: each
+/// layer's light is the light of the layer above passed through its voxels, spread as the sky's (the mean of the 8
+/// horizontal neighbours) and read a voxel's height up towards the sun (bilinearly, sun.xz / sun.y voxels off); 1
+/// above everything and outside the grid. The light-grid fixture's "roof" at graphics quality 1 and 6 in the engine
+/// (0.747), the sun 46.7 degrees up: a 48 x 48 roof of a block 16 studs up shades the floor softly, offset along the
+/// sun as its shadow is, 2 % of the sun at its darkest and from 5 % to 90 % over about 25 studs across its edge
+/// towards the sun; the same roof of a MeshPart casts nothing (from quality 10 up both cast the shadow maps' sharp
+/// shadow).
+fn propagate_sun(transmission: &[f32], dims: [usize; 3], sun: Vec3) -> Vec<u8> {
+	let [nx, ny, nz] = dims;
+	let mut values = vec![255u8; nx * ny * nz];
+	let up = sun.y.max(0.05);
+	let (sx, sz) = (sun.x / up, sun.z / up);
+	let mut entering = vec![1.0f32; nx * nz];
+	let mut spread = vec![1.0f32; nx * nz];
+	let inside = |x: isize, z: isize| x >= 0 && z >= 0 && x < nx as isize && z < nz as isize;
+	for y in (0..ny).rev() {
+		if y + 1 < ny {
+			let layer = &transmission[nx * nz * (y + 1)..nx * nz * (y + 2)];
+			let entering_above = &entering;
+			let passed = |x: isize, z: isize| {
+				if inside(x, z) {
+					let at = x as usize + nx * z as usize;
+					entering_above[at] * layer[at]
+				} else {
+					1.0
+				}
+			};
+			spread.par_chunks_mut(nx).enumerate().for_each(|(z, row)| {
+				let z = z as isize;
+				for (x, value) in row.iter_mut().enumerate() {
+					let x = x as isize;
+					let mut sum = 0.0;
+					for dz in -1..=1 {
+						for dx in -1..=1 {
+							if dx != 0 || dz != 0 {
+								sum += passed(x + dx, z + dz);
+							}
+						}
+					}
+					*value = sum / 8.0;
+				}
+			});
+			let spread = &spread;
+			let read = |x: isize, z: isize| if inside(x, z) { spread[x as usize + nx * z as usize] } else { 1.0 };
+			entering.par_chunks_mut(nx).enumerate().for_each(|(z, row)| {
+				for (x, value) in row.iter_mut().enumerate() {
+					let (u, w) = (x as f32 + sx, z as f32 + sz);
+					let (x0, z0) = (u.floor(), w.floor());
+					let (fu, fw) = (u - x0, w - z0);
+					let (x0, z0) = (x0 as isize, z0 as isize);
+					let near = read(x0, z0) * (1.0 - fu) + read(x0 + 1, z0) * fu;
+					let far = read(x0, z0 + 1) * (1.0 - fu) + read(x0 + 1, z0 + 1) * fu;
+					*value = near * (1.0 - fw) + far * fw;
+				}
+			});
+		}
+		values.par_chunks_mut(nx * ny).enumerate().for_each(|(z, slice)| {
+			for x in 0..nx {
+				slice[x + nx * y] = (entering[x + nx * z].clamp(0.0, 1.0) * 255.0).round() as u8;
+			}
+		});
 	}
 	values
 }
@@ -941,6 +1033,33 @@ mod tests {
 		let block_roof = build(&Scene { parts: vec![Arc::new(block(Vec3::new(-12.0, 8.0, -12.0), Vec3::new(12.0, 12.0, 12.0)))], ..Default::default() }).unwrap();
 		let open = |grid: &LightGrid| grid.values.iter().map(|&value| value as u32).sum::<u32>();
 		assert!(open(&head) > open(&block_roof), "a Head's disc leaves its box's corners open");
+	}
+
+	/// The sun's light without its shadow maps (render::lightgrid propagate_sun): a 48 x 1 x 48 roof 16 studs up, the sun
+	/// 46.7 degrees up towards -X (ClockTime 14.667 at the default latitude). The floor's voxel under the roof's side away
+	/// from the sun is in its shade, under its edge towards the sun lit (the light-grid fixture's "roof" at graphics
+	/// quality 1 in the engine), where the sky's visibility is closed on both; with the maps there is no sun channel.
+	#[test]
+	fn without_the_suns_shadow_maps_the_grid_passes_the_sun_along_its_direction() {
+		let roof = block(Vec3::new(-24.0, 16.0, -24.0), Vec3::new(24.0, 17.0, 24.0));
+		let mut scene = Scene { parts: vec![Arc::new(roof)], ..Default::default() };
+		(scene.environment.clock_time, scene.environment.geographic_latitude) = (14.667, 41.733);
+		assert!(build(&scene).unwrap().sun.is_none(), "the shadow maps draw the sun");
+		scene.environment.sun_shadow_maps = false;
+		let grid = build(&scene).unwrap();
+		let sun = |point: Vec3| {
+			let v = ((point - grid.origin) / VOXEL).floor();
+			let [nx, ny, _] = grid.dims;
+			grid.sun.as_ref().expect("a sun channel")[v.x as usize + nx * (v.y as usize + ny * v.z as usize)] as f32 / 255.0
+		};
+		assert_eq!(at(&grid, Vec3::new(14.0, 6.0, 2.0)), 0.0, "the sky closed");
+		assert!(sun(Vec3::new(14.0, 6.0, 2.0)) < 0.05, "away from the sun: {}", sun(Vec3::new(14.0, 6.0, 2.0)));
+		// the shade lies away from the sun: lit under the roof's edge towards it, shaded past its other edge
+		for (x, lit) in [(-18.0, true), (30.0, false)] {
+			let (sun, sky) = (sun(Vec3::new(x, 6.0, 2.0)), at(&grid, Vec3::new(x, 6.0, 2.0)));
+			assert!(if lit { sun > 0.5 && sun > sky } else { sun < 0.5 && sun < sky }, "at {x}: the sun {sun}, the sky {sky}");
+		}
+		assert!(sun(Vec3::new(-60.0, 6.0, 2.0)) > 0.99, "past the roof towards the sun");
 	}
 
 	#[test]

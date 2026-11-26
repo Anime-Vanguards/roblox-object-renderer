@@ -63,6 +63,16 @@ fn light_grid_visibility(position: vec3<f32>, normal: vec3<f32>) -> f32 {
 	return textureSampleLevel(light_grid, linear_sampler, uvw, 0.0).r;
 }
 
+// the sun's light through the grid where its shadow maps are not drawn (frame.light_grid.w 2; render::lightgrid
+// propagate_sun), read as the sky's visibility is; 1 without a grid
+fn light_grid_sun(position: vec3<f32>, normal: vec3<f32>) -> f32 {
+	if (frame.light_grid.w < 1.5) {
+		return 1.0;
+	}
+	let uvw = (position + normal * LIGHT_GRID_OFFSET - frame.light_grid.xyz) * frame.light_grid_scale.xyz;
+	return textureSampleLevel(light_grid, linear_sampler, uvw, 0.0).g;
+}
+
 @group(1) @binding(0) var color_map: texture_2d<f32>;
 @group(1) @binding(1) var normal_map: texture_2d<f32>;
 @group(1) @binding(2) var metalness_map: texture_2d<f32>;
@@ -990,8 +1000,8 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 	let geometric_normal = normalize(input.world_normal) * select(-1.0, 1.0, front_facing);
 	// OutdoorAmbient only as far as the light grid sees the sky (Ambient everywhere: lightgrid)
 	let sky_open = light_grid_visibility(input.world_position, geometric_normal);
-	// without the sun's shadow maps (frame.light_grid.w 2) the sun reaches as far as the grid sees the sky
-	let shadow = shadow_factor(input.world_position, geometric_normal) * cloud_sun(input.world_position) * select(1.0, sky_open, frame.light_grid.w > 1.5);
+	// without the sun's shadow maps (frame.light_grid.w 2) the sun reaches as far as the grid lets it through
+	let shadow = shadow_factor(input.world_position, geometric_normal) * cloud_sun(input.world_position) * light_grid_sun(input.world_position, geometric_normal);
 	var color = direct_light(surface, n, v, frame.sun_direction.xyz, frame.sun_color.rgb * shadow, 0.0);
 	color += local_lights(surface, input.world_position, n, v, geometric_normal, input.clip.xy);
 

@@ -507,12 +507,13 @@ mod tests {
 		let lease = reuse.lease(&gpu);
 		let dims = [5u32, 3, 4];
 		let values: Vec<u8> = (0..60u8).map(|index| index * 4 + 1).collect();
+		let sun: Vec<u8> = (0..60u8).map(|index| 255 - index * 3).collect();
 		// readable here
 		fn copyable<'a>(desc: &wgpu::TextureDescriptor<'a>) -> wgpu::TextureDescriptor<'a> {
 			wgpu::TextureDescriptor { usage: desc.usage | wgpu::TextureUsages::COPY_SRC, ..desc.clone() }
 		}
 		// twice: a kept texture written over
-		crate::render::light_grid_texture(&gpu, |desc| lease.texture(&copyable(desc)), dims, &[0; 60]);
+		crate::render::light_grid_texture(&gpu, |desc| lease.texture(&copyable(desc)), dims, &[0; 60], None);
 		drop(lease);
 		let lease = reuse.lease(&gpu);
 		let mut taken = None;
@@ -525,6 +526,7 @@ mod tests {
 			},
 			dims,
 			&values,
+			Some(&sun),
 		);
 		let texture = taken.expect("the grid's texture");
 		let row = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -539,8 +541,8 @@ mod tests {
 		readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
 		gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).expect("GPU wait");
 		let mapped = readback.slice(..).get_mapped_range();
-		// x fastest, then y, then z
-		let read: Vec<u8> = (0..dims[1] * dims[2]).flat_map(|line| mapped[(line * row) as usize..(line * row + dims[0]) as usize].to_vec()).collect();
-		assert_eq!(read, values);
+		// x fastest, then y, then z; the sky's visibility and the sun's light in each texel
+		let read: Vec<u8> = (0..dims[1] * dims[2]).flat_map(|line| mapped[(line * row) as usize..(line * row + dims[0] * 2) as usize].to_vec()).collect();
+		assert_eq!(read, values.iter().zip(&sun).flat_map(|(&sky, &sun)| [sky, sun]).collect::<Vec<u8>>());
 	}
 }
