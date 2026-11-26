@@ -1,9 +1,10 @@
-// Image-space post effects (notes/render.md "Post effects"): BlurEffect on the shown image,
-// DepthOfFieldEffect on the scene's radiance before the bloom. Their blurs run at reduced resolution
-// with few taps a pixel and are sampled back bilinearly, so no pass grows long on large renders.
+// Image-space post effects (notes/render.md "Post effects"): DepthOfFieldEffect and BlurEffect on the
+// scene's radiance before the bloom. Their blurs run at reduced resolution with few taps a pixel and are
+// sampled back bilinearly, so no pass grows long on large renders.
 
 struct PostParams {
-	// x Gaussian sigma in input texels, y direction (0 horizontal, 1 vertical), z kernel radius
+	// x Gaussian sigma in input texels, y direction (0 horizontal, 1 vertical), z kernel radius;
+	// fs_post_blur_out: x the blurred level's share, y its gain
 	blur: vec4<f32>,
 	// depth of field: x FocusDistance, y InFocusRadius, z FarIntensity, w NearIntensity
 	focus: vec4<f32>,
@@ -11,7 +12,7 @@ struct PostParams {
 	// sigma, z the middle level's sigma, w the widest level's sigma (render pixels)
 	lens: vec4<f32>,
 	// x, y, w the middle, widest and near levels' texel sizes in render pixels (x alone: the blurred
-	// image's when presenting); z the box factor of fs_post_radiance
+	// level's in fs_post_over and fs_post_blur_out); z the box factor of fs_post_radiance
 	texels: vec4<f32>,
 }
 
@@ -55,11 +56,30 @@ fn fs_post_blur(input: FullscreenOutput) -> @location(0) vec4<f32> {
 	return sum / total;
 }
 
-// The blurred image back at the output's size, bilinearly
+// BlurEffect's space: a Roblox client blurs the scene's radiance as x^0.525 (render::post::BLUR), which
+// is the scene target's √x to the power 1.05
+const BLUR_POWER: f32 = 1.05;
+
+fn blur_space(texel: vec4<f32>) -> vec4<f32> {
+	let straight = select(vec3<f32>(0.0), texel.rgb / texel.a, texel.a > 1e-5);
+	return vec4<f32>(pow(max(straight, vec3<f32>(0.0)), vec3<f32>(BLUR_POWER)) * texel.a, texel.a);
+}
+
+// The scene target (premultiplied √x) in the blur's space, premultiplied
 @fragment
-fn fs_post_present(input: FullscreenOutput) -> @location(0) vec4<f32> {
-	let uv = input.clip.xy / (vec2<f32>(textureDimensions(source)) * post.texels.x);
-	return textureSampleLevel(source, post_sampler, uv, 0.0);
+fn fs_post_blur_in(input: FullscreenOutput) -> @location(0) vec4<f32> {
+	return blur_space(textureLoad(source, vec2<i32>(input.clip.xy), 0));
+}
+
+// The blurred level (`level_mid`, its texels texels.x render pixels, read back bilinearly) laid over the
+// sharp scene by its share (post.blur.x) and scaled by its gain (post.blur.y), back to premultiplied √x
+@fragment
+fn fs_post_blur_out(input: FullscreenOutput) -> @location(0) vec4<f32> {
+	let sharp = blur_space(textureLoad(source, vec2<i32>(input.clip.xy), 0));
+	let level = textureSampleLevel(level_mid, post_sampler, input.clip.xy / (vec2<f32>(textureDimensions(level_mid)) * post.texels.x), 0.0);
+	let mixed = mix(sharp, vec4<f32>(level.rgb * post.blur.y, level.a), post.blur.x);
+	let straight = select(vec3<f32>(0.0), mixed.rgb / mixed.a, mixed.a > 1e-5);
+	return vec4<f32>(pow(max(straight, vec3<f32>(0.0)), vec3<f32>(1.0 / BLUR_POWER)) * mixed.a, mixed.a);
 }
 
 // Depth of field (post-depth: checkers 5-160 studs away under ten settings; the blur is of the

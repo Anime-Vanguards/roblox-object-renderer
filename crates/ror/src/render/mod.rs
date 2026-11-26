@@ -39,6 +39,8 @@ mod cutout_depth_tests;
 #[cfg(test)]
 mod sun_shadow_tests;
 #[cfg(test)]
+mod post_tests;
+#[cfg(test)]
 mod tone_tests;
 pub mod environment;
 pub mod geometry;
@@ -4984,10 +4986,10 @@ impl Renderer {
 
 		let frame_buffer = lease.buffer("frame", wgpu::BufferUsages::UNIFORM, bytemuck::bytes_of(&frame));
 		let shadow_view = sun_atlas.as_ref().map(|(atlas, _)| atlas).unwrap_or(&self.defaults.empty_moments);
-		// post effects: DepthOfField on the scene's radiance before the bloom, Blur on the shown image,
+		// post effects: DepthOfField and Blur on the scene's radiance (the bloom reads it between the two),
 		// SunRays added to the radiance (over the sky only: not on flat or transparent backgrounds)
 		let depth_of_field = post::depth_of_field(&environment.effects);
-		let blur_sigma = post::blur_sigma(&environment.effects, height);
+		let blur = post::blur(&environment.effects, height).map(|blur| post::Blur { sigma: blur.sigma * render_height as f32 / height as f32, ..blur });
 		let sun_rays = post::sun_rays(&environment.effects).filter(|_| request.background == Background::Sky).and_then(|rays| {
 			let view_proj = camera.view_projection(width as f32 / height as f32);
 			let sun = environment::sun_direction(environment.clock_time, environment.geographic_latitude);
@@ -5270,6 +5272,17 @@ impl Renderer {
 			}
 			_ => lit_view.clone(),
 		};
+		// BlurEffect after the depth of field (both blur the radiance); the bloom reads the scene before the
+		// blur and its glow stays sharp (post-blur size8-bloom: 95.9 % within 2 of 255, 91.6 with the bloom
+		// of the blurred scene)
+		let bloom_source = scene_view.clone();
+		let scene_view = match blur {
+			Some(blur) => {
+				let index = dof_passes.blur(lease, &scene_view, (render_width, render_height), blur, &self.defaults.no_bloom, &self.defaults.empty_shadow);
+				dof_passes.view(index).clone()
+			}
+			None => scene_view,
+		};
 		let rays_view = match (&sun_rays, &scene_depth) {
 			(Some(uniform), Some(scene_depth)) => {
 				let index = dof_passes.sun_rays(lease, uniform, scene_depth, (width, height), &self.defaults.no_bloom);
@@ -5359,7 +5372,7 @@ impl Renderer {
 				}
 				sums.push(bloom_views.len() - 3);
 			}
-			bloom_steps.push((step(&scene_view, None, uniform(false, [0.0; 4])), &self.pipelines.bloom_extract, 0));
+			bloom_steps.push((step(&bloom_source, None, uniform(false, [0.0; 4])), &self.pipelines.bloom_extract, 0));
 			let mut previous = 0;
 			for (index, &(level, _)) in levels.iter().enumerate() {
 				bloom_steps.push((step(&bloom_views[previous], None, uniform(index == 0, [0.0, 0.0, 0.0, bloom.taps[index]])), &self.pipelines.bloom_down, level));
@@ -5722,7 +5735,7 @@ impl Renderer {
 			pass.set_bind_group(0, &group, &[]);
 			pass.draw(0..3, 0..1);
 		}
-		dof_passes.encode(&mut encoder, None, &profile);
+		dof_passes.encode(&mut encoder, &profile);
 		for (group, pipeline, target) in &bloom_steps {
 			let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
 				label: Some("bloom"),
@@ -5740,24 +5753,11 @@ impl Renderer {
 			pass.set_bind_group(0, group, &[]);
 			pass.draw(0..3, 0..1);
 		}
-		// with a BlurEffect the resolve draws into an image of its own that the blur reads
-		let shown = blur_sigma.map(|_| {
-			lease.scratch_view(&wgpu::TextureDescriptor {
-				label: Some("shown"),
-				size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-				mip_level_count: 1,
-				sample_count: 1,
-				dimension: wgpu::TextureDimension::D2,
-				format: OUTPUT_FORMAT,
-				usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-				view_formats: &[],
-			})
-		});
 		{
 			let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
 				label: Some("resolve"),
 				color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-					view: shown.as_ref().unwrap_or(&output_view),
+					view: &output_view,
 					depth_slice: None,
 					resolve_target: None,
 					ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
@@ -5769,11 +5769,6 @@ impl Renderer {
 			pass.set_pipeline(&self.pipelines.resolve);
 			pass.set_bind_group(0, &resolve_group, &[]);
 			pass.draw(0..3, 0..1);
-		}
-		if let (Some(sigma), Some(shown)) = (blur_sigma, &shown) {
-			let mut blur_passes = post::PostPasses::new(&self.post);
-			blur_passes.blur(lease, shown, (width, height), sigma, &self.defaults.no_bloom, &self.defaults.empty_shadow);
-			blur_passes.encode(&mut encoder, Some(&output_view), &profile);
 		}
 		// ViewRequest::texture: the image stays on the GPU, without what is composited after a readback
 		let keep = request.texture;

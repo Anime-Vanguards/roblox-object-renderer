@@ -1,12 +1,12 @@
 //! Image-space post effects (shaders/post.wgsl, sun_rays.wgsl; notes/render.md "Post effects"):
-//! BlurEffect blurs the shown image, DepthOfFieldEffect the scene's radiance before the bloom,
-//! SunRaysEffect adds to it from a quarter of the resolution. Every blur runs on a level boxed down
+//! DepthOfFieldEffect and BlurEffect blur the scene's radiance before the bloom, SunRaysEffect adds
+//! to it from a quarter of the resolution. Every blur runs on a level boxed down
 //! until its sigma is at most [`MAX_SIGMA`] texels and is read back bilinearly, so no pass takes many
 //! taps a pixel however large the render (long passes can reset the driver).
 
 use bytemuck::{Pod, Zeroable};
 
-use super::pipelines::{HDR_FORMAT, OUTPUT_FORMAT};
+use super::pipelines::HDR_FORMAT;
 use super::reuse::Lease;
 use crate::scene::environment::PostEffect;
 
@@ -16,9 +16,40 @@ const MAX_SIGMA: f32 = 4.0;
 /// Studio's capture viewport height, where the effects' sizes were measured.
 const REFERENCE_HEIGHT: f32 = 1116.0;
 
-/// BlurEffect: a Gaussian of the shown values (post-blur: 0.5-1.8 of 255 mean error over the line,
-/// square and checker, 3-7 in radiance) whose sigma follows Size: (Size, sigma px at 1116 px).
-const BLUR_SIGMA: [(f32, f32); 8] = [(0.0, 0.0), (2.0, 0.45), (4.0, 0.64), (8.0, 2.45), (16.0, 5.98), (24.0, 8.45), (40.0, 13.73), (56.0, 19.38)];
+/// BlurEffect (a Roblox client, fixtures/post-effects.luau "blur": white lines 1-8 px wide, squares
+/// 1-32 px and 6-stud squares of grays 50-255, Sizes 0-64 at 558, 1116 and 1674 px tall) blurs the
+/// scene's radiance before the bloom and the tone curve, as x^0.525 (BLUR_POWER in post.wgsl: gray
+/// squares' edges fall to 0.32 of a gray 50 square's shown value and 0.55 of a white one's halfway,
+/// where a blur of shown values gives 0.5 for both; a power of the shown value misses by 1.3-3.8 of
+/// 255, of x^0.525 by 0.3-0.7): thin lines and dots keep 0.4-0.6 of their shown light at Size 56,
+/// bright squares gain 8 %. Per Size: (Size, sigma px at 1116 px, the blurred image's share, its
+/// gain). Under Size 12 the client lays a blur of about 4.5 px over the sharp image by a share that
+/// grows with Size (a sharp core in a halo; one Gaussian misses by 0.4-0.9 of 255 more); from 12 one
+/// Gaussian; past 48 a little of its light is lost; Size 64 draws as 56. The sigmas scale with the
+/// view's height (Size 24: 11.3 / 12.3 / 11.3 px a 1116 px height at 1116 / 558 / 1674 px), but
+/// stop near BLUR_MAX_SIGMA px (Size 48 and 56 at 1674 px: 30.4 and 32.6).
+const BLUR: [(f32, f32, f32, f32); 19] = [
+	(0.0, 4.5, 0.0, 1.0),
+	(1.0, 4.5, 0.074, 1.0),
+	(2.0, 4.57, 0.145, 1.0),
+	(3.0, 4.55, 0.218, 1.0),
+	(4.0, 4.53, 0.298, 1.0),
+	(5.0, 4.41, 0.387, 1.0),
+	(6.0, 4.42, 0.482, 1.0),
+	(7.0, 4.29, 0.604, 1.0),
+	(8.0, 4.31, 0.686, 1.0),
+	(10.0, 5.24, 0.861, 1.0),
+	(12.0, 6.16, 1.0, 1.0),
+	(14.0, 7.01, 1.0, 1.0),
+	(16.0, 7.93, 1.0, 1.0),
+	(20.0, 9.72, 1.0, 1.0),
+	(24.0, 11.28, 1.0, 1.0),
+	(32.0, 15.29, 1.0, 0.997),
+	(40.0, 18.53, 1.0, 0.994),
+	(48.0, 22.73, 1.0, 0.979),
+	(56.0, 25.6, 1.0, 0.970),
+];
+const BLUR_MAX_SIGMA: f32 = 33.0;
 
 /// DepthOfFieldEffect's largest blur and its middle level (sigma px at 1116 px; post-depth: the far
 /// checkers stop growing at 6.1-6.6 px).
@@ -88,7 +119,9 @@ pub struct PostPipelines {
 	dof: wgpu::RenderPipeline,
 	/// a premultiplied layer (the level binding) over the source
 	over: wgpu::RenderPipeline,
-	present: wgpu::RenderPipeline,
+	/// BlurEffect: the scene into the blur's space, and back with the blurred level laid over it
+	blur_in: wgpu::RenderPipeline,
+	blur_out: wgpu::RenderPipeline,
 	sun_rays: wgpu::RenderPipeline,
 	sampler: wgpu::Sampler,
 }
@@ -159,7 +192,8 @@ impl PostPipelines {
 			radiance: pipeline("fs_post_radiance", HDR_FORMAT),
 			dof: pipeline("fs_post_dof", HDR_FORMAT),
 			over: pipeline("fs_post_over", HDR_FORMAT),
-			present: pipeline("fs_post_present", OUTPUT_FORMAT),
+			blur_in: pipeline("fs_post_blur_in", HDR_FORMAT),
+			blur_out: pipeline("fs_post_blur_out", HDR_FORMAT),
 			sun_rays: pipeline_in(&rays_module, "fs_sun_rays", HDR_FORMAT),
 			layout,
 			sampler,
@@ -232,19 +266,30 @@ pub fn sun_rays_uniform((intensity, spread): (f32, f32), sun: glam::Vec3, view_p
 	})
 }
 
-/// The BlurEffect's sigma in pixels at `height` (the largest Size of the scene's BlurEffects: two of
-/// Size 8 blur as one, post-blur "two"), None without one.
-pub fn blur_sigma(effects: &[PostEffect], height: u32) -> Option<f32> {
+/// What a BlurEffect does to a view ([`BLUR`]): a Gaussian of `sigma` view pixels, laid over the sharp
+/// image by `share` and scaled by `gain`, in the blur's space.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Blur {
+	pub sigma: f32,
+	pub share: f32,
+	pub gain: f32,
+}
+
+/// The scene's BlurEffect for a view `height` pixels tall (the largest Size of the scene's
+/// BlurEffects: two of Size 8 blur as one, post-blur "two"), None without one.
+pub fn blur(effects: &[PostEffect], height: u32) -> Option<Blur> {
 	let size = effects.iter().filter_map(|effect| if let PostEffect::Blur { size } = effect { Some(*size) } else { None }).reduce(f32::max)?;
-	let mut sigma = BLUR_SIGMA[BLUR_SIGMA.len() - 1].1 + (size - BLUR_SIGMA[BLUR_SIGMA.len() - 1].0) * 0.353;
-	for pair in BLUR_SIGMA.windows(2) {
-		let ((s0, g0), (s1, g1)) = (pair[0], pair[1]);
+	let size = size.clamp(0.0, BLUR[BLUR.len() - 1].0);
+	let (_, mut sigma, mut share, mut gain) = BLUR[BLUR.len() - 1];
+	for pair in BLUR.windows(2) {
+		let ((s0, sigma0, share0, gain0), (s1, sigma1, share1, gain1)) = (pair[0], pair[1]);
 		if size <= s1 {
-			sigma = g0 + (g1 - g0) * ((size.max(0.0) - s0) / (s1 - s0));
+			let t = (size - s0) / (s1 - s0);
+			(sigma, share, gain) = (sigma0 + (sigma1 - sigma0) * t, share0 + (share1 - share0) * t, gain0 + (gain1 - gain0) * t);
 			break;
 		}
 	}
-	(sigma > 0.05).then_some(sigma * height as f32 / REFERENCE_HEIGHT)
+	(share > 0.0).then(|| Blur { sigma: (sigma * height as f32 / REFERENCE_HEIGHT).min(BLUR_MAX_SIGMA), share, gain })
 }
 
 /// The steps what blends takes its far blur in (render::mod: one layer each that a frame uses).
@@ -350,12 +395,17 @@ impl<'a> PostPasses<'a> {
 		(vertical, texels)
 	}
 
-	/// BlurEffect: `shown` (the resolved image, `size`) blurred by `sigma` px into the frame's output
-	/// ([`OUTPUT`] at encoding).
-	pub fn blur(&mut self, lease: &Lease, shown: &wgpu::TextureView, size: (u32, u32), sigma: f32, filler: &wgpu::TextureView, depth: &wgpu::TextureView) {
-		let (blurred, texels) = self.gaussian(lease, shown, size, sigma, filler, depth, "blur level");
-		let input = self.views[blurred].clone();
-		self.pass(lease, &self.pipelines.present, &input, PostUniform { texels: [texels, 0.0, 0.0, 0.0], ..Default::default() }, filler, filler, depth, OUTPUT);
+	/// BlurEffect on `color` (the scene's premultiplied √x, `size` render pixels; `blur` with its sigma in
+	/// render pixels), into a new target of the same kind; returns its index.
+	pub fn blur(&mut self, lease: &Lease, color: &wgpu::TextureView, size: (u32, u32), blur: Blur, filler: &wgpu::TextureView, depth: &wgpu::TextureView) -> usize {
+		let space = self.target(lease, "blur space", size, HDR_FORMAT);
+		self.pass(lease, &self.pipelines.blur_in, color, PostUniform::default(), filler, filler, depth, space);
+		let input = self.views[space].clone();
+		let (blurred, texels) = self.gaussian(lease, &input, size, blur.sigma, filler, depth, "blur level");
+		let level = self.views[blurred].clone();
+		let output = self.target(lease, "blurred", size, HDR_FORMAT);
+		self.pass(lease, &self.pipelines.blur_out, color, PostUniform { blur: [blur.share, blur.gain, 0.0, 0.0], texels: [texels, 0.0, 0.0, 0.0], ..Default::default() }, &level, filler, depth, output);
+		output
 	}
 
 	/// The field alone: the scene target `color` (premultiplied √x, `size` render pixels) blurred by its
@@ -439,9 +489,9 @@ impl<'a> PostPasses<'a> {
 	}
 
 	/// Encodes every pass in order.
-	pub fn encode(&self, encoder: &mut wgpu::CommandEncoder, output: Option<&wgpu::TextureView>, profile: &super::profile::Profile) {
+	pub fn encode(&self, encoder: &mut wgpu::CommandEncoder, profile: &super::profile::Profile) {
 		for (group, pipeline, target) in &self.passes {
-			let view = if *target == usize::MAX { output.expect("post output") } else { &self.views[*target] };
+			let view = &self.views[*target];
 			let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
 				label: Some("post"),
 				color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -460,9 +510,6 @@ impl<'a> PostPasses<'a> {
 		}
 	}
 }
-
-/// The target index meaning "the frame's output" in [`PostPasses::blur`].
-pub const OUTPUT: usize = usize::MAX;
 
 #[cfg(test)]
 mod tests {
