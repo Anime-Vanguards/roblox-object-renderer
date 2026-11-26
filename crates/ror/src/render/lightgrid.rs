@@ -796,68 +796,111 @@ fn propagate(transmission: &[f32], dims: [usize; 3], mut kept: Option<&mut [f32]
 	values
 }
 
-/// The sun's light per voxel (0..255 linear, X fastest, then Y, then Z): each
-/// layer's light is the light of the layer above passed through its voxels, spread as the sky's (the mean of the 8
-/// horizontal neighbours) and read a voxel's height up towards the sun (bilinearly, sun.xz / sun.y voxels off); 1
-/// above everything and outside the grid. The light-grid fixture's "roof" at graphics quality 1 and 6 in the engine
-/// (0.747), the sun 46.7 degrees up: a 48 x 48 roof of a block 16 studs up shades the floor softly, offset along the
-/// sun as its shadow is, 2 % of the sun at its darkest and from 5 % to 90 % over about 25 studs across its edge
-/// towards the sun; the same roof of a MeshPart casts nothing (from quality 10 up both cast the shadow maps' sharp
-/// shadow).
+/// How much of the sun's light a voxel takes from its 8 neighbours across the sweep each step (the rest its own
+/// goes straight on): [`propagate_sun`]'s fit.
+const SUN_SPREAD: f32 = 0.5;
+
+/// The sun's light per voxel (0..255 linear, X fastest, then Y, then Z): swept through the grid along the sun's
+/// largest component (down the layers for a sun higher than 45 degrees, across them along X or Z for a lower one).
+/// Each slice's light is read from the slice before it towards the sun, the sun's offset over one step away
+/// (bilinearly: the sun's other components over its largest), as that slice passed it on: 1 - SUN_SPREAD of each
+/// voxel's own light and SUN_SPREAD of its 8 neighbours' across the sweep (their light averaged by how much each lets
+/// through, so an opaque neighbour, a floor beside the air above it, neither darkens nor lights it), through the
+/// voxel. 1 before everything and outside the grid. Surfaces read it 2 studs off along their normal
+/// (shaders/mesh.wgsl `light_grid_sun`).
+///
+/// Fitted on the engine's (0.747, graphics quality 5, fixtures/quality-levels.luau, the floor's lit share along each
+/// caster's bearing, rms in the sun's share): `voxsun` under a sun 26 degrees up (blocks of 4, 8 and 16 studs, slabs
+/// 8 and 24 up, a 4 x 12 x 4 column: 0.037, the old sweep down the layers with every voxel's light spread over its
+/// neighbours: 0.120) and 70 degrees up (0.046 against 0.035), and `roof`'s 48 x 1 x 48 block 16 studs up under the
+/// 26-degree sun (0.066 against 0.268: 0.33 of the sun at the shadow's darkest, soft over some 45 studs each way,
+/// where the old sweep went black over 25). A low sun's sweep across the layers lets a caster shade its horizontal
+/// neighbours (the 8-stud block's floor 4 studs out: 0.40 of the sun in the engine, unshaded by the old sweep) and
+/// spreads a high caster's shadow over more steps (the 24-stud slab's: 0.82 at its darkest); the open floor takes the
+/// whole sun, as the engine's does (the same under the voxels as under the shadow maps). The light-grid fixture's
+/// "roof" (P11) under a sun 46.7 degrees up shades the floor softly, offset along the sun as its shadow is, a MeshPart
+/// roof not at all.
 fn propagate_sun(transmission: &[f32], dims: [usize; 3], sun: Vec3) -> Vec<u8> {
 	let [nx, ny, nz] = dims;
 	let mut values = vec![255u8; nx * ny * nz];
-	let up = sun.y.max(0.05);
-	let (sx, sz) = (sun.x / up, sun.z / up);
-	let mut entering = vec![1.0f32; nx * nz];
-	let mut spread = vec![1.0f32; nx * nz];
-	let inside = |x: isize, z: isize| x >= 0 && z >= 0 && x < nx as isize && z < nz as isize;
-	for y in (0..ny).rev() {
-		if y + 1 < ny {
-			let layer = &transmission[nx * nz * (y + 1)..nx * nz * (y + 2)];
-			let entering_above = &entering;
-			let passed = |x: isize, z: isize| {
-				if inside(x, z) {
-					let at = x as usize + nx * z as usize;
-					entering_above[at] * layer[at]
-				} else {
-					1.0
+	// the sweep's axis: the sun's largest component, down the layers on a tie
+	let axis = if sun.x.abs() > sun.y.abs() && sun.x.abs() >= sun.z.abs() {
+		0
+	} else if sun.z.abs() > sun.y.abs() && sun.z.abs() > sun.x.abs() {
+		2
+	} else {
+		1
+	};
+	let (across, along) = match axis {
+		0 => (1, 2),
+		1 => (0, 2),
+		_ => (0, 1),
+	};
+	let (n, nu, nv) = (dims[axis], dims[across], dims[along]);
+	let step = sun[axis].abs().max(0.05);
+	let (su, sv) = (sun[across] / step, sun[along] / step);
+	// a slice's voxel (u, v) at k: its index in the transmissions (X fastest, then Z, then Y) and in the values
+	let at = move |k: usize, u: usize, v: usize| {
+		let mut p = [0usize; 3];
+		(p[axis], p[across], p[along]) = (k, u, v);
+		(p[0] + nx * (p[2] + nz * p[1]), p[0] + nx * (p[1] + ny * p[2]))
+	};
+	// from the slice nearest the sun
+	let order: Vec<usize> = if sun[axis] > 0.0 { (0..n).rev().collect() } else { (0..n).collect() };
+	let mut entering = vec![1.0f32; nu * nv];
+	let mut through = vec![1.0f32; nu * nv];
+	let mut spread = vec![1.0f32; nu * nv];
+	let inside = |u: isize, v: isize| u >= 0 && v >= 0 && u < nu as isize && v < nv as isize;
+	let mut previous = None;
+	for &k in &order {
+		if let Some(previous) = previous {
+			through.par_chunks_mut(nu).enumerate().for_each(|(v, row)| {
+				for (u, value) in row.iter_mut().enumerate() {
+					*value = transmission[at(previous, u, v).0];
 				}
-			};
-			spread.par_chunks_mut(nx).enumerate().for_each(|(z, row)| {
-				let z = z as isize;
-				for (x, value) in row.iter_mut().enumerate() {
-					let x = x as isize;
-					let mut sum = 0.0;
-					for dz in -1..=1 {
-						for dx in -1..=1 {
-							if dx != 0 || dz != 0 {
-								sum += passed(x + dx, z + dz);
+			});
+			let (light, through) = (&entering, &through);
+			// a voxel of the slice: its light and transmission; outside the grid lit and open
+			let voxel = |u: isize, v: isize| if inside(u, v) { (light[u as usize + nu * v as usize], through[u as usize + nu * v as usize]) } else { (1.0, 1.0) };
+			spread.par_chunks_mut(nu).enumerate().for_each(|(v, row)| {
+				let v = v as isize;
+				for (u, value) in row.iter_mut().enumerate() {
+					let u = u as isize;
+					let (mut passed, mut open) = (0.0, 0.0);
+					for dv in -1..=1 {
+						for du in -1..=1 {
+							if du != 0 || dv != 0 {
+								let (light, through) = voxel(u + du, v + dv);
+								passed += light * through;
+								open += through;
 							}
 						}
 					}
-					*value = sum / 8.0;
+					let (light, through) = voxel(u, v);
+					let around = if open > 1e-6 { passed / open } else { 0.0 };
+					*value = ((1.0 - SUN_SPREAD) * light + SUN_SPREAD * around) * through;
 				}
 			});
 			let spread = &spread;
-			let read = |x: isize, z: isize| if inside(x, z) { spread[x as usize + nx * z as usize] } else { 1.0 };
-			entering.par_chunks_mut(nx).enumerate().for_each(|(z, row)| {
-				for (x, value) in row.iter_mut().enumerate() {
-					let (u, w) = (x as f32 + sx, z as f32 + sz);
-					let (x0, z0) = (u.floor(), w.floor());
-					let (fu, fw) = (u - x0, w - z0);
-					let (x0, z0) = (x0 as isize, z0 as isize);
-					let near = read(x0, z0) * (1.0 - fu) + read(x0 + 1, z0) * fu;
-					let far = read(x0, z0 + 1) * (1.0 - fu) + read(x0 + 1, z0 + 1) * fu;
+			let read = |u: isize, v: isize| if inside(u, v) { spread[u as usize + nu * v as usize] } else { 1.0 };
+			entering.par_chunks_mut(nu).enumerate().for_each(|(v, row)| {
+				for (u, value) in row.iter_mut().enumerate() {
+					let (x, w) = (u as f32 + su, v as f32 + sv);
+					let (x0, w0) = (x.floor(), w.floor());
+					let (fx, fw) = (x - x0, w - w0);
+					let (x0, w0) = (x0 as isize, w0 as isize);
+					let near = read(x0, w0) * (1.0 - fx) + read(x0 + 1, w0) * fx;
+					let far = read(x0, w0 + 1) * (1.0 - fx) + read(x0 + 1, w0 + 1) * fx;
 					*value = near * (1.0 - fw) + far * fw;
 				}
 			});
 		}
-		values.par_chunks_mut(nx * ny).enumerate().for_each(|(z, slice)| {
-			for x in 0..nx {
-				slice[x + nx * y] = (entering[x + nx * z].clamp(0.0, 1.0) * 255.0).round() as u8;
+		for v in 0..nv {
+			for u in 0..nu {
+				values[at(k, u, v).1] = (entering[u + nu * v].clamp(0.0, 1.0) * 255.0).round() as u8;
 			}
-		});
+		}
+		previous = Some(k);
 	}
 	values
 }
@@ -1064,6 +1107,35 @@ mod tests {
 			assert!(if lit { sun > 0.5 && sun > sky } else { sun < 0.5 && sun < sky }, "at {x}: the sun {sun}, the sky {sky}");
 		}
 		assert!(sun(Vec3::new(-60.0, 6.0, 2.0)) > 0.99, "past the roof towards the sun");
+	}
+
+	/// A low sun sweeps across the layers (render::lightgrid propagate_sun): the engine's 8-stud block under a sun 26
+	/// degrees up (`voxsun` at graphics quality 5) shades the floor beside it, 0.40 of the sun 4 studs past its far
+	/// side, where a sweep down the layers read the light the block's layers never shade; a 24-stud-high slab's
+	/// shadow is spread out (0.82 of the sun at its darkest in the engine).
+	#[test]
+	fn a_low_sun_crosses_the_layers() {
+		let floor = block(Vec3::new(-60.0, -1.0, -60.0), Vec3::new(60.0, 0.0, 60.0));
+		let cube = block(Vec3::new(-4.0, 0.0, -4.0), Vec3::new(4.0, 8.0, 4.0));
+		let mut scene = Scene { parts: vec![Arc::new(floor), Arc::new(cube)], ..Default::default() };
+		(scene.environment.clock_time, scene.environment.geographic_latitude) = (16.2, 38.0);
+		let sun = grid_sun(&scene).unwrap();
+		assert!(sun.x.abs() > sun.y, "the sun is low: {sun}");
+		let grid = build(&scene).unwrap();
+		let at = |grid: &LightGrid, point: Vec3| {
+			let v = ((point - grid.origin) / VOXEL).floor();
+			let [nx, ny, _] = grid.dims;
+			grid.sun.as_ref().unwrap()[v.x as usize + nx * (v.y as usize + ny * v.z as usize)] as f32 / 255.0
+		};
+		// the voxel beside the block's far side from the sun, at its middle's height
+		let beside = at(&grid, Vec3::new(6.0, 6.0, -2.0));
+		assert!(beside < 0.75, "the block's own layers shade their neighbour (a sweep down the layers: 1): {beside}");
+		assert!(at(&grid, Vec3::new(-6.0, 6.0, 2.0)) > 0.95, "towards the sun, open");
+		let slab = block(Vec3::new(-8.0, 24.0, -8.0), Vec3::new(8.0, 25.0, 8.0));
+		let scene = Scene { parts: vec![Arc::new(block(Vec3::new(-60.0, -1.0, -60.0), Vec3::new(60.0, 0.0, 60.0))), Arc::new(slab)], environment: scene.environment.clone(), ..Default::default() };
+		let grid = build(&scene).unwrap();
+		let darkest = (0..40).map(|step| at(&grid, Vec3::new(step as f32 * 2.0, 2.0, -2.0 - step as f32 * 0.6))).fold(1.0f32, f32::min);
+		assert!(darkest > 0.3 && darkest < 0.95, "a high slab's shadow spread out: {darkest}");
 	}
 
 	#[test]
