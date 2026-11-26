@@ -117,15 +117,16 @@ fn particle_light(input: ParticleOutput, texel: vec4<f32>) -> ParticleLight {
 	}
 	let weight = sqrt(input.params.y);
 	// capped per channel like transparent Neon once the texture's alpha is in, before Transparency: √x
-	// times the texel's alpha at most √7.84 (particle-bright: faint red squares stop brightening at
-	// Brightness 4, x = 7.74, alpha and additive alike; particle-sheets: an effect's soft blue sheets at
-	// Brightness 10-25 keep their hue and read 0.68-0.77 of Studio's light under a plain cap, 0.90-1.02
-	// with this one, 46-73 % of their pixels within 8 against 9-35 %); a legacy effect's cap is beyond
-	// any (its emitter's `extra.x`). The lit share alone passes it: particles near a bright light
-	// (light-particle-voxels b10: LightInfluence 1 at 0.96 of 19.8 shows 253 at -2 EV where the cap
-	// gave 223), while the mix stays capped (vfx-lit: orange at Brightness 15, LightInfluence 0.25-0.75
-	// in daylight)
-	let cap = input.extra.x / max(texel.a * texel.a, 1e-4);
+	// times the texel's alpha at most √7.84 once exposed, as surfaces are (particle-bright: faint red
+	// squares stop brightening at Brightness 4, x = 7.74, alpha and additive alike; in a Roblox client
+	// at -2 EV they brighten to Brightness 15-25 and at +2 EV stop at Brightness 1, each EV's plateau
+	// as this cap gives it; particle-sheets: an effect's soft blue sheets at Brightness 10-25 keep their
+	// hue and read 0.68-0.77 of Studio's light under a plain cap, 0.90-1.02 with this one, 46-73 % of
+	// their pixels within 8 against 9-35 %); a legacy effect's cap is beyond any (its emitter's
+	// `extra.x`). The lit share alone passes it: particles near a bright light (light-particle-voxels
+	// b10: LightInfluence 1 at 0.96 of 19.8 shows 253 at -2 EV where the cap gave 223), while the mix
+	// stays capped (vfx-lit: orange at Brightness 15, LightInfluence 0.25-0.75 in daylight)
+	let cap = input.extra.x / frame.environment.z / max(texel.a * texel.a, 1e-4);
 	let lit_share = albedo * lit * weight;
 	let radiance = max(min(albedo * input.params.x * (1.0 - weight) + lit_share, vec3<f32>(cap)), lit_share);
 	return ParticleLight(radiance, alpha, opacity);
@@ -152,13 +153,16 @@ fn fs_particle(input: ParticleOutput) -> @location(0) vec4<f32> {
 }
 
 // What one particle adds lands on Studio's target in whole steps: its scene target keeps √(x / 7.74)
-// in 10 bits (particle-quantize: stacks of 50 faint additive squares add their light in multiples of
-// √7.74 / 1023, each particle's rounded to the nearest, at Brightness 0.25-4 alike; the 7.74 is the
-// cap particle-bright found). ror's target is float: the particle's own light is rounded so.
+// of the exposed x in 10 bits (particle-quantize: stacks of 50 faint additive squares add their light in
+// multiples of √7.74 / 1023, each particle's rounded to the nearest, at Brightness 0.25-4 alike; the
+// 7.74 is the cap particle-bright found; in a Roblox client the same stacks at -2, +1 and +2 EV step as
+// finely as the exposed light, √(7.74 / exposure) / 1023 of √x). ror's target is float and unexposed:
+// the particle's own light is rounded so.
 const TARGET_STEP: f32 = 2.7821 / 1023.0;
 
 fn target_steps(light: vec3<f32>) -> vec3<f32> {
-	return round(light / TARGET_STEP) * TARGET_STEP;
+	let step = TARGET_STEP / sqrt(frame.environment.z);
+	return round(light / step) * step;
 }
 
 // Legacy effects (notes/render.md "Legacy effects") blend in linear light: premultiplied radiance over

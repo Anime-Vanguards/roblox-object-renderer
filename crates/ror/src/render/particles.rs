@@ -1263,6 +1263,86 @@ mod tests {
 		assert!((position.x - frames).abs() < 1e-3, "{position} against {frames}");
 	}
 
+	/// Particles cap their light once exposed, as surfaces do, and land in steps of the exposed light:
+	/// particle-bright's faint red squares (Transparency 0.9, Brightness 1 / 4 / 15 / 25, over a black
+	/// wall in the dark) and particle-quantize's 50 stacked gray ones of opacity 1.01 / 255 (Color 0.36),
+	/// each experiment as captured, against a Roblox client's levels at -2, 0 and +2 EV (0.747;
+	/// notes/render.md "Particles")
+	#[test]
+	fn particles_cap_and_step_their_light_once_exposed() {
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use glam::Affine3A;
+		use rbx_dom_weak::InstanceBuilder;
+		use rbx_dom_weak::types::{Color3, ColorSequence, ColorSequenceKeypoint, ContentId, NumberRange, NumberSequence, NumberSequenceKeypoint};
+		let state = std::env::temp_dir().join(format!("ror-particle-exposure-test-{}", std::process::id()));
+		std::fs::create_dir_all(&state).unwrap();
+		let white = state.join("white.png");
+		crate::output::write_png(&white, 8, 8, &[255u8; 4].repeat(64), false).unwrap();
+		let white = format!("file:///{}", white.display().to_string().replace('\\', "/"));
+		let gpu = Arc::new(super::super::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = super::super::Renderer::new(gpu, assets).expect("a renderer");
+		let constant = |value: f32| NumberSequence { keypoints: vec![NumberSequenceKeypoint::new(0.0, value, 0.0), NumberSequenceKeypoint::new(1.0, value, 0.0)] };
+		// (wall, eye, field of view, ambient, then per emitter where, Size, colour, opacity, Brightness, count;
+		// and the client's levels per EV)
+		type Emitter = (Vec3, f32, [f32; 3], f32, f32, u32);
+		type Case<'a> = (f32, Vec3, f32, f32, &'a [Emitter], [(f32, &'a [f32]); 3]);
+		let red = [1.0, 0.0, 0.0];
+		let bright: [Emitter; 4] = [(Vec3::new(6.0, 2.5, 0.0), 1.0, red, 0.1, 1.0, 1), (Vec3::new(2.0, 2.5, 0.0), 1.0, red, 0.1, 4.0, 1), (Vec3::new(-2.0, 2.5, 0.0), 1.0, red, 0.1, 15.0, 1), (Vec3::new(-6.0, 2.5, 0.0), 1.0, red, 0.1, 25.0, 1)];
+		let quantize: [Emitter; 1] = [(Vec3::new(2.5, 1.0, 0.0), 1.2, [0.36; 3], 1.01 / 255.0, 1.0, 50)];
+		let cases: [Case; 2] = [
+			(10.0, Vec3::new(0.0, 0.0, -45.0), 30.0, 0.0, &bright, [(-2.0, &[3.0, 10.0, 31.0, 32.3]), (0.0, &[11.6, 35.5, 35.5, 35.5]), (2.0, &[42.0, 42.0, 42.0, 42.0])]),
+			(6.0, Vec3::new(0.0, -4.0, -75.0), 25.0, 0.5, &quantize, [(-2.0, &[0.0]), (0.0, &[12.0]), (2.0, &[17.6])]),
+		];
+		for (wall, eye, fov, ambient, emitters, client) in cases {
+			let mut model = ModelBuilder::new("Exposure");
+			model.part(&PartSpec { name: "Wall".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, 0.0, wall)), size: Vec3::new(200.0, 100.0, 1.0), color: [0, 0, 0], cast_shadow: false, ..Default::default() });
+			for &(at, size, color, opacity, brightness, _) in emitters {
+				let holder = model.part(&PartSpec { name: "Holder".into(), cframe: Affine3A::from_translation(at), size: Vec3::splat(0.2), transparency: 1.0, cast_shadow: false, ..Default::default() });
+				let color = Color3::new(color[0], color[1], color[2]);
+				model.child(
+					holder,
+					InstanceBuilder::new("ParticleEmitter")
+						.with_property("Texture", ContentId::from(white.clone()))
+						.with_property("Color", ColorSequence { keypoints: vec![ColorSequenceKeypoint::new(0.0, color), ColorSequenceKeypoint::new(1.0, color)] })
+						.with_property("Size", constant(size))
+						.with_property("Transparency", constant(1.0 - opacity))
+						.with_property("Lifetime", NumberRange::new(10.0, 10.0))
+						.with_property("Speed", NumberRange::new(0.0, 0.0))
+						.with_property("Rate", 0.0f32)
+						.with_property("LightEmission", 1.0f32)
+						.with_property("Brightness", brightness),
+				);
+			}
+			let mut scene = crate::scene::extract::extract(&model.into_document());
+			for (emitter, &(.., count)) in scene.particles.iter_mut().zip(emitters) {
+				emitter.bursts = vec![(0.0, count)];
+			}
+			let spec = super::super::CameraSpec::LookAt { eye: eye.into(), target: (eye + Vec3::Z * -eye.z).into(), fov };
+			let (width, height) = (548u32, 372u32);
+			let project = spec.place(None, width, height).view_projection(width as f32 / height as f32);
+			for (exposure, levels) in client {
+				scene.environment = crate::scene::Environment { brightness: 0.0, ambient: Vec3::splat(ambient), outdoor_ambient: Vec3::ZERO, environment_diffuse_scale: 0.0, environment_specular_scale: 0.0, global_shadows: false, exposure_compensation: exposure, ..Default::default() };
+				let view = super::super::ViewRequest { width, height, camera: spec.clone(), background: super::super::Background::Sky, ..Default::default() };
+				let (images, _) = renderer.render(&scene, &[view]).unwrap();
+				for (&(at, ..), &level) in emitters.iter().zip(levels) {
+					let clip = project * at.extend(1.0);
+					let (x, y) = (((clip.x / clip.w * 0.5 + 0.5) * width as f32) as usize, ((0.5 - clip.y / clip.w * 0.5) * height as f32) as usize);
+					let mut sum = 0.0;
+					for dy in 0..5 {
+						for dx in 0..5 {
+							let index = ((y + dy - 2) * width as usize + x + dx - 2) * 4;
+							sum += images[0].rgba[index..index + 3].iter().map(|&channel| channel as f32).fold(0.0, f32::max);
+						}
+					}
+					let read = sum / 25.0;
+					assert!((read - level).abs() <= 1.5, "EV {exposure}, the emitter at {at}: {read} where the client shows {level}");
+				}
+			}
+		}
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
 	#[test]
 	fn flipbook_frames() {
 		// OneShot: the 16 frames of a 4 x 4 sheet over the lifetime
