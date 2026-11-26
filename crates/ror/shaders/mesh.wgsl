@@ -821,15 +821,16 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 	if ((flags & TEX_COLOR) != 0u) {
 		raw_texel = material_texel(color_map, material_info.sizes[0].xy, uv, organic, wang);
 	}
-	// far tiling (pre-2022 Slate, Concrete, Granite, CorrodedMetal; 2022 Granite): the colour map
-	// blends into larger tiles linearly with view depth (material-far: the same weight through 15, 30
-	// and 60 degree fields of view and across the frame), in stored values before decoding (it darkens
-	// the swatches as measured: Granite 0.932, predicted 0.945; CorrodedMetal 0.977 / 0.975)
+	// far tiling (pre-2022 Slate, Concrete, Granite, CorrodedMetal, Salt; 2022 Granite, Fabric, Salt,
+	// Cobblestone): the colour map blends into larger tiles linearly with view depth (material-far: the
+	// same weight through 15, 30 and 60 degree fields of view and across the frame), in
+	// stored values before decoding (it darkens the swatches as measured: Granite 0.932, predicted 0.945;
+	// CorrodedMetal 0.977 / 0.975)
 	let far = select(0.0, instance.texture.x, (flags & TEX_MATERIAL) != 0u);
+	let view_depth = (frame.view_proj * vec4<f32>(input.world_position, 1.0)).w;
 	if (far > 0.0 && (flags & TEX_COLOR) != 0u) {
 		let far_texel = studio_mips(color_map, material_info.sizes[0].xy, uv * far, organic.dx * far, organic.dy * far);
-		let depth = (frame.view_proj * vec4<f32>(input.world_position, 1.0)).w;
-		raw_texel = vec4<f32>(mix(raw_texel.rgb, far_texel.rgb, saturate(depth * instance.texture.y)), raw_texel.a);
+		raw_texel = vec4<f32>(mix(raw_texel.rgb, far_texel.rgb, saturate(view_depth * instance.texture.y)), raw_texel.a);
 	}
 	// colour textures are stored raw; Roblox decodes them with a square (gamma 2.0), material colour
 	// maps with the sRGB curve (material-swatches: flat-lit swatches against their packs)
@@ -976,7 +977,13 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 		}
 		var sample = select(vec3<f32>(0.0, 0.0, 1.0), normal_texel * 2.0 - 1.0, (flags & TEX_NORMAL) != 0u);
 		if ((flags & TEX_MATERIAL) != 0u) {
-			sample = vec3<f32>(sample.xy * instance.specular.w, sample.z);
+			// a built-in pack's strength from the view depth instance.tint.w on; nearer, Foil's grows as (depth / that
+			// depth) to the power instance.texture.w (render::materials::BuiltInTextures::normal_falloff)
+			var strength = instance.specular.w;
+			if (instance.texture.w != 0.0) {
+				strength *= pow(clamp(view_depth, 1.0, instance.tint.w) / instance.tint.w, instance.texture.w);
+			}
+			sample = vec3<f32>(sample.xy * strength, sample.z);
 		}
 		if (surface_group != 0u) {
 			// the tile's relief over the material's (whiteout blend)

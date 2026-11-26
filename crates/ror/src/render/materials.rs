@@ -146,7 +146,7 @@ pub const VARIANT_ORGANIC_NOISE: f32 = 0.03;
 /// stored; a colour map of 130 0.223 (variant-emission). The variant's AlphaMode changes nothing.
 pub const VARIANT_EMISSION: f32 = 1.94;
 
-/// A pre-2022 colour map's second, larger tiling, blended in with view depth.
+/// A colour map's second, larger tiling, blended in with view depth.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FarTiling {
 	/// Far tiles per near tile (0.25: four times larger).
@@ -155,6 +155,12 @@ pub struct FarTiling {
 	/// from the camera.
 	pub depth: f32,
 }
+
+/// The view depth where 2022 Granite's far tiling has taken over, and Fabric's, Salt's and Cobblestone's, pre-2022
+/// Granite's, CorrodedMetal's and Salt's: in the engine (0.747; material-statistics "tiles", the near and far layers
+/// fitted alike on its frames and on ror's, the camera's focus on the slab) every one of them blends linearly from
+/// the camera to 120-122 studs. The capture Studio (0.741) had pre-2022 Granite and CorrodedMetal at 115.
+const FAR_DEPTH: f32 = 122.0;
 
 /// A built-in material's textures: its texture pack (an asset id) and how it tiles.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -175,8 +181,11 @@ pub struct BuiltInTextures {
 	/// Studio draws the pack without its colour map (DiamondPlate: its flat-lit swatch is uniform,
 	/// std 0.0, and its sun-lit one is a white albedo's, while the pack's normal map matches).
 	pub skip_color: bool,
-	/// How strongly the pack's normal map tilts the surface (1: as stored).
+	/// How strongly the pack's normal map tilts the surface (1: as stored), from `normal_falloff`'s view depth on.
 	pub normal_strength: f32,
+	/// (view depth in studs, power): nearer than that depth the strength grows as (depth / it) to the power (a
+	/// negative one; 0: the same strength at every depth).
+	pub normal_falloff: (f32, f32),
 }
 
 /// Plastic's normal map draws at under half its relief: 0.44 of its pack's (9475362634; 0.38 of the
@@ -188,11 +197,15 @@ pub struct BuiltInTextures {
 /// pack's transcode. Slate and Brick match at 1.
 const PLASTIC_NORMAL_STRENGTH: f32 = 0.44;
 
-/// Foil's crumples tilt about twice as far as its normal map says (its transcode is the PNG's): the
-/// high-passed sun-lit slab matches Studio's at 2.4 x from 6 studs, 2.2 at 12-17, 2.0-2.1 at 24-34,
-/// 1.85 at 48-59 and 1.55 at 96 (material-zoom, material-swatches; surfaces from 40 studs 1.95), and
-/// the mean radiance at 1.9-2.15. DiamondPlate's matches at 1 (0.99-1.07 from 6 to 48 studs).
+/// Foil's crumples tilt about twice as far as its normal map says (its transcode is the PNG's), and more up close:
+/// 2.0 from 40 studs of view depth on, nearer (depth / 40)^-0.15 times that (2.66 at 6 studs, 2.40 at 12, 2.16 at
+/// 24). material-zoom's sun-lit slab (straight down from 6 to 96 studs) against Studio's, per band of the high-pass
+/// (1.5-4 / 4-12 px): at a constant 2.0 1.27 / 1.37 at 6 studs, 1.21 / 1.24 at 12, 1.11 / 1.05 at 24, 0.95 / 0.85 at
+/// 48, 0.97 / 1.05 at 96 (rms log 0.157); with the falloff 0.98 / 1.06, 1.04 / 1.06, 1.04 / 0.98, 0.95 / 0.85, 0.97 /
+/// 1.05 (0.063). A falloff past 40 studs flattens 96 (1.20-1.34 x at (12, -0.15)). The swatch (59 studs), surfaces
+/// (40) and metal-diffuse (200) keep 2.0. DiamondPlate's matches at 1 (0.99-1.07 from 6 to 48 studs).
 const FOIL_NORMAL_STRENGTH: f32 = 2.0;
+const FOIL_NORMAL_FALLOFF: (f32, f32) = (40.0, -0.15);
 
 /// 2022 Glass barely shows its normal map: the sun-lit swatch's high-pass is 5.0 x Studio's at 1,
 /// 1.10 at 0.1, 1.01 at 0.05 and 0.93 without (its colour map's own contrast); within 2 of 255 22 /
@@ -207,11 +220,13 @@ const GLASS_NORMAL_STRENGTH: f32 = 0.05;
 const GLASS_PRE2022_NORMAL_STRENGTH: f32 = 0.1;
 
 /// Pre-2022 Foil (its pack 7546645012, a normal map on white) tilts less than its normal map says, and less the
-/// farther it is, like 2022 Foil: the sun-lit contrast matches Studio's at about 0.85 from 12 studs, 0.77 from 60
-/// (the swatch: 1.40 x at 1, 0.99 at 0.77) and 0.68 from 120 (material-depths, the pre-2022 capture Studio),
-/// and the engine's at 0.65 from 200 (materials-generation "sun": 0.91 / 1.09 x at 0.6 / 0.7); 0.73 is their
-/// geometric mean.
-const FOIL_PRE2022_NORMAL_STRENGTH: f32 = 0.73;
+/// farther it is, like 2022 Foil: 0.66 from 120 studs of view depth on, nearer (depth / 120)^-0.14 times that (0.91
+/// at 12 studs, 0.73 at 59). The pre-2022 capture Studio's sun-lit Foil against ror's, high-pass per band (finest /
+/// 1.5-4 / 4-12 px): material-depths at 12 studs 1.45 / 1.37 / 1.31 at a constant 0.73, 1.05 / 0.99 / 0.96 now; the
+/// swatch (59 studs) 1.06 / 1.06 / 1.08 -> 1.07 / 1.06 / 1.08; material-depths at 120 0.77 / 0.80 / 0.91 -> 0.87 /
+/// 0.91 / 1.03 (rms log 0.224 -> 0.073); the engine wants 0.65 from 200 (materials-generation "sun").
+const FOIL_PRE2022_NORMAL_STRENGTH: f32 = 0.66;
+const FOIL_PRE2022_NORMAL_FALLOFF: (f32, f32) = (120.0, -0.14);
 
 /// Materials whose texture Studio shifts by a random offset per part (material-offsets: Marble,
 /// CrackedLava, Pavement, Pebble, Cobblestone, Salt, Glass, Fabric and Metal changed phase between
@@ -227,7 +242,25 @@ const RANDOM_OFFSET: [u32; 12] = [784, 804, 832, 836, 864, 880, 1056, 1072, 1088
 /// whole tiles). material-zoom (one slab, one offset, straight down from 12 to 96 studs): far weight
 /// 0.11, 0.15, 0.20, 0.27, 0.38, 0.80 at 12, 17, 24, 34, 48, 96 studs, depth / weight 110-127, D = 122
 /// through the origin; the swatch 0.43-0.46 at 59 (material-swatches), 0.98 at 236 (organic-builtin).
-const GRANITE_FAR: FarTiling = FarTiling { scale: 0.25, depth: 122.0 };
+/// The engine agrees (material-statistics "tiles", a 600-stud slab from 6 to 300 studs: the far weight
+/// fitted alike on its frames and ror's within 0.01, contrast within 2 %).
+const GRANITE_FAR: FarTiling = FarTiling { scale: 0.25, depth: FAR_DEPTH };
+
+/// 2022 Fabric, Salt and Cobblestone blend their colour map into 1 / 0.6 times larger tiles (13.3 studs) with view
+/// depth, over Granite's depth: material-swatches' straight-down swatches (59 studs) are an even mix of the map at 8
+/// and at 13.3 studs per tile (Salt 0.50 / 0.50, fit r 0.88; Cobblestone 0.49 / 0.51, r 0.91; one tiling r 0.59 /
+/// 0.61), the larger at 0.6 times the near tiling's coordinate (its offset predicted from the near one's within 0.002
+/// tiles), no other tile size or turn fitting; that even mix is why ror's single tiling had 1.25-1.41 x Studio's
+/// contrast. In the engine (material-statistics "tiles", 600-stud slabs straight down) Salt's and Cobblestone's far
+/// weight is 0.10-0.11 / 0.20-0.21 / 0.43-0.44 / 0.83 at 12 / 24 / 48 / 96 studs and whole from 150, as 2022
+/// Granite's (0.09 / 0.21 / 0.43 / 0.84). Their relief keeps the near tiling (material-zoom's sun-lit Fabric repeats
+/// every 8 studs at 0.93-0.95 from 24 to 48 studs while its flat-lit colour falls 0.84 -> 0.55).
+const FAR_2022: [(u32, FarTiling); 4] = [
+	(832, GRANITE_FAR),
+	(880, FarTiling { scale: 0.6, depth: FAR_DEPTH }),
+	(1312, FarTiling { scale: 0.6, depth: FAR_DEPTH }),
+	(1392, FarTiling { scale: 0.6, depth: FAR_DEPTH }),
+];
 
 /// CrackedLava's emissive mask glows like a MaterialVariant's (VARIANT_EMISSION): the part colour
 /// times the colour map times the mask as stored, here 3.55 x. material-glass, CrackedLava-*-dark (in
@@ -334,12 +367,13 @@ const fn pack_2022(material: u32, pack: &'static str, noise: f32) -> BuiltInText
 		random_offset,
 		skip_color: material == 1056,
 		normal_strength: 1.0,
+		normal_falloff: (1.0, 0.0),
 	}
 }
 
 /// A pre-2022 pack, tiling regularly from a random offset per part.
 const fn pre(pack: &'static str, studs_per_tile: f32) -> BuiltInTextures {
-	BuiltInTextures { pack, studs_per_tile, organic: None, wang: false, far: None, random_offset: true, skip_color: false, normal_strength: 1.0 }
+	BuiltInTextures { pack, studs_per_tile, organic: None, wang: false, far: None, random_offset: true, skip_color: false, normal_strength: 1.0, normal_falloff: (1.0, 0.0) }
 }
 
 /// A pre-2022 pack tiled in Wang cells.
@@ -373,16 +407,16 @@ const PACKS_PRE2022: [(u32, BuiltInTextures); 39] = [
 	(804, pre("9438582231", 8.0)),                          // CrackedLava
 	(816, pre_far("7546653951", 20.0 / 3.0, 0.25, 64.0)),   // Concrete
 	(820, pre_organic("9873289812", 0.04)),                 // Limestone
-	(832, pre_far("7547164710", 10.0, 0.25, 115.0)),        // Granite
+	(832, pre_far("7547164710", 10.0, 0.25, FAR_DEPTH)),    // Granite
 	(836, pre("9873322398", 8.0)),                          // Pavement
 	(848, pre_wang("7546650097", 8.0)),                     // Brick
 	(864, pre("7547291361", 10.0)),                         // Pebble
 	(880, pre_wang("7546652947", 400.0 / 27.0)),            // Cobblestone
 	(896, pre_organic("9873515198", 0.045)),                // Rock
 	(912, pre_organic("9873521380", 0.03)),                 // Sandstone
-	(1040, pre_far("7547184629", 10.0, 0.5, 115.0)),        // CorrodedMetal
+	(1040, pre_far("7547184629", 10.0, 0.5, FAR_DEPTH)),    // CorrodedMetal
 	(1056, pre("7547162198", 5.0)),                         // DiamondPlate
-	(1072, BuiltInTextures { normal_strength: FOIL_PRE2022_NORMAL_STRENGTH, ..pre("7546645012", 10.0) }), // Foil (a normal map; white colour)
+	(1072, BuiltInTextures { normal_strength: FOIL_PRE2022_NORMAL_STRENGTH, normal_falloff: FOIL_PRE2022_NORMAL_FALLOFF, ..pre("7546645012", 10.0) }), // Foil (a normal map; white colour)
 	(1088, pre("7547288171", 5.0)),                         // Metal
 	(1280, pre_wang("7547169285", 400.0 / 39.0)),           // Grass
 	(1284, pre_organic("9873288083", 0.05)),                // LeafyGrass
@@ -392,7 +426,7 @@ const PACKS_PRE2022: [(u32, BuiltInTextures); 39] = [
 	(1344, pre_organic("9873319819", 0.03)),                // Mud
 	(1360, pre_organic("9439044431", 0.05)),                // Ground
 	(1376, pre_organic("9873267379", 0.03)),                // Asphalt
-	(1392, pre("9439566986", 8.0)),                         // Salt
+	(1392, pre_far("9439566986", 8.0, 0.6, FAR_DEPTH)),     // Salt (FAR_2022's tiling: the engine's far weight as 2022 Salt's)
 	(1536, pre("7547171356", 10.0)),                        // Ice (a normal map; white colour)
 	(1552, pre_organic("9438851661", 0.03)),                // Glacier
 	(1568, BuiltInTextures { normal_strength: GLASS_PRE2022_NORMAL_STRENGTH, ..pre("7547304948", 4.0) }), // Glass
@@ -412,16 +446,33 @@ pub fn built_in_textures(material: u32, use_2022: bool) -> Option<BuiltInTexture
 		PACKS_2022.iter().find(|(value, ..)| *value == material).map(|&(_, pack, noise)| BuiltInTextures {
 			normal_strength: match material {
 				256 => tune_plastic_normal().unwrap_or(PLASTIC_NORMAL_STRENGTH),
-				1072 => FOIL_NORMAL_STRENGTH,
+				1072 => tune_foil_normal().map_or(FOIL_NORMAL_STRENGTH, |(strength, _)| strength),
 				1568 => GLASS_NORMAL_STRENGTH,
 				_ => 1.0,
 			},
-			far: if material == 832 { Some(GRANITE_FAR) } else { None },
+			normal_falloff: if material == 1072 { tune_foil_normal().map_or(FOIL_NORMAL_FALLOFF, |(_, falloff)| falloff) } else { (1.0, 0.0) },
+			far: FAR_2022.iter().find(|(value, _)| *value == material).map(|&(_, far)| far),
 			..pack_2022(material, pack, noise)
 		})
 	} else {
-		PACKS_PRE2022.iter().find(|(value, _)| *value == material).map(|&(_, textures)| textures)
+		PACKS_PRE2022.iter().find(|(value, _)| *value == material).map(|&(_, textures)| match tune_foil_normal() {
+			Some((normal_strength, normal_falloff)) if material == 1072 => BuiltInTextures { normal_strength, normal_falloff, ..textures },
+			_ => textures,
+		})
 	}
+}
+
+/// `ROR_TUNE_FOIL_NORMAL=<strength>,<depth>,<power>`: Foil's normal strength law in either generation, for fits.
+fn tune_foil_normal() -> Option<(f32, (f32, f32))> {
+	static TUNE: std::sync::OnceLock<Option<(f32, (f32, f32))>> = std::sync::OnceLock::new();
+	*TUNE.get_or_init(|| {
+		let value = std::env::var("ROR_TUNE_FOIL_NORMAL").ok()?;
+		let numbers: Vec<f32> = value.split(',').map(|number| number.trim().parse().ok()).collect::<Option<_>>()?;
+		match numbers[..] {
+			[strength, depth, power] => Some((strength, (depth, power))),
+			_ => None,
+		}
+	})
 }
 
 fn tune_plastic_normal() -> Option<f32> {
@@ -487,6 +538,34 @@ mod tests {
 	#[test]
 	fn pre2022_glass_and_foil_flatten_their_normal_maps() {
 		let strength = |material| built_in_textures(material, false).unwrap().normal_strength;
-		assert_eq!((strength(1568), strength(1072), strength(1056)), (0.1, 0.73, 1.0));
+		assert_eq!((strength(1568), strength(1072), strength(1056)), (0.1, 0.66, 1.0));
+	}
+
+	/// Foil's relief grows nearer the camera in both generations (material-zoom, material-depths); no other
+	/// material's changes with depth.
+	#[test]
+	fn foil_relief_grows_up_close() {
+		let falloff = |material, generation| built_in_textures(material, generation).unwrap().normal_falloff;
+		assert_eq!(falloff(1072, true), (40.0, -0.15));
+		assert_eq!(falloff(1072, false), (120.0, -0.14));
+		for material in [256, 1056, 848, 800] {
+			assert_eq!(falloff(material, true).1, 0.0);
+		}
+	}
+
+	/// 2022 Fabric, Salt and Cobblestone blend into 0.6 x tiles over Granite's depth, pre-2022 Salt as 2022 Salt, pre-2022
+	/// Granite and CorrodedMetal over Granite's depth too (material-statistics "tiles" in the engine).
+	#[test]
+	fn far_tilings_follow_the_engine() {
+		let far = |material, generation| built_in_textures(material, generation).unwrap().far;
+		for material in [880, 1312, 1392] {
+			assert_eq!(far(material, true), Some(FarTiling { scale: 0.6, depth: 122.0 }));
+		}
+		assert_eq!(far(832, true), Some(FarTiling { scale: 0.25, depth: 122.0 }));
+		assert_eq!(far(1392, false), Some(FarTiling { scale: 0.6, depth: 122.0 }));
+		assert_eq!((far(832, false).map(|far| far.depth), far(1040, false).map(|far| far.depth)), (Some(122.0), Some(122.0)));
+		assert_eq!((far(800, false).map(|far| far.depth), far(816, false).map(|far| far.depth)), (Some(72.0), Some(64.0)));
+		// pre-2022 Fabric and Cobblestone repeat as one tiling in the engine
+		assert_eq!((far(1312, false), far(880, false)), (None, None));
 	}
 }

@@ -1156,10 +1156,12 @@ struct PartMaterial {
 	/// The Organic pattern: its noise's offset (noise uv) and frequency (noise uv per tile).
 	noise_offset: [f32; 2],
 	noise_frequency: f32,
-	/// How strongly the material normal map tilts the surface (built-in packs; 1 as stored).
+	/// How strongly the material normal map tilts the surface (built-in packs; 1 as stored), and its
+	/// falloff: (the view depth from which it holds, the power of depth / that depth it follows nearer).
 	normal_strength: f32,
+	normal_falloff: (f32, f32),
 	/// Material textures: the colour map's far tiling (far tiles per tile, 0: none) and 1 / the view
-	/// depth where it has taken over (pre-2022 Slate, Concrete, Granite, CorrodedMetal).
+	/// depth where it has taken over (render::materials::FarTiling).
 	far: [f32; 2],
 	/// Provenance of any local TexturePack files read while resolving this material (empty when no
 	/// local pack was read).
@@ -4008,7 +4010,7 @@ impl Renderer {
 		let (instances, draws, missing) = (&mut out.instances, &mut out.draws, &mut out.missing);
 		let neon_share = context.neon_share;
 		{
-			let PartMaterial { mut key, mut flags, params, studs_per_tile, emissive: emission, offset, noise_offset, noise_frequency, normal_strength, far, pack_proofs } = material;
+			let PartMaterial { mut key, mut flags, params, studs_per_tile, emissive: emission, offset, noise_offset, noise_frequency, normal_strength, normal_falloff, far, pack_proofs } = material;
 			if let Some(local_keys) = local_keys {
 				for (uri, proof) in &pack_proofs {
 					stable &= proof_matches(uri, proof, local_keys);
@@ -4295,8 +4297,8 @@ impl Renderer {
 				specular: [specular[0], specular[1], specular[2], normal_strength],
 				material: [emission.x, emission.y, emission.z, noise_frequency],
 				// what of it shadows (`fs_shadow_cutout`): 1 - Transparency, a shadow-only part's whole
-				texture: [far[0], far[1], if part.shadow_only { 1.0 } else { 1.0 - part.transparency }, 0.0],
-				tint: [tint.x, tint.y, tint.z, 1.0],
+				texture: [far[0], far[1], if part.shadow_only { 1.0 } else { 1.0 - part.transparency }, normal_falloff.1],
+				tint: [tint.x, tint.y, tint.z, normal_falloff.0],
 			});
 			let lod = draw_lod(&mesh);
 			// a posed skinned mesh sorts by where its Bones put it, not by its part (skin-sort: a character
@@ -5975,6 +5977,7 @@ impl Renderer {
 			noise_offset: [0.0; 2],
 			noise_frequency: materials::VARIANT_ORGANIC_NOISE,
 			normal_strength: 1.0,
+			normal_falloff: (1.0, 0.0),
 			far: [0.0; 2],
 			pack_proofs: Vec::new(),
 		};
@@ -6187,6 +6190,7 @@ impl Renderer {
 					material.flags |= TEX_ALPHA_TINTMASK;
 				}
 				material.normal_strength = textures.normal_strength;
+				material.normal_falloff = textures.normal_falloff;
 				maps
 			} else {
 				[None, None, None, None, None]
