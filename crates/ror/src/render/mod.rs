@@ -2956,7 +2956,9 @@ impl Renderer {
 		// the time of day tints the skybox and its light (sky-time, sky-night), at night by the sky's
 		// light too (light-night-sky2)
 		let tint = environment::sky_tint(lighting.clock_time, lighting.environment_diffuse_scale);
-		let tint_key = tint.map(|tint| format!("{tint:.4?}"));
+		// and through the twilights its light less than the drawn sky's tint gives (sky_light_twilight)
+		let twilight = environment::sky_light_twilight(lighting.clock_time);
+		let tint_key = tint.map(|tint| format!("{tint:.4?}|{twilight:.4}"));
 		let sky_snaps: [Option<(std::path::PathBuf, ror_assets::FileSnapshot)>; 6] = std::array::from_fn(|index| local_snapshot_for(&sky.skybox[index]));
 		let mut untrusted_sky = std::collections::HashSet::new();
 		for (path, snap) in sky_snaps.iter().flatten() {
@@ -2995,7 +2997,7 @@ impl Renderer {
 							}
 						};
 						let stable = base.stable;
-						let maps = inner_pool().install(|| self.environment_maps(&sky, &base, tint, atmosphere, glare_light, glare_tint, lighting.brightness));
+						let maps = inner_pool().install(|| self.environment_maps(&sky, &base, tint, twilight, atmosphere, glare_light, glare_tint, lighting.brightness));
 						Ok(resources::LoadOutcome { value: maps, keep: stable, offline_fallback: false })
 					})
 				})
@@ -3043,7 +3045,7 @@ impl Renderer {
 
 	/// A Lighting's sky maps from its skybox's base ([`Renderer::environment`]).
 	#[allow(clippy::too_many_arguments)]
-	fn environment_maps(&self, sky: &crate::scene::environment::Sky, base: &SkyBase, tint: Option<(Vec3, Vec3)>, atmosphere: Option<crate::scene::environment::Atmosphere>, glare_light: (Vec3, Vec3), glare_tint: Vec3, brightness: f32) -> EnvironmentMaps {
+	fn environment_maps(&self, sky: &crate::scene::environment::Sky, base: &SkyBase, tint: Option<(Vec3, Vec3)>, twilight: f32, atmosphere: Option<crate::scene::environment::Atmosphere>, glare_light: (Vec3, Vec3), glare_tint: Vec3, brightness: f32) -> EnvironmentMaps {
 		// SkyboxOrientation turns the skybox drawn and reflected, not the sky light nor what distant
 		// surfaces fade into (sky-orientation: Studio's ball lit alike and a far sphere fading into
 		// the same unturned sky under five orientations, its reflections turning)
@@ -3055,7 +3057,7 @@ impl Renderer {
 		}
 		let light = base.upright.as_ref().map_or(&base.light, |(_, light)| light);
 		let ambient = match tint {
-			Some(tint) => light.tinted_by_halves(tint).ambient_cube(),
+			Some(tint) => light.tinted_by_halves(tint).ambient_cube().map(|light| light * twilight),
 			None => light.ambient_cube(),
 		};
 		let cube = tinted(&base.cube, tint);

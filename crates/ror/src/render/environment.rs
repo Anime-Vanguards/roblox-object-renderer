@@ -779,6 +779,29 @@ pub fn star_light(clock_time: f32, diffuse_scale: f32) -> f32 {
 	table(&STAR_TIME, since) * (STAR_DIFFUSE + (1.0 - STAR_DIFFUSE) * diffuse_scale.clamp(0.0, 1.0))
 }
 
+/// The sky's light through the half hours of dawn (6 to 6.5) and dusk (17.5 to 18), against what the
+/// drawn sky's tint gives it ([`CubeImage::tinted_by_halves`]): 1 - 0.02 sin(π s), s the share of the
+/// half hour gone (the Roblox client 0.747: light-night-sky's white floor and back wall under the
+/// sky's light alone, settled, two sessions alike; ror's light over the client's against the same at
+/// the half hour's ends: the default sky every 1/16 hour, floor 1.011-1.027 and wall 1.015-1.040 from
+/// 17.5625 to 17.9375 and 6.0625 to 6.4375; at 17.75 and 6.25 the floor 1.018 / 1.019 under the
+/// default sky, 1.014 / 1.014 under a white skybox, 1.025 / 1.020 under its Up face alone and 1.012 /
+/// 1.011 under its sides alone; Studio's light-night-sky t17.75-sky and t6.25-sky 1.02-1.1). The sky
+/// drawn keeps its tint (sky-time, sky-night).
+pub fn sky_light_twilight(clock_time: f32) -> f32 {
+	let hours = clock_time.rem_euclid(24.0);
+	let start = if (6.0..6.5).contains(&hours) {
+		6.0
+	} else if (17.5..18.0).contains(&hours) {
+		17.5
+	} else {
+		return 1.0;
+	};
+	1.0 - SKY_LIGHT_TWILIGHT * (std::f32::consts::PI * (hours - start) / 0.5).sin()
+}
+
+const SKY_LIGHT_TWILIGHT: f32 = 0.02;
+
 /// The radiance tint along `direction`: the display tints above and below the horizon blend linearly
 /// on the sky's cube, by saturate(0.75 (1 - y / max(|x|, |z|))): all "above" from the side faces' top
 /// edge, all "below" a third of the way down them (sky-elements dim: the share in √ space follows
@@ -841,7 +864,7 @@ const GLARE_SCALE: f32 = 0.975;
 /// The night's glare as a share of the day's (atmosphere-sky at 0, 18 and 19 o'clock, the haze's own
 /// light the skybox's untinted: the even red reads 0.221; atmosphere-night-glare: so from 17.75 to
 /// 6.25 wherever the sun's table gives less, green and blue alike at 19.25 and 4.75-5.5; just after
-/// sunset, 17.75-17.9, Studio's blue reads 0.256).
+/// sunset, 17.75-17.9, Studio's blue reads 0.256, the Roblox client 0.747's no more than its red).
 const GLARE_NIGHT: f32 = 0.221;
 
 /// ColorShift_Top tints the glare keeping its channels' sum: 1 + k (s² - mean(s²)) per channel, k =
@@ -1093,6 +1116,16 @@ mod tests {
 			let [a, b] = split_sum_brdf(roughness, n_dot_v, 4096);
 			assert!((a - scale).abs() < 0.006 && (b - bias).abs() < 0.006, "roughness {roughness} n·v {n_dot_v}: {a} {b} vs {scale} {bias}");
 		}
+	}
+
+	#[test]
+	fn the_sky_light_dips_through_the_twilights() {
+		for clock in [0.0f32, 5.99, 6.5, 12.0, 17.49, 18.0, 23.0] {
+			assert_eq!(sky_light_twilight(clock), 1.0, "{clock}");
+		}
+		assert!((sky_light_twilight(6.25) - 0.98).abs() < 1e-5 && (sky_light_twilight(17.75) - 0.98).abs() < 1e-5);
+		assert!((sky_light_twilight(17.625) - (1.0 - 0.02 * std::f32::consts::FRAC_1_SQRT_2)).abs() < 1e-5);
+		assert_eq!(sky_light_twilight(-6.25), sky_light_twilight(17.75));
 	}
 
 	#[test]
