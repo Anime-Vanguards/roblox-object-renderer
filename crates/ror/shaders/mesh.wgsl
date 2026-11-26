@@ -501,10 +501,15 @@ fn light_shadow(light: Light, world_position: vec3<f32>, geometric_normal: vec3<
 	// off the surface, and towards the light by as much as the surface recedes across the filter
 	// disk (the slope of a surface the light grazes would shadow itself otherwise), up to tan θ 50
 	// (light-graze-kinds: capped at 10, lights 0.05-0.2 studs over a floor shadowed it to 0.53-0.95
-	// of itself where Studio keeps 0.66-1.03 as `light_graze` gives)
+	// of itself where Studio keeps 0.66-1.03 as `light_graze` gives). A surface turned away from a
+	// SurfaceLight (its size term lights it) is not lifted: what stands between it and the light shadows
+	// it (fixtures/local-lights.luau "backs": the far side of a board 1 or 2 studs thick before a
+	// SurfaceLight keeps none of the light in a Roblox client, where the lift crossed the board; one 0.2
+	// thick keeps 0.58 at Angle 0, 0.26 at 30 and 0.10 at 90 and 180, not modelled)
 	let l = -from_light / max(length(from_light), 1e-4);
-	let n_dot_l = clamp(dot(geometric_normal, l), 0.02, 1.0);
-	let slope = sqrt(1.0 - n_dot_l * n_dot_l) / n_dot_l;
+	let facing = dot(geometric_normal, l);
+	let n_dot_l = clamp(facing, 0.02, 1.0);
+	let slope = select(0.0, sqrt(1.0 - n_dot_l * n_dot_l) / n_dot_l, facing >= 0.0 || u32(light.position.w) != 2u);
 	let lifted = world_position + geometric_normal * (texel * 1.5) + l * (disk * slope);
 	let clip = light_shadow_matrices[layer] * vec4<f32>(lifted, 1.0);
 	let ndc = clip.xyz / clip.w;

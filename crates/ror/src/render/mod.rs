@@ -7419,6 +7419,15 @@ mod surface_light_shadow_tests {
 				assert!((shut - open).abs() < 2.0, "Angle {angle}, opaque carrier {opaque}, plate behind the face {plate}: {shut} against {open}");
 			}
 		}
+		// a surface turned away from the face: the far side of a board 1 stud thick 1.4 studs before an
+		// 8-stud face of Angle 0 (Back) takes its size term, all of it shadowed by the board (the client:
+		// none of it; ror's lifted lookup crossed the board and kept all of it)
+		let back = |shadows: bool| {
+			let lamp = Lamp { at: Vec3::new(0.0, 20.0, -0.5), size: Vec3::new(8.0, 8.0, 1.0), opaque: false, face: 2, angle: 0.0, range: 30.0, shadows };
+			level(&renderer, &scene(&lamp, &[(Vec3::new(0.0, 20.0, 1.9), Vec3::new(4.0, 4.0, 1.0))], false), [3.0, 22.0, 32.4], [0.0, 20.0, 2.4])
+		};
+		let (lit, shadowed) = (back(false), back(true));
+		assert!(lit > 50.0 && shadowed < 0.1 * lit, "the board's far side: {shadowed} with Shadows, {lit} without");
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
 	}
