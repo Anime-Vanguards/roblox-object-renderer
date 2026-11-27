@@ -17,3 +17,13 @@ fn fs_legacy_composite(input: FullscreenOutput) -> @location(0) vec4<f32> {
 	let alpha = 1.0 - above.a * (1.0 - below.a);
 	return vec4<f32>(sqrt(max(radiance, vec3<f32>(0.0))), alpha);
 }
+
+// What blends after a legacy effect in the order (render::Blended): its layer holds it premultiplied in √x
+// over transparent black, as the scene would have taken it, laid over the scene with the effect in it
+@fragment
+fn fs_blended_over(input: FullscreenOutput) -> @location(0) vec4<f32> {
+	let position = vec2<i32>(input.clip.xy);
+	let below = textureLoad(scene, position, 0);
+	let above = textureLoad(layer, position, 0);
+	return vec4<f32>(above.rgb + below.rgb * (1.0 - above.a), above.a + below.a * (1.0 - above.a));
+}

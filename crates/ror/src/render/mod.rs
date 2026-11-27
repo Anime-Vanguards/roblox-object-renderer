@@ -1595,7 +1595,7 @@ impl DrawItem {
 	}
 }
 
-/// A blended draw: a transparent part, a beam, a trail, an emitter's particles or a GUI.
+/// A blended draw: a transparent part, a beam, a trail, an emitter's particles, a legacy effect's or a GUI.
 enum Blended<'a> {
 	Part(&'a DrawItem),
 	/// a see-through part's decal, after its part
@@ -1603,7 +1603,34 @@ enum Blended<'a> {
 	Beam(&'a beams::BeamDraw),
 	Trail(&'a trails::TrailDraw),
 	Particles(&'a particles::ParticleDraw),
+	/// a legacy effect's particles, blended in linear light in a layer of their own composited at their
+	/// place in the order (render::particles)
+	Legacy(&'a particles::ParticleDraw),
 	Gui(&'a guis::ViewGui),
+}
+
+/// A run of the blend order drawn together: what blends as the scene takes it, or legacy effects in their
+/// linear-light layer.
+#[derive(Clone, Debug, PartialEq)]
+enum BlendRun {
+	Blended(std::ops::Range<usize>),
+	Legacy(std::ops::Range<usize>),
+}
+
+/// The blend order cut into runs (`legacy[i]`: whether its i-th draw is a legacy effect's): what blends up
+/// to the first legacy effect (drawn with the scene, perhaps nothing), then each run of legacy effects and
+/// each run of what blends after one, in order.
+fn blend_runs(legacy: &[bool]) -> Vec<BlendRun> {
+	let first = legacy.iter().position(|&is| is).unwrap_or(legacy.len());
+	let mut runs = vec![BlendRun::Blended(0..first)];
+	let mut start = first;
+	while start < legacy.len() {
+		let kind = legacy[start];
+		let end = legacy[start..].iter().position(|&is| is != kind).map_or(legacy.len(), |offset| start + offset);
+		runs.push(if kind { BlendRun::Legacy(start..end) } else { BlendRun::Blended(start..end) });
+		start = end;
+	}
+	runs
 }
 
 /// Shadow maps a frame draws that the shadow cache keeps, once the frame is submitted.
@@ -5301,7 +5328,6 @@ impl Renderer {
 			let composited = target("legacy composite", HDR_FORMAT, 1, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
 			(msaa, layer, composited)
 		});
-		let lit_view = legacy_targets.as_ref().map(|(_, _, composited)| composited.clone()).unwrap_or_else(|| color_view.clone());
 		// transparent parts and beams together, back to front along this camera's forward axis
 		// (Camera::depth; beam-order: a transparent part in front of a beam covers it)
 		// with multisampling, parts at Transparency 0 whose SurfaceAppearance is in AlphaMode Transparency
@@ -5320,8 +5346,20 @@ impl Renderer {
 		// particles by their emitter's position moved towards the camera by ZOffset (particle-sort
 		// glass-zoffset: a particle behind a glass block's centre pulled out in front of it draws over it)
 		transparent.extend(particle_view.draws.iter().filter(|draw| !scene.particles[draw.emitter].linear).map(|draw| (camera.depth(draw.center) - scene.particles[draw.emitter].z_offset, Blended::Particles(draw))));
-		// legacy effects into their layer, back to front among themselves
-		let mut legacy_draws: Vec<(f32, &particles::ParticleDraw)> = particle_view.draws.iter().filter(|draw| scene.particles[draw.emitter].linear).map(|draw| (camera.depth(draw.center), draw)).collect();
+		// legacy effects take their place in the order too (`fixtures/draw-order.luau` "legacy", "legacy2" in a
+		// Roblox client: a Fire 2.5 studs behind a SmoothPlastic pane at Transparency 0.2, 0.5 or 0.8, a beam
+		// or a ParticleEmitter square at 0.5 shows through it, one 2.5 studs in front over it, two either side
+		// of one pane each so); under a depth of field they go into their layer, back to front among
+		// themselves, before what blends
+		let interleaved = depth_of_field.is_none() || scene_depth.is_none();
+		let mut legacy_draws: Vec<(f32, &particles::ParticleDraw)> = Vec::new();
+		for draw in particle_view.draws.iter().filter(|draw| scene.particles[draw.emitter].linear) {
+			if interleaved {
+				transparent.push((camera.depth(draw.center), Blended::Legacy(draw)));
+			} else {
+				legacy_draws.push((camera.depth(draw.center), draw));
+			}
+		}
 		legacy_draws.sort_by(|a, b| b.0.total_cmp(&a.0));
 		// GUIs sort by their face's centre or their anchor; on a shared face a higher ZOffset draws later
 		transparent.extend(view_guis.draws.iter().filter(|draw| !draw.overlay).map(|draw| (camera.depth(draw.center) - draw.z_offset * 1e-3, Blended::Gui(draw))));
@@ -5353,12 +5391,37 @@ impl Renderer {
 			Blended::Decal(_) => (0, 0.0, f32::MAX),
 			Blended::Beam(_) | Blended::Trail(_) => (0, 0.0, 0.0),
 			Blended::Particles(draw) => (1, draw.moved, -largest[draw.emitter]),
+			// a legacy effect's systems at one place keep their own order (a Fire's wisps over its flame:
+			// legacy-fire-cover)
+			Blended::Legacy(_) => (1, 0.0, 0.0),
 			Blended::Gui(_) => (2, 0.0, 0.0),
 		};
 		transparent.sort_by(|a, b| {
 			let (first, second) = (tie(&a.1), tie(&b.1));
 			b.0.total_cmp(&a.0).then(first.0.cmp(&second.0)).then(first.1.total_cmp(&second.1)).then(first.2.total_cmp(&second.2))
 		});
+		// the order's runs: what blends up to the first legacy effect goes with the scene; then each run of
+		// legacy effects into their layer, composited over what is drawn so far, and each run of what blends
+		// after one into a layer of its own (premultiplied in √x over transparent black, as the scene would
+		// take it) laid over that, turn by turn
+		let runs = blend_runs(&transparent.iter().map(|(_, item)| matches!(item, Blended::Legacy(_))).collect::<Vec<_>>());
+		let first_run = match runs.first() {
+			Some(BlendRun::Blended(range)) => range.clone(),
+			_ => 0..0,
+		};
+		// each run after the first writes the scene anew, into one of two targets in turn
+		let composites: Vec<wgpu::TextureView> = match &legacy_targets {
+			Some((_, _, composited)) if interleaved && runs.len() > 2 => {
+				vec![composited.clone(), target("legacy composite 2", HDR_FORMAT, 1, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default())]
+			}
+			Some((_, _, composited)) => vec![composited.clone()],
+			None => Vec::new(),
+		};
+		let lit_view = match &legacy_targets {
+			Some(_) if interleaved && runs.len() > 1 => composites[(runs.len() - 2) % composites.len()].clone(),
+			Some((_, _, composited)) if !interleaved => composited.clone(),
+			_ => color_view.clone(),
+		};
 		// the depth of field blurs the opaque scene; what blends (particles, beams, trails, transparent
 		// parts and decals, GUIs; Glass goes with the scene) takes its far blur by its own depth, not the
 		// depth behind it, and its near blur from the scene behind it (post-depth-blended: under Roblox's
@@ -5378,7 +5441,7 @@ impl Renderer {
 						Blended::Part(draw) | Blended::Decal(draw) => draw.center,
 						Blended::Beam(draw) => draw.center,
 						Blended::Trail(draw) => draw.center,
-						Blended::Particles(draw) => draw.center,
+						Blended::Particles(draw) | Blended::Legacy(draw) => draw.center,
 						Blended::Gui(draw) => draw.center,
 					};
 					(post::far_blur_share(focus, camera.depth(center)) * post::FAR_STEPS as f32).round() as u8
@@ -5616,7 +5679,7 @@ impl Renderer {
 		// far half it draws, shown; an effect's black hole draws its particles over its eight spheres).
 		// `glass` / `rest` say which of the two it draws (the depth of field's layers take the rest),
 		// `step` the far blur step of the rest it draws (its layer), every one when None.
-		let draw_transparent = |pass: &mut wgpu::RenderPass, glass: bool, rest: bool, step: Option<u8>| {
+		let draw_transparent = |pass: &mut wgpu::RenderPass, glass: bool, rest: bool, step: Option<u8>, range: std::ops::Range<usize>| {
 			for (_, item) in transparent.iter().filter(|_| glass) {
 				if let Blended::Part(draw) = item
 					&& draw.glass
@@ -5629,7 +5692,7 @@ impl Renderer {
 				}
 			}
 			for (index, (_, item)) in transparent.iter().enumerate() {
-				if !rest || step.is_some_and(|step| far_steps.get(index).copied().unwrap_or(0) != step) {
+				if !rest || !range.contains(&index) || step.is_some_and(|step| far_steps.get(index).copied().unwrap_or(0) != step) {
 					continue;
 				}
 				match item {
@@ -5655,6 +5718,8 @@ impl Renderer {
 					Blended::Beam(draw) => self.draw_beam(pass, &beam_view, draw, &prepared.beam_textures, samples),
 					Blended::Trail(draw) => self.draw_trail(pass, &trail_view, draw, &prepared.trail_textures, samples),
 					Blended::Particles(draw) => self.draw_particles(pass, &particle_view, draw, &prepared.particles, samples, false),
+					// in their own layer (`runs`)
+					Blended::Legacy(_) => {}
 					Blended::Gui(draw) => self.draw_gui(pass, view_guis, draw, samples),
 				}
 			}
@@ -5734,7 +5799,7 @@ impl Renderer {
 			profile.end(&mut pass, decal_time);
 			if !split {
 				let transparent_time = profile.start(&mut pass, "main transparent");
-				draw_transparent(&mut pass, true, true, None);
+				draw_transparent(&mut pass, true, true, None, first_run.clone());
 				profile.end(&mut pass, transparent_time);
 			}
 		}
@@ -5802,7 +5867,7 @@ impl Renderer {
 				occlusion_query_set: None,
 			});
 			pass.set_bind_group(0, &frame_group, &[]);
-			draw_transparent(&mut pass, true, late_layers.is_empty(), None);
+			draw_transparent(&mut pass, true, late_layers.is_empty(), None, first_run.clone());
 		}
 		// what blends, into its layers for the depth of field, the farthest-blurred first, depth-tested
 		// against the scene (and the depth its cut-out parts write, kept from layer to layer)
@@ -5829,9 +5894,65 @@ impl Renderer {
 				occlusion_query_set: None,
 			});
 			pass.set_bind_group(0, &frame_group, &[]);
-			draw_transparent(&mut pass, false, true, Some(*step));
+			draw_transparent(&mut pass, false, true, Some(*step), 0..transparent.len());
 		}
-		if let Some((msaa, layer, composited)) = &legacy_targets {
+		if let Some((msaa, layer, _)) = &legacy_targets
+			&& interleaved
+		{
+			let (view, resolve_target) = match msaa {
+				Some(msaa) => (msaa, Some(layer)),
+				None => (layer, None),
+			};
+			let mut below = color_view.clone();
+			for (turn, run) in runs.iter().skip(1).enumerate() {
+				let legacy = matches!(run, BlendRun::Legacy(_));
+				{
+					let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+						label: Some(if legacy { "legacy effects" } else { "blended after legacy effects" }),
+						color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+							view,
+							depth_slice: None,
+							resolve_target,
+							// legacy effects: no light, everything behind seen; what blends: transparent black
+							ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: if legacy { 1.0 } else { 0.0 } }), store: wgpu::StoreOp::Store },
+						})],
+						// what blends may write its cut-outs' depth for what comes after it
+						depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &depth_view, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }), stencil_ops: None }),
+						timestamp_writes: if turn == 0 { profile.pass("legacy effects") } else { None },
+						occlusion_query_set: None,
+					});
+					pass.set_bind_group(0, &frame_group, &[]);
+					match run {
+						BlendRun::Legacy(range) => {
+							for (_, item) in &transparent[range.clone()] {
+								if let Blended::Legacy(draw) = item {
+									self.draw_particles(&mut pass, &particle_view, draw, &prepared.particles, samples, true);
+								}
+							}
+						}
+						BlendRun::Blended(range) => draw_transparent(&mut pass, false, true, None, range.clone()),
+					}
+				}
+				let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+					label: Some("legacy composite"),
+					layout: &self.particles.composite_layout,
+					entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&below) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(layer) }],
+				});
+				let out = &composites[turn % composites.len()];
+				let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+					label: Some("legacy composite"),
+					color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: out, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } })],
+					depth_stencil_attachment: None,
+					timestamp_writes: if turn == 0 { profile.pass("legacy composite") } else { None },
+					occlusion_query_set: None,
+				});
+				pass.set_pipeline(if legacy { &self.particles.composite } else { &self.particles.over });
+				pass.set_bind_group(0, &group, &[]);
+				pass.draw(0..3, 0..1);
+				drop(pass);
+				below = out.clone();
+			}
+		} else if let Some((msaa, layer, composited)) = &legacy_targets {
 			{
 				let (view, resolve_target) = match msaa {
 					Some(msaa) => (msaa, Some(layer)),
@@ -8598,6 +8719,14 @@ mod blend_order_tests {
 		}
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	#[test]
+	fn the_blend_order_runs_legacy_effects_apart() {
+		assert_eq!(blend_runs(&[]), vec![BlendRun::Blended(0..0)]);
+		assert_eq!(blend_runs(&[false, false]), vec![BlendRun::Blended(0..2)]);
+		assert_eq!(blend_runs(&[true, false]), vec![BlendRun::Blended(0..0), BlendRun::Legacy(0..1), BlendRun::Blended(1..2)]);
+		assert_eq!(blend_runs(&[false, true, true, false, true]), vec![BlendRun::Blended(0..1), BlendRun::Legacy(1..3), BlendRun::Blended(3..4), BlendRun::Legacy(4..5)]);
 	}
 
 	#[test]

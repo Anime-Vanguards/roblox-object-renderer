@@ -566,8 +566,8 @@ pub fn simulate(emitter: &ParticleEmitter) -> Vec<Particle> {
 }
 
 /// The particle pipelines (per MSAA sample count, and whether the draw's flipbook cross-fades), their
-/// texture bind group layout and sampler; the legacy effects' linear-light pipelines and the composite
-/// of their layer over the scene.
+/// texture bind group layout and sampler; the legacy effects' linear-light pipelines, the composite of
+/// their layer over the scene and the layer of what blends after them laid over that.
 pub struct ParticlePipelines {
 	layout: wgpu::BindGroupLayout,
 	sampler: wgpu::Sampler,
@@ -575,6 +575,7 @@ pub struct ParticlePipelines {
 	linear: Vec<(u32, bool, wgpu::RenderPipeline)>,
 	pub composite_layout: wgpu::BindGroupLayout,
 	pub composite: wgpu::RenderPipeline,
+	pub over: wgpu::RenderPipeline,
 }
 
 impl ParticlePipelines {
@@ -644,23 +645,27 @@ impl ParticlePipelines {
 		let composite_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("legacy composite"), entries: &[texture(0), texture(1)] });
 		let composite_module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("legacy composite"), source: wgpu::ShaderSource::Wgsl(format!("{}\n{LEGACY}", super::pipelines::FULLSCREEN).into()) });
 		let composite_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("legacy composite"), bind_group_layouts: &[&composite_layout], push_constant_ranges: &[] });
-		let composite = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-			label: Some("legacy composite"),
-			layout: Some(&composite_pipeline_layout),
-			vertex: wgpu::VertexState { module: &composite_module, entry_point: Some("vs_fullscreen"), buffers: &[], compilation_options: Default::default() },
-			primitive: Default::default(),
-			depth_stencil: None,
-			multisample: Default::default(),
-			fragment: Some(wgpu::FragmentState {
-				module: &composite_module,
-				entry_point: Some("fs_legacy_composite"),
-				targets: &[Some(wgpu::ColorTargetState { format: HDR_FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })],
-				compilation_options: Default::default(),
-			}),
-			multiview: None,
-			cache,
-		});
-		Self { layout, sampler, pipelines, linear, composite_layout, composite }
+		let composite_pipeline = |entry: &str| {
+			device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+				label: Some(entry),
+				layout: Some(&composite_pipeline_layout),
+				vertex: wgpu::VertexState { module: &composite_module, entry_point: Some("vs_fullscreen"), buffers: &[], compilation_options: Default::default() },
+				primitive: Default::default(),
+				depth_stencil: None,
+				multisample: Default::default(),
+				fragment: Some(wgpu::FragmentState {
+					module: &composite_module,
+					entry_point: Some(entry),
+					targets: &[Some(wgpu::ColorTargetState { format: HDR_FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+					compilation_options: Default::default(),
+				}),
+				multiview: None,
+				cache,
+			})
+		};
+		let composite = composite_pipeline("fs_legacy_composite");
+		let over = composite_pipeline("fs_blended_over");
+		Self { layout, sampler, pipelines, linear, composite_layout, composite, over }
 	}
 
 	pub fn pipeline(&self, samples: u32, cross_fade: bool) -> &wgpu::RenderPipeline {
