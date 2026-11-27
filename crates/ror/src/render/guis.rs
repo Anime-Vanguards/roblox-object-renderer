@@ -40,6 +40,27 @@ const GUI: &str = include_str!("../../shaders/gui.wgsl");
 /// and rasterises its glyphs at 1.5 x TextSize (gui-surface-basics: magnified, one-pixel frames
 /// come out 0.67 or 1.33 canvas pixels).
 pub const SURFACE_SCALE: f32 = 1.5;
+
+/// Device pixels per canvas pixel a SurfaceGui's image is drawn at, from its canvas's corners projected into the view's
+/// pixels (top-left, top-right, bottom-left, bottom-right; `None` behind the camera): SURFACE_SCALE, or where the view
+/// magnifies the canvas past it, the doubling of it at or past the most a canvas pixel covers on screen, so that its
+/// frames keep an edge a pixel wide as a client's do (fixtures/world-guis.luau "sampling" in a Roblox client: a 32 x 24
+/// canvas seen at 32 device pixels a canvas pixel draws its frames as geometry, one-pixel frames whole canvas pixels,
+/// where the image at 1.5 ramped over 21 pixels). The texture's size limit caps it ([`GuiKey::new`]).
+fn surface_scale(canvas: [f32; 2], corners: [Option<glam::Vec2>; 4]) -> f32 {
+	let [Some(a), Some(b), Some(c), Some(d)] = corners else {
+		return SURFACE_SCALE;
+	};
+	let across = a.distance(b).max(c.distance(d)) / canvas[0].max(1e-3);
+	let down = a.distance(c).max(b.distance(d)) / canvas[1].max(1e-3);
+	let shown = across.max(down);
+	if shown.is_nan() || shown <= SURFACE_SCALE {
+		return SURFACE_SCALE;
+	}
+	// (at most 2^10 times: a canvas pixel over 1,500 device pixels wide)
+	SURFACE_SCALE * 2f32.powf((shown / SURFACE_SCALE).log2().ceil().min(10.0))
+}
+
 /// The capture viewport's height in GUI pixels (1116 device pixels at DPI 144).
 pub const REFERENCE_HEIGHT: f32 = 744.0;
 /// The largest GUI texture side (device pixels, margins included); bigger canvases are drawn at a
@@ -354,7 +375,7 @@ impl GuiPipelines {
 				],
 			})
 		};
-		// trilinear and anisotropic: SurfaceGuis are mostly seen smaller than their texture, and at angles
+		// (the GUI draws read the image's texels themselves, gui.wgsl `gui_sample`; the bind group keeps a sampler)
 		let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
 			label: Some("gui"),
 			mag_filter: wgpu::FilterMode::Linear,
@@ -560,20 +581,21 @@ pub(super) fn plan_with_skips(scene: &Scene, camera: &Camera, request: &ViewRequ
 					continue;
 				}
 				let (content_hash, local_snaps) = crate::scene::guis::stamp_gui_hash(gui.base_content_hash, &gui.local_files);
-				let key = GuiKey::new(content_hash, surface.canvas, SURFACE_SCALE, gui.clips);
 				let (across, upward) = (right, up);
-				let [left, top, right, bottom] = key.extent();
-				// a framed ViewportFrame's picture as tall as the view shows the frame (its sides projected),
-				// else as tall as the GUI's image draws it
 				let focal = (height * if gui.always_on_top { 1 } else { supersample }) as f32 * 0.5 / tan;
 				let project = |point: Vec3| {
 					let relative = point - camera.eye;
 					let depth = -relative.dot(back);
 					(depth > camera.near).then(|| glam::Vec2::new(relative.dot(across) / depth, relative.dot(upward) / depth) * focal)
 				};
+				let corners = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)].map(|(u, v)| project(surface.point(u, v)));
+				let key = GuiKey::new(content_hash, surface.canvas, surface_scale(surface.canvas, corners), gui.clips);
+				let [left, top, right, bottom] = key.extent();
+				// a framed ViewportFrame's picture as tall as the view shows the frame (its sides projected),
+				// else as tall as the GUI's image draws it
 				let shown = |rect: [f32; 4], pixels: [f32; 4]| match [(rect[0], rect[1]), (rect[2], rect[1]), (rect[0], rect[3]), (rect[2], rect[3])].map(|(u, v)| project(surface.point(u, v))) {
 					[Some(a), Some(b), Some(c), Some(d)] => a.distance(c).max(b.distance(d)),
-					_ => pixels[3] * SURFACE_SCALE,
+					_ => pixels[3] * key.scale(),
 				};
 				let framed = plan_framed(gui, surface.canvas, &key, &shown);
 				draws.push(GuiDraw {
@@ -2263,12 +2285,26 @@ mod tests {
 		let _ = std::fs::remove_dir_all(&dir);
 	}
 
-	/// What a Roblox client shows of GUIs in the world (fixtures/world-guis.luau; notes/render.md "GUIs"): a SurfaceGui
-	/// facing the sun takes it with GlobalShadows on as without them, a PointLight lights a SurfaceGui beside it, and a
-	/// billboard seen against the sun takes 0.41 of it from behind with GlobalShadows on. Before, the first and last
-	/// were black (GUIs took no sun with GlobalShadows, none from behind) and the second unlit.
 	#[test]
-	fn guis_in_the_world_are_lit_as_a_client_lights_them() {
+	fn a_magnified_surface_gui_is_drawn_at_a_doubling_of_its_scale_past_the_screens() {
+		let corners = |width: f32, height: f32| [Some(glam::Vec2::ZERO), Some(glam::Vec2::new(width, 0.0)), Some(glam::Vec2::new(0.0, height)), Some(glam::Vec2::new(width, height))];
+		// a 32 x 24 canvas 1,024 pixels across: 32 device pixels a canvas pixel, drawn at 48
+		assert_eq!(surface_scale([32.0, 24.0], corners(1024.0, 768.0)), 48.0);
+		// at its own size or smaller, at 1.5
+		assert_eq!(surface_scale([32.0, 24.0], corners(48.0, 36.0)), SURFACE_SCALE);
+		assert_eq!(surface_scale([300.0, 300.0], corners(40.0, 40.0)), SURFACE_SCALE);
+		// a hair past it, the next doubling; a corner behind the camera, as before
+		assert_eq!(surface_scale([100.0, 100.0], corners(151.0, 100.0)), 3.0);
+		assert_eq!(surface_scale([100.0, 100.0], [None, Some(glam::Vec2::ZERO), Some(glam::Vec2::ZERO), Some(glam::Vec2::ZERO)]), SURFACE_SCALE);
+	}
+
+	/// What a Roblox client shows of GUIs in the world (fixtures/world-guis.luau; notes/render.md "GUIs"): a SurfaceGui
+	/// facing the sun takes it with GlobalShadows on as without them, a PointLight lights a SurfaceGui beside it, a
+	/// billboard seen against the sun takes 0.41 of it from behind with GlobalShadows on, and a SurfaceGui seen smaller
+	/// than its image shows the coverage of 4x MSAA samples, not filtered texels. Before, the first and third were
+	/// black (GUIs took no sun with GlobalShadows, none from behind), the second unlit and the last filtered.
+	#[test]
+	fn guis_in_the_world_are_lit_and_sampled_as_a_client_draws_them() {
 		use crate::render::camera::CameraSpec;
 		use crate::scene::build::{ModelBuilder, PartSpec, facing};
 		use rbx_dom_weak::InstanceBuilder;
@@ -2373,6 +2409,23 @@ mod tests {
 		let (open, shadows) = (against(false), against(true));
 		assert!(open > 60.0, "a billboard seen against the sun is lit from behind ({open})");
 		assert!((open - shadows).abs() <= 1.0, "with GlobalShadows a billboard takes the sun from behind as without them ({shadows} against {open})");
+
+		// an unlit SurfaceGui of one-texel black lines every third texel on white, seen 2.7 times smaller than its image
+		let mut model = ModelBuilder::new("Lines");
+		let part = model.part(&PartSpec { name: "Board".into(), size: Vec3::new(12.0, 4.0, 0.5), color: [0, 0, 0], material: 272, ..Default::default() });
+		surface(&mut model, part, [300.0, 100.0], 0.0);
+		let mut scene = crate::scene::extract::extract(&model.into_document());
+		lighting(&mut scene, 0.0, false);
+		// 300 canvas pixels over 12 studs, 1.5 / 2.7 device pixels each: the camera this far off
+		let focal = 64.0 / 20f32.to_radians().tan();
+		let request = view(Vec3::new(0.0, 0.0, -focal / (25.0 * 1.5 / 2.7)), Vec3::ZERO, 40.0, 256);
+		let image = draw(&scene, &request, &|column, _| if column % 3 == 0 { [0, 0, 0, 255] } else { [255; 4] });
+		let mut levels: Vec<u8> = (48..80u32).flat_map(|row| (98..158u32).map(move |column| (row, column))).map(|(row, column)| image.rgba[((row * 256 + column) * 4) as usize]).collect();
+		levels.sort_unstable();
+		levels.dedup();
+		assert!(levels.len() <= 5, "each pixel shows 0-4 quarters of a line, as 4x MSAA samples of geometry do: {levels:?}");
+		// (a pixel 2.7 texels wide holds the four samples over two of them: one or two quarters of a line)
+		assert!(levels.len() >= 2, "lines of the image show: {levels:?}");
 
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);

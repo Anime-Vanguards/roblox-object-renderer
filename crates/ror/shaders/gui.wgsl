@@ -10,6 +10,7 @@
 @group(0) @binding(5) var linear_sampler: sampler;
 
 @group(1) @binding(0) var gui_texture: texture_2d<f32>;
+// (unread: the image's texels are read by `gui_sample`)
 @group(1) @binding(1) var gui_sampler: sampler;
 
 // A ViewportFrame's world (scene::guis::Viewport), straight alpha in display values: a window's as
@@ -64,11 +65,25 @@ const GUI_LIT_SCALE: f32 = 0.98;
 // slab turned 120° from the sun 0.40 / 0.41 in white / grey without them, a billboard seen from the side away from the
 // sun 0.42 either way; Studio's edit viewport: 0.39 without them, none with them)
 const GUI_BACK_LIGHT: f32 = 0.41;
-// Minified, Studio's SurfaceGuis are as sharp as their full-size image sampled bilinearly (gui-content
-// surface-far, 2.4 times smaller: 67.5 % of the GUI's pixels within 2 with the mips, 94.0 % from a bias
-// of -1.5 on, the same at -6; gui-surface-basics light-*: one point better); -1.5 keeps the full-size
-// image down to 2.8 times smaller, the mips beyond (not measured)
-const GUI_MIP_BIAS: f32 = -1.5;
+// The GUI's image at this pixel as a Roblox client draws a GUI's content in the world: as geometry rasterised with the
+// scene's 4x MSAA (fixtures/world-guis.luau "sampling": a canvas of one-pixel lines seen 1 to 16 times smaller than its
+// image shows each pixel at 0, 1, 2, 3 or 4 quarters of the line's colour, in √x, each line whole or missed, where mips
+// averaged them to grey; magnified, frames keep an edge a pixel wide). The image's texel under each of the four sample
+// positions of 4x MSAA, averaged: the coverage of its whole-pixel rects (a SurfaceGui's image is drawn at least as fine as
+// the screen shows it, guis.rs `surface_scale`; a billboard's 1:1, each texel under all four)
+fn gui_sample(uv: vec2<f32>) -> vec4<f32> {
+	let size = vec2<f32>(textureDimensions(gui_texture, 0));
+	let dx = dpdx(uv);
+	let dy = dpdy(uv);
+	let last = vec2<i32>(size) - 1;
+	let samples = array<vec2<f32>, 4>(vec2<f32>(-2.0, -6.0), vec2<f32>(6.0, -2.0), vec2<f32>(-6.0, 2.0), vec2<f32>(2.0, 6.0));
+	var sum = vec4<f32>(0.0);
+	for (var i = 0; i < 4; i++) {
+		let at = uv + (dx * samples[i].x + dy * samples[i].y) / 16.0;
+		sum += textureLoad(gui_texture, clamp(vec2<i32>(floor(at * size)), vec2<i32>(0), last), 0);
+	}
+	return sum * 0.25;
+}
 
 @vertex
 fn vs_gui(input: GuiInput) -> GuiOutput {
@@ -230,7 +245,7 @@ fn gui_texel(input: GuiOutput, texel_in: vec4<f32>) -> vec4<f32> {
 @fragment
 fn fs_gui(input: GuiOutput) -> @location(0) vec4<f32> {
 	// premultiplied display colour (c · a)
-	let texel = gui_texel(input, textureSampleBias(gui_texture, gui_sampler, input.uv, GUI_MIP_BIAS));
+	let texel = gui_texel(input, gui_sample(input.uv));
 	if (texel.a <= 0.0) {
 		discard;
 	}
@@ -257,7 +272,7 @@ fn fs_gui(input: GuiOutput) -> @location(0) vec4<f32> {
 // 255 behind a wall)
 @fragment
 fn fs_gui_overlay(input: GuiOutput) -> @location(0) vec4<f32> {
-	let texel = textureSampleBias(gui_texture, gui_sampler, input.uv, GUI_MIP_BIAS);
+	let texel = gui_sample(input.uv);
 	// a framed ViewportFrame's picture laid in (gui_texel); no window draws here
 	if (gui_window.mode.x > 0.5) {
 		return gui_texel(input, texel);
