@@ -45,6 +45,10 @@ const SLOWEST_ORIENTED: f32 = 1e-4;
 /// 0.38 / 0.40 / 0.43 / 0.5, 200 for floor + 1).
 const RANDOM_PHASE: f32 = 0.38;
 
+/// How far past a whole frame an unblended OneShot flipbook's position must be to show that frame: a
+/// Roblox client shows the frame before at a whole one (render::particles::flipbook).
+const FRAME_REACHED: f32 = 1e-4;
+
 /// Soft particles: a particle's opacity fades in over this many times its Size of view depth in front
 /// of the surface behind it (particle-soft, particle-soft-size: linear, exactly one Size).
 const SOFT_DEPTH: f32 = 1.0;
@@ -361,11 +365,25 @@ fn flipbook(emitter: &ParticleEmitter, age: f32, lifetime: f32, rng: &mut Rng) -
 		// one, the rest of the sheet spread over the life, ending on the last frame (particle-startrandom:
 		// the swirl sheet's frames at 0.25, 0.5, 0.75 and 0.95 of the life, χ² 17 / 6 / 3 / 0 against 41 /
 		// 66 / 188 / 448 for running on round the sheet; particle-flipbook-random: every first frame)
+		// Cross-faded, the sheet runs to its last frame at the end of the life, (frames - 1) of them, not
+		// frames: a Roblox client shows a 4 x 4 sheet at 15 · age / Lifetime, 2 x 2 at 3 and 8 x 8 at 63,
+		// from a random first frame s + (15 - s) · age / Lifetime (fixtures/playback-timing.luau "sheet",
+		// "sheet2": frames read from coded test sheets frozen at 1-9 frames of age, Lifetimes 0.03-0.15 s,
+		// client / ror 0.7500, 0.9375, 0.9844 on the sim's exact 60-frames-a-second clock, two sessions);
+		// without the cross-fade each frame keeps 1 / frames of the life, and a frame reached exactly
+		// still shows the one before (16 · age / Lifetime = 8.0: frame 7 in both sessions, where every
+		// reading off a whole frame is floor(16 · age / Lifetime))
 		1 => {
 			let life = (age / lifetime.max(1e-6)).clamp(0.0, 1.0);
-			let position = start + (count as f32 - start) * life;
-			let frame = (position.floor() as u32).min(count - 1);
-			(frame, (frame + 1).min(count - 1), position.fract())
+			if emitter.flipbook_blend_frames {
+				let position = start + (count as f32 - 1.0 - start).max(0.0) * life;
+				let frame = (position.floor() as u32).min(count - 1);
+				(frame, (frame + 1).min(count - 1), position.fract())
+			} else {
+				let position = start + (count as f32 - start).max(0.0) * life;
+				let frame = ((position - FRAME_REACHED).floor().max(0.0) as u32).min(count - 1);
+				(frame, (frame + 1).min(count - 1), 0.0)
+			}
 		}
 		// PingPong: first to last and back
 		2 => {
@@ -1462,6 +1480,49 @@ mod tests {
 		// Loop at 2 frames a second wraps after 8 seconds
 		let looping = ParticleEmitter { flipbook_mode: 0, flipbook_framerate: (2.0, 2.0), ..emitter };
 		assert_eq!(flipbook(&looping, 8.75, 100.0, &mut rng).0, 1);
+	}
+
+	/// Cross-faded, a OneShot sheet runs to its last frame at the end of the life: 15 · age / Lifetime on
+	/// a 4 x 4 sheet, 3 on a 2 x 2 and 63 on an 8 x 8 (a Roblox client's frames, fixtures/
+	/// playback-timing.luau "sheet" and "sheet2"), not 16, 4 and 64 as unblended sheets keep; unblended,
+	/// a frame reached exactly still shows the one before (the client's frame 7 at 16 · age / Lifetime =
+	/// 8.0).
+	#[test]
+	fn cross_faded_one_shot_sheets_end_on_their_last_frame() {
+		let mut rng = Rng::new(1, 1);
+		for (layout, count) in [(1u32, 4.0f32), (2, 16.0), (3, 64.0)] {
+			let blended = ParticleEmitter { flipbook_layout: layout, flipbook_mode: 1, flipbook_blend_frames: true, ..emitter() };
+			for life in [0.1f32, 0.3, 0.55, 0.9] {
+				let (frame, next, blend) = flipbook(&blended, life * 0.15, 0.15, &mut rng);
+				let position = (count - 1.0) * life;
+				assert_eq!(frame, position.floor() as u32, "{count} frames at {life}");
+				assert_eq!(next, frame + 1);
+				assert!((blend - position.fract()).abs() < 1e-4, "{count} frames at {life}: blend {blend}");
+			}
+			// the last frame whole at the end of the life
+			let (frame, _, blend) = flipbook(&blended, 0.15, 0.15, &mut rng);
+			assert_eq!((frame, blend), (count as u32 - 1, 0.0));
+		}
+		// unblended, each frame keeps a sixteenth of the life, the one before at a whole frame (an age of 3
+		// frames at Lifetime 0.1 s, as the client was frozen at)
+		let unblended = ParticleEmitter { flipbook_layout: 2, flipbook_mode: 1, flipbook_blend_frames: false, ..emitter() };
+		assert_eq!(flipbook(&unblended, 0.55 * 0.15, 0.15, &mut rng), (8, 9, 0.0));
+		assert_eq!(flipbook(&unblended, 3.0 / 60.0, 0.1, &mut rng), (7, 8, 0.0));
+		assert_eq!(flipbook(&unblended, 2.0 / 60.0, 0.1, &mut rng), (5, 6, 0.0));
+		assert_eq!(flipbook(&unblended, 0.0, 0.1, &mut rng), (0, 1, 0.0));
+		// from a random first frame s, s + (15 - s) · age / Lifetime
+		let random = ParticleEmitter { flipbook_layout: 2, flipbook_mode: 1, flipbook_blend_frames: true, flipbook_start_random: true, ..emitter() };
+		for stream in 0..16 {
+			let start = {
+				let mut rng = Rng::new(7, stream);
+				rng.range(random.flipbook_framerate);
+				(rng.unit() * 16.0).floor()
+			};
+			let (frame, _, blend) = flipbook(&random, 0.5 * 0.15, 0.15, &mut Rng::new(7, stream));
+			let position = start + (15.0 - start) * 0.5;
+			assert_eq!(frame, position.floor() as u32);
+			assert!((blend - position.fract()).abs() < 1e-4);
+		}
 	}
 
 	#[test]
