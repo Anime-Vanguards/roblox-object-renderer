@@ -2454,12 +2454,19 @@ mod tests {
 		renderer.upload_guis(vec![(key, image, true)], &mut textures, &mut warn, &mut skipped);
 		assert!(renderer.gui_textures.get(&key).is_some());
 
+		// Each render's views are read back before the next and before the device goes: dropped unread, the
+		// renders were still running on a slow runner's software adapter when the test ended, and the device
+		// gave up waiting for them (wgpu panics after 6.3 s).
+		let finish = |(pending, mut stats): (Vec<crate::render::PendingView<'_>>, crate::render::RenderStats)| {
+			for view in pending {
+				view.finish(&mut stats).expect("the view read back");
+			}
+			stats
+		};
 		// Pass an empty ready map + a prefetch failure entry for `key`: draw-time retry must
 		// pick up the recovered texture, draw the GUI, and leave `gui_report.skipped` empty.
 		let prefetch_failed = (GuiTextures::new(), HashMap::from([(key, "transient prefetch error".to_string())]));
-		let (_pending, stats) = renderer
-			.submit_views(&scene, std::slice::from_ref(&view), None, None, Some(prefetch_failed), None, None)
-			.expect("render with draw-time GUI retry");
+		let stats = finish(renderer.submit_views(&scene, std::slice::from_ref(&view), None, None, Some(prefetch_failed), None, None).expect("render with draw-time GUI retry"));
 		assert_eq!(stats.guis, 1, "GUI must be drawn after draw-time retry recovers it");
 		assert_eq!(stats.gui_report.drawn.len(), 1, "recovered GUI must appear in gui_report.drawn: {:?}", stats.gui_report);
 		assert!(stats.gui_report.skipped.is_empty(), "recovered GUI must not remain in gui_report.skipped: {:?}", stats.gui_report);
@@ -2472,9 +2479,7 @@ mod tests {
 		] {
 			assert!(is_unrecoverable_gui_skip(cause));
 			let unrecoverable = (GuiTextures::new(), HashMap::from([(key, cause.to_string())]));
-			let (_pending, stats) = renderer
-				.submit_views(&scene, std::slice::from_ref(&view), None, None, Some(unrecoverable), None, None)
-				.expect("render skipping unrecoverable GUI retry");
+			let stats = finish(renderer.submit_views(&scene, std::slice::from_ref(&view), None, None, Some(unrecoverable), None, None).expect("render skipping unrecoverable GUI retry"));
 			assert_eq!(stats.guis, 0, "unrecoverable cause {cause:?} must not retry at draw time");
 			assert!(stats.gui_report.drawn.is_empty());
 			assert_eq!(stats.gui_report.skipped.len(), 1);

@@ -7975,12 +7975,21 @@ mod lighting_style_tests {
 			scene
 		};
 		// straight down over the cube: the floor round it and its top, as lit as the open floor but for the occlusion
-		let views = [ViewRequest { width: 64, height: 64, camera: CameraSpec::LookAt { eye: [0.0, 12.0, -0.05], target: [0.0; 3], fov: 40.0 }, background: Background::Color([0.0, 0.0, 1.0]), bloom: false, ..Default::default() }];
-		let draw = |soft: bool, cube: bool| -> Vec<f32> {
-			let (images, _) = renderer.render(&scene(soft, cube), &views).unwrap();
-			images[0].rgba.chunks(4).map(|pixel| (pixel[1] as f32 / 255.0).powf(2.2)).collect()
+		let view = |linear_scale: f32| ViewRequest { width: 64, height: 64, camera: CameraSpec::LookAt { eye: [0.0, 12.0, -0.05], target: [0.0; 3], fov: 40.0 }, background: Background::Color([0.0, 0.0, 1.0]), bloom: false, linear_scale: Some(linear_scale), ..Default::default() };
+		// each pixel's radiance (green's): without the tone curve the image is the square root of the exposed radiance
+		// times the view's scale
+		let draw = |soft: bool, cube: bool, linear_scale: f32| -> Vec<f32> {
+			let (images, _) = renderer.render(&scene(soft, cube), &[view(linear_scale)]).unwrap();
+			images[0].rgba.chunks(4).map(|pixel| (pixel[1] as f32 / 255.0).powi(2)).collect()
 		};
-		let (open, realistic, soft) = (draw(false, false), draw(false, true), draw(true, true));
+		// read in radiance, the open floor near the top of the 8 bits: through the tone curve the darkening is 1 to 4
+		// levels of 255 and Soft's smaller share of it is lost in the rounding (a GPU read 0.82 of Realistic's, the
+		// software adapter 0.78, the two a level apart on a tenth of the pixels)
+		let floor = draw(false, false, 1.0).iter().sum::<f32>() / (64 * 64) as f32;
+		assert!(floor > 0.001 && floor < 1.0, "the open floor's radiance read unclipped ({floor})");
+		let linear_scale = 0.8 / floor;
+		let (open, realistic, soft) = (draw(false, false, linear_scale), draw(false, true, linear_scale), draw(true, true, linear_scale));
+		assert!(open.iter().all(|&open| (0.7..0.9).contains(&open)), "the open floor near the top of the range");
 		// over the pixels Realistic's occlusion darkens by 2 % or more
 		let (mut darkened, mut by_realistic, mut by_soft) = (0, 0.0, 0.0);
 		for ((open, realistic), soft) in open.iter().zip(&realistic).zip(&soft) {
