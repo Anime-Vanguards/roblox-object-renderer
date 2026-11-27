@@ -1472,7 +1472,7 @@ pub struct Resolved<'a> {
 	/// Each Rate emitter's monotonic accumulator and live-birth ring through the last grid frame
 	/// drawn ([`Resolved::apply_history_timed`]), keyed by `(referent, seed)` so multi-system
 	/// legacy effects never collide.
-	scans: parking_lot::Mutex<std::collections::HashMap<(Ref, u64), RateScan>>,
+	scans: parking_lot::Mutex<std::collections::HashMap<(Ref, u64, u64), RateScan>>,
 	/// Each Trail's incremental grid scan up to the last frame drawn, so later moments append new
 	/// grid points instead of replaying from `t = 0`.
 	trails: parking_lot::Mutex<std::collections::HashMap<Ref, TrailScan>>,
@@ -1480,7 +1480,7 @@ pub struct Resolved<'a> {
 	beams: parking_lot::Mutex<std::collections::HashMap<Ref, BeamScan>>,
 	/// Each emitter's viewer-masked timeline (with precomputed [`ScaleCurve`]s) over the grid
 	/// ([`Resolved::watched_timeline`]), worked out once per grid.
-	views: parking_lot::Mutex<std::collections::HashMap<(Ref, u64), std::sync::Arc<Timeline>>>,
+	views: parking_lot::Mutex<std::collections::HashMap<(Ref, u64, u64), std::sync::Arc<Timeline>>>,
 	#[cfg(test)]
 	trail_full_scans: std::sync::atomic::AtomicUsize,
 	#[cfg(test)]
@@ -2501,7 +2501,9 @@ impl Resolved<'_> {
 		if viewer.is_empty() {
 			return None;
 		}
-		let view_key = (referent, emitter.seed);
+		// a legacy effect's systems that share a random stream (Sparkles' stars and their white cores) share
+		// its seed, so the key tells them apart by path
+		let view_key = (referent, emitter.seed, path_key(&emitter.path));
 		if let Some(cached) = self.views.lock().get(&view_key) {
 			return Some(cached.clone());
 		}
@@ -3094,7 +3096,7 @@ impl Resolved<'_> {
 				// clips from 10 s: a map's Specks thinned to none, 4,718 particles to 1,464)
 				let longest = emitter.lifetime.0.max(emitter.lifetime.1);
 				let monotonic = timeline.time_curve.valid_for(start) && timeline.time_curve.monotonic;
-				let scan_key = (referent, emitter.seed);
+				let scan_key = (referent, emitter.seed, path_key(&emitter.path));
 				// Advance strictly forward from the previous moment's live-birth ring when valid,
 				// so already-scanned grid frames are never replayed.
 				let resume = if monotonic {
@@ -3507,6 +3509,11 @@ mod skewed_cframes {
 		assert!(!skewed(&affine(&numbers(&upright).iter().map(|&n| n as f32).collect::<Vec<_>>(), Affine3A::IDENTITY).unwrap()));
 		assert!(skewed(&affine(&numbers(&a).iter().map(|&n| n as f32).collect::<Vec<_>>(), Affine3A::IDENTITY).unwrap()));
 	}
+}
+
+/// An emitter's path as a cache key (FNV-1a): a legacy effect's systems sharing one seed differ by it.
+fn path_key(path: &str) -> u64 {
+	path.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ byte as u64).wrapping_mul(0x100_0000_01b3))
 }
 
 #[cfg(test)]

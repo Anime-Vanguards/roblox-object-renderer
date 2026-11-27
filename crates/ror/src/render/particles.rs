@@ -1712,4 +1712,24 @@ mod tests {
 		assert_eq!(lost, 0, "particles that stopped drawing");
 		assert!(gained < 40, "{gained} particles started drawing for a 0.01 change of the share");
 	}
+
+	/// Sparkles' white cores draw on their stars' particles: the same births, places and turns, the
+	/// stars in SparkleColor (times the client's warm tint) and the cores white.
+	#[test]
+	fn sparkles_cores_share_their_stars_particles() {
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		let mut model = ModelBuilder::new("Cores");
+		let part = model.part(&PartSpec { name: "Holder".into(), size: Vec3::splat(0.2), ..Default::default() });
+		model.child(part, rbx_dom_weak::InstanceBuilder::new("Sparkles").with_property("SparkleColor", rbx_dom_weak::types::Color3::new(1.0, 0.0, 0.0)));
+		let scene = crate::scene::extract::extract(&model.into_document());
+		let find = |name: &str| scene.particles.iter().find(|emitter| emitter.path.ends_with(name)).expect(name);
+		let (stars, cores) = (find("#stars"), find("#cores"));
+		assert_eq!(stars.seed, cores.seed);
+		assert!((stars.color[0].1 - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-6 && cores.color[0].1 == Vec3::ONE);
+		let (a, b) = (simulate(stars), simulate(cores));
+		assert!(!a.is_empty() && a.len() == b.len());
+		for (star, core) in a.iter().zip(&b) {
+			assert!(star.position.distance(core.position) < 1e-5 && star.rotation == core.rotation && (core.size - 0.35 * star.size).abs() < 1e-5);
+		}
+	}
 }

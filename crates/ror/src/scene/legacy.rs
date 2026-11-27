@@ -65,6 +65,9 @@ pub struct System {
 	pub linear: bool,
 	/// The spin turns the texture within the quad, which stays upright.
 	pub spin_texture: bool,
+	/// Draws the particles of the system of this name (its random stream: the same births, places and
+	/// turns), as Sparkles' white cores draw over their stars.
+	pub stream: Option<&'static str>,
 }
 
 impl System {
@@ -97,6 +100,7 @@ impl System {
 			alpha_ramp: (0.0, 0.0),
 			linear: true,
 			spin_texture: false,
+			stream: None,
 		}
 	}
 }
@@ -203,34 +207,45 @@ fn fire_systems() -> Vec<System> {
 	vec![flame, secondary]
 }
 
-/// Sparkles' systems (legacy-sparkles-mean): stars of SparkleColor thrown outwards from the
-/// emitter, mostly across its up axis (from above the cloud is round, 2.1 studs of spread; from
-/// the front 1.4 tall, centred 1.5 studs up), slowing and rising, adding their light in the √ space
-/// as ParticleEmitters do (legacy-sparkles-panel: over a panel as bright as a daytime sky Studio's
-/// add 2.0 to 2.4 times what linear light would; fewer and brighter than they would be in linear
-/// light: Studio's frames over black show 76 to 111 stars, the brightest 9 to 11.5); and a few
-/// white dots that do not take the colour (black-ev-3: 4 % of a white one's light). The opacities
-/// are the square roots of the linear fit's (a star's light goes as its opacity squared).
+/// Sparkles' systems (legacy-sparkles-mean): stars thrown outwards from the emitter, mostly across its
+/// up axis (from above the cloud is round, 2.1 studs of spread; from the front 1.4 tall, centred 1.5
+/// studs up), slowing and rising, adding their light in the √ space as ParticleEmitters do
+/// (legacy-sparkles-panel: over a panel as bright as a daytime sky Studio's add 2.0 to 2.4 times what
+/// linear light would), their opacities the square roots of the linear fit's (a star's light goes as
+/// its opacity squared), SparkleColor's (`sparkle_color`); and a small white core over each star that
+/// does not take the colour (the same particles: `System::stream`). In a Roblox client (Sparkles of
+/// SparkleColor white, (144, 25, 255), red and green 12 studs from the camera and legacy-sparkles-mean's
+/// runs, 24 frames each): red and green ones keep 0.051-0.055 of white Sparkles' light in their other
+/// channels, black ones show the whole field of stars as small white stars (35 a frame above 6 of 255
+/// against white's 50, 5 % of the light, peaks 2 / 3 of white ones').
 fn sparkles_systems() -> Vec<System> {
+	// 36 a second (a client's frames show 50 stars above 6 of 255 at exposure -3 where 22 gave 30),
+	// faster and rising more than first fitted (legacy-sparkles-mean from the front: the light's spread
+	// 0.80-0.85 of Studio's and its centre 0.4 studs low, now 0.89-0.97 and within 0.13)
 	let stars = System {
-		rate: 22.0,
+		rate: 36.0,
 		lifetime: (1.0, 1.6),
-		speed: (4.5, 8.0),
+		speed: (5.2, 9.2),
 		spread: 30.0,
-		rise: 8.5,
+		rise: 10.5,
 		drag: 1.5,
 		outwards: true,
 		size: vec![(0.0, 0.6), (0.3, 1.0), (1.0, 0.8)],
 		transparency: vec![(0.0, 0.29), (0.2, 0.0), (0.8, 0.16), (1.0, 1.0)],
-		brightness: 0.95,
+		brightness: 0.43,
 		light_emission: 1.0,
 		rot_speed: (-90.0, 90.0),
 		linear: false,
 		..System::new("stars", "rbxasset://textures/particles/sparkles_main.dds")
 	};
-	let dots = System { rate: 4.0, size: vec![(0.0, 0.15), (1.0, 0.15)], brightness: 7.8, ..System::new("dots", "rbxasset://textures/particles/sparkles_main.dds") };
-	let dots = System { lifetime: stars.lifetime, speed: stars.speed, spread: stars.spread, rise: stars.rise, drag: stars.drag, outwards: true, transparency: stars.transparency.clone(), light_emission: 1.0, linear: false, ..dots };
-	vec![stars, dots]
+	let cores = System { name: "cores", stream: Some("stars"), size: stars.size.iter().map(|&(time, size)| (time, size * 0.35)).collect(), brightness: 0.37, ..stars.clone() };
+	vec![stars, cores]
+}
+
+/// The colour (sRGB) Sparkles' stars take from SparkleColor, times a warm tint (white ones read
+/// 1 : 0.90 : 0.84 in a Roblox client, their white cores neutral).
+fn sparkle_color(color: Vec3) -> Vec3 {
+	color * Vec3::new(1.0, 0.947, 0.912)
 }
 
 /// Smoke's puffs at RiseVelocity 1 for `size` and `opacity`: white (Color tints them), lit, blending
@@ -454,7 +469,8 @@ fn emitter(document: &Document, referent: Ref, class: &str, system: System, plac
 	// outwards: a cylinder about the frame's up axis (a ParticleEmitter's cylinder runs along its
 	// part's X axis) of no size, its particles leaving radially
 	let frame = if system.outwards { frame * Affine3A::from_rotation_z(std::f32::consts::FRAC_PI_2) } else { frame };
-	let seed = path.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ byte as u64).wrapping_mul(0x100_0000_01b3));
+	let stream = system.stream.map_or(path.clone(), |name| format!("{}#{name}", document.path_of(referent)));
+	let seed = stream.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ byte as u64).wrapping_mul(0x100_0000_01b3));
 	ParticleEmitter {
 		path,
 		cframe: frame,
@@ -576,8 +592,8 @@ pub fn read(document: &Document, referent: Ref, instance: &Instance, warnings: &
 				enabled: props::bool(instance, "Enabled", true),
 				time_scale: props::f32(instance, "TimeScale", 1.0),
 			};
-			// SparkleColor tints the stars; the dots stay white (legacy-sparkles-mean black-ev-3)
-			let colors = [props::color(instance, "SparkleColor", Vec3::new(144.0, 25.0, 255.0) / 255.0), Vec3::ONE];
+			// SparkleColor tints the stars; their cores stay white
+			let colors = [sparkle_color(props::color(instance, "SparkleColor", Vec3::new(144.0, 25.0, 255.0) / 255.0)), Vec3::ONE];
 			sparkles_systems().into_iter().zip(colors).map(|(system, color)| emitter(document, referent, "sparkles", system, &placement, color)).collect()
 		}
 		"Smoke" => {
