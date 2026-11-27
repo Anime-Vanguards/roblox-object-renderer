@@ -172,7 +172,7 @@ fn main() {
 	let image = [root.join("../ror-image/src"), root.join("../ror-image/Cargo.toml")];
 	let texels = code(&root, &[&image[..], &[root.join("src/render/texels.rs"), root.join("src/render/transcode.rs")]].concat(), &image_crates, &manifests);
 	println!("cargo:rustc-env=ROR_TEXTURE_CODE={texels:016x}");
-	// a GUI image file: its pixels' premultiplying and mips (gui_files.rs, ror-image's) and its pieces'
+	// a GUI image file: its pixels' premultiplying (gui_files.rs, ror-image's) and its pieces'
 	// compression (zstd)
 	let mut gui_crates = image_crates.clone();
 	gui_crates.extend(closure(&packages, "ror", &BTreeSet::from(["zstd".to_string()])));

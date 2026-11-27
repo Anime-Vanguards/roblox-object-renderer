@@ -1741,10 +1741,11 @@ mod tests {
 
 	#[test]
 	fn gui_images_keep_their_levels_through_files_and_pieces() {
-		// odd sides (the float mip path) and several pieces
+		// odd sides and several pieces
 		let (width, height) = (601u32, 377u32);
 		let rgba: Vec<u8> = (0..width * height * 4).map(|index| (index.wrapping_mul(2654435761) >> 13) as u8).collect();
 		let expected = gui_image(width, height, rgba.clone());
+		assert_eq!(expected.levels.len(), 1, "no mips: a GUI is read at its 4x MSAA sample positions, level 0 alone");
 		let image = GuiImage::from_rgba(width, height, rgba).unwrap();
 		assert!(image.ends.len() > 1);
 		let read = GuiImage::from_file(&image.file_bytes()).unwrap();

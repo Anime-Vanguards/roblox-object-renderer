@@ -1,13 +1,14 @@
 //! What a GUI image kept on disk holds (`<state dir>/guis/<rur build>-<code>/<key>.gui`, and the
-//! content store's, render::guis): the premultiplied pixels rur drew, their mips, and the file layout.
-//! build.rs hashes this file, ror-image (the mips) and their locked dependencies into
+//! content store's, render::guis): the premultiplied pixels rur drew, and the file layout.
+//! build.rs hashes this file, ror-image and their locked dependencies into
 //! `ROR_GUI_CODE`, the folder's second half, so a build whose GUI images could differ never reads
 //! another's; render::guis only finds, reads and uploads them.
 
 use anyhow::Result;
 
-/// Premultiplied, with a box-filtered mip chain (minified GUIs average their colours as Studio's
-/// multisampled geometry does, in display values).
+/// Premultiplied, one level: a GUI is read texel by texel at its 4x MSAA sample positions, as a Roblox
+/// client rasterises its content (gui.wgsl `gui_sample`, fixtures/world-guis.luau "sampling": no mips),
+/// so a mip chain would be made, kept and uploaded for nothing (a third more bytes).
 pub(super) fn gui_image(width: u32, height: u32, mut rgba: Vec<u8>) -> ror_image::Image {
 	for pixel in rgba.chunks_exact_mut(4) {
 		let alpha = pixel[3] as u32;
@@ -15,13 +16,11 @@ pub(super) fn gui_image(width: u32, height: u32, mut rgba: Vec<u8>) -> ror_image
 			*value = ((*value as u32 * alpha + 127) / 255) as u8;
 		}
 	}
-	let mut image = ror_image::Image::from_rgba8(width, height, rgba);
-	ror_image::generate_mips(&mut image);
-	image
+	ror_image::Image::from_rgba8(width, height, rgba)
 }
 
-/// A GUI's image as the GPU takes it: premultiplied RGBA8 with its box-filtered mip chain
-/// ([`gui_image`]), each level's rows padded to wgpu's copy alignment one level after another,
+/// A GUI's image as the GPU takes it: premultiplied RGBA8 ([`gui_image`]; files of older builds held a
+/// mip chain too, each level's rows padded to wgpu's copy alignment one level after another),
 /// compressed (zstd) in pieces of [`GUI_CHUNK`] bytes. Kept so in memory and on disk (`<key>.gui`), a
 /// frame's images go to the GPU by decompressing every piece on every core straight into one staging
 /// buffer, then one copy per level ([`Renderer::upload_guis`]). A GUI clip's frames each draw new
