@@ -26,7 +26,7 @@ use wgpu::util::DeviceExt;
 
 use super::camera::Camera;
 use super::ids::{Readback, copy_out};
-use super::pipelines::{DEPTH_FORMAT, HDR_FORMAT, OUTPUT_FORMAT, SAMPLE_COUNTS, SHADOW};
+use super::pipelines::{DEPTH_FORMAT, HDR_FORMAT, LIGHTS, OUTPUT_FORMAT, SAMPLE_COUNTS, SHADOW, VOXEL_READ};
 use super::gui_files::{GUI_CHUNK, GuiImage};
 use super::resources::{GpuTexture, Weighed};
 use super::{Prepared, Renderer, ViewRequest, rur};
@@ -82,7 +82,7 @@ struct GuiVertex {
 	position: [f32; 3],
 	uv: [f32; 2],
 	normal: [f32; 3],
-	/// x LightInfluence, y Brightness, z 1 when the sun reaches it, w unused
+	/// x LightInfluence, y Brightness, z and w unused
 	params: [f32; 4],
 }
 
@@ -368,7 +368,7 @@ impl GuiPipelines {
 			layout: &layout,
 			entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&blank) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) }],
 		});
-		let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("gui"), source: wgpu::ShaderSource::Wgsl(format!("{COMMON}\n{SHADOW}\n{GUI}").into()) });
+		let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("gui"), source: wgpu::ShaderSource::Wgsl(format!("{COMMON}\n{SHADOW}\n{LIGHTS}\n{GUI}\n{VOXEL_READ}").into()) });
 		let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("gui"), bind_group_layouts: &[frame_layout, &layout, &window_layout], push_constant_ranges: &[] });
 		let premultiplied = Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING);
 		let pipeline = |label: &str, entry: &str, samples: u32, format: wgpu::TextureFormat, depth: Option<wgpu::DepthStencilState>| {
@@ -559,9 +559,6 @@ pub(super) fn plan_with_skips(scene: &Scene, camera: &Camera, request: &ViewRequ
 					skipped.push(crate::scene::guis::SkippedGui { path: gui.path.clone(), reason: "beyond MaxDistance".into() });
 					continue;
 				}
-				// with GlobalShadows Studio lights a SurfaceGui from its light-grid voxel, which its own
-				// part fills: no sun (gui-light: default, every orientation)
-				let sun = if scene.environment.global_shadows { 0.0 } else { 1.0 };
 				let (content_hash, local_snaps) = crate::scene::guis::stamp_gui_hash(gui.base_content_hash, &gui.local_files);
 				let key = GuiKey::new(content_hash, surface.canvas, SURFACE_SCALE, gui.clips);
 				let (across, upward) = (right, up);
@@ -585,7 +582,7 @@ pub(super) fn plan_with_skips(scene: &Scene, camera: &Camera, request: &ViewRequ
 					local_snaps: Arc::from(local_snaps),
 					corners: [surface.point(left, top), surface.point(right, top), surface.point(left, bottom), surface.point(right, bottom)],
 					normal,
-					params: [gui.light_influence, gui.brightness, sun, 0.0],
+					params: [gui.light_influence, gui.brightness, 0.0, 0.0],
 					center,
 					z_offset: surface.z_offset,
 					overlay: gui.always_on_top,
@@ -650,7 +647,7 @@ pub(super) fn plan_with_skips(scene: &Scene, camera: &Camera, request: &ViewRequ
 					corners: [corner(left, top), corner(right_edge, top), corner(left, bottom_edge), corner(right_edge, bottom_edge)],
 					// lit facing the camera (gui-light: bb-front, bb-behind)
 					normal: back,
-					params: [gui.light_influence, gui.brightness, 1.0, 0.0],
+					params: [gui.light_influence, gui.brightness, 0.0, 0.0],
 					center: position,
 					z_offset: 0.0,
 					overlay,
@@ -2264,5 +2261,120 @@ mod tests {
 		assert_eq!(sink.0.lock().len(), 1, "invalid ROR_RUR must warn once per run per cause, got: {:?}", *sink.0.lock());
 
 		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	/// What a Roblox client shows of GUIs in the world (fixtures/world-guis.luau; notes/render.md "GUIs"): a SurfaceGui
+	/// facing the sun takes it with GlobalShadows on as without them, a PointLight lights a SurfaceGui beside it, and a
+	/// billboard seen against the sun takes 0.41 of it from behind with GlobalShadows on. Before, the first and last
+	/// were black (GUIs took no sun with GlobalShadows, none from behind) and the second unlit.
+	#[test]
+	fn guis_in_the_world_are_lit_as_a_client_lights_them() {
+		use crate::render::camera::CameraSpec;
+		use crate::scene::build::{ModelBuilder, PartSpec, facing};
+		use rbx_dom_weak::InstanceBuilder;
+		use rbx_dom_weak::types::{Color3, Enum, UDim, UDim2, Vector2};
+
+		let state = std::env::temp_dir().join(format!("ror-world-gui-test-{}", std::process::id()));
+		std::fs::create_dir_all(&state).unwrap();
+		let gpu = Arc::new(super::super::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let sun = crate::render::environment::sun_direction(14.5, 0.0);
+		// the sun alone (Brightness 2) or nothing at all, no fog
+		let lighting = |scene: &mut Scene, brightness: f32, global_shadows: bool| {
+			let environment = &mut scene.environment;
+			(environment.ambient, environment.outdoor_ambient, environment.environment_diffuse_scale, environment.environment_specular_scale) = (Vec3::ZERO, Vec3::ZERO, 0.0, 0.0);
+			(environment.clock_time, environment.geographic_latitude, environment.brightness, environment.global_shadows) = (14.5, 0.0, brightness, global_shadows);
+			(environment.fog_color, environment.fog_start, environment.fog_end) = (Vec3::ZERO, 0.0, 100000.0);
+		};
+		// the view of `scene` with each GUI's image filled by `fill(column, row)`
+		let draw = |scene: &Scene, request: &ViewRequest, fill: &dyn Fn(u32, u32) -> [u8; 4]| -> super::super::ViewImage {
+			let camera = request.camera.place(None, request.width, request.height);
+			let mut images = Vec::new();
+			for draw in plan(scene, &camera, request) {
+				let (columns, rows) = rur::image_size(draw.key.canvas(), draw.key.scale(), draw.key.margin());
+				let rgba: Vec<u8> = (0..rows).flat_map(|row| (0..columns).flat_map(move |column| fill(column, row))).collect();
+				images.push((draw.key, Arc::new(GuiImage::from_rgba(columns, rows, rgba).unwrap()), false));
+			}
+			assert!(!images.is_empty(), "the GUI is planned");
+			let (mut textures, mut warnings, mut skipped) = (HashMap::new(), Vec::new(), HashMap::new());
+			renderer.upload_guis(images, &mut textures, &mut warnings, &mut skipped);
+			assert!(warnings.is_empty(), "{warnings:?}");
+			let (pending, mut stats) = renderer.submit_views(scene, std::slice::from_ref(request), None, None, Some((textures, skipped)), None, None).unwrap();
+			pending.into_iter().next().unwrap().finish(&mut stats).unwrap()
+		};
+		// the mean red level of the 3 x 3 pixels round where `at` lands in the view
+		let level = |image: &super::super::ViewImage, request: &ViewRequest, at: Vec3| -> f32 {
+			let camera = request.camera.place(None, request.width, request.height);
+			let clip = camera.view_projection(request.width as f32 / request.height as f32) * at.extend(1.0);
+			let (x, y) = ((((clip.x / clip.w) * 0.5 + 0.5) * request.width as f32) as i32, ((0.5 - (clip.y / clip.w) * 0.5) * request.height as f32) as i32);
+			let mut sum = 0.0;
+			for dy in -1..=1 {
+				for dx in -1..=1 {
+					sum += image.rgba[(((y + dy) as u32 * request.width + (x + dx) as u32) * 4) as usize] as f32;
+				}
+			}
+			sum / 9.0
+		};
+		let surface = |model: &mut ModelBuilder, part: rbx_dom_weak::types::Ref, canvas: [f32; 2], light_influence: f32| {
+			model.child(
+				part,
+				InstanceBuilder::new("SurfaceGui")
+					.with_property("Face", Enum::from_u32(5))
+					.with_property("CanvasSize", Vector2::new(canvas[0], canvas[1]))
+					.with_property("LightInfluence", light_influence)
+					.with_property("Brightness", 1.0f32),
+			);
+		};
+		let white = |_: u32, _: u32| [255u8; 4];
+		let view = |eye: Vec3, target: Vec3, fov: f32, width: u32| ViewRequest { width, height: 128, camera: CameraSpec::LookAt { eye: eye.into(), target: target.into(), fov }, background: super::super::Background::Color([0.0, 0.0, 0.0]), bloom: false, ..Default::default() };
+
+		// a white SurfaceGui (LightInfluence 1) on a slab facing the sun, seen from near the sun
+		let slab = |global_shadows: bool| {
+			let mut model = ModelBuilder::new("Sun");
+			let part = model.part(&PartSpec { name: "Slab".into(), cframe: facing(Vec3::ZERO, sun), size: Vec3::new(8.0, 8.0, 0.5), color: [0, 0, 0], material: 272, ..Default::default() });
+			surface(&mut model, part, [100.0, 100.0], 1.0);
+			let mut scene = crate::scene::extract::extract(&model.into_document());
+			lighting(&mut scene, 2.0, global_shadows);
+			scene
+		};
+		let request = view(sun * 30.0 + Vec3::new(0.0, 0.0, 0.5), Vec3::ZERO, 30.0, 128);
+		let front = |global_shadows: bool| level(&draw(&slab(global_shadows), &request, &white), &request, sun * 0.25);
+		let (open, shadows) = (front(false), front(true));
+		assert!(open > 150.0, "a SurfaceGui facing the sun is lit ({open})");
+		assert!((open - shadows).abs() <= 1.0, "with GlobalShadows a SurfaceGui facing the sun takes it as without them ({shadows} against {open})");
+
+		// in the dark, a PointLight (Brightness 2, Range 16) 3 studs before a white SurfaceGui
+		let mut model = ModelBuilder::new("Lamp");
+		let part = model.part(&PartSpec { name: "Board".into(), size: Vec3::new(12.0, 6.0, 0.5), color: [0, 0, 0], material: 272, ..Default::default() });
+		surface(&mut model, part, [200.0, 100.0], 1.0);
+		let lamp = model.part(&PartSpec { name: "Lamp".into(), cframe: glam::Affine3A::from_translation(Vec3::new(0.0, 0.0, -3.0)), size: Vec3::splat(0.2), transparency: 1.0, cast_shadow: false, ..Default::default() });
+		model.child(lamp, InstanceBuilder::new("PointLight").with_property("Brightness", 2.0f32).with_property("Range", 16.0f32).with_property("Color", Color3::new(1.0, 1.0, 1.0)));
+		let mut scene = crate::scene::extract::extract(&model.into_document());
+		lighting(&mut scene, 0.0, true);
+		let request = view(Vec3::new(3.0, 2.0, -30.0), Vec3::ZERO, 30.0, 128);
+		let lit = level(&draw(&scene, &request, &white), &request, Vec3::new(0.0, 0.0, -0.25));
+		assert!(lit > 150.0, "a PointLight before a SurfaceGui lights it ({lit})");
+
+		// a white billboard (LightInfluence 1) seen against the sun: its normal faces the camera, away from the sun
+		let across = Vec3::Y.cross(sun).normalize();
+		let against = |global_shadows: bool| {
+			let mut model = ModelBuilder::new("Behind");
+			let anchor = model.part(&PartSpec { name: "Anchor".into(), size: Vec3::splat(0.2), transparency: 1.0, cast_shadow: false, ..Default::default() });
+			let size = UDim2::new(UDim::new(4.0, 0), UDim::new(4.0, 0));
+			model.child(anchor, InstanceBuilder::new("BillboardGui").with_property("Size", size).with_property("LightInfluence", 1.0f32).with_property("Brightness", 1.0f32));
+			// (a block below it, so that GlobalShadows draw the sun's shadow maps)
+			model.part(&PartSpec { name: "Caster".into(), cframe: glam::Affine3A::from_translation(Vec3::new(0.0, -12.0, 0.0)), size: Vec3::splat(4.0), color: [0, 0, 0], material: 272, ..Default::default() });
+			let mut scene = crate::scene::extract::extract(&model.into_document());
+			lighting(&mut scene, 2.0, global_shadows);
+			let request = view((across - sun * 0.8).normalize() * 25.0, Vec3::ZERO, 30.0, 128);
+			level(&draw(&scene, &request, &white), &request, Vec3::ZERO)
+		};
+		let (open, shadows) = (against(false), against(true));
+		assert!(open > 60.0, "a billboard seen against the sun is lit from behind ({open})");
+		assert!((open - shadows).abs() <= 1.0, "with GlobalShadows a billboard takes the sun from behind as without them ({shadows} against {open})");
+
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
 	}
 }

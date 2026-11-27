@@ -15,6 +15,7 @@ const MESH: &str = include_str!("../../shaders/mesh.wgsl");
 /// and surfaces under LightingStyle Soft
 pub(super) const VOXEL_READ: &str = include_str!("../../shaders/voxel_read.wgsl");
 pub(super) const SHADOW: &str = include_str!("../../shaders/shadow.wgsl");
+pub(super) const LIGHTS: &str = include_str!("../../shaders/lights.wgsl");
 const SHADOW_BLUR: &str = include_str!("../../shaders/shadow_blur.wgsl");
 pub(crate) const FULLSCREEN: &str = include_str!("../../shaders/fullscreen.wgsl");
 const SKY: &str = include_str!("../../shaders/sky.wgsl");
@@ -263,7 +264,7 @@ impl Pipelines {
 
 		let mesh_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
 			label: Some("mesh"),
-			source: wgpu::ShaderSource::Wgsl(format!("{COMMON}\n{SHADOW}\n{MESH}\n{VOXEL_READ}").into()),
+			source: wgpu::ShaderSource::Wgsl(format!("{COMMON}\n{SHADOW}\n{LIGHTS}\n{MESH}\n{VOXEL_READ}").into()),
 		});
 		let sky_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
 			label: Some("sky"),

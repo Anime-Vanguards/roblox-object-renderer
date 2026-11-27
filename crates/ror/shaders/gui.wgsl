@@ -3,6 +3,8 @@
 // the √-space scene target; AlwaysOnTop ones are drawn over the finished image as they are.
 
 @group(0) @binding(0) var<uniform> frame: Frame;
+// the view's local lights (lights.wgsl)
+@group(0) @binding(7) var<storage, read> lights: array<Light>;
 // the sky chain the Atmosphere's fog fades into
 @group(0) @binding(19) var faded_map: texture_cube<f32>;
 @group(0) @binding(5) var linear_sampler: sampler;
@@ -35,7 +37,7 @@ struct GuiInput {
 	@location(0) position: vec3<f32>,
 	@location(1) uv: vec2<f32>,
 	@location(2) normal: vec3<f32>,
-	// x LightInfluence, y Brightness, z 1 when the sun reaches it (through the shadow map), w unused
+	// x LightInfluence, y Brightness, z and w unused
 	@location(3) params: vec4<f32>,
 }
 
@@ -53,13 +55,15 @@ const GUI_DEPTH_BIAS: f32 = 1e-5;
 // An unlit GUI colour c shows at radiance GUI_RADIANCE · Brightness · c², like a sky texel (gui-surface-
 // basics: white 223 of 255 at Brightness 1; gui-brightness: linear over 0.5-8 at -3 and -2 EV)
 const GUI_RADIANCE: f32 = 1.935;
-// The lit colour: 0.975 of a part's sun and flat ambient (gui-light: a white frame facing a Brightness-1
-// sun reads 0.98, under Ambient 0.5 0.482 where a part reads 0.495), the sky's average radiance
-// whichever way it faces (gui-light: sky, the same for six orientations), no specular
-const GUI_LIT_SCALE: f32 = 0.975;
-// lit from behind at 0.39 of |n·l| without GlobalShadows (gui-light: the slab turned 120° from the sun,
-// bb-behind-sun), not at all with them (bb-behind-default: the sky and ambient alone)
-const GUI_BACK_LIGHT: f32 = 0.39;
+// The lit colour: what a white Lambert surface facing the GUI's normal takes, times GUI_LIT_SCALE
+// (fixtures/world-guis.luau in a Roblox client: frames facing the sun, under flat ambient, the sky and beside
+// local lights; Studio's gui-light: a white frame facing a Brightness-1 sun reads 0.98, under Ambient 0.5 0.482
+// where a part reads 0.495), no specular
+const GUI_LIT_SCALE: f32 = 0.98;
+// lit from behind at 0.41 of |n·l|, with GlobalShadows or not (fixtures/world-guis.luau "light" in a Roblox client: a
+// slab turned 120° from the sun 0.40 / 0.41 in white / grey without them, a billboard seen from the side away from the
+// sun 0.42 either way; Studio's edit viewport: 0.39 without them, none with them)
+const GUI_BACK_LIGHT: f32 = 0.41;
 // Minified, Studio's SurfaceGuis are as sharp as their full-size image sampled bilinearly (gui-content
 // surface-far, 2.4 times smaller: 67.5 % of the GUI's pixels within 2 with the mips, 94.0 % from a bias
 // of -1.5 on, the same at -6; gui-surface-basics light-*: one point better); -1.5 keeps the full-size
@@ -78,20 +82,73 @@ fn vs_gui(input: GuiInput) -> GuiOutput {
 	return output;
 }
 
+// The local lights on a GUI at `world_position` facing `n` (a billboard's normal faces the camera): a white Lambert
+// surface's diffuse there, per pixel as parts take them (with their shadows; their voxels far from the camera and
+// under LightingStyle Soft), the view's clusters walked as mesh.wgsl `local_lights` walks them (fixtures/world-guis.luau
+// "lights" in a Roblox client: frames beside a PointLight, a SpotLight and a SurfaceLight read the bare part's
+// diffuse along the light's whole fade; a billboard with the light in its plane takes none of it, one before it all;
+// a light behind a SurfaceGui's face none)
+fn gui_local_lights(world_position: vec3<f32>, n: vec3<f32>, pixel: vec2<f32>) -> vec3<f32> {
+	let reach = local_light_reach(world_position);
+	let far = reach.x;
+	let distant = reach.y;
+	let read_at = world_position + n * 6.0;
+	if (lights_from_voxels() && far <= 0.0) {
+		let field = voxel_field_light(read_at);
+		if (field.w > 0.0) {
+			return field.rgb * VOXEL_LIGHT_SURFACES;
+		}
+	}
+	var sum = vec3<f32>(0.0);
+	var voxels = vec3<f32>(0.0);
+	let count = frame.counts.x;
+	let clustered = frame.light_clusters.w > 0.0;
+	let words = select((count + 31u) / 32u, u32(frame.light_clusters.w), clustered);
+	let first = select(0u, light_cluster(world_position, pixel) * words, clustered);
+	for (var word = 0u; word < words; word++) {
+		let left = count - word * 32u;
+		var bits = select(select(0xffffffffu, (1u << left) - 1u, left < 32u), light_clusters[first + word], clustered);
+		while (bits != 0u) {
+			let i = word * 32u + firstTrailingBit(bits);
+			bits &= bits - 1u;
+			let share = local_light_share(i, world_position, n, far, distant, read_at);
+			voxels += share.voxels;
+			sum += share.radiance / PI * max(min(dot(n, share.l) + share.wrap, 1.0), 0.0);
+		}
+	}
+	return sum * (1.0 - far) + voxels * (VOXEL_LIGHT_SURFACES * select(far, 1.0, lights_from_voxels()));
+}
+
+// The sky's light on a GUI: the same whichever way it faces, the mean of the ambient cube's six colours (common.wgsl
+// `sky_light`; fixtures/world-guis.luau "sky": frames and billboards facing each axis read 0.98 of the mean of what a
+// white part facing each axis reads, under the default sky and skies white in one image only, where the sky's
+// average radiance fell 1-3.6 % short in green and blue)
+fn gui_sky_light() -> vec3<f32> {
+	var sum = vec3<f32>(0.0);
+	for (var axis = 0; axis < 6; axis++) {
+		sum += frame.sky_cube[axis].xyz;
+	}
+	return sum / 6.0;
+}
+
 fn gui_light(input: GuiOutput) -> vec3<f32> {
 	let n = normalize(input.normal);
 	let n_dot_l = dot(n, frame.sun_direction.xyz);
-	let back_light = select(GUI_BACK_LIGHT, 0.0, frame.sun_direction.w > 0.5);
-	var sun = frame.sun_color.rgb / PI * select(-n_dot_l * back_light, n_dot_l, n_dot_l >= 0.0);
-	if (input.params.z < 0.5) {
-		sun = vec3<f32>(0.0);
-	} else {
-		sun *= shadow_factor(input.world_position, n) * cloud_sun(input.world_position);
-	}
-	let flat_ambient = max(frame.ambient.rgb, frame.outdoor_ambient.rgb);
-	// the sky's average radiance: its SH constant term (c4 · L00 / π = 0.282095 · L00)
-	let sky = max(frame.sky_sh[0].xyz, vec3<f32>(0.0)) * 0.282095 * frame.environment.x;
-	return (sun + flat_ambient) * GUI_LIT_SCALE + sky;
+	// the sun through its shadow as parts take it, SurfaceGuis and billboards alike (fixtures/world-guis.luau "light" in
+	// a Roblox client: with GlobalShadows frames on slabs facing the sun read as without them, whatever holds them
+	// (opaque, invisible, half transparent, without CastShadow, a block, a 0.05 plate), a roof's shadow falls across
+	// a frame as across the part beside it, and 700 studs off the light grid's sun shades both alike; Studio's edit
+	// viewport lights them from its light grid instead); from behind, the shadow as the side facing the sun takes it
+	let facing = n_dot_l >= 0.0;
+	let shade = sun_shade(input.world_position, select(-n, n, facing)) * cloud_sun(input.world_position);
+	let sun = frame.sun_color.rgb / PI * select(-n_dot_l * GUI_BACK_LIGHT, n_dot_l, facing) * shade;
+	// OutdoorAmbient and the sky's light as far as the light grid sees the sky, as parts take them (fixtures/world-guis.luau
+	// "light": frames under a roof keep 0.61 of OutdoorAmbient and 0.70 / 0.65 / 0.64 of the sky's light where the part
+	// beside them keeps 0.61 and 0.68 / 0.64 / 0.63)
+	let sky_open = light_grid_visibility(input.world_position, n);
+	let flat_ambient = max(frame.ambient.rgb, frame.outdoor_ambient.rgb * (sky_open * frame.light_grid_scale.w));
+	let sky = mix(LIGHT_GRID_SKY_CLOSED, gui_sky_light(), sky_open) * frame.environment.x;
+	return (sun + flat_ambient + sky + gui_local_lights(input.world_position, n, input.clip.xy)) * GUI_LIT_SCALE;
 }
 
 // A UIGradient's keypoints at t, as rur interpolates them: the first's value before it, the last's

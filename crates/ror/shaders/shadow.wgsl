@@ -1,9 +1,13 @@
 // The sun's shadow, shared by the part and GUI passes: Studio's cascaded exponential variance shadow
 // maps (notes/render.md "Shadows"). Each view's cascades are spheres along its axis; their blurred
-// warped moments (shadow_blur.wgsl) sit side by side in one atlas.
+// warped moments (shadow_blur.wgsl) sit side by side in one atlas. And the light grid's reads (notes/render.md
+// "Light grid"): the sky's visibility and the sun past the shadow maps.
 
 @group(0) @binding(2) var sun_moments: texture_2d<f32>;
 @group(0) @binding(3) var shadow_sampler: sampler_comparison;
+// the light grid, one texel per 4-stud voxel (render::lightgrid): the sky's visibility in r, the sun's light through
+// it in g (needs `linear_sampler` declared)
+@group(0) @binding(15) var light_grid: texture_3d<f32>;
 
 // A cascade's blurred moments at `uv` (0..1 over its square), bilinear between its texels
 fn sun_moments_at(region: vec4<f32>, uv: vec2<f32>) -> vec4<f32> {
@@ -79,4 +83,53 @@ fn shadow_factor(world_position: vec3<f32>, normal: vec3<f32>) -> f32 {
 fn cloud_sun(world_position: vec3<f32>) -> f32 {
 	let across = max(abs(world_position.x - frame.cloud_sun.y), abs(world_position.z - frame.cloud_sun.z));
 	return 1.0 - frame.cloud_sun.x * (1.0 - saturate((across - 585.0) / 115.0));
+}
+
+// what the sky's diffuse light falls to where the grid is closed: a fixed warm grey whatever the sky
+// (lg-sky: on a white floor under a 48-stud roof the same for skies dark, white, default, white in
+// the Up or the Dn image only and at midnight, half at EnvironmentDiffuseScale 0.5)
+const LIGHT_GRID_SKY_CLOSED: vec3<f32> = vec3<f32>(0.104, 0.100, 0.092);
+// how far along the normal a surface reads the grid (lg-height, lg-walls: 6 studs)
+const LIGHT_GRID_OFFSET: f32 = 6.0;
+
+// the light grid at a surface: trilinear between voxel centres, 6 studs along the normal; 1 without
+// a grid
+fn light_grid_visibility(position: vec3<f32>, normal: vec3<f32>) -> f32 {
+	if (frame.light_grid.w < 0.5) {
+		return 1.0;
+	}
+	let uvw = (position + normal * LIGHT_GRID_OFFSET - frame.light_grid.xyz) * frame.light_grid_scale.xyz;
+	return textureSampleLevel(light_grid, linear_sampler, uvw, 0.0).r;
+}
+
+// how far along its normal a surface reads the grid's sun (render::lightgrid propagate_sun's fit against the engine's
+// voxel shadows under a sun 26 and 70 degrees up)
+const LIGHT_GRID_SUN_OFFSET: f32 = 2.0;
+
+// the sun's light through the grid (frame.light_grid.w 2; render::lightgrid propagate_sun), trilinear between
+// voxel centres; 1 without a grid or its sun channel
+fn light_grid_sun(position: vec3<f32>, normal: vec3<f32>) -> f32 {
+	if (frame.light_grid.w < 1.5) {
+		return 1.0;
+	}
+	let uvw = (position + normal * LIGHT_GRID_SUN_OFFSET - frame.light_grid.xyz) * frame.light_grid_scale.xyz;
+	return textureSampleLevel(light_grid, linear_sampler, uvw, 0.0).g;
+}
+
+// what of the sun reaches a surface: the shadow maps within the view's graphics quality's reach of the camera,
+// the grid's voxel sun past it, the one fading into the other between frame.shadow.x and frame.shadow.z studs
+// from the camera (crate::quality::SunReach; both 0 at a level without the maps: the voxels everywhere). The
+// client's rails 6 studs up cast their strips to 587.5 studs at level 21 and none past, fading out over the last
+// ~14 studs below 19; past them its floors take the voxel sun at every level (notes/render.md "Graphics quality
+// levels")
+fn sun_shade(position: vec3<f32>, normal: vec3<f32>) -> f32 {
+	let from_camera = distance(position, frame.camera_position.xyz);
+	if (from_camera <= frame.shadow.x) {
+		return shadow_factor(position, normal);
+	}
+	let voxels = light_grid_sun(position, normal);
+	if (from_camera >= frame.shadow.z) {
+		return voxels;
+	}
+	return mix(shadow_factor(position, normal), voxels, (from_camera - frame.shadow.x) / (frame.shadow.z - frame.shadow.x));
 }
