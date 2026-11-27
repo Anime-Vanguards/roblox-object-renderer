@@ -287,7 +287,8 @@ impl Weighed for GuiTexture {
 /// the quad's uv (left, top, right, bottom) and the image's tint (ImageColor3, and its opacity in w; 0:
 /// no world); for a framed one (`mode` x 1) its UIGradient: `plane` gives t over the frame, `mode` y
 /// and z count `colors` (t, r, g, b) and `transparency` (t, value) keypoints; `corner` xy its UICorner's
-/// radius in the quad's uv (0: square corners).
+/// radius in the quad's uv (0: square corners), z a framed one's Rotation (radians) and w the quad's pixels
+/// per uv across over those down.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 struct WindowUniform {
@@ -1606,7 +1607,11 @@ impl Renderer {
 				let Some(viewport) = scene.guis.get(draw.gui).and_then(|gui| gui.viewports.get(framed.viewport)) else {
 					continue;
 				};
-				let corner = corner_uv(viewport.corner(draw.key.canvas()));
+				let mut corner = corner_uv(viewport.corner(draw.key.canvas()));
+				// its Rotation, and the quad's pixels per uv across over down (it turns in the canvas's pixels)
+				let canvas = draw.key.canvas();
+				corner[2] = viewport.rotation.to_radians();
+				corner[3] = ((right - left) * canvas[0] / u.max(1e-6)) / ((bottom - top) * canvas[1] / v.max(1e-6)).max(1e-6);
 				let mut uniform = WindowUniform { rect: to_uv(framed.rect), tint: viewport.tint, plane: [framed.plane[0], framed.plane[1], framed.plane[2], 0.0], mode: [1.0, 0.0, 0.0, 0.0], corner, ..Default::default() };
 				if let ViewportKind::Framed(crate::scene::guis::Framed { gradient: Some(gradient), .. }) = &viewport.kind {
 					uniform.mode = [1.0, gradient.colors.len() as f32, gradient.transparency.len() as f32, 0.0];
@@ -1876,7 +1881,7 @@ mod tests {
 			max_distance: 0.0,
 			clips: false,
 			z_index_behavior: 1,
-			viewports: vec![Viewport { placement: vec![frame], tint: [1.0; 4], scene: Arc::new(Scene::default()), kind: ViewportKind::Framed(framed), corner_radius: None }],
+			viewports: vec![Viewport { placement: vec![frame], tint: [1.0; 4], scene: Arc::new(Scene::default()), kind: ViewportKind::Framed(framed), corner_radius: None, rotation: 0.0 }],
 		};
 		let scene = Scene { guis: vec![gui], ..Default::default() };
 		let request = ViewRequest { width: 1280, height: 720, camera: CameraSpec::LookAt { eye: [0.0, 0.0, -20.0], target: [0.0; 3], fov: 40.0 }, ..Default::default() };
@@ -1909,6 +1914,7 @@ mod tests {
 			scene: Arc::new(Scene::default()),
 			kind: ViewportKind::Framed(Framed { camera: [0.0, 0.0, 8.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], fov: 40.0, over: None, over_local_files: Vec::new(), gradient: None }),
 			corner_radius: None,
+			rotation: 0.0,
 		};
 		let gui = |inset: bool| Gui {
 			path: "PlayerGui.View".into(),
@@ -2031,6 +2037,82 @@ mod tests {
 			assert!(if cover_over { white(plate) } else { red(plate) }, "{case}: the plate under the cover {plate:?}");
 			assert!(white(at(&image, 1.0, 1.0)), "{case}: the mask's hole over the cover {:?}", at(&image, 1.0, 1.0));
 		}
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	/// A ScreenGui's ViewportFrame turned by its Rotation turns its picture with it, about the frame's centre, and
+	/// its UIGradient mixes colours in squared values (fixtures/screen-guis.luau "vp-rotation" and "vp-shape" in a
+	/// Roblox client: the turned frame 80.0 -> 99.2 % within 2 of 255, the gradient 15.6 -> 99.6 %). Before, the
+	/// picture stayed upright and the gradient mixed plainly.
+	#[test]
+	fn a_screen_guis_viewport_frame_turns_its_picture_and_mixes_its_gradient_as_a_client() {
+		use crate::render::camera::CameraSpec;
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use rbx_dom_weak::InstanceBuilder;
+		use rbx_dom_weak::types::{CFrame, Color3, ColorSequence, ColorSequenceKeypoint, Enum, Matrix3, UDim, UDim2, Variant, Vector3};
+
+		let state = std::env::temp_dir().join(format!("ror-screen-viewport-turn-test-{}", std::process::id()));
+		std::fs::create_dir_all(&state).unwrap();
+		let gpu = Arc::new(super::super::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let (width, height) = (160u32, 160u32);
+		// a frame 80 x 20 GUI pixels at the view's centre, holding a white plate wider than its picture under white
+		// ambient light; turned 90 degrees, or shaded by a red-to-white UIGradient
+		let draw = |rotation: f32, gradient: bool| -> Vec<u8> {
+			let mut model = ModelBuilder::new("Scene");
+			let player_gui = model.child(model.model, InstanceBuilder::new("PlayerGui").with_name("PlayerGui"));
+			let view = model.child(player_gui, InstanceBuilder::new("ScreenGui").with_name("View").with_property("ScreenInsets", Enum::from_u32(1)));
+			let frame = model.child(
+				view,
+				InstanceBuilder::new("ViewportFrame")
+					.with_property("AnchorPoint", rbx_dom_weak::types::Vector2::new(0.5, 0.5))
+					.with_property("Position", UDim2::new(UDim::new(0.5, 0), UDim::new(0.5, 0)))
+					.with_property("Size", UDim2::new(UDim::new(0.0, 80), UDim::new(0.0, 20)))
+					.with_property("BackgroundTransparency", 1.0f32)
+					.with_property("Rotation", rotation)
+					.with_property("Ambient", Color3::new(1.0, 1.0, 1.0))
+					.with_property("LightColor", Color3::new(0.0, 0.0, 0.0)),
+			);
+			if gradient {
+				model.child(frame, InstanceBuilder::new("UIGradient").with_property("Color", ColorSequence { keypoints: vec![ColorSequenceKeypoint::new(0.0, Color3::new(1.0, 0.0, 0.0)), ColorSequenceKeypoint::new(1.0, Color3::new(1.0, 1.0, 1.0))] }));
+			}
+			let world = model.child(frame, InstanceBuilder::new("WorldModel"));
+			let plate = model.part(&PartSpec { name: "Plate".into(), size: glam::Vec3::new(40.0, 40.0, 0.2), color: [255, 255, 255], material: 272, cast_shadow: false, ..Default::default() });
+			model.dom.transfer_within(plate, world);
+			let camera = model.child(frame, InstanceBuilder::new("Camera").with_property("CFrame", CFrame::new(Vector3::new(0.0, 0.0, 10.0), Matrix3::identity())).with_property("FieldOfView", 40.0f32));
+			model.set(frame, "CurrentCamera", Variant::Ref(camera));
+			let scene = crate::scene::extract::extract(&model.into_document());
+			assert_eq!(scene.guis.len(), 1, "{:?}", scene.warnings);
+			let request = ViewRequest { width, height, camera: CameraSpec::LookAt { eye: [0.0, 0.0, 10.0], target: [0.0; 3], fov: 40.0 }, background: super::super::Background::Color([0.0, 0.0, 1.0]), bloom: false, gui_scale: Some(1.0), ..Default::default() };
+			let camera = request.camera.place(None, width, height);
+			// rur's image of the ScreenGui: nothing of its own (the frame has no background)
+			let mut images = Vec::new();
+			for draw in plan(&scene, &camera, &request) {
+				let (columns, rows) = rur::image_size(draw.key.canvas(), draw.key.scale(), draw.key.margin());
+				images.push((draw.key, Arc::new(GuiImage::from_rgba(columns, rows, vec![0u8; (columns * rows * 4) as usize]).unwrap()), false));
+			}
+			let (mut textures, mut warnings, mut skipped) = (HashMap::new(), Vec::new(), HashMap::new());
+			renderer.upload_guis(images, &mut textures, &mut warnings, &mut skipped);
+			let (pending, mut stats) = renderer.submit_views(&scene, std::slice::from_ref(&request), None, None, Some((textures, skipped)), None, None).unwrap();
+			pending.into_iter().next().unwrap().finish(&mut stats).unwrap().rgba
+		};
+		let at = |image: &[u8], x: u32, y: u32| -> [u8; 3] {
+			let index = ((y * width + x) * 4) as usize;
+			[image[index], image[index + 1], image[index + 2]]
+		};
+		let white = |pixel: [u8; 3]| pixel.iter().all(|value| *value > 230);
+		let blue = |pixel: [u8; 3]| pixel[0] < 40 && pixel[1] < 40 && pixel[2] > 150;
+		let upright = draw(0.0, false);
+		assert!(white(at(&upright, 110, 80)) && blue(at(&upright, 80, 110)), "upright: {:?} {:?}", at(&upright, 110, 80), at(&upright, 80, 110));
+		// turned a quarter: 20 wide and 80 tall about the same centre
+		let turned = draw(90.0, false);
+		assert!(white(at(&turned, 80, 110)) && blue(at(&turned, 110, 80)), "turned: {:?} {:?}", at(&turned, 80, 110), at(&turned, 110, 80));
+		// a quarter of the way across: green sqrt(0.25) of the white, not 0.25
+		let shaded = draw(0.0, true);
+		let quarter = at(&shaded, 60, 80);
+		assert!(quarter[0] > 230 && (110..=145).contains(&quarter[1]), "a quarter across the gradient: {quarter:?}");
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
 	}

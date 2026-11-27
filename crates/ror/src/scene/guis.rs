@@ -110,6 +110,9 @@ pub struct Viewport {
 	/// Its UICorner's CornerRadius (scale, offset), which rounds its world's corners as it rounds its
 	/// background; `None` without one.
 	pub corner_radius: Option<[f32; 2]>,
+	/// Its Rotation (degrees, clockwise): a Roblox client turns its picture with its background, as one
+	/// layer, about the frame's centre (fixtures/screen-guis.luau "vp-rotation").
+	pub rotation: f32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -692,7 +695,10 @@ fn viewports(document: &Document, gui: Ref, windows: bool, global: bool, warning
 				ambient: props::color(item, "Ambient", Vec3::splat(200.0 / 255.0)),
 				light_color: props::color(item, "LightColor", Vec3::splat(140.0 / 255.0)),
 				light_direction: props::vec3(item, "LightDirection", Vec3::NEG_ONE),
-				sky: None,
+				// a Sky child: the sky's light and reflections in its world (fixtures/screen-guis.luau
+				// "vp-sky": in a Roblox client balls under a sky white above read up to 38 levels brighter
+				// than without its light)
+				sky: super::environment::Environment::from_lighting(&document.dom, item).sky,
 			};
 			let roots: Vec<Ref> = item.children().iter().copied().filter(|&root| document.dom.get_by_ref(root).is_some_and(|root| !is_gui(root))).collect();
 			let mut scene = super::extract::extract_roots(document, &roots);
@@ -705,8 +711,9 @@ fn viewports(document: &Document, gui: Ref, windows: bool, global: bool, warning
 			scene.parts.retain(|part| part.transparency < 1.0 || !part.decals.is_empty());
 			let (placement, tint, scene) = (own, [color.x, color.y, color.z, opacity], Arc::new(scene));
 			let corner_radius = corner_radius(document, item);
+			let rotation = props::f32(item, "Rotation", 0.0);
 			let Some((camera, fov)) = camera else {
-				found.push(Viewport { placement, tint, scene, kind: ViewportKind::Window, corner_radius });
+				found.push(Viewport { placement, tint, scene, kind: ViewportKind::Window, corner_radius, rotation });
 				continue;
 			};
 			if scene.parts.is_empty() {
@@ -721,7 +728,7 @@ fn viewports(document: &Document, gui: Ref, windows: bool, global: bool, warning
 				None => (None, Vec::new()),
 			};
 			let kind = ViewportKind::Framed(Framed { camera, fov, over, over_local_files, gradient: gradient(document, item) });
-			framed.push((child, Viewport { placement, tint, scene, kind, corner_radius }));
+			framed.push((child, Viewport { placement, tint, scene, kind, corner_radius, rotation }));
 		}
 	}
 	if !framed.is_empty() {

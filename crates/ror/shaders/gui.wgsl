@@ -19,7 +19,8 @@
 // rect in the quad's uv and the image's tint (ImageColor3, its opacity in w: 0 for a GUI that shows no
 // world); a framed one's UIGradient: t = plane.x · x + plane.y · y + plane.z over the frame (x, y its
 // fractions), mode.y colour keypoints (t, r, g, b) and mode.z transparency ones (t, value); corner.xy
-// its UICorner's radius in the quad's uv (0: square corners)
+// its UICorner's radius in the quad's uv (0: square corners), corner.z a framed one's Rotation (radians,
+// clockwise) and corner.w the quad's pixels per uv across over those down
 struct GuiWindow {
 	rect: vec4<f32>,
 	tint: vec4<f32>,
@@ -166,16 +167,18 @@ fn gui_light(input: GuiOutput) -> vec3<f32> {
 	return (sun + flat_ambient + sky + gui_local_lights(input.world_position, n, input.clip.xy)) * GUI_LIT_SCALE;
 }
 
-// A UIGradient's keypoints at t, as rur interpolates them: the first's value before it, the last's
-// after, linear between
+// A UIGradient's keypoints at t: the first's value before it, the last's
+// after, between them mixed in squared values
 fn gradient_colour(t: f32) -> vec3<f32> {
 	let count = u32(gui_window.mode.y);
 	var colour = gui_window.colors[0].yzw;
 	for (var key = 1u; key < count; key++) {
 		let a = gui_window.colors[key - 1u];
 		let b = gui_window.colors[key];
+		// mixed in squared values (fixtures/screen-guis.luau "vp-shape": a picture under a red to white
+		// gradient reads green sqrt(t) of its white in a Roblox client, t in a plain mix)
 		if (t > a.x) {
-			colour = select(b.yzw, mix(a.yzw, b.yzw, (t - a.x) / (b.x - a.x)), t < b.x && b.x > a.x);
+			colour = select(b.yzw, sqrt(mix(a.yzw * a.yzw, b.yzw * b.yzw, (t - a.x) / (b.x - a.x))), t < b.x && b.x > a.x);
 		}
 	}
 	return select(vec3<f32>(1.0), colour, count > 0u);
@@ -209,8 +212,19 @@ fn corner_coverage(uv: vec2<f32>) -> f32 {
 // the world of its ViewportFrame, if it shows one.
 fn gui_texel(input: GuiOutput, texel_in: vec4<f32>) -> vec4<f32> {
 	var texel = texel_in;
-	let rounded = corner_coverage(input.uv);
 	if (gui_window.mode.x > 0.5) {
+		// a turned frame turns its picture about its centre with its background (rur turns that): read
+		// the picture where this pixel was before the turn, in the canvas's pixels
+		var at = input.uv;
+		if (gui_window.corner.z != 0.0) {
+			let centre = (gui_window.rect.xy + gui_window.rect.zw) * 0.5;
+			let stretch = vec2<f32>(max(gui_window.corner.w, 1e-6), 1.0);
+			let d = (input.uv - centre) * stretch;
+			let c = cos(gui_window.corner.z);
+			let s = sin(gui_window.corner.z);
+			at = centre + vec2<f32>(c * d.x + s * d.y, -s * d.x + c * d.y) / stretch;
+		}
+		let rounded = corner_coverage(at);
 		// A framed ViewportFrame's picture, laid in under what the GUI draws over the frame: this draw
 		// goes over the GUI's image so far, R, and `texel` is what draws over the frame, O, so it blends
 		// coverage · O + (1 - O.a) · picture at alpha coverage, which leaves (1 - coverage) · R + coverage
@@ -218,7 +232,7 @@ fn gui_texel(input: GuiOutput, texel_in: vec4<f32>) -> vec4<f32> {
 		// picture fills the frame's rect, clipped to it, tinted by ImageColor3, ImageTransparency and its
 		// UIGradient as an image (rur's ImageLabel)
 		let size = max(gui_window.rect.zw - gui_window.rect.xy, vec2<f32>(1e-6));
-		let place = (input.uv - gui_window.rect.xy) / size;
+		let place = (at - gui_window.rect.xy) / size;
 		let inside = all(place >= vec2<f32>(0.0)) && all(place <= vec2<f32>(1.0));
 		let world = textureSampleLevel(window_texture, window_sampler, clamp(place, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0);
 		let t = dot(gui_window.plane.xy, place) + gui_window.plane.z;
@@ -226,6 +240,7 @@ fn gui_texel(input: GuiOutput, texel_in: vec4<f32>) -> vec4<f32> {
 		let picture = world.rgb * gui_window.tint.rgb * gradient_colour(t) * coverage;
 		return vec4<f32>(texel.rgb * coverage + picture * (1.0 - texel.a), coverage);
 	}
+	let rounded = corner_coverage(input.uv);
 	// a window's world over the GUI's own image (the frame's background) inside the frame's rect: the
 	// world as seen through the face, read at this pixel of the view (a window player's camera
 	// follows the player's so that its frame shows exactly that). An opaque surface replaces the

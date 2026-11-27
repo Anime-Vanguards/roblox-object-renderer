@@ -52,7 +52,7 @@ pub struct ViewportLighting {
 	pub light_color: Vec3,
 	/// `LightDirection` as set (any length): the way the light travels.
 	pub light_direction: Vec3,
-	/// A Sky child of the frame: its six images as the reflections' cubemap, the sky's light on.
+	/// A Sky child of the frame: half its sky's diffuse light, no reflections of it ([`Environment::viewport_frame`]).
 	pub sky: Option<Sky>,
 }
 
@@ -73,15 +73,19 @@ impl Environment {
 	/// ViewportFrame reference) unless the frame holds a Sky, no shadows, fog, Atmosphere, clouds or
 	/// post effects; the render leaves out its local lights, ambient occlusion and bloom too.
 	pub fn viewport_frame(lighting: ViewportLighting) -> Self {
-		let environment_scale = if lighting.sky.is_some() { 1.0 } else { 0.0 };
+		// with a Sky child, half the sky's diffuse light and no reflections of it (fixtures/screen-guis.luau
+		// "vp-sky" in a Roblox client: under a sky white above, a block's faces gain half of what ror's sky
+		// light at EnvironmentDiffuseScale 1 gives them, 0.49 and 0.50 in squared values, and a Metal ball
+		// shows the light's highlight alone); without one neither (the reference: they act as 0)
+		let (diffuse_scale, specular_scale) = if lighting.sky.is_some() { (0.5, 0.0) } else { (0.0, 0.0) };
 		Self {
 			ambient: lighting.ambient,
 			outdoor_ambient: Vec3::ZERO,
 			brightness: 1.0,
 			color_shift_top: Vec3::ZERO,
 			color_shift_bottom: Vec3::ZERO,
-			environment_diffuse_scale: environment_scale,
-			environment_specular_scale: environment_scale,
+			environment_diffuse_scale: diffuse_scale,
+			environment_specular_scale: specular_scale,
 			exposure_compensation: 0.0,
 			global_shadows: false,
 			sky: lighting.sky.clone(),
@@ -378,9 +382,9 @@ mod tests {
 		assert_eq!((environment.environment_diffuse_scale, environment.environment_specular_scale, environment.global_shadows), (0.0, 0.0, false));
 		assert_eq!((environment.ambient, environment.outdoor_ambient, environment.brightness), (Vec3::ONE, Vec3::ZERO, 1.0));
 		assert!(environment.viewport.is_some() && environment.sky.is_none() && environment.atmosphere.is_none() && environment.effects.is_empty() && environment.clouds.is_none());
-		// a Sky child: its images the reflections' cubemap, the sky's light on
+		// a Sky child: half its diffuse light, no reflections of it (fixtures/screen-guis.luau "vp-sky" in a client)
 		let with_sky = Environment::viewport_frame(ViewportLighting { sky: Some(Sky::default()), ..lighting });
-		assert_eq!((with_sky.environment_diffuse_scale, with_sky.environment_specular_scale), (1.0, 1.0));
+		assert_eq!((with_sky.environment_diffuse_scale, with_sky.environment_specular_scale), (0.5, 0.0));
 		assert!(with_sky.sky.is_some());
 	}
 }
