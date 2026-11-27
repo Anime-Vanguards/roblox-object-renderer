@@ -86,6 +86,14 @@ pub const SPECULAR_FADE: [f32; 4] = [1214.0, 1214.0, 1.0, 1.0];
 /// experiments as Studio did to the pixel (notes/render.md "Specular fade").
 pub const SKY_SPECULAR_COLOUR: [f32; 3] = [1.0, 1.0, 1.0];
 
+/// The part colour's level where a pack is drawn without its colour map ([`BuiltInTextures::skip_color`], 2022
+/// DiamondPlate): a Roblox client's 600-stud white DiamondPlate slab, straight down from 12, 48 and 200 studs
+/// (fixtures/sky-specular.luau, two sessions within 0.02), reads 0.968-0.983 of ror's radiance under the sky's
+/// diffuse light, 0.983-0.984 under the sun at EnvironmentSpecularScale 0 (no metal there), 0.948-0.974 under the
+/// sky specular and 0.955-0.987 under all of them, where the Metal slab beside it reads 0.98-1.02; Studio's
+/// DiamondPlate ball 0.96 (notes/materials.md "DiamondPlate's level").
+pub const SKIPPED_COLOR_LEVEL: f32 = 0.975;
+
 /// The direct specular's visibility term (MaterialParams::visibility).
 const VISIBILITY: u32 = 4;
 
@@ -178,7 +186,8 @@ pub struct BuiltInTextures {
 	/// newer materials'.
 	pub random_offset: bool,
 	/// Studio draws the pack without its colour map (DiamondPlate: its flat-lit swatch is uniform,
-	/// std 0.0, and its sun-lit one is a white albedo's, while the pack's normal map matches).
+	/// std 0.0, and its sun-lit one is a white albedo's, while the pack's normal map matches), the
+	/// part colour at [`SKIPPED_COLOR_LEVEL`].
 	pub skip_color: bool,
 	/// How strongly the pack's normal map tilts the surface (1: as stored), from `normal_falloff`'s view depth on.
 	pub normal_strength: f32,
@@ -444,6 +453,15 @@ const PACKS_PRE2022: [(u32, BuiltInTextures); 39] = [
 	(2311, pack_2022(2311, "14108675388", 0.0)),            // Rubber
 ];
 
+/// The part colour's level for a built-in material: [`SKIPPED_COLOR_LEVEL`] where its pack is drawn without its
+/// colour map, else 1.
+pub fn untextured_level(material: u32, use_2022: bool) -> f32 {
+	match built_in_textures(material, use_2022) {
+		Some(textures) if textures.skip_color => SKIPPED_COLOR_LEVEL,
+		_ => 1.0,
+	}
+}
+
 /// The textures a built-in material shows in a place with or without the 2022 materials.
 pub fn built_in_textures(material: u32, use_2022: bool) -> Option<BuiltInTextures> {
 	if use_2022 {
@@ -562,6 +580,17 @@ mod tests {
 		assert_eq!(built_in_textures(800, false).and_then(|slate| slate.far).map(|far| far.scale), Some(0.25));
 		// pre-2022 DiamondPlate keeps its colour map
 		assert_eq!(built_in_textures(1056, false).map(|textures| textures.skip_color), Some(false));
+	}
+
+	/// 2022 DiamondPlate draws without its colour map, its part colour a little darker than ror's white albedo
+	/// was (a client's slab 0.97-0.98 of it in every light); every other pack keeps its colour map at full level.
+	#[test]
+	fn diamondplate_draws_its_part_colour_at_the_clients_level() {
+		assert_eq!(untextured_level(1056, true), SKIPPED_COLOR_LEVEL);
+		assert!((0.965..=0.985).contains(&SKIPPED_COLOR_LEVEL));
+		for (material, generation) in [(1056, false), (1088, true), (1072, true), (848, true), (256, true)] {
+			assert_eq!(untextured_level(material, generation), 1.0, "{material} {generation}");
+		}
 	}
 
 	/// Pre-2022 Glass and Foil show less relief than their normal maps hold, as the engine draws them

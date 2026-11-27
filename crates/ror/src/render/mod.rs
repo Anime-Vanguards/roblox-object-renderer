@@ -1102,6 +1102,9 @@ struct PartMaterial {
 	normal_falloff: (f32, f32),
 	/// A lobe widening with the view depth (built-in packs: render::materials::BuiltInTextures::lobe)
 	lobe: (f32, f32),
+	/// The part colour's level (render::materials::untextured_level: 2022 DiamondPlate's, drawn without its
+	/// colour map); 1 elsewhere.
+	albedo: f32,
 	/// Material textures: the colour map's far tiling (far tiles per tile, 0: none) and 1 / the view
 	/// depth where it has taken over (render::materials::FarTiling).
 	far: [f32; 2],
@@ -4014,7 +4017,7 @@ impl Renderer {
 		let (instances, draws, missing) = (&mut out.instances, &mut out.draws, &mut out.missing);
 		let neon_share = context.neon_share;
 		{
-			let PartMaterial { mut key, mut flags, params, studs_per_tile, emissive: emission, offset, noise_offset, noise_frequency, normal_strength, normal_falloff, lobe, far, pack_proofs } = material;
+			let PartMaterial { mut key, mut flags, params, studs_per_tile, emissive: emission, offset, noise_offset, noise_frequency, normal_strength, normal_falloff, lobe, albedo, far, pack_proofs } = material;
 			if let Some(local_keys) = local_keys {
 				for (uri, proof) in &pack_proofs {
 					stable &= proof_matches(uri, proof, local_keys);
@@ -4280,7 +4283,7 @@ impl Renderer {
 				// under flat Ambient, OutdoorAmbient and the sun alone; humanoid-parts: "Torso" flat-lit
 				// 143.8 against a Plastic block's 146.0)
 				_ if part.body_part.is_some() && part.material == 256 => linear(part.color) * COMPOSITED_ALBEDO,
-				_ => linear(part.color),
+				_ => linear(part.color) * albedo,
 			};
 			// SurfaceAppearance.Color tints the colour map in AlphaMode Overlay too, squared like any
 			// colour (a ship model's SA parts: Studio / ror radiance 0.66-0.68 at Color 0.82 (0.672), 0.49-0.53
@@ -6006,6 +6009,7 @@ impl Renderer {
 			normal_strength: 1.0,
 			normal_falloff: (1.0, 0.0),
 			lobe: (0.0, 0.0),
+			albedo: 1.0,
 			far: [0.0; 2],
 			pack_proofs: Vec::new(),
 		};
@@ -6210,6 +6214,7 @@ impl Renderer {
 				};
 				if textures.skip_color {
 					maps[0] = None;
+					material.albedo = materials::untextured_level(part.material, materials.use_2022);
 				}
 				// the colour map's alpha masks where the part colour tints it (alphamode 2, every 2022
 				// pack): Brick's mortar and CrackedLava's cracks keep their own colour on a coloured part
