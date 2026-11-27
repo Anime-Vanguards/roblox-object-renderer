@@ -1,9 +1,12 @@
 //! Glass against a Roblox 0.747 client's frames (fixtures/glass-client.luau; notes/materials.md "Glass"): the
-//! push off the view's axis, and no refraction below graphics quality level 16. Each scene has a uniform white or black Sky of its own (8 x 8 file faces), so nothing
+//! sky it reflects by its own Fresnel whatever EnvironmentSpecularScale and tinted by its colour, the light
+//! opaque Glass gives up at grazing angles, its Reflectance's mirror image whatever the light, the push off
+//! the view's axis, and no refraction below graphics quality level 16. Each scene has a uniform white or black Sky of its own (8 x 8 file faces), so nothing
 //! waits on Roblox's built-in textures.
 
 use super::*;
 use crate::scene::build::{ModelBuilder, PartSpec};
+use rbx_dom_weak::InstanceBuilder;
 
 const GLASS: u32 = 1568;
 const SMOOTH_PLASTIC: u32 = 272;
@@ -63,6 +66,66 @@ fn pixel(image: &[u8], width: u32, x: u32, y: u32) -> [f32; 3] {
 
 fn ball(model: &mut ModelBuilder, name: &str, color: [u8; 3], transparency: f32) {
 	model.part(&PartSpec { name: name.into(), size: Vec3::splat(6.0), color, material: GLASS, shape: Some(0), transparency, cast_shadow: false, ..Default::default() });
+}
+
+/// Glass reflects the sky by its own Fresnel at EnvironmentSpecularScale 0 as at 1, a black Ball 0.48 of
+/// what a white one does, and from Transparency 0.5 more of it at a lower Transparency, (1 - T); opaque Glass
+/// keeps 0.35-0.5 of SmoothPlastic's light from a PointLight where it is seen at a grazing angle; its
+/// Reflectance's mirror image reads the same lit by Ambient alone as on a face no light reaches. Before, the
+/// sky's reflection scaled with EnvironmentSpecularScale and took no tint, opaque Glass shaded as
+/// SmoothPlastic and the mirror was lit by half the diffuse light.
+#[test]
+fn glass_reflects_tints_and_gives_up_light_as_a_client_draws_it() {
+	let bench = Bench::new("shading");
+	let size = 64u32;
+	// a 6-stud Ball 30 studs off at fov 15 is 24 px across its radius: its rim (r / R 0.92) 22 px right of the middle
+	let rim = |image: &[u8]| pixel(image, size, size / 2 + 22, size / 2);
+	let reflected = |color: [u8; 3], transparency: f32, specular: f32| {
+		let mut model = ModelBuilder::new("Ball");
+		ball(&mut model, "Ball", color, transparency);
+		let scene = bench.scene(model, true, |env| env.environment_specular_scale = specular);
+		rim(&bench.image(&scene, [0.0, 0.0, -30.0], [0.0; 3], 15.0, size, size, None))
+	};
+	let black_off = reflected([0, 0, 0], 0.5, 0.0);
+	let black_on = reflected([0, 0, 0], 0.5, 1.0);
+	assert!(black_off[0] > 40.0, "Glass reflects the sky at EnvironmentSpecularScale 0: {black_off:?}");
+	assert!((0..3).all(|c| (black_off[c] - black_on[c]).abs() <= 2.0), "and the same at 1: {black_off:?} against {black_on:?}");
+	let white = reflected([255, 255, 255], 0.5, 0.0);
+	assert!(white[0] > black_off[0] + 20.0, "a white Ball reflects more than a black one: {white:?} against {black_off:?}");
+	let fainter = reflected([255, 255, 255], 0.8, 0.0);
+	assert!(fainter[0] + 20.0 < white[0], "and less at Transparency 0.8 than at 0.5: {fainter:?} against {white:?}");
+
+	// floors of opaque Glass and SmoothPlastic under a PointLight, seen low over the floor in the dark
+	let floor = |material: u32| {
+		let mut model = ModelBuilder::new("Floor");
+		model.part(&PartSpec { name: "Floor".into(), size: Vec3::new(60.0, 1.0, 60.0), color: [255, 255, 255], material, cast_shadow: false, ..Default::default() });
+		let lamp = model.part(&PartSpec { name: "Lamp".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, 13.5, 0.0)), size: Vec3::splat(0.2), transparency: 1.0, cast_shadow: false, ..Default::default() });
+		model.child(lamp, InstanceBuilder::new("PointLight").with_property("Range", 60.0f32).with_property("Brightness", 1.5f32));
+		let scene = bench.scene(model, false, |env| env.clock_time = 0.0);
+		// the floor 10 studs past the light, away from its mirror image
+		let image = bench.image(&scene, [-30.0, 5.0, 0.0], [10.0, 0.5, 0.0], 30.0, size, size, None);
+		pixel(&image, size, size / 2, size / 2)
+	};
+	let glass = floor(GLASS);
+	let plastic = floor(SMOOTH_PLASTIC);
+	assert!(plastic[0] > 40.0, "the SmoothPlastic floor is lit: {plastic:?}");
+	assert!(glass[0] < 0.85 * plastic[0], "opaque Glass gives up much of the PointLight's light at a grazing angle: {glass:?} against {plastic:?}");
+
+	// a black Glass cube at Reflectance 1 facing the camera, lit by Ambient alone or by a noon sun its face never sees
+	let mirror = |ambient: f32, sun: f32| {
+		let mut model = ModelBuilder::new("Mirror");
+		model.part(&PartSpec { name: "Cube".into(), size: Vec3::splat(6.0), color: [0, 0, 0], material: GLASS, reflectance: 1.0, cast_shadow: false, ..Default::default() });
+		let scene = bench.scene(model, true, |env| {
+			env.ambient = Vec3::splat(ambient);
+			env.brightness = sun;
+			env.clock_time = 12.0;
+		});
+		pixel(&bench.image(&scene, [0.0, 0.0, -30.0], [0.0; 3], 15.0, size, size, None), size, size / 2, size / 2)
+	};
+	let by_ambient = mirror(0.7, 0.0);
+	let by_sun = mirror(0.0, 2.0);
+	assert!(by_sun[0] > 40.0, "the mirror image shows on a face no light reaches: {by_sun:?}");
+	assert!((0..3).all(|c| (by_ambient[c] - by_sun[c]).abs() <= 2.0), "and reads the same lit by Ambient: {by_ambient:?} against {by_sun:?}");
 }
 
 /// What Glass shows behind it moves off the view's axis (a pane facing the camera 10 studs aside moves the

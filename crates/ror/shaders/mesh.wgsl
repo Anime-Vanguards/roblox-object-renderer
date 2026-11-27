@@ -33,13 +33,17 @@
 @group(0) @binding(17) var scene_color: texture_2d<f32>;
 
 // Glass's shading normal (its normal map in), n·v, the sky it reflects (the prefiltered sky at the
-// sky specular's level, without its Fresnel), the sun's and local lights' glint and the sky's diffuse
-// light on its surface, left by shade_surface for fs_glass
+// sky specular's level, without its Fresnel, tinted by its colour), the sun's and local lights' glint,
+// the sky's diffuse light on its surface, its sky specular, the share of the sky it reflects when opaque
+// and its Reflectance's mirror image, left by shade_surface for fs_glass
 var<private> glass_normal: vec3<f32>;
 var<private> glass_facing: f32;
 var<private> glass_sky: vec3<f32>;
 var<private> glass_glint: vec3<f32>;
 var<private> glass_sky_diffuse: vec3<f32>;
+var<private> glass_specular: vec3<f32>;
+var<private> glass_reflected: vec3<f32>;
+var<private> glass_mirror: vec3<f32>;
 
 // what the sky's diffuse light falls to where the grid is closed: a fixed warm grey whatever the sky
 // (lg-sky: on a white floor under a 48-stud roof the same for skies dark, white, default, white in
@@ -1089,6 +1093,7 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 	let shadow = sun_shade(input.world_position, geometric_normal) * cloud_sun(input.world_position);
 	var color = direct_light(surface, n, v, frame.sun_direction.xyz, frame.sun_color.rgb * shadow, 0.0);
 	color += local_lights(surface, input.world_position, n, v, geometric_normal, input.clip.xy);
+	let lit = color;
 
 	// ambient: the flat Ambient / OutdoorAmbient terms plus the sky's irradiance
 	let n_dot_v = max(dot(n, v), 1e-4);
@@ -1146,29 +1151,61 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 		bare.albedo = vec3<f32>(0.0);
 		direct_spec = direct_light(bare, n, v, frame.sun_direction.xyz, frame.sun_color.rgb * shadow, 0.0) + local_lights(bare, input.world_position, n, v, geometric_normal, input.clip.xy);
 	}
+	// Glass reflects the sky by a Fresnel of its own (glass_reflection) whatever EnvironmentSpecularScale,
+	// tinted by its colour, mix(GLASS_TINT_FLOOR, 1, albedo), giving up that share of the ambient and sky
+	// light on it and GLASS_DIRECT_FRESNEL (1 - n·v)² of the sun's and local lights' (glass-client
+	// "fresnel": black and white Glass Balls over a black wall at EnvironmentSpecularScale 0, 0.5 and 1
+	// reflect the same, black 0.48 of white; "light": an opaque Glass floor beside a PointLight's mirror
+	// image keeps 0.52 / 0.42 / 0.35 of a SmoothPlastic floor's light where it is seen at grazing angles,
+	// the sun-lit slab 0.95)
+	var glass_tint = vec3<f32>(1.0);
+	var glass_env = vec3<f32>(0.0);
+	var glass_share = 0.0;
+	if (shading == SHADING_GLASS) {
+		glass_tint = mix(vec3<f32>(GLASS_TINT_FLOOR), vec3<f32>(1.0), surface.albedo);
+		glass_env = textureSampleLevel(environment_map, linear_sampler, r, lod).rgb * sky_reach * glass_tint;
+		let grazing = (1.0 - n_dot_v) * (1.0 - n_dot_v);
+		glass_share = glass_reflection(0.0) * grazing;
+		color = (1.0 - glass_share) * (color - lit) + (1.0 - GLASS_DIRECT_FRESNEL * grazing) * max(lit - direct_spec, vec3<f32>(0.0)) + direct_spec + glass_share * glass_env;
+	}
 	if (reflectance > 0.0) {
 		let mirror = textureSampleLevel(environment_map, linear_sampler, r, SPECULAR_LOD_BIAS).rgb;
-		let sun_light = frame.sun_color.rgb * shadow * max(dot(n, frame.sun_direction.xyz), 0.0) / PI;
-		let light = 0.5 * (flat_ambient + sky_irradiance * frame.environment.x + sun_light);
-		color = mix(color - direct_spec, mirror * light, reflectance) + direct_spec;
+		var image = mirror;
+		if (shading == SHADING_GLASS) {
+			// Glass's mirror is the sky itself tinted as its Fresnel's is, whatever the light on it
+			// (glass-client "reflectance": white, black and lavender Glass cubes read the same at every
+			// Reflectance under flat light, the sun alone, the sky alone and the default lighting, the
+			// rest (1 - Reflectance) of the cube without; white's the sky's own light, black's 0.5 of it)
+			image = mirror * glass_tint;
+		} else {
+			let sun_light = frame.sun_color.rgb * shadow * max(dot(n, frame.sun_direction.xyz), 0.0) / PI;
+			image = mirror * 0.5 * (flat_ambient + sky_irradiance * frame.environment.x + sun_light);
+		}
+		color = mix(color - direct_spec, image, reflectance) + direct_spec;
+		if (shading == SHADING_GLASS) {
+			glass_mirror = reflectance * image;
+		}
 	}
 	// the sky specular: the prefiltered sky (render::environment::prefilter_specular) times its Fresnel,
 	// s and the fade (ibl-spheres at 150 studs: a white mirror metal shows the default sky at 0.76, a
 	// dielectric head-on at 0.034) in the sky's colour (frame.sky_specular_colour, for fits); the
 	// closed grid leaves 0.12 of it (lg-terms)
 	let prefiltered = textureSampleLevel(environment_map, linear_sampler, r, lod).rgb;
-	color += prefiltered * frame.sky_specular_colour.rgb * sky_fresnel * sky_specular * sky_reach;
+	var specular = prefiltered * frame.sky_specular_colour.rgb * sky_fresnel * sky_specular * sky_reach;
 	// where the grid is closed the sky the surface reflects is the closed grid's grey, as its diffuse light is (the
 	// light-grid fixture's "sky" in the engine, 0.747: under a roof a white floor reflects (1.01, 1, 0.92) times
 	// 1.4 LIGHT_GRID_SKY_CLOSED in green, the same in two sessions; ror kept 0.12 of the blue sky): linear in v from the
 	// open sky's share above (nothing changes where the grid is open)
-	color += (LIGHT_GRID_SPECULAR_CLOSED - LIGHT_GRID_SPECULAR_FLOOR * prefiltered * frame.sky_specular_colour.rgb) * (sky_fresnel * sky_specular * (1.0 - sky_open));
+	specular += (LIGHT_GRID_SPECULAR_CLOSED - LIGHT_GRID_SPECULAR_FLOOR * prefiltered * frame.sky_specular_colour.rgb) * (sky_fresnel * sky_specular * (1.0 - sky_open));
+	color += specular;
 	if (shading == SHADING_GLASS) {
 		glass_normal = n;
 		glass_facing = n_dot_v;
-		glass_sky = prefiltered * sky_specular * sky_reach;
-		glass_sky_diffuse = sky_diffuse * (1.0 - reflectance);
+		glass_sky = glass_env;
+		glass_sky_diffuse = sky_diffuse * (1.0 - glass_share) * (1.0 - reflectance);
 		glass_glint = direct_spec;
+		glass_specular = specular;
+		glass_reflected = glass_share * (1.0 - reflectance) * glass_env;
 	}
 	color += surface.albedo * instance.params.w;
 	if ((flags & TEX_EMISSIVE) != 0u) {
@@ -1286,14 +1323,14 @@ const GLASS_OFF_AXIS: f32 = 0.82;
 // colour (0..1 as stored), and adds no surface (material-glass: 5-stud panes over coloured stripes,
 // the stripes seen through each pane against the same stripes beside it; white 0.99 x at 0.5, 0.7
 // and 0.9; red's green 0.00 / 0.39 / 0.78 x; blue (13, 105, 172) at 0.5 0.05 / 0.40 / 0.66 x), and
-// reflects the sky over that, mixed in by F = (1 - T²) 0.97 (1 - n·v)², none head-on
-// (glass-fresnel: balls over a gray Neon panel pass 0.96 / 0.91 / 0.83 / 0.72 / 0.59 of it at r / R
-// 0.6 / 0.75 / 0.85 / 0.925 / 0.97 at T 0.5, losses 1 - T² scales to T 0.8, fit rms 0.005 over T
-// 0.5-0.9; over a black wall they add what that share of the sky gives), with the sun's and local
-// lights' glint at full strength whatever T (the glint the same size at T 0.5 to 1; an effect's rings
-// are a PointLight's glint on eight nested spheres). Below 0.5 it blends linearly: out = (1 - 2T)²
-// s + 2T (1 - F) c d + 4T (1 - T) F sky + (1 - (1 - 2T)²) glint, s the surface as if opaque with
-// the sky's diffuse light on it cut by a further 1 - 2T, d what is behind (glass-low: facing panes
+// passes 1 - F of it, F = (1 - T²) 0.97 (1 - n·v)², none head-on (glass-fresnel: balls over a gray
+// Neon panel pass 0.96 / 0.91 / 0.83 / 0.72 / 0.59 of it at r / R 0.6 / 0.75 / 0.85 / 0.925 / 0.97 at
+// T 0.5, losses 1 - T² scales to T 0.8, fit rms 0.005 over T 0.5-0.9), reflecting the sky by
+// glass_reflection (below), with the sun's and local lights' glint at full strength whatever T (the
+// glint the same size at T 0.5 to 1; an effect's rings are a PointLight's glint on eight nested
+// spheres). Below 0.5 it blends linearly: out = (1 - 2T)² s + (1 - 2T) spec + 2T (1 - F) c d + R sky +
+// glint, s the surface as if opaque with the sky's diffuse light on it cut by a further 1 - 2T, spec its
+// sky specular, R glass_reflection's share, d what is behind (glass-low: facing panes
 // over gray Neon and black pass 0.200 / 0.407 / 0.604 / 0.806 / 0.903 of what is behind at T 0.1 /
 // 0.2 / 0.3 / 0.4 / 0.45, 2T, balls 2T (1 - F) ring by ring, reflecting 0.4-1.2 F of the sky at
 // their rims; glass-low-light: the opaque pane's light shows by 0.641 / 0.360 / 0.161 / 0.040 /
@@ -1304,6 +1341,20 @@ const GLASS_OFF_AXIS: f32 = 0.82;
 // (glass-quirks: balls at T 1 / 1.5 / 3 with disabled Highlights show only the glint over a black
 // wall). The target holds √x.
 const GLASS_FRESNEL: f32 = 0.97;
+// The sky Glass reflects, by its own Fresnel, (1 - n·v)² times GLASS_REFLECTION (1 - T) from Transparency
+// 0.5 and GLASS_REFLECTION / 2 below, opaque Glass too, whatever EnvironmentSpecularScale (glass-client
+// "fresnel": white Glass Balls over a black wall from T 0.5 to 0.9 reflect 1.21 / 1.14 / 1.07 / 1.03 / 0.98
+// times the old (1 - T²) law's sky, (1 - T) / (1 - T²) to 2 %; black ones' rims from T 0 to 0.4 as at 0.5;
+// glass-fresnel and glass-low in Studio 1.07-1.14 times the old law at T 0.3-0.6), tinted by
+// mix(GLASS_TINT_FLOOR, 1, albedo); what it passes still loses GLASS_FRESNEL (1 - T²) (1 - n·v)²
+// (glass-fresnel). Nothing past 1.
+const GLASS_REFLECTION: f32 = 1.6;
+const GLASS_TINT_FLOOR: f32 = 0.5;
+const GLASS_DIRECT_FRESNEL: f32 = 0.8;
+const GLASS_MIRROR_FADE: f32 = 0.8;
+fn glass_reflection(t: f32) -> f32 {
+	return GLASS_REFLECTION * min(0.5, max(1.0 - t, 0.0));
+}
 
 @fragment
 fn fs_glass(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> @location(0) vec4<f32> {
@@ -1359,16 +1410,24 @@ fn fs_glass(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> @
 	let behind = textureSampleLevel(scene_color, linear_sampler, uv, 0.0);
 	let d = behind.rgb * behind.rgb;
 	let c = sqrt(instance.color.rgb);
-	let grazing = 1.0 - glass_facing;
-	let fresnel = GLASS_FRESNEL * grazing * grazing * max(1.0 - t * t, 0.0);
+	let grazing = (1.0 - glass_facing) * (1.0 - glass_facing);
+	// what it passes loses F = GLASS_FRESNEL (1 - T²) (1 - n·v)²; the sky it reflects is glass_reflection(T) (1 - n·v)²
+	let fresnel = GLASS_FRESNEL * grazing * max(1.0 - t * t, 0.0);
+	let reflected = glass_reflection(t) * grazing;
 	var color: vec3<f32>;
 	if (t >= 0.5) {
 		let tint = mix(c, vec3<f32>(1.0), saturate(2.0 * t - 1.0));
-		color = mix(tint * d, glass_sky, fresnel) + glass_glint;
+		color = (1.0 - fresnel) * tint * d + reflected * glass_sky + glass_glint;
 	} else {
+		// the surface's light by (1 - 2T)², the sky's diffuse light on it by a further 1 - 2T, its sky
+		// specular by 1 - 2T, its Reflectance's mirror image by (1 - 2T)^GLASS_MIRROR_FADE (glass-client
+		// "fresnel": the sky specular a black Ball's middle shows at EnvironmentSpecularScale 1 falls as
+		// 1 - 2T, a white one's light under flat Ambient as (1 - 2T)²; "reflectance": lavender cubes at
+		// Transparency 0.1 and 0.3 keep 0.89 and 0.43 of the mirror image at 0)
 		let cover = (1.0 - 2.0 * t) * (1.0 - 2.0 * t);
-		let shown = cover * max(surface.rgb - 2.0 * t * glass_sky_diffuse, vec3<f32>(0.0));
-		color = shown + 2.0 * t * (1.0 - fresnel) * c * d + 4.0 * t * (1.0 - t) * fresnel * glass_sky + (1.0 - cover) * glass_glint;
+		let body = surface.rgb - glass_glint - glass_specular - glass_mirror - glass_reflected;
+		let shown = cover * max(body - 2.0 * t * glass_sky_diffuse, vec3<f32>(0.0));
+		color = shown + (1.0 - 2.0 * t) * glass_specular + pow(1.0 - 2.0 * t, GLASS_MIRROR_FADE) * glass_mirror + 2.0 * t * (1.0 - fresnel) * c * d + reflected * glass_sky + glass_glint;
 	}
 	// at most EXPOSED_CAP once exposed, as every surface (`shade`)
 	color = clamp(color, vec3<f32>(0.0), vec3<f32>(EXPOSED_CAP / frame.environment.z));

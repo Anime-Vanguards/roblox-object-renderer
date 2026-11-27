@@ -7097,8 +7097,9 @@ mod reflectance_tests {
 		assert!((sky - amb).abs() <= 2.0, "sky diffuse weight must match flat ambient (0.5): amb {amb:.1}, sky {sky:.1}");
 		assert!((sun - amb).abs() <= 2.0, "sun diffuse weight must match flat ambient (0.5): amb {amb:.1}, sun {sun:.1}");
 
-		// 3. Glass at Transparency 0.3, Reflectance 1 under sky diffuse alone: white and black parts
-		// have identical surface radiance (no unscaled sky_diffuse subtracted from the mirror).
+		// 3. Glass at Transparency 0.3, Reflectance 1 under sky diffuse alone keeps its mirror image (no
+		// unscaled sky_diffuse subtracted from it), black Glass's half the sky, white's the sky itself
+		// (glass_tests for the rule).
 		let glass_scene = |color: [u8; 3]| {
 			let mut model = ModelBuilder::new("GlassRefl");
 			model.part(&PartSpec { name: "Pane".into(), size: Vec3::new(10.0, 10.0, 1.0), color, material: 1568, transparency: 0.3, reflectance: 1.0, cast_shadow: false, ..Default::default() });
@@ -7111,7 +7112,7 @@ mod reflectance_tests {
 		let glass_white = render_center(&glass_scene([255, 255, 255]), [0.0, 0.0, -10.0]);
 		let glass_black = render_center(&glass_scene([0, 0, 0]), [0.0, 0.0, -10.0]);
 		assert!(glass_black[0] > 40.0, "reflective Glass under sky diffuse should be lit, got {glass_black:?}");
-		assert!((0..3).all(|c| (glass_white[c] - glass_black[c]).abs() <= 2.0), "white Glass at R=1 T=0.3 must match black Glass (no unscaled sky_diffuse subtraction): white {glass_white:?}, black {glass_black:?}");
+		assert!((0..3).all(|c| glass_white[c] >= glass_black[c]), "white Glass at R=1 T=0.3 reflects at least what black Glass does: white {glass_white:?}, black {glass_black:?}");
 
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
