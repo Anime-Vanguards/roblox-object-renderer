@@ -482,7 +482,8 @@ struct RenderArgs {
 	/// Output directory (default <state dir>/out/<input name>)
 	#[arg(long)]
 	out: Option<PathBuf>,
-	/// Image size, WIDTHxHEIGHT
+	/// Image size, WIDTHxHEIGHT; WIDTHxHEIGHT@SCALE also sets the GUI scale, device pixels per GUI pixel
+	/// (a Roblox client at DPI scale 1: @1; default the height / 744, Studio's 1.5 at 1116 pixels tall)
 	#[arg(long, default_value = "1536x1536")]
 	size: String,
 	/// Views: front, back, left, right, top, bottom, iso, default, turntable:N (comma-separated)
@@ -693,7 +694,8 @@ struct VideoArgs {
 	/// playback's start, comma-separated, or a JSON file holding an array of them (stills at their own times)
 	#[arg(long)]
 	times: Option<String>,
-	/// Image size, WIDTHxHEIGHT (even sizes for mp4 and webm)
+	/// Image size, WIDTHxHEIGHT (even sizes for mp4 and webm); WIDTHxHEIGHT@SCALE also sets the GUI scale
+	/// (device pixels per GUI pixel; default the height / 744)
 	#[arg(long, default_value = "1920x1080")]
 	size: String,
 	/// One view: front, back, left, right, top, bottom, iso, default
@@ -984,6 +986,24 @@ fn playback_args(args: &TimelineArgs) -> Result<PlaybackInput> {
 	}
 }
 
+/// `--size WIDTHxHEIGHT[@SCALE]`: the image's size, and the view's GUI scale (device pixels per GUI pixel,
+/// `ViewRequest::gui_scale`) when given: a Roblox client at DPI scale 1 draws its GUIs at 1 (`@1`), where the
+/// default follows Studio's 1.5 at a 1116-pixel-tall view (the image height / 744).
+fn parse_view_size(size: &str) -> Result<(u32, u32, Option<f32>)> {
+	let (size, scale) = match size.split_once('@') {
+		Some((size, scale)) => {
+			let scale: f32 = scale.trim().trim_end_matches(['x', 'X']).parse().context("--size WIDTHxHEIGHT@SCALE: the GUI scale")?;
+			if !(scale.is_finite() && scale > 0.0 && scale <= 16.0) {
+				bail!("--size: the GUI scale after @ must be above 0 and at most 16");
+			}
+			(size, Some(scale))
+		}
+		None => (size, None),
+	};
+	let (width, height) = parse_size(size)?;
+	Ok((width, height, scale))
+}
+
 fn parse_size(size: &str) -> Result<(u32, u32)> {
 	let (width, height) = size.split_once(['x', 'X']).context("--size WIDTHxHEIGHT")?;
 	let width: u32 = width.trim().parse().context("--size width")?;
@@ -1063,7 +1083,7 @@ fn render(mut args: RenderArgs) -> Result<()> {
 		args.out = Some(out);
 		script = Some(recording.report);
 	}
-	let (width, height) = parse_size(&args.size)?;
+	let (width, height, gui_scale) = parse_view_size(&args.size)?;
 	let background = parse_background(&args.background)?;
 	let mut views = if let Some(camera) = &args.camera {
 		// a list of cameras: a view each, camera1 on
@@ -1112,6 +1132,7 @@ fn render(mut args: RenderArgs) -> Result<()> {
 		view.view.ids = args.ids;
 		view.view.lod = lod;
 		view.view.quality = args.quality;
+		view.view.gui_scale = gui_scale;
 	}
 	let playback = playback_args(&TimelineArgs { playback: args.playback.as_deref(), time: args.time, emit: &args.emit, enable: &args.enable, disable: &args.disable, changes: Some(&args.changes) })?;
 	let job = Job {
@@ -1246,7 +1267,7 @@ fn video(mut args: VideoArgs) -> Result<()> {
 		args.out = Some(out);
 		script = Some(recording.report);
 	}
-	let (width, height) = parse_size(&args.size)?;
+	let (width, height, gui_scale) = parse_view_size(&args.size)?;
 	let background = parse_background(&args.background)?;
 	// one view: a camera given, an orbit at a yaw, or a preset (named as `render --views` takes it, so
 	// `render --camera-from <out> --views <name>` draws a still from the video's camera)
@@ -1276,7 +1297,7 @@ fn video(mut args: VideoArgs) -> Result<()> {
 		bail!("--orbit turns an orbit camera (--view, --yaw); this one is fixed (--camera, or --camera-from a render)");
 	}
 	let lod = args.lod.as_deref().map(ror::lod::Lod::parse).transpose()?;
-	let view = ror::render::ViewRequest { width, height, camera, background, msaa: args.msaa, bloom: !args.no_bloom, lod, quality: args.quality, ..Default::default() };
+	let view = ror::render::ViewRequest { width, height, camera, background, msaa: args.msaa, bloom: !args.no_bloom, lod, quality: args.quality, gui_scale, ..Default::default() };
 	let mut playback = playback_args(&TimelineArgs { playback: args.playback.as_deref(), time: None, emit: &args.emit, enable: &args.enable, disable: &args.disable, changes: Some(&args.changes) })?;
 	// an effect plays by its emitters' attributes at 0 (`--emit =attributes`),
 	// unless told what it emits (its Lighting's changes or a property's say nothing of that)
@@ -2503,6 +2524,14 @@ mod tests {
 			Command::Studio(StudioCommand::Capture { out }) => out,
 			_ => panic!("expected studio capture"),
 		}
+	}
+
+	#[test]
+	fn a_size_can_carry_the_views_gui_scale() {
+		assert_eq!(parse_view_size("1644x1116").unwrap(), (1644, 1116, None));
+		assert_eq!(parse_view_size("1644x1116@1").unwrap(), (1644, 1116, Some(1.0)));
+		assert_eq!(parse_view_size("3840x2160@2.5x").unwrap(), (3840, 2160, Some(2.5)));
+		assert!(parse_view_size("1644x1116@0").is_err() && parse_view_size("1644x1116@").is_err() && parse_view_size("x@1").is_err());
 	}
 
 	#[test]
