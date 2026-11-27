@@ -107,7 +107,7 @@ struct GuiVertex {
 	position: [f32; 3],
 	uv: [f32; 2],
 	normal: [f32; 3],
-	/// x LightInfluence, y Brightness, z and w unused
+	/// x LightInfluence, y Brightness, z the transparency an overlay draw takes (a name tag's fade), w unused
 	params: [f32; 4],
 }
 
@@ -468,6 +468,9 @@ pub(super) struct GuiDraw {
 	pub screen: Option<i32>,
 	/// Its framed ViewportFrames as this view draws them, in the order the GUI draws them.
 	framed: Vec<FramedDraw>,
+	/// A name tag's content this view draws (scene::guis::NameTag::content: its text size, its bar);
+	/// `None`: the GUI's own.
+	tag: Option<(usize, bool)>,
 }
 
 /// A framed ViewportFrame of a GUI draw (scene::guis::Framed): its world drawn by its own camera at
@@ -620,6 +623,7 @@ pub(super) fn plan_with_skips(scene: &Scene, camera: &Camera, request: &ViewRequ
 					overlay: gui.always_on_top,
 					screen: None,
 					framed,
+					tag: None,
 				});
 			}
 			GuiKind::Billboard(billboard) => {
@@ -685,6 +689,7 @@ pub(super) fn plan_with_skips(scene: &Scene, camera: &Camera, request: &ViewRequ
 					overlay,
 					screen: None,
 					framed,
+					tag: None,
 				});
 			}
 			GuiKind::Screen(screen) => {
@@ -731,6 +736,61 @@ pub(super) fn plan_with_skips(scene: &Scene, camera: &Camera, request: &ViewRequ
 					overlay: true,
 					screen: Some(screen.display_order),
 					framed,
+					tag: None,
+				});
+			}
+
+			GuiKind::NameTag(tag) => {
+				// drawn over the finished image as AlwaysOnTop GUIs are, in the image's pixels, sized as a
+				// billboard's pixels are (the view's GUI scale)
+				let anchor = tag.head + Vec3::Y * crate::scene::guis::NAME_RISE;
+				let relative = anchor - camera.eye;
+				let depth = -relative.dot(back);
+				if depth <= camera.near {
+					skipped.push(crate::scene::guis::SkippedGui { path: gui.path.clone(), reason: "behind near plane".into() });
+					continue;
+				}
+				// (the client measures from its local character; ror has none and takes the camera)
+				let distance = camera.eye.distance(tag.head);
+				let opacity = crate::scene::guis::NameTag::fade(distance, tag.name_distance);
+				if opacity <= 0.0 {
+					skipped.push(crate::scene::guis::SkippedGui { path: gui.path.clone(), reason: "beyond NameDisplayDistance".into() });
+					continue;
+				}
+				if tag.hidden(camera.eye) {
+					skipped.push(crate::scene::guis::SkippedGui { path: gui.path.clone(), reason: "hidden behind a part".into() });
+					continue;
+				}
+				let size = crate::scene::guis::NameTag::size(distance);
+				let bar = tag.health.is_some() && crate::scene::guis::NameTag::fade(distance, tag.health_distance) > 0.0;
+				let Some((_, base_hash)) = tag.content(size, bar) else {
+					continue;
+				};
+				let gui_scale = (request.gui_scale.filter(|scale| *scale > 0.0).unwrap_or(height as f32 / REFERENCE_HEIGHT) * 1024.0).floor().max(1.0) / 1024.0;
+				let (image_width, image_height) = (width as f32, height as f32);
+				let focal = image_height * 0.5 / tan;
+				// the point over the head on a whole pixel, the canvas's centre on it (fixtures/name-tags.luau:
+				// the name's baseline and the bar's top keep their rows as the point moves within a pixel)
+				let x = (relative.dot(right) / depth * focal + image_width * 0.5).round();
+				let y = (-relative.dot(up) / depth * focal + image_height * 0.5).round();
+				let key = GuiKey::new(*base_hash, tag.canvases[size], gui_scale, true);
+				let [canvas_width, canvas_height] = key.canvas().map(|side| side * key.scale());
+				let (left, top) = ((x - canvas_width * 0.5).round(), (y - canvas_height * 0.5).round());
+				let corner = |px: f32, py: f32| camera.eye - back * depth + right * ((px - image_width * 0.5) * depth / focal) + up * ((image_height * 0.5 - py) * depth / focal);
+				draws.push(GuiDraw {
+					gui: index,
+					key,
+					local_snaps: Arc::from([]),
+					corners: [corner(left, top), corner(left + canvas_width, top), corner(left, top + canvas_height), corner(left + canvas_width, top + canvas_height)],
+					normal: back,
+					// (z: its transparency, the fade)
+					params: [0.0, 1.0, 1.0 - opacity, 0.0],
+					center: anchor,
+					z_offset: 0.0,
+					overlay: true,
+					screen: None,
+					framed: Vec::new(),
+					tag: Some((size, bar)),
 				});
 			}
 		}
@@ -807,7 +867,11 @@ fn wanted<'a>(scene: &'a Scene, draws: &[&'a GuiDraw]) -> Members<'a> {
 		let Some(gui) = scene.guis.get(draw.gui) else {
 			continue;
 		};
-		wanted.push((draw.key, gui, &gui.content, &draw.local_snaps));
+		let content = match (&gui.kind, draw.tag) {
+			(GuiKind::NameTag(tag), Some((size, bar))) => tag.content(size, bar).map_or(&gui.content, |(content, _)| content),
+			_ => &gui.content,
+		};
+		wanted.push((draw.key, gui, content, &draw.local_snaps));
 		for framed in &draw.framed {
 			if let (Some(key), Some(ViewportKind::Framed(crate::scene::guis::Framed { over: Some((content, _)), .. }))) = (framed.over, gui.viewports.get(framed.viewport).map(|viewport| &viewport.kind)) {
 				wanted.push((key, gui, content, &framed.over_snaps));
@@ -2115,6 +2179,58 @@ mod tests {
 		assert!(quarter[0] > 230 && (110..=145).contains(&quarter[1]), "a quarter across the gradient: {quarter:?}");
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	/// A Humanoid's name over its head is drawn over the finished image at the text size its distance gives, fading
+	/// out over the last tenth of NameDisplayDistance, and not while a part stands between the camera and the head
+	/// (fixtures/name-tags.luau in a Roblox client). Before, no name was drawn.
+	#[test]
+	fn a_humanoids_name_is_planned_as_a_client_draws_it() {
+		use crate::render::camera::CameraSpec;
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use rbx_dom_weak::InstanceBuilder;
+
+		// a rig whose head's centre is at the origin, its own torso under it, and a board `blocked` between
+		let scene = |blocked: bool| {
+			let mut model = ModelBuilder::new("Scene");
+			let rig = model.child(model.model, InstanceBuilder::new("Model").with_name("Rig"));
+			for (name, at, size) in [("Head", glam::Vec3::ZERO, glam::Vec3::new(2.0, 1.0, 1.0)), ("Torso", glam::Vec3::new(0.0, -1.5, 0.0), glam::Vec3::new(2.0, 2.0, 1.0))] {
+				let part = model.part(&PartSpec { name: name.into(), cframe: glam::Affine3A::from_translation(at), size, ..Default::default() });
+				model.dom.transfer_within(part, rig);
+			}
+			model.child(rig, InstanceBuilder::new("Humanoid").with_property("Health_XML", 50.0f32));
+			if blocked {
+				model.part(&PartSpec { name: "Board".into(), cframe: glam::Affine3A::from_translation(glam::Vec3::new(0.0, 0.0, 5.0)), size: glam::Vec3::new(4.0, 4.0, 0.2), ..Default::default() });
+			}
+			crate::scene::extract::extract(&model.into_document())
+		};
+		let open = scene(false);
+		let [gui] = open.guis.as_slice() else {
+			panic!("one name tag: {:?}", open.guis.iter().map(|gui| &gui.path).collect::<Vec<_>>());
+		};
+		let GuiKind::NameTag(tag) = &gui.kind else {
+			panic!("a name tag");
+		};
+		assert_eq!((tag.health, tag.contents.len()), (Some(0.5), 6), "half health: a bar at each of three sizes");
+		let plan_at = |scene: &Scene, distance: f32| {
+			let request = ViewRequest { width: 400, height: 300, camera: CameraSpec::LookAt { eye: [0.0, 0.0, distance], target: [0.0; 3], fov: 70.0 }, gui_scale: Some(1.0), ..Default::default() };
+			let camera = request.camera.place(None, request.width, request.height);
+			plan_with_skips(scene, &camera, &request)
+		};
+		for (distance, size, opacity) in [(10.0, 0, 1.0), (30.0, 1, 1.0), (60.0, 2, 1.0), (94.0, 2, 0.52)] {
+			let (draws, skipped) = plan_at(&open, distance);
+			let [draw] = draws.as_slice() else {
+				panic!("at {distance}: {skipped:?}");
+			};
+			assert!(draw.overlay && draw.screen.is_none() && draw.tag == Some((size, true)), "at {distance}: {:?}", draw.tag);
+			assert!((1.0 - draw.params[2] - opacity).abs() < 0.01, "at {distance}: opacity {}", 1.0 - draw.params[2]);
+			// the canvas's centre on the point 1.5 studs over the head, on a whole pixel
+			assert_eq!(draw.key.canvas(), tag.canvases[size]);
+		}
+		let (draws, skipped) = plan_at(&open, 99.5);
+		assert!(draws.is_empty() && skipped.iter().any(|entry| entry.reason == "beyond NameDisplayDistance"), "{skipped:?}");
+		let (draws, skipped) = plan_at(&scene(true), 10.0);
+		assert!(draws.is_empty() && skipped.iter().any(|entry| entry.reason == "hidden behind a part"), "{skipped:?}");
 	}
 
 	#[test]

@@ -50,6 +50,15 @@ fn noted(document: &Document, mut scene: Scene) -> Scene {
 			scene.guis.push(gui);
 		}
 	}
+	// what can hide a name tag: the parts a ray hits, read once for all of them
+	if scene.guis.iter().any(|gui| matches!(gui.kind, super::guis::GuiKind::NameTag(_))) {
+		let occluders = Arc::new(super::guis::occluders(document, &document.roots));
+		for gui in &mut scene.guis {
+			if let super::guis::GuiKind::NameTag(tag) = &mut gui.kind {
+				tag.occluders = occluders.clone();
+			}
+		}
+	}
 	scene
 }
 
@@ -419,6 +428,12 @@ fn walk_one(
 				scene.guis.push(gui);
 			}
 			return;
+		}
+		// a Humanoid's name (and health) over its head, as a client draws it
+		if class == "Humanoid"
+			&& let Some(gui) = super::guis::name_tag(document, referent, instance, &mut scene.warnings)
+		{
+			scene.guis.push(gui);
 		}
 		if props::class_is_a(class, "BasePart") && class != "Terrain" {
 			let count = scene.parts.len();

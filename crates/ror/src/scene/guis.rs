@@ -227,6 +227,324 @@ pub enum GuiKind {
 	Surface(SurfaceGui),
 	Billboard(BillboardGui),
 	Screen(ScreenGui),
+	/// A Humanoid's name and health over its head ([`NameTag`]).
+	NameTag(NameTag),
+}
+
+/// A Humanoid's name, and its health bar, over its head as a Roblox client draws them (0.747,
+/// fixtures/name-tags.luau; notes/render.md "Names over heads"): SourceSans in white with a dark edge, 24,
+/// 18 or 12 pixels by the camera's distance, its line ending two pixels above a point 1.5 studs over the
+/// head's centre, the bar under that point; over the finished image (no light, no post effect, nearer over
+/// farther), fading out over the last tenth of its distance, and not at all while a part a ray can hit
+/// stands between the camera and the head.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NameTag {
+	/// Its head's centre.
+	pub head: Vec3,
+	/// Drawn within this distance (studs): its own NameDisplayDistance with DisplayDistanceType Subject,
+	/// else the viewer's (a client's local character's; here a default Humanoid's 100).
+	pub name_distance: f32,
+	/// The bar within this distance (HealthDisplayDistance, as `name_distance`).
+	pub health_distance: f32,
+	/// The bar's share, Health / MaxHealth, when its HealthDisplayType shows one (AlwaysOn, or
+	/// DisplayWhenDamaged below MaxHealth).
+	pub health: Option<f32>,
+	/// The model holding the Humanoid: its own parts never hide its name.
+	pub model: Ref,
+	/// Its canvas at each text size ([`NAME_SIZES`]), GUI pixels; the point over the head is its centre.
+	pub canvases: [[f32; 2]; 3],
+	/// What rur draws at each text size, without the bar then with it (when `health` is some): each
+	/// content and its FNV-1a.
+	pub contents: Vec<(Arc<Vec<u8>>, u64)>,
+	/// The parts a ray can hit (CanCollide or CanQuery) in the scene, shared by its name tags.
+	pub occluders: Arc<Vec<Occluder>>,
+}
+
+/// A part a ray can hit, as a box (a ball as a sphere), and the character model it belongs to.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Occluder {
+	pub frame: Affine3A,
+	pub half: Vec3,
+	pub ball: bool,
+	pub owner: Ref,
+}
+
+/// A name's text sizes (GUI pixels) nearer than 20 studs, than 50, and farther (fixtures/name-tags.luau:
+/// SourceSans's widths at 24, 18 and 12; the bar 4 times the size plus 6 wide).
+pub const NAME_SIZES: [f32; 3] = [24.0, 18.0, 12.0];
+
+/// How far over the head's centre the name's point lies (studs).
+pub const NAME_RISE: f32 = 1.5;
+
+impl NameTag {
+	/// Its text size ([`NAME_SIZES`]) at a camera `distance` from the head.
+	pub fn size(distance: f32) -> usize {
+		if distance < 20.0 {
+			0
+		} else if distance < 50.0 {
+			1
+		} else {
+			2
+		}
+	}
+
+	/// Its opacity at `distance` from the head within `limit`: whole, then fading out over the last tenth
+	/// (fixtures/name-tags.luau: at a limit of 100 the text's white reads 212 / 135 / 54 of 255 at 91 / 94
+	/// / 97 studs, at 50 163 at 46: (limit - 0.8 - distance) / (0.1 · limit)).
+	pub fn fade(distance: f32, limit: f32) -> f32 {
+		if limit <= 0.0 {
+			return 0.0;
+		}
+		((limit - 0.8 - distance) / (0.1 * limit)).clamp(0.0, 1.0)
+	}
+
+	/// What rur draws at text size `size`, with the bar or not.
+	pub fn content(&self, size: usize, bar: bool) -> Option<&(Arc<Vec<u8>>, u64)> {
+		let per_size = if self.health.is_some() { 2 } else { 1 };
+		self.contents.get(size * per_size + usize::from(bar && self.health.is_some()))
+	}
+
+	/// Whether a part a ray can hit (not its own model's) stands between `eye` and the head
+	/// (fixtures/name-tags.luau: a board over the line to the head hides the name, one over the name
+	/// alone does not; half transparent it still hides, CanCollide and CanQuery off it does not).
+	pub fn hidden(&self, eye: Vec3) -> bool {
+		let span = self.head - eye;
+		let length = span.length();
+		if length <= 1e-4 {
+			return false;
+		}
+		let direction = span / length;
+		self.occluders.iter().filter(|occluder| occluder.owner != self.model).any(|occluder| {
+			let inverse = occluder.frame.inverse();
+			let origin = inverse.transform_point3(eye);
+			let towards = inverse.transform_vector3(direction);
+			let hit = if occluder.ball {
+				let radius = occluder.half.min_element();
+				let b = origin.dot(towards);
+				let c = origin.length_squared() - radius * radius;
+				let disc = b * b - c;
+				(disc >= 0.0).then(|| -b - disc.sqrt())
+			} else {
+				let mut near = f32::NEG_INFINITY;
+				let mut far = f32::INFINITY;
+				let mut missed = false;
+				for axis in 0..3 {
+					if towards[axis].abs() < 1e-9 {
+						missed |= origin[axis].abs() > occluder.half[axis];
+						continue;
+					}
+					let (a, b) = ((-occluder.half[axis] - origin[axis]) / towards[axis], (occluder.half[axis] - origin[axis]) / towards[axis]);
+					near = near.max(a.min(b));
+					far = far.min(a.max(b));
+				}
+				(!missed && near <= far && far > 0.0).then_some(near.max(0.0))
+			};
+			hit.is_some_and(|at| at < length)
+		})
+	}
+}
+
+/// Health's colour on the bar (display values): green over 80 %, red under 10 %, between them Shepard's
+/// inverse-square interpolation of red at 10 %, yellow at 50 % and green at 80 % (fixtures/name-tags.luau:
+/// (36, 251, 102) at 75 %, (250, 235, 0) at 50 %, (242, 91, 5) at 25 %, (255, 28, 0) at 10 % and 0).
+pub fn health_colour(share: f32) -> [f32; 3] {
+	const POINTS: [(f32, [f32; 3]); 3] = [(0.1, [255.0, 28.0, 0.0]), (0.5, [250.0, 235.0, 0.0]), (0.8, [27.0, 252.0, 107.0])];
+	if share < 0.1 {
+		return POINTS[0].1;
+	}
+	if share > 0.8 {
+		return POINTS[2].1;
+	}
+	let mut sum = [0.0f32; 3];
+	let mut weights = 0.0;
+	for (at, colour) in POINTS {
+		let distance = share - at;
+		if distance == 0.0 {
+			return colour;
+		}
+		let weight = 1.0 / (distance * distance);
+		for channel in 0..3 {
+			sum[channel] += weight * colour[channel];
+		}
+		weights += weight;
+	}
+	sum.map(|value| value / weights)
+}
+
+/// A name tag's canvas at a text size: wide enough for the name, the point over the head at its centre.
+fn name_canvas(name: &str, size: f32) -> [f32; 2] {
+	let width = (size * (0.6 * name.chars().count() as f32 + 2.0)).max(4.0 * size + 16.0);
+	[(width / 2.0).ceil() * 2.0, 2.0 * (2.0 * size + 10.0)]
+}
+
+/// The name's edge: a dark grey text stroke, part transparent (fixtures/name-tags.luau: the edge reads
+/// 91-105 of 255 before a white wall at 224, a faint 16-47 halo on black; a stroke of grey g at opacity a
+/// gives 224 (1 - a) + g a and g a there).
+const NAME_STROKE_TRANSPARENCY: f32 = 0.27;
+const NAME_STROKE_GREY: f32 = 41.0 / 255.0;
+
+/// How far above the point over the head the name's line ends (GUI pixels): its baseline lands 6 / 5 / 4
+/// pixels above the point at 24 / 18 / 12 (fixtures/name-tags.luau), the bar's top a pixel above it.
+const NAME_LINE_GAP: i32 = 2;
+
+/// What rur draws of a name tag at a text size: the name in SourceSans, white with a dark edge, its line
+/// ending two pixels above the point over the head, and the health bar from there down (8 pixels: a
+/// health-coloured rim with rounded ends, a dark inside with grey ends, the health's share of it filled
+/// two pixels tall; fixtures/name-tags.luau, the same pixels at every size but its width, 4 x size + 6).
+fn name_content(name: &str, size: f32, health: Option<f32>) -> Result<Vec<u8>, rbx_binary::EncodeError> {
+	use rbx_dom_weak::types::{Color3, Enum, Font, FontStyle, FontWeight, UDim, UDim2, Vector2};
+	let canvas = name_canvas(name, size);
+	let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+	let root = dom.root_ref();
+	let gui = dom.insert(root, InstanceBuilder::new("BillboardGui").with_name("NameTag").with_property("Size", UDim2::new(UDim::new(0.0, canvas[0] as i32), UDim::new(0.0, canvas[1] as i32))));
+	let middle = (canvas[1] / 2.0) as i32;
+	dom.insert(
+		gui,
+		InstanceBuilder::new("TextLabel")
+			.with_name("Name")
+			.with_property("AnchorPoint", Vector2::new(0.5, 1.0))
+			.with_property("Position", UDim2::new(UDim::new(0.5, 0), UDim::new(0.0, middle - NAME_LINE_GAP)))
+			.with_property("Size", UDim2::new(UDim::new(1.0, 0), UDim::new(0.0, (2.0 * size) as i32)))
+			.with_property("BackgroundTransparency", 1.0f32)
+			.with_property("Text", name.to_string())
+			.with_property("FontFace", Font::new("rbxasset://fonts/families/SourceSansPro.json", FontWeight::Regular, FontStyle::Normal))
+			.with_property("TextSize", size)
+			.with_property("TextColor3", Color3::new(1.0, 1.0, 1.0))
+			.with_property("TextStrokeColor3", Color3::new(NAME_STROKE_GREY, NAME_STROKE_GREY, NAME_STROKE_GREY))
+			.with_property("TextStrokeTransparency", NAME_STROKE_TRANSPARENCY)
+			// Enum.TextYAlignment.Bottom
+			.with_property("TextYAlignment", Enum::from_u32(2)),
+	);
+	if let Some(share) = health {
+		let width = (4.0 * size + 6.0) as i32;
+		let left = canvas[0] as i32 / 2 - width / 2;
+		let top = middle - 1;
+		let colour = health_colour(share).map(|value| value / 255.0);
+		let rim = Color3::new(colour[0], colour[1], colour[2]);
+		let filled = (share.clamp(0.0, 1.0) * (width - 6) as f32).round() as i32;
+		let dark = Color3::new(51.0 / 255.0, 50.0 / 255.0, 50.0 / 255.0);
+		let grey = Color3::new(100.0 / 255.0, 100.0 / 255.0, 100.0 / 255.0);
+		// (x, y, width, height, colour) in the bar's pixels, drawn in this order
+		let mut pieces = vec![(3, 1, width - 6, 6, dark), (3, 0, width - 6, 1, rim), (3, 7, width - 6, 1, rim)];
+		for (x, inner) in [(0, 1), (width - 1, width - 3)] {
+			pieces.extend([(x, 1, 1, 6, rim), (inner, 1, 2, 1, rim), (inner, 6, 2, 1, rim), (inner, 2, 2, 4, grey)]);
+		}
+		pieces.push((3, 3, filled, 2, rim));
+		for (index, (x, y, w, h, colour)) in pieces.into_iter().enumerate() {
+			if w <= 0 || h <= 0 {
+				continue;
+			}
+			dom.insert(
+				gui,
+				InstanceBuilder::new("Frame")
+					.with_name(format!("Bar{index}"))
+					.with_property("Position", UDim2::new(UDim::new(0.0, left + x), UDim::new(0.0, top + y)))
+					.with_property("Size", UDim2::new(UDim::new(0.0, w), UDim::new(0.0, h)))
+					.with_property("BackgroundColor3", colour)
+					.with_property("BorderSizePixel", 0i32)
+					.with_property("ZIndex", index as i32 + 1),
+			);
+		}
+	}
+	let mut bytes = Vec::new();
+	rbx_binary::to_writer(&mut bytes, &dom, &[gui])?;
+	Ok(bytes)
+}
+
+/// A Humanoid's name tag, as a client draws one over its head ([`NameTag`]), or `None` when it shows
+/// none: DisplayDistanceType None, no Head part beside it, a model outside the world.
+pub fn name_tag(document: &Document, referent: Ref, instance: &Instance, warnings: &mut Vec<String>) -> Option<Gui> {
+	// Viewer 0, Subject 1, None 2
+	let kind = props::enum_value(instance, "DisplayDistanceType", 0);
+	if kind == 2 {
+		return None;
+	}
+	let model = instance.parent();
+	let holder = document.dom.get_by_ref(model)?;
+	if !beams::drawn(document, model) {
+		return None;
+	}
+	let head = holder.children().iter().filter_map(|&child| document.dom.get_by_ref(child)).find(|child| child.name == "Head" && props::is_a(child, "BasePart"))?;
+	let (centre, _) = part_box(head)?;
+	// a Viewer is shown within the viewer's distances (a default Humanoid's: no local character here)
+	let (name_distance, health_distance) = if kind == 1 { (props::f32(instance, "NameDisplayDistance", 100.0), props::f32(instance, "HealthDisplayDistance", 100.0)) } else { (100.0, 100.0) };
+	let display = props::string(instance, "DisplayName").filter(|name| !name.is_empty()).unwrap_or_else(|| holder.name.to_string());
+	let max_health = props::f32(instance, "MaxHealth", 100.0);
+	// Health as a file keeps it (a place or model saved by Studio: Health_XML); a recording of play does not
+	// keep the live Health (ree's scene.rbxm writes Health_XML 0 whatever a script set), so its Humanoids
+	// are drawn at full health
+	let held = |name: &str| match instance.properties.get(&rbx_dom_weak::ustr(name)) {
+		Some(Variant::Float32(value)) => Some(*value),
+		Some(Variant::Float64(value)) => Some(*value as f32),
+		_ => None,
+	};
+	let health = if document.play { max_health } else { held("Health").or_else(|| held("Health_XML")).unwrap_or(max_health) };
+	// DisplayWhenDamaged 0, AlwaysOn 1, AlwaysOff 2
+	let shown = match props::enum_value(instance, "HealthDisplayType", 0) {
+		1 => true,
+		2 => false,
+		_ => health < max_health,
+	};
+	let share = shown.then(|| if max_health > 0.0 { (health / max_health).clamp(0.0, 1.0) } else { 0.0 });
+	let path = document.path_of(referent);
+	let mut contents = Vec::new();
+	for size in NAME_SIZES {
+		let bars: &[Option<f32>] = if share.is_some() { &[None, share] } else { &[None] };
+		for bar in bars {
+			match name_content(&display, size, *bar) {
+				Ok(bytes) => {
+					let hash = fnv1a(&bytes);
+					contents.push((Arc::new(bytes), hash));
+				}
+				Err(error) => {
+					warnings.push(format!("{path}: could not make its name tag (not drawn): {error}"));
+					return None;
+				}
+			}
+		}
+	}
+	let canvases = NAME_SIZES.map(|size| name_canvas(&display, size));
+	let (content, base_content_hash) = contents[0].clone();
+	Some(Gui {
+		path,
+		kind: GuiKind::NameTag(NameTag { head: centre, name_distance, health_distance, health: share, model, canvases, contents, occluders: Arc::new(Vec::new()) }),
+		content,
+		base_content_hash,
+		content_hash: base_content_hash,
+		local_files: Vec::new(),
+		light_influence: 0.0,
+		brightness: 1.0,
+		always_on_top: true,
+		max_distance: 0.0,
+		clips: true,
+		z_index_behavior: 1,
+		viewports: Vec::new(),
+	})
+}
+
+/// The parts a ray can hit at and under `roots` (CanCollide, or CanQuery), for the scene's name tags
+/// ([`NameTag::occluders`]), each with the Humanoid's model it belongs to (none: `Ref::none()`).
+pub fn occluders(document: &Document, roots: &[Ref]) -> Vec<Occluder> {
+	let mut found = Vec::new();
+	let mut stack: Vec<(Ref, Ref)> = roots.iter().map(|&root| (root, Ref::none())).collect();
+	while let Some((referent, owner)) = stack.pop() {
+		let Some(instance) = document.dom.get_by_ref(referent) else {
+			continue;
+		};
+		let owner = if instance.class == "Model" && instance.children().iter().any(|&child| document.dom.get_by_ref(child).is_some_and(|child| child.class == "Humanoid")) { referent } else { owner };
+		if props::is_a(instance, "BasePart")
+			&& instance.class != "Terrain"
+			&& (props::bool(instance, "CanCollide", true) || props::bool(instance, "CanQuery", true))
+			&& let Some(cframe) = props::cframe(instance, "CFrame")
+		{
+			let size = props::vec3(instance, "Size", Vec3::new(4.0, 1.0, 2.0)).abs();
+			// Enum.PartType.Ball 0
+			let ball = instance.class == "Part" && props::enum_value(instance, "Shape", 1) == 0;
+			found.push(Occluder { frame: cframe, half: size * 0.5, ball, owner });
+		}
+		stack.extend(instance.children().iter().map(|&child| (child, owner)));
+	}
+	found
 }
 
 /// A ScreenGui of a PlayerGui: drawn over the finished image, post effects included, at the view's
@@ -918,6 +1236,7 @@ mod tests {
 
 	use super::GuiKind;
 	use crate::scene::build::{ModelBuilder, PartSpec, cframe};
+	use std::sync::Arc;
 
 	fn extract(model: ModelBuilder) -> crate::scene::Scene {
 		crate::scene::extract::extract(&model.into_document())
@@ -1009,6 +1328,65 @@ mod tests {
 		assert!(scene.skipped_guis.iter().any(|entry| entry.path.ends_with("Stray") && entry.reason == "ScreenGui outside PlayerGui"), "{:?}", scene.skipped_guis);
 		assert!(scene.warnings.is_empty(), "{:?}", scene.warnings);
 		assert_eq!((super::top_bar_inset(true), super::top_bar_inset(false)), (58.0, 0.0));
+	}
+
+	#[test]
+	fn humanoids_show_their_names_as_a_client_does() {
+		// rigs with a Head beside their Humanoid: a default one (a Viewer's distance, 100), one at DisplayDistanceType
+		// None, a Subject at NameDisplayDistance 20 with a DisplayName, one at half health (DisplayWhenDamaged: a
+		// bar), one AlwaysOff at half health, and a Humanoid without a Head (fixtures/name-tags.luau in a client)
+		let mut model = ModelBuilder::new("Scene");
+		let rig = |model: &mut ModelBuilder, name: &str, x: f32, humanoid: InstanceBuilder, head: bool| {
+			let holder = model.child(model.model, InstanceBuilder::new("Model").with_name(name));
+			if head {
+				let part = model.part(&PartSpec { name: "Head".into(), cframe: Affine3A::from_translation(Vec3::new(x, 4.5, 0.0)), size: Vec3::new(2.0, 1.0, 1.0), ..Default::default() });
+				model.dom.transfer_within(part, holder);
+			}
+			model.child(holder, humanoid);
+		};
+		let enum_of = |value: u32| Enum::from_u32(value);
+		rig(&mut model, "Plain", 0.0, InstanceBuilder::new("Humanoid"), true);
+		rig(&mut model, "Hidden", 5.0, InstanceBuilder::new("Humanoid").with_property("DisplayDistanceType", enum_of(2)), true);
+		rig(&mut model, "Own", 10.0, InstanceBuilder::new("Humanoid").with_property("DisplayDistanceType", enum_of(1)).with_property("NameDisplayDistance", 20.0f32).with_property("DisplayName", "Shown Name"), true);
+		rig(&mut model, "Hurt", 15.0, InstanceBuilder::new("Humanoid").with_property("Health_XML", 50.0f32), true);
+		rig(&mut model, "Quiet", 20.0, InstanceBuilder::new("Humanoid").with_property("Health_XML", 50.0f32).with_property("HealthDisplayType", enum_of(2)), true);
+		rig(&mut model, "Headless", 25.0, InstanceBuilder::new("Humanoid"), false);
+		let scene = extract(model);
+		let tags: Vec<(&str, &super::NameTag)> = scene
+			.guis
+			.iter()
+			.filter_map(|gui| match &gui.kind {
+				GuiKind::NameTag(tag) => Some((gui.path.as_str(), tag)),
+				_ => None,
+			})
+			.collect();
+		let names: Vec<&str> = tags.iter().map(|(path, _)| *path).collect();
+		assert_eq!(tags.len(), 4, "{names:?}");
+		let tag = |name: &str| tags.iter().find(|(path, _)| path.contains(&format!("{name}."))).map(|(_, tag)| *tag).unwrap_or_else(|| panic!("{name} in {names:?}"));
+		assert!((tag("Plain").head - Vec3::new(0.0, 4.5, 0.0)).length() < 1e-4 && tag("Plain").name_distance == 100.0 && tag("Plain").health.is_none() && tag("Plain").contents.len() == 3);
+		assert_eq!(tag("Own").name_distance, 20.0);
+		assert!(tag("Own").canvases[0][0] > tag("Plain").canvases[0][0], "a longer name, a wider canvas");
+		assert_eq!((tag("Hurt").health, tag("Hurt").contents.len()), (Some(0.5), 6));
+		assert!(tag("Quiet").health.is_none());
+		// text sizes and the fade (24 nearer than 20 studs, 18 nearer than 50, then 12; whole to the last tenth)
+		assert_eq!([19.9, 20.0, 49.9, 50.0].map(super::NameTag::size), [0, 1, 1, 2]);
+		for (distance, limit, opacity) in [(80.0, 100.0, 1.0), (91.0, 100.0, 0.82), (97.0, 100.0, 0.22), (46.0, 50.0, 0.64), (99.5, 100.0, 0.0)] {
+			assert!((super::NameTag::fade(distance, limit) - opacity).abs() < 0.005, "{distance} of {limit}");
+		}
+		// the bar's colours (the client's, within a level)
+		for (share, colour) in [(1.0, [27.0, 252.0, 107.0]), (0.75, [36.0, 251.0, 102.0]), (0.5, [250.0, 235.0, 0.0]), (0.25, [242.0, 91.0, 5.0]), (0.1, [255.0, 28.0, 0.0]), (0.0, [255.0, 28.0, 0.0])] {
+			let found = super::health_colour(share);
+			assert!(found.iter().zip(colour).all(|(a, b)| (a - b).abs() <= 1.0), "{share}: {found:?}");
+		}
+		// what hides it: a part a ray hits between the camera and the head, not its own model's; a ball as a ball
+		let mut hidden = tag("Plain").clone();
+		let board = |at: Vec3, ball: bool, owner: rbx_dom_weak::types::Ref| super::Occluder { frame: Affine3A::from_translation(at), half: Vec3::new(1.0, 1.0, 0.1), ball, owner };
+		hidden.occluders = Arc::new(vec![board(Vec3::new(0.0, 4.5, 5.0), false, rbx_dom_weak::types::Ref::none())]);
+		assert!(hidden.hidden(Vec3::new(0.0, 4.5, 10.0)) && !hidden.hidden(Vec3::new(0.0, 4.5, -10.0)), "before the head, not behind it");
+		hidden.occluders = Arc::new(vec![board(Vec3::new(0.0, 4.5, 5.0), false, hidden.model)]);
+		assert!(!hidden.hidden(Vec3::new(0.0, 4.5, 10.0)), "its own model's part");
+		hidden.occluders = Arc::new(vec![board(Vec3::new(0.95, 5.45, 5.0), true, rbx_dom_weak::types::Ref::none())]);
+		assert!(!hidden.hidden(Vec3::new(0.0, 4.5, 10.0)), "a ball's corner of its box is open");
 	}
 
 	#[test]

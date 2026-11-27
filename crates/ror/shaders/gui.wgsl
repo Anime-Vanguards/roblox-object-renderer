@@ -284,13 +284,14 @@ fn fs_gui(input: GuiOutput) -> @location(0) vec4<f32> {
 }
 
 // AlwaysOnTop: over the finished image, the GUI's own colours (gui-surface-basics: alwaysontop, white
-// 255 behind a wall)
+// 255 behind a wall), at 1 - params.z of its opacity (a name over a head fading out near its distance)
 @fragment
 fn fs_gui_overlay(input: GuiOutput) -> @location(0) vec4<f32> {
 	let texel = gui_sample(input.uv);
+	let opacity = 1.0 - saturate(input.params.z);
 	// a framed ViewportFrame's picture laid in (gui_texel); no window draws here
 	if (gui_window.mode.x > 0.5) {
-		return gui_texel(input, texel);
+		return gui_texel(input, texel) * opacity;
 	}
-	return texel;
+	return texel * opacity;
 }
