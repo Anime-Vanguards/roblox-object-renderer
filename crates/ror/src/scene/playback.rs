@@ -171,14 +171,16 @@ pub struct Action {
 	/// nil`).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub parent: Option<String>,
-	/// With an `emit` count: where the burst leaves from, the world CFrame (12 numbers) of the emitter's
-	/// part or attachment at the call, instead of where the playback has that part or attachment at
-	/// the frame. Roblox's `Emit` spawns its particles in the call (not measured here), so a script that
-	/// moves an attachment between calls in one frame leaves a burst at each place, where a frame's
-	/// motion holds one (a recording's emits carry it: ree; one without it is placed by the motion).
+	/// With an `emit` count: the world CFrame (12 numbers) of the emitter's part or attachment at the
+	/// call, as recordings write it. Read and checked, not drawn from: a Roblox client spawns an Emit's
+	/// particles at its next particle step, from where the emitter is then, so the bursts of a script
+	/// that moves an attachment between Emit calls in one frame all leave from its last place, and an
+	/// Emit called after a frame's render from where the next frame's step finds it (notes/render.md
+	/// "Playback"). A burst leaves from where the playback has the part or attachment at its frame.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub cframe: Option<Vec<f32>>,
-	/// With `cframe`, an emitter on a part: the part's Size at the call, which its particles spawn over.
+	/// With `cframe`, an emitter on a part: the part's Size at the call. Not drawn from either: a part
+	/// emitter spawns over the part's Size at the burst's frame.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub part_size: Option<[f32; 3]>,
 }
@@ -1237,20 +1239,17 @@ impl ByAttributes {
 	}
 }
 
-/// One burst of an emitter's playback: when, how many, and where it left from when the action says
-/// ([`Action::cframe`]; else where the emitter's part or attachment is at that time).
+/// One burst of an emitter's playback: when and how many. It leaves from where the emitter's part or
+/// attachment is at that time, the frame's particle step ([`Action::cframe`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Burst {
 	at: f32,
 	count: u32,
-	from: Option<Affine3A>,
-	/// the emitting part's size then ([`Action::part_size`])
-	part_size: Option<Vec3>,
 }
 
 impl Burst {
 	fn at(at: f32, count: u32) -> Self {
-		Self { at, count, from: None, part_size: None }
+		Self { at, count }
 	}
 }
 
@@ -2304,13 +2303,14 @@ impl Playback {
 				_ => None,
 			};
 			// where a count's burst leaves from, when the action says
-			let from = match &action.cframe {
+			// an emit's `cframe` and `partSize` (where a recording saw the emitter at the call) are checked but
+			// not used: a Roblox client spawns an Emit's particles at its next particle step, from where the
+			// emitter is then ([`Action::cframe`])
+			match &action.cframe {
 				Some(_) if !matches!(action.emit, Some(Emit::Count(_))) => bail!("playback: {}: a cframe goes with an emit count", action.target),
 				Some(components) if components.len() != 12 => bail!("playback: {}: an emit's cframe has 12 numbers, not {}", action.target, components.len()),
-				Some(components) => Some(affine(components, Affine3A::IDENTITY)?),
-				None => None,
-			};
-			let part_size = action.part_size.map(Vec3::from);
+				_ => {}
+			}
 			for target in paths.get(&action.target)? {
 				for referent in descendants(document, target) {
 					let Some(instance) = document.dom.get_by_ref(referent) else {
@@ -2339,7 +2339,7 @@ impl Playback {
 					}
 					if instance.class == "ParticleEmitter" {
 						match (&action.emit, by_attributes) {
-							(Some(Emit::Count(count)), _) => timeline.emits.push(Burst { at, count: *count, from, part_size }),
+							(Some(Emit::Count(count)), _) => timeline.emits.push(Burst::at(at, *count)),
 							(_, Some(by_attributes)) => by_attributes.schedule(instance, &grid, action.at, timeline),
 							_ => {}
 						}
@@ -3176,10 +3176,11 @@ impl Resolved<'_> {
 				}
 				let age = (now - timeline.particle_time(start, at)).max(0.0);
 				let lived = (spawn_now - timeline.spawn_time(start, at)).max(0.0);
-				// where the emitter was at the call when the playback says (several bursts of one frame from
-				// an attachment moved between them), else where its part or attachment is then
-				let cframe = emitted.from.unwrap_or_else(|| frame_at(at));
-				let (velocity, size) = (velocity_at(at), emitted.part_size.unwrap_or_else(|| size_at(at)));
+				// where its part or attachment is at the burst's frame, whatever moved it between Emit calls
+				// in that frame: a Roblox client spawns an Emit's particles at its next particle step
+				// ([`Action::cframe`])
+				let cframe = frame_at(at);
+				let (velocity, size) = (velocity_at(at), size_at(at));
 				for index in 0..count * emitter.emit_count.unwrap_or(1) {
 					births.push(Birth { age, lived, cframe, velocity, stream: (1 << 40) + ((burst as u64) << 20) + index as u64, size, follow: follow_of(at) });
 				}
@@ -4563,13 +4564,13 @@ mod tests {
 		assert!((390..=410).contains(&alive), "{alive}");
 	}
 
-	/// A recording's bursts leave from where their emitter was at the call (`cframe`, and a part's
-	/// `partSize`): an attachment moved to four corners in one frame, emitting after each move (an effect
-	/// that locks its rectangle so), draws four bursts at four corners where its motion
-	/// holds the last corner only; without them every burst is where the motion has the emitter, as
-	/// before.
+	/// A frame's bursts leave from where their emitter is at the frame's particle step, whatever `cframe`
+	/// and `partSize` a recording wrote at each call: an attachment moved to four corners in one frame,
+	/// emitting after each move, leaves all four bursts at the last corner, and a part's emitter spawns
+	/// over the part as the frame has it (a Roblox client: fixtures/playback-timing.luau "emitmove",
+	/// three corners, an attachment, a part and two LockedToPart emitters, four sessions alike).
 	#[test]
-	fn each_burst_leaves_from_where_its_emit_says() {
+	fn a_frames_bursts_leave_from_where_the_emitter_is_then() {
 		use crate::scene::build::{ModelBuilder, PartSpec};
 		use rbx_dom_weak::InstanceBuilder;
 		use rbx_dom_weak::types::NumberRange;
@@ -4582,40 +4583,44 @@ mod tests {
 		let mut document = model.into_document();
 		let corners = [Vec3::new(-6.0, 0.0, -4.0), Vec3::new(6.0, 0.0, -4.0), Vec3::new(6.0, 0.0, 4.0), Vec3::new(-6.0, 0.0, 4.0)];
 		let at = |position: Vec3| -> Vec<f32> { cframe_json(Affine3A::from_translation(position)).as_array().unwrap().iter().map(|n| n.as_f64().unwrap() as f32).collect() };
-		// the corner's track: still, then at the frame's last corner
-		let motion = vec![Motion { target: "Fx.Plate.Corner".into(), keys: vec![MotionKey { at: 0.0, cframe: vec![0.0, 0.0, 0.0], ..Default::default() }, MotionKey { at: 0.1, cframe: corners[3].to_array().to_vec(), ..Default::default() }], ..Default::default() }];
-		let burst = |placed: bool, corner: Vec3| Action { at: 0.1, target: "Fx.Plate.Corner.Burst".into(), emit: Some(Emit::Count(8)), cframe: placed.then(|| at(corner)), ..Default::default() };
+		// the corner's track: still, then at the frame's last corner, then moved on at 0.3 s
+		let later = Vec3::new(0.0, 3.0, 0.0);
+		let motion = vec![Motion {
+			target: "Fx.Plate.Corner".into(),
+			keys: vec![
+				MotionKey { at: 0.0, cframe: vec![0.0, 0.0, 0.0], ..Default::default() },
+				MotionKey { at: 0.1, cframe: corners[3].to_array().to_vec(), ..Default::default() },
+				MotionKey { at: 0.3 - 1.0 / 60.0, cframe: corners[3].to_array().to_vec(), ..Default::default() },
+				MotionKey { at: 0.3, cframe: later.to_array().to_vec(), ..Default::default() },
+			],
+			..Default::default()
+		}];
+		// as a recording writes them: each burst with the place of its call
+		let burst = |time: f32, corner: Vec3| Action { at: time, target: "Fx.Plate.Corner.Burst".into(), emit: Some(Emit::Count(8)), cframe: Some(at(corner)), ..Default::default() };
 		let lift = |count: u32, position: Vec3, size: [f32; 3]| Action { at: 0.1, target: "Fx.Field.Lift".into(), emit: Some(Emit::Count(count)), cframe: Some(at(position)), part_size: Some(size), ..Default::default() };
-		let births = |document: &mut Document, placed: bool| -> (Vec<Birth>, Vec<Birth>) {
-			let mut actions: Vec<Action> = corners.iter().map(|&corner| burst(placed, corner)).collect();
-			actions.extend([lift(3, Vec3::new(0.0, 0.2, 0.0), [12.0, 0.1, 8.0]), lift(5, Vec3::new(10.0, 0.2, 0.0), [4.0, 0.1, 4.0])]);
-			let playback = Playback { time: 0.5, actions, motion: motion.clone(), ..Default::default() };
-			let resolved = playback.resolve(document).unwrap();
-			let undo = resolved.apply_state(document).unwrap();
-			let mut scene = crate::scene::extract::extract(document);
-			resolved.apply_history(document, &mut scene);
-			undo.restore(document);
-			let of = |name: &str| scene.particles.iter().find(|emitter| emitter.path.ends_with(name)).and_then(|emitter| emitter.births.clone()).unwrap_or_default();
-			(of("Burst"), of("Lift"))
-		};
-		let (bursts, lifts) = births(&mut document, true);
-		assert_eq!(bursts.len(), 32);
-		for (index, corner) in corners.iter().enumerate() {
-			let here = bursts.iter().filter(|birth| (Vec3::from(birth.cframe.translation) - *corner).length() < 1e-4).count();
-			assert_eq!(here, 8, "corner {index} ({corner})");
-		}
-		// a part's emitter over the part as it was at each call
+		let mut actions: Vec<Action> = corners.iter().map(|&corner| burst(0.1, corner)).collect();
+		// an emit at 0.3 s that the recording saw at the corner, before the move of its frame
+		actions.push(burst(0.3, corners[3]));
+		actions.extend([lift(3, Vec3::new(0.0, 0.2, 0.0), [12.0, 0.1, 8.0]), lift(5, Vec3::new(10.0, 0.2, 0.0), [4.0, 0.1, 4.0])]);
+		let playback = Playback { time: 0.5, actions, motion, ..Default::default() };
+		let resolved = playback.resolve(&document).unwrap();
+		let undo = resolved.apply_state(&mut document).unwrap();
+		let mut scene = crate::scene::extract::extract(&document);
+		resolved.apply_history(&document, &mut scene);
+		undo.restore(&mut document);
+		let of = |name: &str| scene.particles.iter().find(|emitter| emitter.path.ends_with(name)).and_then(|emitter| emitter.births.clone()).unwrap_or_default();
+		let (bursts, lifts) = (of("Burst"), of("Lift"));
+		assert_eq!(bursts.len(), 40);
+		let near = |birth: &Birth, place: Vec3| (Vec3::from(birth.cframe.translation) - place).length() < 1e-4;
+		assert_eq!(bursts.iter().filter(|birth| near(birth, corners[3])).count(), 32, "the frame's four bursts at its last corner");
+		assert_eq!(bursts.iter().filter(|birth| near(birth, later)).count(), 8, "the later burst where its frame has the attachment");
+		// a part's emitter over the part as the frame has it (unmoved, its own size)
 		assert_eq!(lifts.len(), 8);
-		assert!(lifts.iter().filter(|birth| birth.size == Vec3::new(12.0, 0.1, 8.0) && birth.cframe.translation.x == 0.0).count() == 3, "{lifts:?}");
-		assert!(lifts.iter().filter(|birth| birth.size == Vec3::new(4.0, 0.1, 4.0) && birth.cframe.translation.x == 10.0).count() == 5, "{lifts:?}");
-		// a recording without them: every burst where the motion has the corner at that frame
-		let (bursts, _) = births(&mut document, false);
-		assert_eq!(bursts.len(), 32);
-		assert!(bursts.iter().all(|birth| (Vec3::from(birth.cframe.translation) - corners[3]).length() < 1e-4));
+		assert!(lifts.iter().all(|birth| birth.size == Vec3::splat(1.0) && near(birth, Vec3::ZERO)), "{lifts:?}");
 		// a cframe goes with a count, and has twelve numbers
-		let mode = Action { emit: Some(Emit::Mode("attributes".into())), ..burst(true, corners[0]) };
+		let mode = Action { emit: Some(Emit::Mode("attributes".into())), ..burst(0.1, corners[0]) };
 		assert!(Playback { actions: vec![mode], ..Default::default() }.resolve(&document).is_err());
-		let short = Action { cframe: Some(vec![1.0, 2.0, 3.0]), ..burst(true, corners[0]) };
+		let short = Action { cframe: Some(vec![1.0, 2.0, 3.0]), ..burst(0.1, corners[0]) };
 		assert!(Playback { actions: vec![short], ..Default::default() }.resolve(&document).is_err());
 	}
 
