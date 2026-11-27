@@ -58,9 +58,13 @@ By default every view draws what a Roblox client draws at its highest graphics q
 - the sun's shadow maps only within the level's distance of the camera, the voxel light grid's softer sun past it (none of the maps below level 8);
 - local lights per pixel, with their shadows, only within the level's distance of the camera (none below level 14, or 17 under `PrioritizeLightingQuality` false: every surface takes the lights' voxels, as under `LightingStyle` Soft), the voxels past it;
 - the share of each `ParticleEmitter`'s `Rate` the level makes (`max(level, 2) / 21`; `Emit` bursts in full);
+- per-pixel lighting, with the sun's glint, only for parts whose box is within the level's distance of the view's focus (none at levels 1 to 4, 10 studs at 5, 36 at 6, 70 at 7, 382 at 12, 775 at 16, 1,180 at 21; two levels later under `PrioritizeLightingQuality` false). The focus is what a look-at or orbit camera looks at, else the camera itself. Past it a part is lit by vertex: its sun glint taken at its corners (a large floor shows none), no metalness, no normal maps, and the sky's light the same from every side;
+- the high-quality shading only within the level's distance of the camera (from level 7: 55 studs, 142 at 9, 310 at 12, 547 at 15, 756 at 17, everywhere from 18), fading over a quarter of that distance each way: past it metals and `Foil` reflect no sky and are drawn as any surface, nothing shows the sky's specular, and normal maps lie flat;
+- the built-in glow round bright surfaces in three strengths (levels 1-5, 6-11, 12 and up, the lower two weaker and weighing a source's luminance), and no `BloomEffect` below level 12;
+- ambient occlusion from level 20; no anti-aliasing below level 17 (4 samples from 17, where a client takes 2); `SunRaysEffect` and `DepthOfFieldEffect` from level 16; `BlurEffect` at every level;
 - without `--lod`: each `MeshPart` at its level of detail, as `--lod` draws it, and none of the parts the client's view distance and size cull at that level leave out (490 studs at level 1, 1,600 at 4 to 12, 10,000 at 17). `summary.json`'s `lod` says `"client": true`. With `--lod roblox:N` the cull is Studio's edit quality's instead.
 
-Level 21 with `--quality 21` differs from the default only in the levels of detail and the cull. Not yet followed by level: the specular and shading model, the built-in glow and post effects, ambient occlusion, anti-aliasing, Glass refraction and clouds (`ror::quality::Quality` holds the client's numbers for them).
+Level 21 with `--quality 21` differs from the default only in the levels of detail and the cull. Not yet followed by level: clouds, and the light a client gives faces turned away from the sun where it draws no shadow maps (`ror::quality::Quality` holds the client's numbers for the clouds).
 
 ## Lighting, materials, and map backdrops
 
