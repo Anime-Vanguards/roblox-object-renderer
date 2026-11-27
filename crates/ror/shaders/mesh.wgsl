@@ -680,6 +680,26 @@ fn shading_tier(world_position: vec3<f32>, instance: Instance) -> vec2<f32> {
 	return vec2<f32>(select(high, 0.0, lowest > 0.5), lowest);
 }
 
+// Whether a part takes the sun as the parts round the view's focus do, faces turned away from it unlit: its cluster's box
+// (render::cluster_boxes) within frame.quality_focus.w of the focus (crate::quality::Quality::back_light_radius; notes/
+// render.md "Graphics quality levels", "Faces turned from the sun")
+fn near_sun(instance: Instance) -> bool {
+	let focus = frame.quality_focus.xyz;
+	let gap = max(instance.cluster_low.xyz - focus, vec3<f32>(0.0)) + max(focus - instance.cluster_high.xyz, vec3<f32>(0.0));
+	return length(gap) < frame.quality_focus.w;
+}
+
+// The sun's share on a face turned away from it, past the near sun's radius: shadow.wgsl `sun_back_share` through the light
+// grid's voxel sun as the face reads it (a client's wall facing away from the sun on a floor reads darker near the floor's
+// voxels, and evenly without GlobalShadows)
+fn back_sun(position: vec3<f32>, geometric_normal: vec3<f32>, n: vec3<f32>, instance: Instance) -> f32 {
+	let share = sun_back_share(dot(n, frame.sun_direction.xyz));
+	if (share <= 0.0 || near_sun(instance)) {
+		return 0.0;
+	}
+	return share * light_grid_sun(position, geometric_normal) * cloud_sun(position);
+}
+
 fn shading_term(bit: u32) -> bool {
 	return (u32(frame.quality_shading.w) & bit) != 0u;
 }
@@ -935,6 +955,11 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 		// the lowest shading: diffuse light, and its glint lit by vertex, shaded here
 		color = surface.diffuse_weight * surface.albedo / PI * max(dot(n, frame.sun_direction.xyz), 0.0) * frame.sun_color.rgb * shadow;
 		color += input.vertex_glint * shadow;
+	}
+	// faces turned from the sun, past the near sun's radius of the focus
+	let back = back_sun(input.world_position, geometric_normal, n, instance);
+	if (back > 0.0) {
+		color += surface.diffuse_weight * surface.albedo / PI * back * frame.sun_color.rgb;
 	}
 	color += local_lights(surface, input.world_position, n, v, geometric_normal, input.clip.xy);
 	let lit = color;

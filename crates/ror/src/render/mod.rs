@@ -350,7 +350,8 @@ struct FrameUniform {
 	/// The view's graphics quality shading ([`quality_shading`]): where the high-quality shading starts fading and
 	/// has gone from the camera, how far a part's box may be from the focus to be lit per pixel, the terms left out
 	quality_shading: [f32; 4],
-	/// The view's focus ([`view_focus`])
+	/// The view's focus ([`view_focus`]), and how far a part's cluster may be from it with faces turned from the sun
+	/// unlit (crate::quality::Quality::back_light_radius)
 	quality_focus: [f32; 4],
 }
 
@@ -378,6 +379,9 @@ struct InstanceData {
 	texture: [f32; 4],
 	tint: [f32; 4],
 	lobe: [f32; 4],
+	/// The box round the part's cluster (xyz, w unused; [`cluster_boxes`]), for faces turned from the sun
+	cluster_low: [f32; 4],
+	cluster_high: [f32; 4],
 }
 
 #[repr(C)]
@@ -645,6 +649,37 @@ fn shading_terms() -> u32 {
 fn quality_shading(quality: &crate::quality::Quality) -> [f32; 4] {
 	let finite = |studs: f32| studs.min(1e9);
 	[finite(quality.shading_radius * 0.75), finite(quality.shading_radius * 1.25), finite(quality.lit_radius), shading_terms() as f32]
+}
+
+/// The cells a Roblox client groups parts into by their middles, whose joint box decides how they take the sun near the
+/// focus (crate::quality::Quality::back_light_radius; the `cluster` station: a ball's far side follows a part of any
+/// material, transparency or kind 68 studs off in its 128 x 64 x 128-stud cell, not one across X = 128 or Y = 64, and a
+/// bar whose middle is in the cell while it reaches past it)
+const SUN_CLUSTER_CELL: Vec3 = Vec3::new(128.0, 64.0, 128.0);
+
+/// Each instance's cluster box (`InstanceData::cluster_low`, `cluster_high`; mesh.wgsl `near_sun`): the box round every
+/// part's box whose middle shares its part's cell ([`SUN_CLUSTER_CELL`]); decals take their part's. A box that is not
+/// finite stands alone, as wide as the world (always near the focus).
+fn cluster_boxes(instances: &mut [InstanceData]) {
+	let boxes: Vec<Option<(glam::IVec3, Vec3, Vec3)>> = instances
+		.iter()
+		.map(|instance| {
+			let part = Mat4::from_cols_array_2d(&instance.part_inverse).inverse();
+			let centre = part.w_axis.truncate();
+			let half = (part.x_axis.truncate().abs() + part.y_axis.truncate().abs() + part.z_axis.truncate().abs()) * 0.5;
+			(centre.is_finite() && half.is_finite()).then(|| ((centre / SUN_CLUSTER_CELL).floor().as_ivec3(), centre - half, centre + half))
+		})
+		.collect();
+	let mut clusters: std::collections::HashMap<glam::IVec3, (Vec3, Vec3)> = std::collections::HashMap::new();
+	for &(cell, low, high) in boxes.iter().flatten() {
+		let cluster = clusters.entry(cell).or_insert((low, high));
+		*cluster = (cluster.0.min(low), cluster.1.max(high));
+	}
+	for (instance, part) in instances.iter_mut().zip(&boxes) {
+		let (low, high) = part.map_or((Vec3::splat(-1e30), Vec3::splat(1e30)), |(cell, ..)| clusters[&cell]);
+		instance.cluster_low = [low.x, low.y, low.z, 0.0];
+		instance.cluster_high = [high.x, high.y, high.z, 0.0];
+	}
 }
 
 /// The point a view's focus is at, which the client's per-pixel lighting follows (Camera.Focus; crate::quality::
@@ -3990,6 +4025,7 @@ impl Renderer {
 		};
 		drop(last);
 		let prepared::Layout { mut instances, draws, part_draws, draw_parts, drawn, offsets } = laid;
+		cluster_boxes(&mut instances);
 		if profile {
 			eprintln!("profile: parts {:.1} ms ({} of {} prepared)", phase.elapsed().as_secs_f64() * 1000.0, fresh.len(), scene.parts.len());
 		}
@@ -4050,6 +4086,10 @@ impl Renderer {
 		};
 		if none {
 			instances.clear();
+		}
+		// (kept as the parts laid them, which a later frame's changed parts are: the boxes come anew each frame)
+		for instance in &mut instances {
+			(instance.cluster_low, instance.cluster_high) = ([0.0; 4], [0.0; 4]);
 		}
 		let frame = table.map(|context| prepared::FramePieces { context, flags, reusable, instances, drawn, offsets });
 		Ok((prepared, moving, frame, remembered, offline_fallback, all_stable))
@@ -4311,6 +4351,8 @@ impl Renderer {
 					texture: [0.0; 4],
 					tint: [1.0; 4],
 					lobe: [0.0; 4],
+					cluster_low: [0.0; 4],
+					cluster_high: [0.0; 4],
 				});
 				let runs = self.decal_runs(&mesh, &local, box_size, decal.face.min(5), decal_flags);
 				draws.push(DrawItem {
@@ -4443,6 +4485,8 @@ impl Renderer {
 				texture: [far[0], far[1], if part.shadow_only { 1.0 } else { 1.0 - part.transparency }, normal_falloff.1],
 				tint: [tint.x, tint.y, tint.z, normal_falloff.0],
 				lobe: [lobe.1, lobe.0, 0.0, 0.0],
+				cluster_low: [0.0; 4],
+				cluster_high: [0.0; 4],
 			});
 			let lod = draw_lod(&mesh);
 			// a posed skinned mesh sorts by where its Bones put it, not by its part (skin-sort: a character
@@ -4829,8 +4873,9 @@ impl Renderer {
 			frame.sky_specular_colour = sky_specular_colour();
 			frame.direct_metal = direct_metal();
 			frame.specular_fade = specular_fade();
-			// level 21: the high-quality shading everywhere
+			// level 21: the high-quality shading everywhere, and the sun as round the focus (faces turned from it unlit)
 			frame.quality_shading = quality_shading(&crate::quality::Quality::top());
+			frame.quality_focus = [0.0, 0.0, 0.0, 1e9];
 		})
 	}
 
@@ -4991,7 +5036,8 @@ impl Renderer {
 		// the level's shading: high quality within its radius of the camera, per pixel within its radius of the
 		// focus, the lowest shading past that (mesh.wgsl `shading_tier`)
 		frame.quality_shading = quality_shading(&quality);
-		frame.quality_focus = Vec4::from((view_focus(&request.camera, &camera, prepared.bounds), 0.0)).into();
+		// and where faces turned from the sun take some of it: past the level's radius of the focus, by cluster
+		frame.quality_focus = Vec4::from((view_focus(&request.camera, &camera, prepared.bounds), quality.back_light_radius.min(1e9))).into();
 		// which of them each cluster of the view's pixels can be lit by: the light within its Range (past
 		// a SurfaceLight's face), the far surfaces' voxels 6 studs out within their reach (under Soft the
 		// near surfaces' too, a light placed with a playback's as well, and past a lower level's per-pixel

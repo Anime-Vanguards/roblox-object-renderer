@@ -2617,7 +2617,7 @@ mod tests {
 
 		// a white billboard (LightInfluence 1) seen against the sun: its normal faces the camera, away from the sun
 		let across = Vec3::Y.cross(sun).normalize();
-		let against = |global_shadows: bool| {
+		let against_at = |global_shadows: bool, diffuse: f32, brightness: f32| {
 			let mut model = ModelBuilder::new("Behind");
 			let anchor = model.part(&PartSpec { name: "Anchor".into(), size: Vec3::splat(0.2), transparency: 1.0, cast_shadow: false, ..Default::default() });
 			let size = UDim2::new(UDim::new(4.0, 0), UDim::new(4.0, 0));
@@ -2625,13 +2625,18 @@ mod tests {
 			// (a block below it, so that GlobalShadows draw the sun's shadow maps)
 			model.part(&PartSpec { name: "Caster".into(), cframe: glam::Affine3A::from_translation(Vec3::new(0.0, -12.0, 0.0)), size: Vec3::splat(4.0), color: [0, 0, 0], material: 272, ..Default::default() });
 			let mut scene = crate::scene::extract::extract(&model.into_document());
-			lighting(&mut scene, 2.0, global_shadows);
+			lighting(&mut scene, brightness, global_shadows);
+			scene.environment.environment_diffuse_scale = diffuse;
 			let request = view((across - sun * 0.8).normalize() * 25.0, Vec3::ZERO, 30.0, 128);
 			level(&draw(&scene, &request, &white), &request, Vec3::ZERO)
 		};
-		let (open, shadows) = (against(false), against(true));
+		let (open, shadows) = (against_at(false, 0.0, 2.0), against_at(true, 0.0, 2.0));
 		assert!(open > 60.0, "a billboard seen against the sun is lit from behind ({open})");
 		assert!((open - shadows).abs() <= 1.0, "with GlobalShadows a billboard takes the sun from behind as without them ({shadows} against {open})");
+		// the light from behind gives way to the sky's as EnvironmentDiffuseScale rises (fixtures/quality-levels.luau
+		// `guiback`: none at 1, the sky's own light all there is)
+		let (sun_and_sky, sky_only) = (against_at(false, 1.0, 2.0), against_at(false, 1.0, 0.0));
+		assert!((sun_and_sky - sky_only).abs() <= 1.0, "EnvironmentDiffuseScale 1: no light from behind ({sun_and_sky} against the sky's {sky_only})");
 
 		// an unlit SurfaceGui of one-texel black lines every third texel on white, seen 2.7 times smaller than its image
 		let mut model = ModelBuilder::new("Lines");

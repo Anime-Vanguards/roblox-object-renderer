@@ -62,10 +62,6 @@ const GUI_RADIANCE: f32 = 1.935;
 // local lights; Studio's gui-light: a white frame facing a Brightness-1 sun reads 0.98, under Ambient 0.5 0.482
 // where a part reads 0.495), no specular
 const GUI_LIT_SCALE: f32 = 0.98;
-// lit from behind at 0.41 of |n·l|, with GlobalShadows or not (fixtures/world-guis.luau "light" in a Roblox client: a
-// slab turned 120° from the sun 0.40 / 0.41 in white / grey without them, a billboard seen from the side away from the
-// sun 0.42 either way; Studio's edit viewport: 0.39 without them, none with them)
-const GUI_BACK_LIGHT: f32 = 0.41;
 // The GUI's image at this pixel as a Roblox client draws a GUI's content in the world: as geometry rasterised with the
 // scene's 4x MSAA (fixtures/world-guis.luau "sampling": a canvas of one-pixel lines seen 1 to 16 times smaller than its
 // image shows each pixel at 0, 1, 2, 3 or 4 quarters of the line's colour, in √x, each line whole or missed, where mips
@@ -157,7 +153,9 @@ fn gui_light(input: GuiOutput) -> vec3<f32> {
 	// viewport lights them from its light grid instead); from behind, the shadow as the side facing the sun takes it
 	let facing = n_dot_l >= 0.0;
 	let shade = sun_shade(input.world_position, select(-n, n, facing)) * cloud_sun(input.world_position);
-	let sun = frame.sun_color.rgb / PI * select(-n_dot_l * GUI_BACK_LIGHT, n_dot_l, facing) * shade;
+	// from behind shadow.wgsl `sun_back_share`, with GlobalShadows or not, wherever the GUI is (Studio's edit viewport: 0.39
+	// without them, none with them)
+	let sun = frame.sun_color.rgb / PI * select(sun_back_share(n_dot_l), n_dot_l, facing) * shade;
 	// OutdoorAmbient and the sky's light as far as the light grid sees the sky, as parts take them (fixtures/world-guis.luau
 	// "light": frames under a roof keep 0.61 of OutdoorAmbient and 0.70 / 0.65 / 0.64 of the sky's light where the part
 	// beside them keeps 0.61 and 0.68 / 0.64 / 0.63)

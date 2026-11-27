@@ -85,6 +85,22 @@ fn cloud_sun(world_position: vec3<f32>) -> f32 {
 	return 1.0 - frame.cloud_sun.x * (1.0 - saturate((across - 585.0) / 115.0));
 }
 
+// A Roblox client lights a face turned away from the sun by SUN_BACK_LIGHT · |n·l| of the sun's diffuse light where it does
+// not take the sun as round the focus: a GUI everywhere (gui.wgsl `gui_light`; fixtures/world-guis.luau "light": a slab
+// turned 120 degrees from the sun 0.40 / 0.41, a billboard seen against it 0.42), a part past its graphics quality level's
+// radius of the focus (mesh.wgsl `back_sun`; fixtures/quality-levels.luau `backs` under the sun alone: plates turned to
+// n·l -0.25, -0.5, -0.75 and -0.95 read 0.664, 0.657, 0.650 and 0.656 of tone-curve input per unit |n·l|; `bounce` without
+// GlobalShadows, a wall 0.404 and balls 0.398 of the sun's diffuse light)
+const SUN_BACK_LIGHT: f32 = 0.41;
+
+// The share of the sun's diffuse light a face at `n_dot_l` turned away from it takes (SUN_BACK_LIGHT · |n·l|), giving way
+// to the sky's diffuse light as EnvironmentDiffuseScale e rises: times 1 - e (fixtures/quality-levels.luau `kinds` at level
+// 4 under the sun: the shapes' far sides keep 0.92, 0.56 and none of it at e 0.1, 0.5 and 1 beside e times the sky's
+// light; `guiback`: a white frame on a slab's face turned from the sun alike, at levels 4 and 21); 0 facing the sun
+fn sun_back_share(n_dot_l: f32) -> f32 {
+	return SUN_BACK_LIGHT * (1.0 - saturate(frame.environment.x)) * max(-n_dot_l, 0.0);
+}
+
 // what the sky's diffuse light falls to where the grid is closed: a fixed warm grey whatever the sky
 // (lg-sky: on a white floor under a 48-stud roof the same for skies dark, white, default, white in
 // the Up or the Dn image only and at midnight, half at EnvironmentDiffuseScale 0.5)

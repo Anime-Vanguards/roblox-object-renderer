@@ -1,7 +1,7 @@
 //! What a view draws at a graphics quality level beyond the shadows and lights (crate::quality, notes/render.md
 //! "Graphics quality levels"): the shading tiers by the focus and the camera, the ambient occlusion from 20 and the
-//! anti-aliasing by level, against a Roblox 0.747 client's frames (fixtures/quality-levels.luau `shading`,
-//! `kinds`, `ao`).
+//! anti-aliasing by level, the sun's light on faces turned from it, against a Roblox 0.747 client's frames
+//! (fixtures/quality-levels.luau `shading`, `kinds`, `ao`, `backs`, `chunk`, `cluster`).
 
 use super::*;
 use crate::scene::build::{ModelBuilder, PartSpec};
@@ -137,6 +137,52 @@ fn ambient_occlusion_starts_at_level_20() {
 	assert!((corner(None) - occluded).abs() < 0.5);
 }
 
+/// Faces turned away from the sun take 0.41 · |n·l| of its light where a part's cluster lies past the level's radius of
+/// the focus (crate::quality::Quality::back_light_radius; `backs`, `chunk`, `cluster`): a white plate whose face looks
+/// straight away from the sun, 40 studs from the focus between it and the camera, without GlobalShadows (no light grid).
+/// Lit at level 4 (every part), not at 21 (599.5 studs); at 7 (19.5 studs) lit alone in its 128 x 64 x 128-stud cell,
+/// not with a block 8 studs from the focus in the cell, lit again with that block across the cell's edge. Half as lit at
+/// EnvironmentDiffuseScale 0.5, not at all at 1 (the sky black: its own light nothing).
+#[test]
+fn faces_turned_from_the_sun_take_its_back_light_past_the_focus_radius() {
+	let views = Views::new();
+	let plate = Vec3::new(64.0, 32.0, 64.0);
+	let away = -SUN;
+	let focus = plate + away * 40.0;
+	let eye = plate + away * 50.0;
+	let draw_at = |other: Option<Vec3>, quality: Option<u32>, diffuse: f32| {
+		let mut model = ModelBuilder::new("Backs");
+		// the plate's top faces away from the sun
+		let up = away;
+		let side = up.cross(Vec3::Z).normalize();
+		let rotation = glam::Mat3::from_cols(side, up, side.cross(up));
+		model.part(&PartSpec { name: "Plate".into(), cframe: Affine3A::from_mat3_translation(rotation, plate), size: Vec3::new(8.0, 0.2, 8.0), color: [230; 3], material: 272, ..Default::default() });
+		if let Some(at) = other {
+			model.part(&PartSpec { name: "Other".into(), cframe: Affine3A::from_translation(at), size: Vec3::ONE, color: [230; 3], material: 272, ..Default::default() });
+		}
+		let mut scene = crate::scene::extract::extract(&model.into_document());
+		let environment = &mut scene.environment;
+		(environment.ambient, environment.outdoor_ambient, environment.environment_diffuse_scale, environment.environment_specular_scale) = (Vec3::ZERO, Vec3::ZERO, diffuse, 0.0);
+		(environment.clock_time, environment.geographic_latitude, environment.brightness, environment.global_shadows) = (16.2, 38.0, 2.0, false);
+		environment.sky = Some(views.sky([0, 0, 0]));
+		views.level(&scene, view(eye, focus, 2.0 * (3.0f32 / 50.0).atan().to_degrees(), quality))
+	};
+	let draw = |other: Option<Vec3>, quality: Option<u32>| draw_at(other, quality, 0.0);
+	let lit = draw(None, Some(4));
+	assert!(lit > 60.0, "level 4: the face turned from the sun takes its back light ({lit})");
+	assert!(draw(None, None) < 1.0 && draw(None, Some(21)) < 1.0, "level 21: none within 599.5 studs of the focus");
+	assert!((draw(None, Some(7)) - lit).abs() < 1.0, "level 7: alone in its cell, 40 studs out ({} against {lit})", draw(None, Some(7)));
+	// a block 8 studs from the focus, off the view, in the plate's cell; then across the cell's edge at X = 128
+	let near = focus + Vec3::new(0.0, 0.0, 8.0);
+	assert!(near.x < 128.0 && near.y < 64.0 && near.z < 128.0 && near.min_element() >= 0.0);
+	assert!(draw(Some(near), Some(7)) < 1.0, "level 7: its cluster reaches within 19.5 studs of the focus");
+	assert!((draw(Some(near), Some(4)) - lit).abs() < 1.0, "level 4: every cluster");
+	assert!((draw(Some(Vec3::new(130.0, near.y, near.z)), Some(7)) - lit).abs() < 1.0, "level 7: a block in the next cell leaves it out");
+	let half = draw_at(None, Some(4), 0.5);
+	assert!(half > 10.0 && half < lit - 15.0, "EnvironmentDiffuseScale 0.5: about half the light ({half} against {lit})");
+	assert!(draw_at(None, Some(4), 1.0) < 1.0, "EnvironmentDiffuseScale 1: none");
+}
+
 /// Anti-aliasing by level: none at 1-16, 4 samples from 17 (the client's 2 at 17: ror has no 2-sample passes), as
 /// `msaa` asks no more.
 #[test]
@@ -144,4 +190,34 @@ fn a_level_draws_its_samples() {
 	let at = |quality: Option<u32>, msaa: u32| view_samples(&ViewRequest { quality, msaa, ..Default::default() });
 	assert_eq!([None, Some(21), Some(18), Some(17), Some(16), Some(1)].map(|quality| at(quality, 4)), [4, 4, 4, 4, 1, 1]);
 	assert_eq!(at(Some(21), 1), 1);
+}
+
+/// A part's cluster: the box round every part whose middle shares its 128 x 64 x 128-stud cell (`cluster`: a ball's far
+/// side follows a part 68 studs off in its cell, of any material, and a bar whose middle is in the cell while it reaches
+/// past it; not a part across X = 128 or Y = 64).
+#[test]
+fn parts_share_the_box_of_their_cell() {
+	let instance = |middle: Vec3, size: Vec3| {
+		let mut data = InstanceData::zeroed();
+		data.part_inverse = Mat4::from(Affine3A::from_scale_rotation_translation(size, glam::Quat::IDENTITY, middle)).inverse().to_cols_array_2d();
+		data
+	};
+	let mut instances = vec![
+		instance(Vec3::new(32.0, 32.0, 32.0), Vec3::splat(4.0)),
+		instance(Vec3::new(100.0, 32.0, 100.0), Vec3::splat(4.0)),
+		// its middle in the cell, reaching past X = 128
+		instance(Vec3::new(120.0, 32.0, 32.0), Vec3::new(40.0, 4.0, 4.0)),
+		// across X = 128, over Y = 64
+		instance(Vec3::new(140.0, 32.0, 32.0), Vec3::splat(4.0)),
+		instance(Vec3::new(32.0, 70.0, 32.0), Vec3::splat(4.0)),
+	];
+	cluster_boxes(&mut instances);
+	let cluster = |index: usize| (Vec3::from_slice(&instances[index].cluster_low[..3]), Vec3::from_slice(&instances[index].cluster_high[..3]));
+	let shared = (Vec3::new(30.0, 30.0, 30.0), Vec3::new(140.0, 34.0, 102.0));
+	for index in 0..3 {
+		let (low, high) = cluster(index);
+		assert!(low.abs_diff_eq(shared.0, 1e-3) && high.abs_diff_eq(shared.1, 1e-3), "part {index}: {low} {high}");
+	}
+	assert!(cluster(3).0.abs_diff_eq(Vec3::new(138.0, 30.0, 30.0), 1e-3));
+	assert!(cluster(4).1.abs_diff_eq(Vec3::new(34.0, 72.0, 34.0), 1e-3));
 }

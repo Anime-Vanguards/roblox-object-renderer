@@ -53,6 +53,13 @@ pub struct Quality {
 	/// levels 1-4, 10 studs at 5, 36 at 6, 70 at 7 ... 581 at 14, 1,180 at 21; past it the lowest shading (lit by
 	/// vertex: no specular per pixel, the sky's light the same from every side).
 	pub lit_radius: f32,
+	/// How far a part's cluster may be from the view's focus and still take the sun as the parts round the focus do,
+	/// faces turned away from it unlit. Past it a face turned away from the sun takes 0.41 · |n·l| of the sun's light
+	/// (through the light grid's voxel sun). A cluster is the parts whose middles share a 128 x 64 x 128-stud cell of the
+	/// world, by the box round them all, and a part's box distance is its cluster's: 0 (every part) at levels 1-5, 5
+	/// studs at 6, 19.5 at 7, 39 at 8, 66.5 at 9 ... 525.5 at 18, 599.5 from 19 (the shadow maps' reach from 9 to 17);
+	/// under PrioritizeLightingQuality false 0 through 9, 3 at 10 ... 51 at 13, then about the maps' reach under false.
+	pub back_light_radius: f32,
 	/// The built-in glow round Neon: 0 at levels 1-5, 1 at 6-11, 2 from 12 (render/bloom.rs GLOW_TIERS).
 	pub glow: u8,
 	/// BloomEffect (from 12).
@@ -172,6 +179,30 @@ const SHADING_RADIUS_UNPRIORITIZED: [f32; 7] = [73.0, 126.0, 186.0, 276.0, 367.0
 /// floor 13 studs from the focus by vertex at 6 and 7, per pixel at 12; the specular's start moves from 5 to 7 alike).
 const LIT_RADIUS: [f32; 17] = [10.4, 36.0, 70.0, 122.0, 177.0, 257.0, 307.0, 382.0, 482.0, 581.0, 676.0, 775.0, 925.0, 1075.0, 1110.0, 1145.0, 1180.0];
 
+/// The radius round the focus past which a part's cluster takes the sun on faces turned from it (the `chunk` station:
+/// 4-stud white balls in 128 x 64 x 128-stud cells under the sun alone, Camera.Focus moved along a line out of a
+/// cluster's box; between the last focus distance from the box with the balls' far sides black and the first with them
+/// lit): none at 1-5 (lit with the focus in the box), 5 studs at 6 (4 / 6), 19.5 at 7 (19 / 20), 39 at 8 (38 / 40), 66.5
+/// at 9 (66 / 67), 99 at 10 (98 / 100), 135 at 11 (134 / 136), 177 at 12 (176 / 178), 224 at 13 (223 / 225), 277 at 14
+/// (276 / 278), 332 at 15 (331 / 333), 391.5 at 16 (390 / 393), 457 at 17 (456 / 458), 525.5 at 18 (524 / 527), 599.5 at
+/// 19-21 (597 / 600 at 19 and 20, 599 / 602 at 21): from 9 to 17 the shadow maps' "gone by" ([`SUN_REACH`]) within 1.5
+/// studs, though the maps reach from the camera by point and this from the focus by cluster. LightingStyle Soft the same
+/// (38 / 40 at 8, 66 / 68 at 9, 276 / 278 at 14, 599 / 602 at 21).
+const BACK_LIGHT_RADIUS: [f32; 16] = [5.0, 19.5, 39.0, 66.5, 99.0, 135.0, 177.0, 224.0, 277.0, 332.0, 391.5, 457.0, 525.5, 599.5, 599.5, 599.5];
+/// Under PrioritizeLightingQuality false: none through 9 (7: lit with the focus in the box; 8 and 9 not measured), 3 at
+/// 10 (0 / 6), 13 at 11 (12 / 14), 27 at 12 (26 / 28), 51 at 13 (48 / 54), 86 at 14 (84 / 88), 137 at 15 (136 / 138),
+/// 207.5 at 16 (205 / 210), 308.5 at 17 (307 / 310), 437.5 at 18 (435 / 440), 599.5 at 21 (599 / 602; 19 and 20 taken
+/// as 21): from 14 the maps' reach under false ([`SUN_REACH_UNPRIORITIZED`]) within 2 studs.
+const BACK_LIGHT_RADIUS_UNPRIORITIZED: [f32; 12] = [3.0, 13.0, 27.0, 51.0, 86.0, 137.0, 207.5, 308.5, 437.5, 599.5, 599.5, 599.5];
+
+fn back_light_radius(level: u32, prioritize: bool) -> f32 {
+	match (prioritize, level) {
+		(true, 0..=5) | (false, 0..=9) => 0.0,
+		(true, _) => BACK_LIGHT_RADIUS[(level.min(TOP) - 6) as usize],
+		(false, _) => BACK_LIGHT_RADIUS_UNPRIORITIZED[(level.min(TOP) - 10) as usize],
+	}
+}
+
 fn lit_radius(level: u32) -> f32 {
 	match level {
 		0..=4 => 0.0,
@@ -224,6 +255,7 @@ impl Quality {
 			light_reach,
 			shading_radius,
 			lit_radius: lit_radius(if prioritize { level } else { level.saturating_sub(2) }),
+			back_light_radius: back_light_radius(level, prioritize),
 			glow: match level {
 				0..=5 => 0,
 				6..=11 => 1,
@@ -402,6 +434,23 @@ mod tests {
 			let fit = 11.5 * ((level - 4) as f32).powf(1.7);
 			assert!((fit / radius - 1.0).abs() < 0.11, "level {level}: {radius} against {fit}");
 			assert_eq!(Quality::new(level, false, true).lit_radius, radius);
+		}
+		// faces turned from the sun lit past a radius of the focus: every part at 1-5 (1-9 under false), 19.5 studs at
+		// 7, the maps' reach from 9 to 17 (within 1.5 studs), 599.5 from 19; under Soft as under Realistic
+		assert_eq!([1, 5, 6, 7, 18, 19, 21].map(|level| Quality::new(level, false, true).back_light_radius), [0.0, 0.0, 5.0, 19.5, 525.5, 599.5, 599.5]);
+		assert_eq!([9, 10, 13, 14, 21].map(|level| Quality::new(level, false, false).back_light_radius), [0.0, 3.0, 51.0, 86.0, 599.5]);
+		for level in 1..=21 {
+			assert_eq!(Quality::new(level, true, true).back_light_radius, Quality::new(level, false, true).back_light_radius);
+			if (9..=17).contains(&level) {
+				let gone = Quality::new(level, false, true).sun_shadows.unwrap().gone;
+				let radius = Quality::new(level, false, true).back_light_radius;
+				assert!((radius - gone).abs() <= 1.5, "level {level}: {radius} against the maps' {gone}");
+			}
+			if level > 1 {
+				for prioritize in [true, false] {
+					assert!(Quality::new(level, false, prioritize).back_light_radius >= Quality::new(level - 1, false, prioritize).back_light_radius);
+				}
+			}
 		}
 		// glow 1-5 / 6-11 / 12+, BloomEffect from 12, AO from 20, MSAA 1 / 2 / 4, refraction and SunRays from 16
 		assert_eq!([5, 6, 11, 12].map(|level| Quality::new(level, false, true).glow), [0, 1, 1, 2]);

@@ -91,7 +91,8 @@ struct Frame {
 	// be from the focus and still be lit per pixel (past it the lowest shading; 0 nowhere); w which terms the lower
 	// shadings leave out (render::SHADING_TERMS bits)
 	quality_shading: vec4<f32>,
-	// xyz the view's focus (render::view_focus), w unused
+	// xyz the view's focus (render::view_focus), w how far a part's cluster may be from it with faces turned from the sun
+	// unlit (crate::quality::Quality::back_light_radius; 0: no part; mesh.wgsl `near_sun`)
 	quality_focus: vec4<f32>,
 }
 
@@ -132,6 +133,9 @@ struct Instance {
 	// a built-in pack's lobe widening with the view depth where it has no roughness map (2022 Foil): x the GGX width
 	// α's growth per stud (0: none), y the roughness at depth 0; zw unused
 	lobe: vec4<f32>,
+	// the box round the part's cluster, xyz low and high corners (render::cluster_boxes; mesh.wgsl `near_sun`)
+	cluster_low: vec4<f32>,
+	cluster_high: vec4<f32>,
 }
 
 struct Light {

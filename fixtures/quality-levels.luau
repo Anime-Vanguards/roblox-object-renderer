@@ -34,6 +34,9 @@
 --   atmo        an Atmosphere and a ColorGradingEffect (Retro) over columns 30 to 960 studs out
 --   shading     plates and balls of the specular materials under the sun, the sky and both, against the
 --               sun from 30 studs and from 520 (past the high-quality shading below level 15)
+--   kinds       white plates 1 to 8 studs wide, cards and shapes in the sun's glare: which a level lights by vertex
+--   backs       balls, blocks, plates, a slab, a cylinder and a wedge 40 studs up, seen from the side away from the
+--               sun: the light faces turned from the sun take, within the shadow maps and past them
 --
 -- The scene is the same whatever the Lighting; Layout.Captures lists for each capture the Lighting it is
 -- measured under (properties to set, effects to add, the Sky) and its camera. The sun's direction those
@@ -82,8 +85,9 @@ return function(Context)
 	end
 
 	local Samples = {}
-	local function Sample(Name, Point)
-		table.insert(Samples, { Name = Name, Point = Point })
+	-- Normal (optional): the surface's normal there, for analyses by the angle to the sun
+	local function Sample(Name, Point, Normal)
+		table.insert(Samples, { Name = Name, Point = Point, Normal = Normal })
 	end
 	local function Camera(Eye, Target, Fov)
 		return { Eye = Eye, Target = Target, Fov = Fov or 70 }
@@ -672,6 +676,265 @@ return function(Context)
 		Capture("kinds-sun", SUN_ONLY, Camera(Back * 30, Vector3.new(0, 0, 0), 70))
 		Capture("kinds-sky", SKY, Camera(Back * 30, Vector3.new(0, 0, 0), 70))
 		Capture("kinds-day", DAY, Camera(Back * 30, Vector3.new(0, 0, 0), 70))
+		-- which of the day's terms take the light faces turned from the sun get under it alone (sun-* variants)
+		if Context and Context.Terms then
+			local View = Camera(Back * 30, Vector3.new(0, 0, 0), 70)
+			Capture("kinds-sun-envd1", With(SUN_ONLY, { EnvironmentDiffuseScale = 1 }), View)
+			Capture("kinds-sun-envd05", With(SUN_ONLY, { EnvironmentDiffuseScale = 0.5 }), View)
+			Capture("kinds-sun-envd01", With(SUN_ONLY, { EnvironmentDiffuseScale = 0.1 }), View)
+			Capture("kinds-sun-envs1", With(SUN_ONLY, { EnvironmentSpecularScale = 1 }), View)
+			Capture("kinds-sun-amb", With(SUN_ONLY, { Ambient = Color3.fromRGB(50, 50, 50) }), View)
+			Capture("kinds-sun-outdoor", With(SUN_ONLY, { OutdoorAmbient = Color3.fromRGB(128, 128, 128) }), View)
+			Capture("kinds-day-envd0", With(DAY, { EnvironmentDiffuseScale = 0 }), View)
+			Capture("kinds-sun-darksky", With(SUN_ONLY, { EnvironmentDiffuseScale = 1, Sky = "dark" }), View)
+		end
+	elseif Station == "backs" then
+		-- faces turned away from the sun, in the open 40 studs up with no floor: white balls 2, 4 and 12 studs across,
+		-- a red one and a Plastic one, blocks on and off the 4-stud voxel grid, a 12-stud block, plates 0.2 thick and a
+		-- slab 2 thick turned so the side the camera sees takes the sun at n·l -0.25 to -0.95, a cylinder and a
+		-- wedge, in a grid across the sun so no part stands in another's voxel shadow; and a ball, a block and a plate
+		-- in a 24-stud block's shadow. Seen from between the side away from the sun and across it (both sides of the
+		-- balls), from 70 studs (within every level's shadow maps from 12) and 700 (past them at every level)
+		local WHITE = Color3.fromRGB(230, 230, 230)
+		local Ahead = Vector3.new(Sun.X, 0, Sun.Z).Unit
+		local Across = Vector3.new(Ahead.Z, 0, -Ahead.X)
+		local Up = Sun:Cross(Across).Unit
+		local Centre = Vector3.new(0, 40, 0)
+		local Toward = (Across - Sun).Unit
+		local function Slot(I, J)
+			return Centre + Across * (20 * I) + Up * (20 * J)
+		end
+		local function Ball(Name, Diameter, Position, Colour, Material)
+			local Part = Block(Name, Vector3.new(Diameter, Diameter, Diameter), Position, Colour or WHITE, Material)
+			Part.Shape = Enum.PartType.Ball
+			local R = Diameter / 2
+			for Key, Normal in { view = Toward, deep = (Toward - Sun * 0.6).Unit, rim = (Toward - Sun * 1.6).Unit, lit = (Toward + Sun * 0.9).Unit } do
+				Sample(`{Name}-{Key}`, Position + Normal * R, Normal)
+			end
+			return Part
+		end
+		local function Plate(Name, Size, Position, Cos)
+			-- its top face's normal takes the sun at n·l = -Cos, turned towards the camera
+			local Normal = (-Sun * Cos + Across * math.sqrt(1 - Cos * Cos)).Unit
+			local Side = Normal:Cross(Up).Unit
+			local Part = Block(Name, Size, CFrame.fromMatrix(Position, Side, Normal), WHITE)
+			Sample(`{Name}-top`, Position + Normal * (Size.Y / 2), Normal)
+			return Part
+		end
+		local function Snap(Point, Offset)
+			local function S(V)
+				return math.floor(V / 4 + 0.5) * 4 + Offset
+			end
+			return Vector3.new(S(Point.X), S(Point.Y), S(Point.Z))
+		end
+		local function Box(Name, Size, Position)
+			local Part = Block(Name, Size, Position, WHITE)
+			-- the faces the camera sees: +X and -Y turned from the sun, +Z towards it
+			Sample(`{Name}-px`, Position + Vector3.new(Size.X / 2, 0, 0), Vector3.new(1, 0, 0))
+			Sample(`{Name}-ny`, Position - Vector3.new(0, Size.Y / 2, 0), Vector3.new(0, -1, 0))
+			Sample(`{Name}-pz`, Position + Vector3.new(0, 0, Size.Z / 2), Vector3.new(0, 0, 1))
+			return Part
+		end
+		Ball("Ball4", 4, Slot(-2, 1))
+		Ball("Ball2", 2, Slot(-1, 1))
+		Ball("Ball12", 12, Slot(0, 1))
+		Ball("BallRed", 4, Slot(1, 1), Color3.fromRGB(200, 40, 40))
+		Ball("BallPlastic", 4, Slot(2, 1), WHITE, Enum.Material.Plastic)
+		Box("Block4on", Vector3.new(4, 4, 4), Snap(Slot(-2, 0), 2))
+		Box("Block4off", Vector3.new(4, 4, 4), Snap(Slot(-1, 0), 0))
+		Box("Block12", Vector3.new(12, 12, 12), Snap(Slot(0, 0), 2))
+		local Cylinder = Block("Cylinder", Vector3.new(4, 4, 4), Slot(1, 0), WHITE)
+		Cylinder.Shape = Enum.PartType.Cylinder
+		Sample("Cylinder-end", Slot(1, 0) + Vector3.new(2, 0, 0), Vector3.new(1, 0, 0))
+		local Wedge = Instance.new("WedgePart")
+		Wedge.Anchored = true
+		Wedge.Size = Vector3.new(4, 4, 4)
+		-- its slope faces +X and up, away from the sun
+		Wedge.CFrame = CFrame.new(Slot(2, 0)) * CFrame.Angles(0, -math.pi / 2, 0)
+		Wedge.Color = WHITE
+		Wedge.Material = Enum.Material.SmoothPlastic
+		Wedge.TopSurface = Enum.SurfaceType.Smooth
+		Wedge.BottomSurface = Enum.SurfaceType.Smooth
+		Wedge.Parent = Root
+		Sample("Wedge-slope", Slot(2, 0), Vector3.new(1, 1, 0).Unit)
+		for Index, Cos in { 0.25, 0.5, 0.75, 0.95 } do
+			Plate(`Plate{math.floor(Cos * 100)}`, Vector3.new(10, 0.2, 10), Slot(Index - 3, -1), Cos)
+		end
+		Plate("Slab75", Vector3.new(10, 2, 10), Slot(2, -1), 0.75)
+		-- in a 24-stud block's shadow: the block 28 studs towards the sun from the three, far across from the grid
+		local Shade = Centre + Across * 110
+		Block("Caster", Vector3.new(24, 24, 24), Shade + Sun * 28)
+		Ball("ShadeBall", 4, Shade + Up * 6)
+		Box("ShadeBlock", Vector3.new(4, 4, 4), Snap(Shade - Up * 2, 2))
+		Plate("ShadePlate", Vector3.new(6, 0.2, 6), Shade - Across * 7 - Up * 4, 0.75)
+		local NOGS = With(SUN_ONLY, { GlobalShadows = false })
+		-- the focus at the view's target, as a look-at camera's here, near and far alike
+		local function Camera(Eye, Target, Fov)
+			return { Eye = Eye, Target = Target, Fov = Fov, Focus = "target" }
+		end
+		Capture("backs-sun", SUN_ONLY, Camera(Centre + Toward * 70, Centre, 70))
+		Capture("backs-sun-far", SUN_ONLY, Camera(Centre + Toward * 700, Centre, 7))
+		Capture("backs-nogs", NOGS, Camera(Centre + Toward * 70, Centre, 70))
+		Capture("backs-shade", SUN_ONLY, Camera(Shade + Toward * 40, Shade, 50))
+		Capture("backs-shade-far", SUN_ONLY, Camera(Shade + Toward * 700, Shade, 3))
+		-- close by: the 4-stud ball and block, the 12-stud ball
+		Capture("backs-ball4", SUN_ONLY, Camera(Slot(-2, 1) + Toward * 16, Slot(-2, 1), 30))
+		Capture("backs-ball12", SUN_ONLY, Camera(Slot(0, 1) + Toward * 30, Slot(0, 1), 40))
+		Capture("backs-day", DAY, Camera(Centre + Toward * 70, Centre, 70))
+	elseif Station == "chunk" then
+		-- 4-stud white balls in the middles of 64-stud cells of the world ((32, 32, 32) and its neighbours along X, Y and
+		-- Z) and one across a cell's corner (64, 64, 64), seen from the side away from the sun: which focus positions
+		-- leave a ball's far side the light it takes far from the focus
+		local WHITE = Color3.fromRGB(230, 230, 230)
+		local Toward = (Vector3.new(Sun.Z, 0, -Sun.X).Unit - Sun).Unit
+		for _, Spec in { { "c", Vector3.new(32, 32, 32) }, { "x", Vector3.new(96, 32, 32) }, { "y", Vector3.new(32, 96, 32) }, { "z", Vector3.new(32, 32, 96) }, { "k", Vector3.new(64, 64, 64) } } do
+			local Ball = Block(`Ball-{Spec[1]}`, Vector3.new(4, 4, 4), Spec[2], WHITE)
+			Ball.Shape = Enum.PartType.Ball
+			Sample(`Ball-{Spec[1]}-view`, Spec[2] + Toward * 2, Toward)
+		end
+		Capture("chunk-sun", SUN_ONLY, Camera(Vector3.new(64, 64, 64) + Toward * 160, Vector3.new(64, 64, 64), 40))
+	elseif Station == "guiback" then
+		-- a white frame on a SurfaceGui (LightInfluence 1) over half of a slab's face turned from the sun (n·l -0.75),
+		-- 20 studs up with nothing below: the light a GUI and a part take from behind under EnvironmentDiffuseScale 0,
+		-- 0.5 and 1 (a dark Sky, so the sky's own light is next to none)
+		local Normal = (-Sun * 0.75 + Vector3.new(Sun.Z, 0, -Sun.X).Unit * math.sqrt(1 - 0.75 * 0.75)).Unit
+		local Side = Normal:Cross(Vector3.yAxis).Unit
+		local Middle = Vector3.new(0, 20, 0)
+		local Slab = Block("Slab", Vector3.new(12, 0.4, 6), CFrame.fromMatrix(Middle, Side, Normal), Color3.fromRGB(230, 230, 230))
+		local Gui = Instance.new("SurfaceGui")
+		Gui.Face = Enum.NormalId.Top
+		Gui.SizingMode = Enum.SurfaceGuiSizingMode.FixedSize
+		Gui.CanvasSize = Vector2.new(200, 100)
+		Gui.LightInfluence = 1
+		Gui.Brightness = 1
+		local Frame = Instance.new("Frame")
+		Frame.BackgroundColor3 = Color3.fromRGB(230, 230, 230)
+		Frame.BorderSizePixel = 0
+		Frame.Size = UDim2.fromScale(0.5, 1)
+		Frame.Parent = Gui
+		Gui.Parent = Slab
+		-- the canvas's left half (from the face's own top-left corner) and the bare right half
+		local Top = Middle + Normal * 0.2
+		Sample("gui-a", Top + Side * 3, Normal)
+		Sample("gui-b", Top - Side * 3, Normal)
+		local View = { Eye = Top + Normal * 30, Target = Top, Fov = 30, Focus = "target" }
+		local DARKSUN = With(SUN_ONLY, { Sky = "dark" })
+		Capture("guiback-e0", SUN_ONLY, View)
+		Capture("guiback-e0-dark", DARKSUN, View)
+		Capture("guiback-e05", With(DARKSUN, { EnvironmentDiffuseScale = 0.5 }), View)
+		Capture("guiback-e1", With(DARKSUN, { EnvironmentDiffuseScale = 1 }), View)
+	elseif Station == "cluster" then
+		-- which parts share a ball's fill decision: a 4-stud white ball at (32, 32, z) in cells 256 studs apart along Z,
+		-- each with one other part farther along X (none, a like ball, a Plastic block, a Neon block, a half transparent
+		-- block, a MeshPart card, a ball across X = 128, a ball over Y = 64, a 40-stud bar from X 100 to 140, an
+		-- unanchored ball); seen from the side away from the sun
+		local WHITE = Color3.fromRGB(230, 230, 230)
+		local Toward = (Vector3.new(Sun.Z, 0, -Sun.X).Unit - Sun).Unit
+		local Others = { "none", "ball", "plastic", "neon", "glass", "mesh", "acrossx", "overy", "bar", "loose" }
+		for Index, Kind in Others do
+			local Z = 256 * (Index - 1) + 32
+			local Probe = Vector3.new(32, 32, Z)
+			local Ball = Block(`Probe-{Kind}`, Vector3.new(4, 4, 4), Probe, WHITE)
+			Ball.Shape = Enum.PartType.Ball
+			Sample(`Probe-{Kind}`, Probe + Toward * 2, Toward)
+			local Far = Vector3.new(100, 32, Z + 68)
+			if Kind == "ball" or Kind == "loose" then
+				local Other = Block(`Other-{Kind}`, Vector3.new(4, 4, 4), Far, WHITE)
+				Other.Shape = Enum.PartType.Ball
+				Other.Anchored = Kind ~= "loose"
+			elseif Kind == "plastic" then
+				Block("Other-plastic", Vector3.new(4, 4, 4), Far, GREY, Enum.Material.Plastic)
+			elseif Kind == "neon" then
+				Block("Other-neon", Vector3.new(4, 4, 4), Far, WHITE, Enum.Material.Neon)
+			elseif Kind == "glass" then
+				Block("Other-glass", Vector3.new(4, 4, 4), Far, WHITE).Transparency = 0.5
+			elseif Kind == "mesh" then
+				pcall(function()
+					local Card = AssetService:CreateMeshPartAsync(Content.fromUri(QUAD))
+					Card.Anchored = true
+					Card.Size = Vector3.new(4, 4, 0.001)
+					Card.CFrame = CFrame.new(Far) * CFrame.new(-2, -2, 0)
+					Card.Parent = Root
+				end)
+			elseif Kind == "acrossx" then
+				local Other = Block("Other-acrossx", Vector3.new(4, 4, 4), Vector3.new(140, 32, Z + 68), WHITE)
+				Other.Shape = Enum.PartType.Ball
+			elseif Kind == "overy" then
+				local Other = Block("Other-overy", Vector3.new(4, 4, 4), Vector3.new(100, 70, Z + 68), WHITE)
+				Other.Shape = Enum.PartType.Ball
+			elseif Kind == "bar" then
+				Block("Other-bar", Vector3.new(40, 4, 4), Vector3.new(120, 32, Z + 68), WHITE)
+			end
+			Capture(`cluster-{Kind}`, SUN_ONLY, Camera(Probe + Toward * 24, Probe, 30))
+		end
+	elseif Station == "bounce" then
+		-- what lights faces turned from the sun near a floor where no shadow maps are drawn: four 140-stud floors 300
+		-- studs apart (white, grey, black and a white MeshPart quad, which fills no voxel), each with upright walls
+		-- facing away from the sun and across it, balls 2 to 32 studs up and plates facing down 3 to 16 studs up,
+		-- in a row across the sun, seen from low on the side away from the sun
+		local WHITE = Color3.fromRGB(230, 230, 230)
+		local Ahead = Vector3.new(Sun.X, 0, Sun.Z).Unit
+		local Across = Vector3.new(Ahead.Z, 0, -Ahead.X)
+		local Floors = { { "white", WHITE }, { "grey", Color3.fromRGB(120, 120, 120) }, { "black", Color3.new(0, 0, 0) }, { "mesh", WHITE } }
+		for Index, Spec in Floors do
+			local Name = Spec[1]
+			local Middle = Across * (300 * Index - 750)
+			if Name == "mesh" then
+				local ok = pcall(function()
+					local Part = AssetService:CreateMeshPartAsync(Content.fromUri(QUAD))
+					Part.Name = "FloorMesh"
+					Part.Anchored = true
+					Part.Material = Enum.Material.SmoothPlastic
+					Part.Color = Spec[2]
+					Part.Size = Vector3.new(140, 140, 0.001)
+					Part.CFrame = CFrame.new(Middle) * CFrame.Angles(-math.pi / 2, 0, 0) * CFrame.new(-70, -70, 0)
+					Part.Parent = Root
+				end)
+				if not ok then
+					continue
+				end
+			else
+				Block(`Floor-{Name}`, Vector3.new(140, 1, 140), Middle - Vector3.new(0, 0.5, 0), Spec[2])
+			end
+			local function At(Offset, Height)
+				return Middle + Across * Offset + Vector3.new(0, Height, 0)
+			end
+			-- walls 8 x 8 x 0.2 standing on the floor: facing away from the sun (n·l -0.90) and across it (0)
+			for _, Wall in { { "away", -32, -Ahead }, { "across", -20, Across } } do
+				local Normal = Wall[3]
+				local Position = At(Wall[2], 4)
+				Block(`{Name}-wall-{Wall[1]}`, Vector3.new(8, 8, 0.2), CFrame.lookAt(Position, Position + Normal), WHITE)
+				for _, H in { 1, 4, 7 } do
+					Sample(`{Name}-wall-{Wall[1]}-{H}`, At(Wall[2], H) + Normal * 0.1, Normal)
+				end
+			end
+			-- balls 4 across, their middles 2 to 32 studs over the floor
+			for Step, H in { 2, 6, 12, 20, 32 } do
+				local Position = At(-8 + (Step - 1) * 10, H)
+				local Ball = Block(`{Name}-ball-{H}`, Vector3.new(4, 4, 4), Position, WHITE)
+				Ball.Shape = Enum.PartType.Ball
+				for Key, Normal in { side = -Ahead, down = (-Ahead - Vector3.new(0, 1, 0)).Unit, up = (-Ahead + Vector3.new(0, 1, 0)).Unit } do
+					Sample(`{Name}-ball-{H}-{Key}`, Position + Normal * 2, Normal)
+				end
+			end
+			-- plates 6 x 0.2 x 6 facing down, 3, 8 and 16 studs over the floor (n·l -0.44)
+			for Step, H in { 3, 8, 16 } do
+				Block(`{Name}-under-{H}`, Vector3.new(6, 0.2, 6), At(46 + (Step - 1) * 10, H), WHITE)
+				Sample(`{Name}-under-{H}`, At(46 + (Step - 1) * 10, H - 0.1), Vector3.new(0, -1, 0))
+			end
+			-- the floor in front of the row
+			Sample(`{Name}-floor`, At(14, 0) - Ahead * 10, Vector3.new(0, 1, 0))
+			local Eye = Middle + Across * 16 - Ahead * 46 + Vector3.new(0, 2.5, 0)
+			local Target = Middle + Across * 16 + Vector3.new(0, 9, 0)
+			local View = { Eye = Eye, Target = Target, Fov = 70, Focus = "target" }
+			Capture(`bounce-{Name}`, SUN_ONLY, View)
+			if Name == "white" then
+				local Far = { Eye = Target - Ahead * 700 - Vector3.new(0, 5, 0), Target = Target, Fov = 9, Focus = "target" }
+				Capture("bounce-white-far", SUN_ONLY, Far)
+				Capture("bounce-white-nogs", With(SUN_ONLY, { GlobalShadows = false }), View)
+				Capture("bounce-white-day", DAY, View)
+			end
+		end
 	else
 		error("quality-levels: no station " .. tostring(Station))
 	end
