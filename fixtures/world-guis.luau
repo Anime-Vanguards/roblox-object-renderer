@@ -7,6 +7,7 @@
 -- the client's Lighting:GetSunDirection()): opaque, without CastShadow, invisible, half transparent, a 4-stud
 -- block and a 0.05 plate; a wall of frames and a plate facing up with a roof over half of it; billboards in the
 -- open, under a roof, over a block and before a wall.
+-- Context.Phase "backlit": frames on slabs 0.05 to 6 studs deep turned 120 and 150 degrees from the sun.
 -- Context.Phase "sky": frames and a billboard facing each of the six axes, lit by the sky alone.
 -- Context.Phase "lights": frames on boards beside a PointLight (with and without Shadows), a SpotLight, a
 -- SurfaceLight and a light behind the board, and billboards beside, before and over a PointLight, in the dark.
@@ -260,6 +261,22 @@ return function(Context)
 					end
 				end
 				Capture("L-bb-" .. Name, SUN_ENVS, Eye, V(Target), Fov, Mine)
+			end
+		end
+	elseif Phase == "backlit" then
+		-- frames on slabs of 0.05 to 6 studs turned 120 and 150 degrees from the sun: lit from behind through
+		-- the part that holds them
+		local SUN_ENVS = { "sun-gs", "sun" }
+		local Across = Vector3.yAxis:Cross(Sun).Unit
+		for Row, Angle in { 120, 150 } do
+			local Normal = (Sun * math.cos(math.rad(Angle)) + Across * math.sin(math.rad(Angle))).Unit
+			for Index, Depth in { 0.05, 0.5, 2, 6 } do
+				local Center = Vector3.new((Index - 1) * 60, 20, 300 + Row * 60)
+				-- (capture tags take no dots: the depth in hundredths)
+				local Name = `back{Angle}-{math.round(Depth * 100)}`
+				local Probes = Slab(Name, Center, Normal, Vector3.new(12, 2, Depth))
+				local Eye, Target, Fov = Look(Center, (Normal + Across * 0.3).Unit, 30, 30)
+				Capture(`L-{Name}`, SUN_ENVS, Eye, Target, Fov, Probes)
 			end
 		end
 	elseif Phase == "sky" then
