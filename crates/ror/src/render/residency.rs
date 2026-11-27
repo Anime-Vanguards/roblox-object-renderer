@@ -244,7 +244,7 @@ impl Renderer {
 	/// How `request` draws `prepared` (as render_view does: its camera, frustum, size and samples).
 	pub(super) fn residency_plan<'a>(&self, scene: &Scene, prepared: &'a Prepared, request: &ViewRequest) -> ViewPlan<'a> {
 		let supersample = request.supersample.clamp(1, 4);
-		let samples = if request.msaa >= 4 { 4 } else { 1 };
+		let samples = super::view_samples(request);
 		let (width, height) = (request.width.max(1), request.height.max(1));
 		let render = (width * supersample, height * supersample);
 		let camera = request.camera.place(prepared.bounds, width, height);
@@ -255,7 +255,7 @@ impl Renderer {
 		// depth and the occlusion's prepass
 		let by_texels: Vec<&DrawItem> = draws.iter().copied().filter(|draw| draw.write_depth).collect();
 		if samples > 1 && !by_texels.is_empty() {
-			if super::ambient_occlusion_enabled() && scene.environment.viewport.is_none() {
+			if super::ambient_occlusion_enabled() && super::view_quality(request, &scene.environment).ambient_occlusion && scene.environment.viewport.is_none() {
 				let ((width, height), samples) = super::ao::AoTargets::size(render.0, render.1);
 				rasters.push(Raster { width, height, samples, draws: by_texels.iter().copied().filter(|draw| !draw.highlight_only).collect() });
 			}

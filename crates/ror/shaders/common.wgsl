@@ -86,6 +86,13 @@ struct Frame {
 	// where surfaces start taking the local lights' voxels and take them alone at the view's graphics quality
 	// (render::local_light_far); both 0: LOCAL_LIGHT_FAR_START and _END
 	local_light_far: vec4<f32>,
+	// the view's graphics quality shading (render::quality_shading, mesh.wgsl `shading_tier`): x and y where the
+	// high-quality shading starts fading and where it has gone, from the camera (studs); z how far a part's box may
+	// be from the focus and still be lit per pixel (past it the lowest shading; 0 nowhere); w which terms the lower
+	// shadings leave out (render::SHADING_TERMS bits)
+	quality_shading: vec4<f32>,
+	// xyz the view's focus (render::view_focus), w unused
+	quality_focus: vec4<f32>,
 }
 
 

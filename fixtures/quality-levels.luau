@@ -32,6 +32,8 @@
 --               from straight above at 80 and at 800 studs
 --   farfine1/2  upright pillars 490 to 19,000 studs out, finer than far: the view distance
 --   atmo        an Atmosphere and a ColorGradingEffect (Retro) over columns 30 to 960 studs out
+--   shading     plates and balls of the specular materials under the sun, the sky and both, against the
+--               sun from 30 studs and from 520 (past the high-quality shading below level 15)
 --
 -- The scene is the same whatever the Lighting; Layout.Captures lists for each capture the Lighting it is
 -- measured under (properties to set, effects to add, the Sky) and its camera. The sun's direction those
@@ -560,6 +562,116 @@ return function(Context)
 		Capture("atmo-none", Slow, View)
 		Capture("atmo-on", Slow, View, { { Class = "Atmosphere", Density = 0.35, Offset = 0.25, Color = Color3.fromRGB(199, 170, 107), Decay = Color3.fromRGB(92, 60, 13), Glare = 0.5, Haze = 1.5 } })
 		Capture("atmo-retro", Slow, View, { { Class = "ColorGradingEffect", TonemapperPreset = Enum.TonemapperPreset.Retro } })
+	elseif Station == "shading" then
+		-- plates and balls of the specular materials under the sun alone, the sky alone and both, seen
+		-- against the sun from close by (within every level's high-quality shading) and from 520 studs
+		-- (past it below level 15), so a level's shading model reads off the same parts near and far
+		Block("Floor", Vector3.new(200, 1, 200), Vector3.new(0, -0.5, 0), Color3.fromRGB(120, 120, 120))
+		local Plates = { "Metal", "Foil", "DiamondPlate", "CorrodedMetal", "SmoothPlastic", "Plastic", "Brick", "Marble", "Slate" }
+		for Index, Name in Plates do
+			local Position = Vector3.new(0, 0.2, -24 + (Index - 1) * 6)
+			Block(`Plate{Name}`, Vector3.new(5, 0.4, 5), Position, GREY, Enum.Material[Name])
+			Sample(`plate-{Name}`, Position + Vector3.new(0, 0.2, 0))
+		end
+		local Balls = {
+			{ "Metal", GREY, 0 }, { "MetalRed", Color3.fromRGB(200, 40, 40), 0 }, { "Foil", GREY, 0 },
+			{ "SmoothPlastic", Color3.fromRGB(230, 230, 230), 0 }, { "Reflectance", Color3.fromRGB(230, 230, 230), 0.5 },
+			{ "Plastic", Color3.fromRGB(230, 230, 230), 0 },
+		}
+		for Index, Spec in Balls do
+			local Material = if Spec[1] == "MetalRed" then "Metal" elseif Spec[1] == "Reflectance" then "SmoothPlastic" else Spec[1]
+			local Position = Vector3.new(-12, 2, -18 + (Index - 1) * 7)
+			local Ball = Block(`Ball{Spec[1]}`, Vector3.new(4, 4, 4), Position, Spec[2], Enum.Material[Material])
+			Ball.Shape = Enum.PartType.Ball
+			Ball.Reflectance = Spec[3]
+			-- the side towards the camera and the top
+			Sample(`ball-{Spec[1]}-side`, Position + Vector3.new(1.7, 0.4, 0))
+			Sample(`ball-{Spec[1]}-top`, Position + Vector3.new(0.4, 1.9, 0))
+		end
+		Sample("floor-near", Vector3.new(-12, 0, 0))
+		Sample("floor-glare", Vector3.new(0, 0, 0))
+		-- the camera looks along the sun's bearing (towards it), 26 degrees down: the sun's glare on the
+		-- plates lies near the view's middle
+		local Ahead = Vector3.new(Sun.X, 0, Sun.Z).Unit
+		local Down = math.rad(26)
+		local Back = (-Ahead * math.cos(Down) + Vector3.new(0, math.sin(Down), 0))
+		local Near = Camera(Back * 30, Vector3.new(0, 0, 0), 70)
+		local Far = Camera(Back * 520, Vector3.new(0, 0, 0), 7)
+		-- the sky alone, its diffuse light and its specular (no sun, no flat ambient)
+		local SKY = With(DAY, { Brightness = 0, Ambient = Color3.new(0, 0, 0), OutdoorAmbient = Color3.new(0, 0, 0) })
+		Capture("shading-day-near", DAY, Near)
+		Capture("shading-day-far", DAY, Far)
+		Capture("shading-sun-near", SUN_ONLY, Near)
+		Capture("shading-sun-far", SUN_ONLY, Far)
+		Capture("shading-sky-near", SKY, Near)
+		Capture("shading-sky-far", SKY, Far)
+		-- across the sun (it comes from the left), from close by
+		Capture("shading-day-side", DAY, Camera(Vector3.new(-2, 18, 34), Vector3.new(0, 0, -2), 70))
+	elseif Station == "kinds" then
+		-- white SmoothPlastic in the sun's glare, as the shading station sees it: plates 1 to 8 studs wide, a
+		-- MeshPart card and a SpecialMesh card on the glare's line, and a block, ball, cylinder, wedge and a
+		-- block with a SpecialMesh sphere behind them, to tell which kinds of part a level lights by vertex
+		Block("Floor", Vector3.new(200, 1, 200), Vector3.new(0, -0.5, 0), Color3.fromRGB(120, 120, 120))
+		local WHITE = Color3.fromRGB(230, 230, 230)
+		for Index, Width in { 1, 2, 4, 8 } do
+			local Position = Vector3.new(0, 0.1, -20 + (Index - 1) * 8)
+			Block(`Plate{Width}`, Vector3.new(Width, 0.2, Width), Position, WHITE)
+			Sample(`plate-{Width}`, Position + Vector3.new(0, 0.1, 0))
+		end
+		local ok = pcall(function()
+			local Card = AssetService:CreateMeshPartAsync(Content.fromUri(QUAD))
+			Card.Name = "Card"
+			Card.Anchored = true
+			Card.Size = Vector3.new(4, 4, 0.001)
+			Card.Color = WHITE
+			Card.Material = Enum.Material.SmoothPlastic
+			Card.CFrame = CFrame.new(0, 0.05, 12) * CFrame.Angles(-math.pi / 2, 0, 0) * CFrame.new(-2, -2, 0)
+			Card.Parent = Root
+		end)
+		if ok then
+			Sample("meshpart-card", Vector3.new(0, 0.05, 12))
+		end
+		local Holder = Block("SpecialCard", Vector3.new(4, 0.2, 4), Vector3.new(0, 0.1, 20), WHITE)
+		local Special = Instance.new("SpecialMesh")
+		Special.MeshType = Enum.MeshType.Brick
+		Special.Parent = Holder
+		Sample("specialmesh-brick", Vector3.new(0, 0.2, 20))
+		local Shapes = { { "Block", Enum.PartType.Block }, { "Ball", Enum.PartType.Ball }, { "Cylinder", Enum.PartType.Cylinder }, { "Wedge", nil }, { "SphereMesh", nil } }
+		for Index, Spec in Shapes do
+			local Position = Vector3.new(-12, 2, -16 + (Index - 1) * 8)
+			local Part
+			if Spec[1] == "Wedge" then
+				Part = Instance.new("WedgePart")
+				Part.Anchored = true
+				Part.Size = Vector3.new(4, 4, 4)
+				-- its slope towards the camera (+X)
+				Part.CFrame = CFrame.new(Position) * CFrame.Angles(0, -math.pi / 2, 0)
+				Part.Color = WHITE
+				Part.Material = Enum.Material.SmoothPlastic
+				Part.TopSurface = Enum.SurfaceType.Smooth
+				Part.BottomSurface = Enum.SurfaceType.Smooth
+				Part.Parent = Root
+			else
+				Part = Block(Spec[1], Vector3.new(4, 4, 4), Position, WHITE)
+				if Spec[2] then
+					Part.Shape = Spec[2]
+				end
+				if Spec[1] == "SphereMesh" then
+					local Mesh = Instance.new("SpecialMesh")
+					Mesh.MeshType = Enum.MeshType.Sphere
+					Mesh.Parent = Part
+				end
+			end
+			Sample(`{Spec[1]}-top`, Position + Vector3.new(0.4, 1.9, 0))
+			Sample(`{Spec[1]}-side`, Position + Vector3.new(1.9, 0.4, 0))
+		end
+		local Ahead = Vector3.new(Sun.X, 0, Sun.Z).Unit
+		local Down = math.rad(26)
+		local Back = (-Ahead * math.cos(Down) + Vector3.new(0, math.sin(Down), 0))
+		local SKY = With(DAY, { Brightness = 0, Ambient = Color3.new(0, 0, 0), OutdoorAmbient = Color3.new(0, 0, 0) })
+		Capture("kinds-sun", SUN_ONLY, Camera(Back * 30, Vector3.new(0, 0, 0), 70))
+		Capture("kinds-sky", SKY, Camera(Back * 30, Vector3.new(0, 0, 0), 70))
+		Capture("kinds-day", DAY, Camera(Back * 30, Vector3.new(0, 0, 0), 70))
 	else
 		error("quality-levels: no station " .. tostring(Station))
 	end

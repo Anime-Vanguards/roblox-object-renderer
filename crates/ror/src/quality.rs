@@ -5,9 +5,11 @@
 //!
 //! A view asks for a level with `ViewRequest::quality` (`--quality`); without one it draws as level 21,
 //! everything at its best and nothing culled. [`Quality`] holds every switch the level moves. The renderer
-//! follows the sun's shadow maps' reach and the voxel sun past it, local lights' per-pixel reach, the view
-//! distance and size cull (`crate::lod`) and the particles' Rate; the others are kept here, measured, for
-//! the passes that do not follow them yet (their fields say so).
+//! follows the sun's shadow maps' reach and the voxel sun past it, local lights' per-pixel reach, the shading's
+//! tiers (per pixel round the focus, high quality round the camera), the built-in glow, BloomEffect, ambient
+//! occlusion, anti-aliasing, SunRays and DepthOfField, Glass refraction, the view distance and size cull
+//! (`crate::lod`) and the particles' Rate; the clouds' tiers are kept here, measured, for when they are followed
+//! (its field says so).
 //!
 //! Studio's edit quality is not the client's run-time level: `ror cost` and `ror cost --check` keep Studio's
 //! edit table (`crate::lod::Lod::view_distance`, notes/cost.md "Quality").
@@ -31,8 +33,8 @@ pub struct SunReach {
 #[serde(rename_all = "camelCase")]
 pub struct Quality {
 	pub level: u32,
-	/// Any specular light (levels 1-4 have none and light the sun's diffuse 10 % brighter; 1-6 under
-	/// PrioritizeLightingQuality false). Not followed yet.
+	/// Whether any part is lit per pixel, with the direct specular: those within `lit_radius` of the focus (from
+	/// level 5; 7 under PrioritizeLightingQuality false). Below, every part takes the lowest shading.
 	pub specular: bool,
 	/// The sun's shadow maps (from level 8; 14 under PrioritizeLightingQuality false), `None` below:
 	/// the voxel sun everywhere.
@@ -41,21 +43,27 @@ pub struct Quality {
 	/// grid's voxels past it and everywhere at 0 (below 14, 17 under PrioritizeLightingQuality false, every
 	/// level under Soft). Infinite: as level 21 (ror's own handover at 580-600 studs).
 	pub light_reach: f32,
-	/// The high-quality shading's radius (metals' and Foil's reflections, the sky's specular on
-	/// SmoothPlastic, textures' detail), halfway through its blend of about a quarter of it each way: 0
-	/// none, infinite everywhere. Not followed yet.
+	/// The high-quality shading's radius from the camera (metals' and Foil's reflections, the sky's specular
+	/// on SmoothPlastic, textures' detail), halfway through its blend of a quarter of it each way: 0 none,
+	/// infinite everywhere. Past it, within `lit_radius` of the focus, the low-quality shading: per pixel with the
+	/// direct specular, without the sky's specular, normal maps or metalness.
 	pub shading_radius: f32,
-	/// The built-in glow round Neon: 0 at levels 1-5, 1 at 6-11, 2 from 12. Not followed yet.
+	/// How far a part's box may be from the view's focus (Camera.Focus) and still be lit per pixel, with the
+	/// direct specular (the low-quality shading, and the high-quality one within `shading_radius`): none at
+	/// levels 1-4, 10 studs at 5, 36 at 6, 70 at 7 ... 581 at 14, 1,180 at 21; past it the lowest shading (lit by
+	/// vertex: no specular per pixel, the sky's light the same from every side).
+	pub lit_radius: f32,
+	/// The built-in glow round Neon: 0 at levels 1-5, 1 at 6-11, 2 from 12 (render/bloom.rs GLOW_TIERS).
 	pub glow: u8,
-	/// BloomEffect (from 12). Not followed yet.
+	/// BloomEffect (from 12).
 	pub bloom_effect: bool,
-	/// Ambient occlusion (from 20). Not followed yet.
+	/// Ambient occlusion (from 20).
 	pub ambient_occlusion: bool,
-	/// Anti-aliasing samples: 1 at levels 1-16, 2 at 17, 4 from 18. Not followed yet.
+	/// Anti-aliasing samples: 1 at levels 1-16, 2 at 17, 4 from 18 (17 draws 4: render::view_samples).
 	pub msaa: u32,
 	/// Glass refracts what is behind it (from 16; plain blending below; mesh.wgsl `fs_glass`).
 	pub glass_refraction: bool,
-	/// SunRaysEffect and DepthOfFieldEffect (from 16). Not followed yet.
+	/// SunRaysEffect and DepthOfFieldEffect (from 16).
 	pub sun_rays_depth_of_field: bool,
 	/// Terrain Clouds' look: 0 at levels 1-7, 1 at 8-10, 2 at 11-13, 3 from 14. Not followed yet.
 	pub clouds: u8,
@@ -154,6 +162,23 @@ const SHADING_RADIUS: [f32; 11] = [55.0, 94.0, 142.0, 191.0, 246.0, 310.0, 382.0
 /// Under false, from 12: ~73, 126, 186 at 12-14, 15 not measured (between 14's and 16's), 367, 525, 755 at 16-18.
 const SHADING_RADIUS_UNPRIORITIZED: [f32; 7] = [73.0, 126.0, 186.0, 276.0, 367.0, 525.0, 755.0];
 
+/// The per-pixel lighting's radius around the focus by level (the `shading` station under the sun alone with
+/// Camera.Focus moved along the view and up to 3,000 studs behind it: halfway between the farthest part's box lit per
+/// pixel and the nearest lit by vertex): none at 1-4; 10.4 studs at 5 (9.6 / 11.2), 36 at 6 (34.1 / 38.0), 70 at 7
+/// (67.6 / 72.1), 122 at 8 (117 / 127), 177 at 9 (167 / 187), 257 at 10 (237 / 277), 307 at 11 (287 / 327), 382 at 12
+/// (337 / 427), 482 at 13 (437 / 527), 581 at 14 (537 / 625), 676 at 15 (625 / 727), 775 at 16 (724 / 827), 1,075 at 18
+/// (1,022 / 1,127) and 1,180 at 21 (1,137 / 1,222): about 11.5 (level - 4)^1.7 through 18, levelling off by 21. 17,
+/// 19 and 20 between their neighbours (not measured). Under PrioritizeLightingQuality false two levels later (the
+/// floor 13 studs from the focus by vertex at 6 and 7, per pixel at 12; the specular's start moves from 5 to 7 alike).
+const LIT_RADIUS: [f32; 17] = [10.4, 36.0, 70.0, 122.0, 177.0, 257.0, 307.0, 382.0, 482.0, 581.0, 676.0, 775.0, 925.0, 1075.0, 1110.0, 1145.0, 1180.0];
+
+fn lit_radius(level: u32) -> f32 {
+	match level {
+		0..=4 => 0.0,
+		_ => LIT_RADIUS[(level.min(TOP) - 5) as usize],
+	}
+}
+
 impl Quality {
 	/// What `level` (1-21; 0 taken as 1, above 21 as 21) draws under a LightingStyle (`soft`) and
 	/// PrioritizeLightingQuality (`prioritize`).
@@ -198,6 +223,7 @@ impl Quality {
 			sun_shadows,
 			light_reach,
 			shading_radius,
+			lit_radius: lit_radius(if prioritize { level } else { level.saturating_sub(2) }),
 			glow: match level {
 				0..=5 => 0,
 				6..=11 => 1,
@@ -361,6 +387,22 @@ mod tests {
 		assert_eq!(Quality::new(18, false, true).shading_radius, f32::INFINITY);
 		assert_eq!(Quality::new(11, false, false).shading_radius, 0.0);
 		assert_eq!(Quality::new(18, false, false).shading_radius, 755.0);
+		// per pixel within 10.4 studs of the focus at 5, 36 at 6, 581 at 14, 1,180 at 21; under false two levels
+		// later; none below
+		assert_eq!([4, 5, 6, 14, 15, 21].map(|level| Quality::new(level, false, true).lit_radius), [0.0, 10.4, 36.0, 581.0, 676.0, 1180.0]);
+		assert_eq!([6, 7, 8, 16, 21].map(|level| Quality::new(level, false, false).lit_radius), [0.0, 10.4, 36.0, 581.0, 1110.0]);
+		for level in 1..=21 {
+			for prioritize in [true, false] {
+				let quality = Quality::new(level, false, prioritize);
+				assert_eq!(quality.specular, quality.lit_radius > 0.0, "level {level}: specular where any part is lit per pixel");
+			}
+		}
+		// about 11.5 (level - 4)^1.7 studs, the measured levels within 11 %
+		for (level, radius) in [(5, 10.4), (6, 36.0), (7, 70.0), (8, 122.0), (9, 177.0), (10, 257.0), (11, 307.0), (12, 382.0), (13, 482.0), (14, 581.0), (15, 676.0), (16, 775.0), (18, 1075.0)] {
+			let fit = 11.5 * ((level - 4) as f32).powf(1.7);
+			assert!((fit / radius - 1.0).abs() < 0.11, "level {level}: {radius} against {fit}");
+			assert_eq!(Quality::new(level, false, true).lit_radius, radius);
+		}
 		// glow 1-5 / 6-11 / 12+, BloomEffect from 12, AO from 20, MSAA 1 / 2 / 4, refraction and SunRays from 16
 		assert_eq!([5, 6, 11, 12].map(|level| Quality::new(level, false, true).glow), [0, 1, 1, 2]);
 		assert!(!Quality::new(11, false, true).bloom_effect && Quality::new(12, false, true).bloom_effect);

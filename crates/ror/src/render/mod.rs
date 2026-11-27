@@ -43,6 +43,8 @@ mod sun_shadow_tests;
 #[cfg(test)]
 mod post_tests;
 #[cfg(test)]
+mod quality_tests;
+#[cfg(test)]
 mod tone_tests;
 pub mod environment;
 pub mod geometry;
@@ -345,6 +347,11 @@ struct FrameUniform {
 	/// them alone, from the camera, at the view's graphics quality ([`local_light_far`]); both 0: level
 	/// 21's 580 and 600 studs (common.wgsl LOCAL_LIGHT_FAR_START, LOCAL_LIGHT_FAR_END)
 	local_light_far: [f32; 4],
+	/// The view's graphics quality shading ([`quality_shading`]): where the high-quality shading starts fading and
+	/// has gone from the camera, how far a part's box may be from the focus to be lit per pixel, the terms left out
+	quality_shading: [f32; 4],
+	/// The view's focus ([`view_focus`])
+	quality_focus: [f32; 4],
 }
 
 #[repr(C)]
@@ -616,6 +623,46 @@ fn grid_sun_for(scene: &Scene, views: &[ViewRequest], bounds: Option<(Vec3, Vec3
 /// The graphics quality a view draws at: its `quality` level under the scene's Lighting, level 21 without one.
 pub(crate) fn view_quality(request: &ViewRequest, environment: &crate::scene::Environment) -> crate::quality::Quality {
 	request.quality.map_or_else(crate::quality::Quality::top, |level| crate::quality::Quality::for_environment(level, environment))
+}
+
+/// Which terms the shadings below the high-quality one leave out ([`quality_shading`], mesh.wgsl `shading_tier`):
+/// bit 1 the low-quality shading's sky specular, 2 its normal maps, 4 its sky diffuse light giving up what the sky
+/// specular reflects (kept when set), 8 its Part.Reflectance; 16 the lowest shading's sky light the same from every
+/// direction, 32 its direct specular; 64 metalness below the high-quality shading (metals drawn as any surface); 128 the
+/// lowest shading's sky light giving up what the sky specular reflects; 256 the lowest shading's sun glint lit by vertex.
+/// `ROR_TUNE_SHADING_TERMS` replaces them, for fits.
+const SHADING_TERMS: u32 = 1 | 2 | 16 | 32 | 64 | 256;
+
+fn shading_terms() -> u32 {
+	static TERMS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+	*TERMS.get_or_init(|| std::env::var("ROR_TUNE_SHADING_TERMS").ok().and_then(|text| text.trim().parse().ok()).unwrap_or(SHADING_TERMS))
+}
+
+/// A graphics quality level's shading for the shader (`Frame.quality_shading`): the high-quality shading fades
+/// linearly from 3/4 of its radius from the camera to 5/4 of it (crate::quality::Quality::shading_radius), a part is
+/// lit per pixel within its focus radius of the view's focus (crate::quality::Quality::lit_radius), and the terms the
+/// lower shadings leave out. Infinite radii are held to 1e9 studs.
+fn quality_shading(quality: &crate::quality::Quality) -> [f32; 4] {
+	let finite = |studs: f32| studs.min(1e9);
+	[finite(quality.shading_radius * 0.75), finite(quality.shading_radius * 1.25), finite(quality.lit_radius), shading_terms() as f32]
+}
+
+/// The point a view's focus is at, which the client's per-pixel lighting follows (Camera.Focus; crate::quality::
+/// Quality::lit_radius): what a look-at or orbit camera looks at, else the camera itself.
+fn view_focus(spec: &CameraSpec, camera: &camera::Camera, bounds: Option<(Vec3, Vec3)>) -> Vec3 {
+	match spec {
+		CameraSpec::LookAt { target, .. } => Vec3::from(*target),
+		CameraSpec::Orbit { target: Some(target), .. } => Vec3::from(*target),
+		CameraSpec::Orbit { target: None, .. } => bounds.map_or(camera.eye, |(low, high)| (low + high) * 0.5),
+		CameraSpec::CFrame { .. } => camera.eye,
+	}
+}
+
+/// The samples a view draws with: 4 with `msaa` 4 or more, else 1, and none past its graphics quality level's
+/// anti-aliasing (crate::quality::Quality::msaa: none at levels 1-16, 2 samples at 17, which draws 4 here, 4 from 18)
+pub(crate) fn view_samples(request: &ViewRequest) -> u32 {
+	let level = request.quality.map_or(4, |level| crate::quality::Quality::new(level, false, true).msaa);
+	if request.msaa >= 4 && level > 1 { 4 } else { 1 }
 }
 
 /// The sun's cascades at `quality` for a camera whose spheres reach the scene's bounds.
@@ -2354,7 +2401,7 @@ impl Renderer {
 		let mut sets: Vec<crate::budget::TargetSet> = Vec::new();
 		for view in views {
 			let supersample = view.supersample.clamp(1, 4);
-			let samples = if view.msaa >= 4 { 4 } else { 1 };
+			let samples = view_samples(view);
 			let (width, height) = (view.width.max(1), view.height.max(1));
 			let key = (width * supersample, height * supersample, samples);
 			if sets.iter().any(|set| set.key == key) {
@@ -4701,6 +4748,8 @@ impl Renderer {
 			frame.sky_specular_colour = sky_specular_colour();
 			frame.direct_metal = direct_metal();
 			frame.specular_fade = specular_fade();
+			// level 21: the high-quality shading everywhere
+			frame.quality_shading = quality_shading(&crate::quality::Quality::top());
 		})
 	}
 
@@ -4802,7 +4851,7 @@ impl Renderer {
 		// shadow maps to keep, kept once the frame is submitted (shadow_reuse: published read-only)
 		let mut publish: Vec<PendingShadows> = Vec::new();
 		let supersample = request.supersample.clamp(1, 4);
-		let samples = if request.msaa >= 4 { 4 } else { 1 };
+		let samples = view_samples(request);
 		let (width, height) = (request.width.max(1), request.height.max(1));
 		let (render_width, render_height) = (width * supersample, height * supersample);
 		let limit = device.limits().max_texture_dimension_2d;
@@ -4858,6 +4907,10 @@ impl Renderer {
 		if (far_start, far_end) != (LOCAL_LIGHT_FAR_START, LOCAL_LIGHT_FAR_END) {
 			frame.local_light_far = [far_start, far_end, 0.0, 0.0];
 		}
+		// the level's shading: high quality within its radius of the camera, per pixel within its radius of the
+		// focus, the lowest shading past that (mesh.wgsl `shading_tier`)
+		frame.quality_shading = quality_shading(&quality);
+		frame.quality_focus = Vec4::from((view_focus(&request.camera, &camera, prepared.bounds), 0.0)).into();
 		// which of them each cluster of the view's pixels can be lit by: the light within its Range (past
 		// a SurfaceLight's face), the far surfaces' voxels 6 studs out within their reach (under Soft the
 		// near surfaces' too, a light placed with a playback's as well, and past a lower level's per-pixel
@@ -5001,10 +5054,11 @@ impl Renderer {
 		let frame_buffer = lease.buffer("frame", wgpu::BufferUsages::UNIFORM, bytemuck::bytes_of(&frame));
 		let shadow_view = sun_atlas.as_ref().map(|(atlas, _)| atlas).unwrap_or(&self.defaults.empty_moments);
 		// post effects: DepthOfField and Blur on the scene's radiance (the bloom reads it between the two),
-		// SunRays added to the radiance (over the sky only: not on flat or transparent backgrounds)
-		let depth_of_field = post::depth_of_field(&environment.effects);
+		// SunRays added to the radiance (over the sky only: not on flat or transparent backgrounds); a
+		// graphics quality level below 16 draws no DepthOfField and no SunRays, Blur at every level
+		let depth_of_field = post::depth_of_field(&environment.effects).filter(|_| quality.sun_rays_depth_of_field);
 		let blur = post::blur(&environment.effects, height).map(|blur| post::Blur { sigma: blur.sigma * render_height as f32 / height as f32, ..blur });
-		let sun_rays = post::sun_rays(&environment.effects).filter(|_| request.background == Background::Sky).and_then(|rays| {
+		let sun_rays = post::sun_rays(&environment.effects).filter(|_| request.background == Background::Sky && quality.sun_rays_depth_of_field).and_then(|rays| {
 			let view_proj = camera.view_projection(width as f32 / height as f32);
 			let sun = environment::sun_direction(environment.clock_time, environment.geographic_latitude);
 			post::sun_rays_uniform(rays, sun, view_proj, camera.ray_unprojection(width as f32 / height as f32), width as f32 / height as f32)
@@ -5014,8 +5068,8 @@ impl Renderer {
 		// the view
 		let scene_depth_on = visible_draws.iter().copied().any(|draw| draw.forcefield || draw.glass) || !particle_view.draws.is_empty() || depth_of_field.is_some() || sun_rays.is_some();
 		// the ambient occlusion, when the flat ambient or the sky's diffuse light shows (not in a
-		// ViewportFrame)
-		let ambient_lit = (environment.ambient.max_element() > 0.0 || environment.outdoor_ambient.max_element() > 0.0 || environment.environment_diffuse_scale > 0.0) && ambient_occlusion_enabled() && environment.viewport.is_none();
+		// ViewportFrame; from graphics quality level 20)
+		let ambient_lit = (environment.ambient.max_element() > 0.0 || environment.outdoor_ambient.max_element() > 0.0 || environment.environment_diffuse_scale > 0.0) && ambient_occlusion_enabled() && quality.ambient_occlusion && environment.viewport.is_none();
 		let ao_on = ambient_lit && visible_draws.iter().copied().any(|draw| (!draw.transparent || (samples > 1 && draw.write_depth)) && !draw.decal);
 		let scene_depth = scene_depth_on.then(|| {
 			lease.scratch_view(&wgpu::TextureDescriptor {
@@ -5322,7 +5376,7 @@ impl Renderer {
 			lease.hand_out(&output);
 		}
 		let output_view = output.create_view(&Default::default());
-		let bloom = bloom::bloom_parameters(environment);
+		let bloom = bloom::bloom_parameters(environment, &quality);
 		let bloom_count = bloom.level_count();
 		let bloom_on = request.bloom && request.linear_scale.is_none() && bloom_count > 0 && environment.viewport.is_none();
 		let bloom_target = |label: &str, (width, height): (u32, u32)| {
@@ -5364,9 +5418,11 @@ impl Renderer {
 			let footprint = render_height as f32 / bloom.grid_height;
 			let working = (((render_width as f32 / footprint).ceil() as u32).max(1), bloom.grid_height as u32);
 			bloom_texel = 2.0 * footprint;
+			// (source.w past 1: how much of the threshold's peak reads the luminance; footprint.z how much of the
+			// weighting does)
 			let uniform = |threshold: bool, blur: [f32; 4]| BloomUniform {
-				source: [frame.environment[2], bloom.threshold, bloom.cap, if threshold { 1.0 } else { 0.0 }],
-				footprint: [footprint, footprint, 0.0, bloom.weighting[if threshold { 0 } else { 1 }]],
+				source: [frame.environment[2], bloom.threshold, bloom.cap, if threshold { 1.0 + bloom.luminance[1] } else { 0.0 }],
+				footprint: [footprint, footprint, bloom.luminance[0], bloom.weighting[if threshold { 0 } else { 1 }]],
 				blur,
 			};
 			// the textures: the working grid, each level's texels, then for each level below the last

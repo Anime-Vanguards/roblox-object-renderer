@@ -86,6 +86,46 @@ struct VertexOutput {
 	@location(5) object_position: vec3<f32>,
 	@location(6) object_normal: vec3<f32>,
 	@location(7) @interpolate(flat) instance: u32,
+	// the lowest shading's direct specular, lit by vertex (`vertex_glint`; zero elsewhere)
+	@location(8) vertex_glint: vec3<f32>,
+}
+
+// The sun's direct specular on a dielectric at one point, without the split-sum table's multiple scattering (the
+// vertex stage reads no textures): `direct_light`'s GGX lobe, visibility and Schlick rise
+fn sun_glint(n: vec3<f32>, v: vec3<f32>, roughness: f32, f0: f32, fresnel: f32) -> vec3<f32> {
+	let l = frame.sun_direction.xyz;
+	let n_dot_l = dot(n, l);
+	if (n_dot_l <= 0.0) {
+		return vec3<f32>(0.0);
+	}
+	let h = normalize(v + l);
+	let n_dot_v = max(dot(n, v), 1e-4);
+	let lobe = frame.direct_specular;
+	let reflectance = frame.direct_reflectance;
+	let r = clamp(roughness, 0.03, 1.0);
+	let alpha = (lobe.x + (1.0 - lobe.x) * r * r) * lobe.y;
+	let k = min(lobe.z + lobe.w * r, 1.0);
+	let visibility = 0.25 / ((n_dot_v * (1.0 - k) + k) * (n_dot_l * (1.0 - k) + k));
+	let rise = pow(1.0 - max(dot(v, h), 0.0), 5.0) * (fresnel + reflectance.z);
+	let gain = reflectance.x * (1.0 + reflectance.y * alpha * alpha);
+	let f = gain * (f0 + (1.0 - f0) * rise);
+	return vec3<f32>(distribution_ggx(max(dot(n, h), 0.0), alpha) * f * visibility * n_dot_l) * frame.sun_color.rgb;
+}
+
+// The lowest shading lights by vertex (notes/render.md "Graphics quality levels": a client's floor shows no sun glare
+// at levels 1-4 where small plates on it do, a plate 4 studs wide 0.95 of the glare lit per pixel at its middle and
+// one 8 wide 0.92): the sun's glint at this vertex, unshadowed (the fragment takes the sun's shade at its own point),
+// for parts that take that shading (`shading_tier`, frame.quality_shading bit 256); metals' share does not glint
+// (a Metal plate in the glare 119 of 255 by vertex, 212 per pixel)
+fn vertex_glint(world: vec3<f32>, normal: vec3<f32>, instance: Instance) -> vec3<f32> {
+	if (frame.quality_shading.z > 1e8 || (u32(frame.quality_shading.w) & 256u) == 0u || instance.flags.x != SHADING_STANDARD) {
+		return vec3<f32>(0.0);
+	}
+	if (shading_tier(world, instance).y < 0.5) {
+		return vec3<f32>(0.0);
+	}
+	let v = normalize(frame.camera_position.xyz - world);
+	return sun_glint(normal, v, instance.params.x, instance.specular.x, instance.specular.y) * (1.0 - saturate(instance.params.y));
 }
 
 fn vertex_output(input: VertexInput, instance_index: u32) -> VertexOutput {
@@ -101,6 +141,7 @@ fn vertex_output(input: VertexInput, instance_index: u32) -> VertexOutput {
 	output.object_position = input.position;
 	output.object_normal = input.normal;
 	output.instance = instance_index;
+	output.vertex_glint = vertex_glint(world.xyz, output.world_normal, instance);
 	return output;
 }
 
@@ -608,8 +649,47 @@ fn decal_left_out(input: VertexOutput, instance: Instance, coordinates: Material
 // `occluded`: opaque surfaces take the ambient occlusion (render::ao); transparent ones are not in it.
 // The entry point fixes `is_decal`, so ordinary surfaces have no decal discard path and can
 // reject hidden fragments before material sampling and lighting.
+// The inverse of a 3x3 matrix (shading_tier: a part's box back to studs)
+fn inverse3(m: mat3x3<f32>) -> mat3x3<f32> {
+	let a = m[0];
+	let b = m[1];
+	let c = m[2];
+	let r0 = cross(b, c);
+	let r1 = cross(c, a);
+	let r2 = cross(a, b);
+	let det = dot(a, r0);
+	return transpose(mat3x3<f32>(r0, r1, r2)) * (1.0 / select(det, 1e-12, abs(det) < 1e-12));
+}
+
+// The view's graphics quality shading at a surface (notes/render.md "Graphics quality levels", frame.quality_shading):
+// x the share of the high-quality shading (1 within 3/4 of the level's radius from the camera, 0 past 5/4 of it), y 1
+// where the surface's part is farther from the focus than the level lights per pixel (its box's distance), so it takes
+// the lowest shading (no specular, the sky's light the same from every side)
+fn shading_tier(world_position: vec3<f32>, instance: Instance) -> vec2<f32> {
+	let q = frame.quality_shading;
+	let distance = length(world_position - frame.camera_position.xyz);
+	let high = saturate((q.y - distance) / max(q.y - q.x, 1e-3));
+	var lowest = 0.0;
+	if (q.z < 1e8) {
+		// the focus in the part's box (-0.5..0.5), its nearest point in it, the gap back in studs
+		let local = (instance.part_inverse * vec4<f32>(frame.quality_focus.xyz, 1.0)).xyz;
+		let gap = local - clamp(local, vec3<f32>(-0.5), vec3<f32>(0.5));
+		let box = mat3x3<f32>(instance.part_inverse[0].xyz, instance.part_inverse[1].xyz, instance.part_inverse[2].xyz);
+		lowest = select(0.0, 1.0, length(inverse3(box) * gap) >= q.z);
+	}
+	return vec2<f32>(select(high, 0.0, lowest > 0.5), lowest);
+}
+
+fn shading_term(bit: u32) -> bool {
+	return (u32(frame.quality_shading.w) & bit) != 0u;
+}
+
 fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_decal: bool) -> vec4<f32> {
 	let instance = instances[input.instance];
+	// the level's shading here: how much of the high-quality shading, and whether the lowest
+	let tier = shading_tier(input.world_position, instance);
+	let high = tier.x;
+	let lowest = tier.y > 0.5;
 	let flags = instance.flags.y;
 	let shading = instance.flags.x;
 	var surface: Surface;
@@ -777,7 +857,12 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 	// of their diffuse at s = 1; ibl-fade: none at 10 studs, 45 % at 700)
 	let specular_scale = frame.environment.y;
 	let fade = specular_fade(input.world_position);
-	let map_metalness = surface.metalness;
+	var map_metalness = surface.metalness;
+	// below the high-quality shading metals are drawn as any surface, their colour maps alone (each lower shading's
+	// change in a branch of its own: the high-quality shading's arithmetic stays as it is, to the bit)
+	if (shading_term(64u) && high < 1.0) {
+		map_metalness *= high;
+	}
 	surface.metalness = fade.y * map_metalness * specular_scale;
 	// the sky specular's level: s and the fade
 	let sky_specular = fade.x * specular_scale;
@@ -802,6 +887,10 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 			b = cross(n, t) * select(-1.0, 1.0, dot(cross(n, t), up_world) >= 0.0);
 		}
 		var sample = select(vec3<f32>(0.0, 0.0, 1.0), normal_texel * 2.0 - 1.0, (flags & TEX_NORMAL) != 0u);
+		// texture detail only in the high-quality shading
+		if (shading_term(2u) && high < 1.0) {
+			sample = vec3<f32>(sample.xy * high, sample.z);
+		}
 		if ((flags & TEX_MATERIAL) != 0u) {
 			// a built-in pack's strength from the view depth instance.tint.w on; nearer, Foil's grows as (depth / that
 			// depth) to the power instance.texture.w (render::materials::BuiltInTextures::normal_falloff)
@@ -842,6 +931,11 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 	// past the sun's shadow maps the sun reaches as far as the grid lets it through
 	let shadow = sun_shade(input.world_position, geometric_normal) * cloud_sun(input.world_position);
 	var color = direct_light(surface, n, v, frame.sun_direction.xyz, frame.sun_color.rgb * shadow, 0.0);
+	if (lowest && shading_term(32u)) {
+		// the lowest shading: diffuse light, and its glint lit by vertex, shaded here
+		color = surface.diffuse_weight * surface.albedo / PI * max(dot(n, frame.sun_direction.xyz), 0.0) * frame.sun_color.rgb * shadow;
+		color += input.vertex_glint * shadow;
+	}
 	color += local_lights(surface, input.world_position, n, v, geometric_normal, input.clip.xy);
 	let lit = color;
 
@@ -886,15 +980,36 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 	// sky light: the sky's ambient cube (common.wgsl `sky_light`), giving up what the sky specular
 	// reflects (sky-light; ibl-scale, per n·v); towards the closed grid's grey linearly in the grid's
 	// visibility (lg-edge: Studio's light across a roof's edge is grey + (sky - grey) v, rms 0.002-0.005)
-	let sky_irradiance = mix(LIGHT_GRID_SKY_CLOSED, sky_light(frame, n), sky_open);
-	let sky_kd = (1.0 - surface.metalness) * (vec3<f32>(1.0) - sky_specular * sky_fresnel);
+	var sky_seen = sky_light(frame, n);
+	if (lowest && shading_term(16u)) {
+		// the same from every side: the mean of the six directions
+		sky_seen = vec3<f32>(0.0);
+		for (var face = 0u; face < 6u; face++) {
+			sky_seen += frame.sky_cube[face].rgb;
+		}
+		sky_seen /= 6.0;
+	}
+	let sky_irradiance = mix(LIGHT_GRID_SKY_CLOSED, sky_seen, sky_open);
+	// the share of the sky specular this shading draws: none below the high-quality shading
+	let sky_drawn = select(1.0, high, shading_term(1u));
+	var sky_loss = select(sky_drawn, 1.0, shading_term(4u));
+	if (lowest && shading_term(128u)) {
+		sky_loss = 0.0;
+	}
+	var sky_kd = (1.0 - surface.metalness) * (vec3<f32>(1.0) - sky_specular * sky_fresnel);
+	if (sky_loss < 1.0) {
+		sky_kd = (1.0 - surface.metalness) * (vec3<f32>(1.0) - sky_specular * sky_fresnel * sky_loss);
+	}
 	let sky_diffuse = sky_kd * surface.albedo * sky_irradiance * (frame.environment.x * sky_occlusion);
 	color += sky_diffuse;
 
 	let r = reflect(-v, n);
 	// Part.Reflectance (reflectance): a mirror image of the sky lit by half the diffuse light there,
 	// blended over the diffuse shading (direct and sky specular stay on top); metals show none
-	let reflectance = instance.params.z * (1.0 - map_metalness);
+	var reflectance = instance.params.z * (1.0 - map_metalness);
+	if (shading_term(8u) && high < 1.0) {
+		reflectance *= high;
+	}
 	var direct_spec = vec3<f32>(0.0);
 	if (reflectance > 0.0 || shading == SHADING_GLASS) {
 		var bare = surface;
@@ -947,6 +1062,10 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 	// 1.4 LIGHT_GRID_SKY_CLOSED in green, the same in two sessions; ror kept 0.12 of the blue sky): linear in v from the
 	// open sky's share above (nothing changes where the grid is open)
 	specular += (LIGHT_GRID_SPECULAR_CLOSED - LIGHT_GRID_SPECULAR_FLOOR * prefiltered * frame.sky_specular_colour.rgb) * (sky_fresnel * sky_specular * (1.0 - sky_open));
+	// none of it below the high-quality shading (in a branch: the high-quality arithmetic as it is)
+	if (sky_drawn < 1.0) {
+		specular *= sky_drawn;
+	}
 	color += specular;
 	if (shading == SHADING_GLASS) {
 		glass_normal = n;

@@ -9,10 +9,13 @@
 // grid 1116 pixels tall (the capture viewport's), so the halo keeps its size relative to the image.
 
 struct BloomParams {
-	// x exposure multiplier, y threshold, z cap, w 1: keep only the excess over the threshold
+	// x exposure multiplier, y threshold, z cap, w 1 or more: keep only the excess over the threshold
+	// (past 1, how much of the peak against it reads the luminance instead of the brightest channel: a
+	// graphics quality level's built-in glow, render/bloom.rs GLOW_TIERS)
 	source: vec4<f32>,
-	// x, y render pixels per working pixel (fs_extract's footprint), z unused, w how much fs_down lowers
-	// a texel's weight with its brightness
+	// x, y render pixels per working pixel (fs_extract's footprint), z how much of a texel's brightness
+	// fs_down weighs it by reads the luminance, w how much fs_down lowers a texel's weight with its
+	// brightness
 	footprint: vec4<f32>,
 	// x tent radius in texels, y direction (0 horizontal, 1 vertical), z weight of the added level
 	// (fs_blur_add) or of the upsampled one (fs_up); w (fs_down) the weight of the outer two of the
@@ -60,6 +63,14 @@ fn fs_extract(input_position: FullscreenOutput) -> @location(0) vec4<f32> {
 	return vec4<f32>(min(mean.rgb * mean.rgb * bloom.source.x, vec3<f32>(bloom.source.z)), 1.0);
 }
 
+const LUMINANCE: vec3<f32> = vec3<f32>(0.2126, 0.7152, 0.0722);
+
+// a texel's brightness for the weighting and the threshold: its brightest channel, mixed towards its
+// luminance by `share`
+fn brightness(color: vec3<f32>, share: f32) -> f32 {
+	return mix(max(color.r, max(color.g, color.b)), dot(color, LUMINANCE), share);
+}
+
 @fragment
 fn fs_down(input_position: FullscreenOutput) -> @location(0) vec4<f32> {
 	// the next level: texel j from finer texels 2j - 1 .. 2j + 2 per axis (clamped to the edge), each
@@ -77,7 +88,7 @@ fn fs_down(input_position: FullscreenOutput) -> @location(0) vec4<f32> {
 		for (var x = 0; x < 4; x++) {
 			let position = clamp(origin + vec2<i32>(x, y), vec2<i32>(0), size - 1);
 			let texel = textureLoad(input, position, 0).rgb;
-			let weight = taps[x] * taps[y] / (1.0 + bloom.footprint.w * max(texel.r, max(texel.g, texel.b)));
+			let weight = taps[x] * taps[y] / (1.0 + bloom.footprint.w * brightness(texel, bloom.footprint.z));
 			color += texel * weight;
 			total += weight;
 		}
@@ -87,7 +98,7 @@ fn fs_down(input_position: FullscreenOutput) -> @location(0) vec4<f32> {
 		// the brightest channel's excess over the threshold, the colour's ratios kept (an orange source's
 		// halo keeps the clamped colour's ratios: bloom-colors); no knee: nothing under the threshold
 		// glows (render/bloom.rs BLOOM_THRESHOLD)
-		let peak = max(color.r, max(color.g, color.b));
+		let peak = brightness(color, bloom.source.w - 1.0);
 		let excess = max(peak - bloom.source.y, 0.0);
 		color = select(vec3<f32>(0.0), color * (excess / peak), peak > 1e-5);
 	}

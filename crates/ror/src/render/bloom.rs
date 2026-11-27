@@ -11,6 +11,7 @@
 //! tone curve. Threshold and cap in tone-curve input units. The chain runs on a working grid of a fixed
 //! height, so the halo keeps its size relative to the image.
 
+use crate::quality::Quality;
 use crate::scene::Environment;
 use crate::scene::environment::PostEffect;
 
@@ -70,8 +71,33 @@ const BLOOM_TENTS: [f32; 4] = [3.44, 4.00, 4.11, 4.11];
 /// fog-lit black at EV -2 reads 1 of 255 in Studio and the client, 2 in ror before, 0 now).
 const BLOOM_EFFECT_THRESHOLD_OFFSET: f32 = 0.001;
 
-/// The bloom a view draws: every value of the chain that a scene's effects (or, later, a graphics
-/// quality) can change. [`bloom_parameters`] is the one place that sets them.
+/// The built-in glow's three strengths by graphics quality level (crate::quality::Quality::glow: levels 1-5, 6-11,
+/// 12 and up), each [threshold, amplitude, the downsamples' brightness weighting, how much of it reads the
+/// luminance instead of the brightest channel, how much of the threshold's peak does]; 12 and up is the fit above.
+/// Measured in a Roblox client (0.747, fixtures/quality-levels.luau `bloom`: white, red and cyan Neon bars and a
+/// 0.4-stud speck in the dark, 1600 x 900, two sessions a level alike), each halo in linear light as a share of
+/// level 12's 0.8 / 1.5 studs out: at 6-11 white 0.67 / 0.67, red 0.94 / 0.84, cyan 0.70 / 0.60, the speck 0.58 (the
+/// red bar's least dimmed: the luminance weighs it down least); at 1-5 white 0.64 / 0.58, red 0.37 / 0.28, cyan 0.56
+/// / 0.46, the speck 0.24 (a red source's peak read partly as luminance glows least; a small one is weighed down
+/// most). Fitted on ror's chain against those shares times ror's own level-21 halo (rms of the log ratio over the
+/// seven: 6-11 0.38 drawn as 12 → 0.11, 1-5 0.92 → 0.21, its white bar 0.79 / 0.68 and the speck 1.33 of the
+/// client's share). The threshold stays 12's: a lower one fitted these Neon bars a little better (0.29 at 0.8) but
+/// made a daylight scene's sky and sunlit surfaces glow, 20 of 255 over the client at level 4.
+const GLOW_TIERS: [[f32; 5]; 3] = [
+	[BLOOM_THRESHOLD, 0.8, 0.6, 0.0, 0.4],
+	[BLOOM_THRESHOLD, 0.8, 0.2, 1.0, 0.0],
+	[BLOOM_THRESHOLD, 1.0, BLOOM_WEIGHTING[0], 0.0, 0.0],
+];
+
+/// `ROR_TUNE_GLOW="threshold,amplitude,weighting,luminance weighting,luminance peak"` replaces the glow tier
+/// below 12 a view draws, for fits.
+fn tuned_glow() -> Option<[f32; 5]> {
+	let values: Vec<f32> = std::env::var("ROR_TUNE_GLOW").ok()?.split(',').filter_map(|part| part.trim().parse().ok()).collect();
+	values.try_into().ok()
+}
+
+/// The bloom a view draws: every value of the chain that a scene's effects or a graphics quality level
+/// change. [`bloom_parameters`] is the one place that sets them.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct Bloom {
 	/// The brightest channel's excess over this (tone-curve input units) glows
@@ -88,6 +114,9 @@ pub(super) struct Bloom {
 	pub tents: [f32; 4],
 	/// The working grid's height in pixels
 	pub grid_height: f32,
+	/// How much the downsamples' weighting, and the first level's peak against the threshold, read the
+	/// luminance instead of the brightest channel (0 for the brightest channel)
+	pub luminance: [f32; 2],
 }
 
 impl Bloom {
@@ -123,7 +152,19 @@ fn bloom_levels(size: f32, amplitude: f32) -> [f32; 5] {
 /// and 60 matched 9 at 60 exactly, 4 + 4 matched 8, Thresholds 1 and 2 matched 1, 3 and 2 matched 2,
 /// Sizes 30 and 40 matched 40; a Camera's BloomEffect and ColorCorrectionEffect drew exactly as the
 /// Lighting's).
-pub(super) fn bloom_parameters(environment: &Environment) -> Bloom {
+///
+/// At a graphics quality level (crate::quality::Quality) below 12 BloomEffects add nothing (a white
+/// Neon bar's halo in the dark 0.8 studs out reads 78 of 255 at level 11 with a BloomEffect of Threshold
+/// 0.8 and without, 145 with it at 12) and the built-in glow takes the level's strength (GLOW_TIERS).
+pub(super) fn bloom_parameters(environment: &Environment, quality: &Quality) -> Bloom {
+	let built_in = Bloom { threshold: BLOOM_THRESHOLD, levels: bloom_levels(24.0, 1.0), cap: BLOOM_CAP, weighting: BLOOM_WEIGHTING, taps: BLOOM_TAPS, tents: BLOOM_TENTS, grid_height: BLOOM_REFERENCE_HEIGHT, luminance: [0.0; 2] };
+	if !quality.bloom_effect || quality.glow < 2 {
+		let [threshold, amplitude, weighting, luminance_weighting, luminance_peak] = match quality.glow {
+			tier @ 0..=1 => tuned_glow().unwrap_or(GLOW_TIERS[tier as usize]),
+			_ => GLOW_TIERS[2],
+		};
+		return Bloom { threshold, levels: bloom_levels(24.0, amplitude), weighting: [weighting, BLOOM_WEIGHTING[1] * weighting / BLOOM_WEIGHTING[0]], luminance: [luminance_weighting, luminance_peak], ..built_in };
+	}
 	let mut combined: Option<(f32, f32, f32)> = None;
 	for effect in &environment.effects {
 		if let PostEffect::Bloom { intensity, size, threshold } = effect {
@@ -134,11 +175,10 @@ pub(super) fn bloom_parameters(environment: &Environment) -> Bloom {
 			});
 		}
 	}
-	let (threshold, levels) = match combined {
-		Some((intensity, size, threshold)) => (1.951 * threshold + BLOOM_EFFECT_THRESHOLD_OFFSET, bloom_levels(size, intensity)),
-		None => (BLOOM_THRESHOLD, bloom_levels(24.0, 1.0)),
-	};
-	Bloom { threshold, levels, cap: BLOOM_CAP, weighting: BLOOM_WEIGHTING, taps: BLOOM_TAPS, tents: BLOOM_TENTS, grid_height: BLOOM_REFERENCE_HEIGHT }
+	match combined {
+		Some((intensity, size, threshold)) => Bloom { threshold: 1.951 * threshold + BLOOM_EFFECT_THRESHOLD_OFFSET, levels: bloom_levels(size, intensity), ..built_in },
+		None => built_in,
+	}
 }
 
 #[cfg(test)]
@@ -146,7 +186,7 @@ mod tests {
 	use super::*;
 
 	fn bloom_of(effects: Vec<PostEffect>) -> Bloom {
-		bloom_parameters(&Environment { effects, ..Default::default() })
+		bloom_parameters(&Environment { effects, ..Default::default() }, &Quality::top())
 	}
 
 	/// A cutscene lights its impact with a Size-60 Intensity-8 BloomEffect in the Camera over
@@ -162,5 +202,26 @@ mod tests {
 		assert_eq!(bloom_of(vec![bloom(0.0, 24.0, 2.0)]).levels, [0.0; 5], "Intensity 0 removes every halo");
 		assert_eq!(bloom_of(vec![bloom(0.0, 24.0, 2.0)]).level_count(), 0);
 		assert_eq!(bloom_of(Vec::new()).level_count(), 4, "the built-in bloom keeps 3.68 levels");
+	}
+
+	/// Below graphics quality level 12 a BloomEffect adds nothing and the built-in glow takes the level's tier:
+	/// weaker, its weighting reading the luminance (6-11) and its peak too (1-5); from 12 as without a level.
+	#[test]
+	fn a_quality_level_picks_its_glow() {
+		let effect = vec![PostEffect::Bloom { intensity: 1.0, size: 24.0, threshold: 0.8 }];
+		let at = |level: u32, effects: Vec<PostEffect>| bloom_parameters(&Environment { effects, ..Default::default() }, &Quality::new(level, false, true));
+		assert_eq!(at(12, effect.clone()), bloom_of(effect.clone()), "12 draws the BloomEffect");
+		assert_eq!(at(21, Vec::new()), bloom_of(Vec::new()));
+		for level in [1, 5, 6, 11] {
+			assert_eq!(at(level, effect.clone()), at(level, Vec::new()), "level {level}: the BloomEffect adds nothing");
+		}
+		let (low, middle, top) = (at(5, Vec::new()), at(6, Vec::new()), at(12, Vec::new()));
+		assert_eq!(at(1, Vec::new()), low);
+		assert_eq!(at(11, Vec::new()), middle);
+		assert!(middle.levels[0] < top.levels[0] && low.levels[0] < top.levels[0], "weaker below 12");
+		assert!(low.weighting[0] > middle.weighting[0] && middle.weighting[0] > top.weighting[0], "small sources weighed down most below 6");
+		assert_eq!((low.threshold, middle.threshold), (top.threshold, top.threshold), "no lower threshold: daylight does not glow");
+		assert_eq!((top.luminance, middle.luminance[1]), ([0.0; 2], 0.0));
+		assert!(middle.luminance[0] > 0.0 && low.luminance[1] > 0.0);
 	}
 }
