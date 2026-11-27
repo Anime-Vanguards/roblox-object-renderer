@@ -1,7 +1,8 @@
 //! What a view draws at a graphics quality level beyond the shadows and lights (crate::quality, notes/render.md
 //! "Graphics quality levels"): the shading tiers by the focus and the camera, the ambient occlusion from 20 and the
-//! anti-aliasing by level, the sun's light on faces turned from it, against a Roblox 0.747 client's frames
-//! (fixtures/quality-levels.luau `shading`, `kinds`, `ao`, `backs`, `chunk`, `cluster`).
+//! anti-aliasing by level, the sun's light on faces turned from it, the light grid's voxel sun round the focus, against a
+//! Roblox 0.747 client's frames (fixtures/quality-levels.luau `shading`, `kinds`, `ao`, `backs`, `chunk`, `cluster`,
+//! `sunfield`, `sunregion`).
 
 use super::*;
 use crate::scene::build::{ModelBuilder, PartSpec};
@@ -181,6 +182,40 @@ fn faces_turned_from_the_sun_take_its_back_light_past_the_focus_radius() {
 	let half = draw_at(None, Some(4), 0.5);
 	assert!(half > 10.0 && half < lit - 15.0, "EnvironmentDiffuseScale 0.5: about half the light ({half} against {lit})");
 	assert!(draw_at(None, Some(4), 1.0) < 1.0, "EnvironmentDiffuseScale 1: none");
+}
+
+/// The light grid's voxel sun where a level draws no shadow maps (level 4, the sun 26 degrees up), as a Roblox client
+/// draws it (fixtures/quality-levels.luau `sunfield`, `sunregion`): read 6 studs along the normal, so a 4-stud block on a
+/// floor leaves the floor beside it in the sun where a 16-stud block shades it; and only within the 128 x 64 x 128-stud
+/// chunks round Camera.Focus (from two below the focus's chunk to one above): the same views with their focus 1,000
+/// studs further along them draw the floor unshadowed.
+#[test]
+fn the_voxel_sun_reads_six_studs_out_within_the_focus_chunks() {
+	let views = Views::new();
+	let mut model = ModelBuilder::new("VoxelSun");
+	model.part(&PartSpec { name: "Floor".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, -0.5, 0.0)), size: Vec3::new(240.0, 1.0, 240.0), color: [200; 3], material: 272, ..Default::default() });
+	model.part(&PartSpec { name: "Tall".into(), cframe: Affine3A::from_translation(Vec3::new(8.0, 8.0, 8.0)), size: Vec3::splat(16.0), color: [200; 3], material: 272, ..Default::default() });
+	model.part(&PartSpec { name: "Low".into(), cframe: Affine3A::from_translation(Vec3::new(-38.0, 2.0, -38.0)), size: Vec3::splat(4.0), color: [200; 3], material: 272, ..Default::default() });
+	let mut scene = crate::scene::extract::extract(&model.into_document());
+	let environment = &mut scene.environment;
+	(environment.ambient, environment.outdoor_ambient, environment.environment_diffuse_scale, environment.environment_specular_scale) = (Vec3::ZERO, Vec3::ZERO, 0.0, 0.0);
+	(environment.clock_time, environment.geographic_latitude, environment.brightness) = (16.2, 38.0, 2.0);
+	environment.sky = Some(views.sky([0, 0, 0]));
+	// the floor seen from 40 studs straight up, a stud across, the focus on it or 1,000 studs on along the view
+	let floor = |point: Vec3, far: bool| {
+		let eye = point + Vec3::new(0.0, 40.0, 0.05);
+		let target = if far { point + (point - eye).normalize() * 1000.0 } else { point };
+		views.level(&scene, view(eye, target, 2.0 * (0.5f32 / 40.0).atan().to_degrees(), Some(4)))
+	};
+	// along the sun's bearing past each block's far side
+	let bearing = Vec3::new(-SUN.x, 0.0, -SUN.z).normalize();
+	let past = |middle: Vec3, half: f32, distance: f32| middle + bearing * (half * (bearing.x.abs() + bearing.z.abs()) + distance);
+	let tall = past(Vec3::new(8.0, 0.0, 8.0), 8.0, 4.0);
+	let (shaded, open) = (floor(tall, false), floor(tall, true));
+	assert!(shaded < open * 0.6, "4 studs past the 16-stud block: {shaded} with the focus there, {open} 1,000 studs on");
+	let low = past(Vec3::new(-38.0, 0.0, -38.0), 2.0, 2.0);
+	let (beside, open) = (floor(low, false), floor(low, true));
+	assert!((beside - open).abs() < 1.5, "2 studs past the 4-stud block: {beside} against {open} unshadowed");
 }
 
 /// Anti-aliasing by level: none at 1-16, 4 samples from 17 (the client's 2 at 17: ror has no 2-sample passes), as

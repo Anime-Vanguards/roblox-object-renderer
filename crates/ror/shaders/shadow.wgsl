@@ -118,16 +118,29 @@ fn light_grid_visibility(position: vec3<f32>, normal: vec3<f32>) -> f32 {
 	return textureSampleLevel(light_grid, linear_sampler, uvw, 0.0).r;
 }
 
+// A Roblox client keeps the grid's sun in chunks of 128 x 64 x 128 studs round Camera.Focus: the four along each axis
+// from two below the focus's chunk (fixtures/quality-levels.luau `sunregion`: 8-stud blocks every 64 studs shade the
+// floor from x and z -256 to 256 with the focus anywhere from 0 to 96, from -128 to 384 with it at 128; the floor
+// under a focus 160 studs up, not 192). Past them it takes the sun unshadowed.
+const LIGHT_GRID_SUN_CHUNK: vec3<f32> = vec3<f32>(128.0, 64.0, 128.0);
+
 // the sun's light through the grid (frame.light_grid.w 2; render::lightgrid propagate_sun), trilinear between voxel
 // centres 6 studs along the normal, as the sky's (fixtures/quality-levels.luau `sunfield`: a block one layer tall on a
 // floor leaves the floor open, thin plates on it their own tops lit, a block two layers tall shades the floor beside
-// it; faces turned from the sun read 6 studs out, the bounce walls' backs 35 / 65 / 103 of 255 1 / 4 / 7 studs up); 1
-// without a grid or its sun channel
+// it; faces turned from the sun read 6 studs out, the bounce walls' backs 35 / 65 / 103 of 255 1 / 4 / 7 studs up),
+// within the client's chunks round the view's focus (LIGHT_GRID_SUN_CHUNK); 1 without a grid or its sun channel and
+// past those chunks
 fn light_grid_sun(position: vec3<f32>, normal: vec3<f32>) -> f32 {
 	if (frame.light_grid.w < 1.5) {
 		return 1.0;
 	}
 	let point = position + normal * LIGHT_GRID_OFFSET;
+	let chunk = floor(frame.quality_focus.xyz / LIGHT_GRID_SUN_CHUNK);
+	let low = (chunk - 2.0) * LIGHT_GRID_SUN_CHUNK;
+	let high = (chunk + 2.0) * LIGHT_GRID_SUN_CHUNK;
+	if (any(point < low) || any(point >= high)) {
+		return 1.0;
+	}
 	let uvw = (point - frame.light_grid.xyz) * frame.light_grid_scale.xyz;
 	return textureSampleLevel(light_grid, linear_sampler, uvw, 0.0).g;
 }

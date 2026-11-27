@@ -13,7 +13,8 @@
 //! A second channel carries the sun's light through the voxels from their neighbours towards the sun
 //! ([`propagate_sun`]; upright sheets fill it as a whole share where their top edge stands): what shades the sun where
 //! a view's shadow maps do not reach (past their reach from the camera at every graphics quality level, and everywhere
-//! below the levels that draw them: crate::quality).
+//! below the levels that draw them: crate::quality), within the Roblox client's chunks round Camera.Focus
+//! (shaders/shadow.wgsl `light_grid_sun`).
 
 use glam::{Mat3A, Vec3, Vec3A};
 use rayon::prelude::*;
@@ -837,7 +838,7 @@ const SUN_SHEET: f32 = 1.0;
 /// neighbours towards the sun, one along each axis, as each passed it on (its own light times its transmission; 1 outside
 /// the grid), weighted by the sun's components' magnitudes to the power SUN_SHARE_POWER (normalised): from the top layer
 /// down, each layer's rows from the sun's side. Surfaces read it 6 studs along their normal, as the sky's
-/// (shaders/shadow.wgsl `light_grid_sun`).
+/// (shaders/shadow.wgsl `light_grid_sun`), within the Roblox client's chunks round Camera.Focus.
 ///
 /// Fitted on the Roblox client (0.747, graphics quality 5, fixtures/quality-levels.luau `sunslice`, `sunfield`; notes/render.md
 /// "Light grid", "The sun through the grid"): upright quads that fill no voxel through bars, slabs and walls 32 studs long

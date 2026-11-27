@@ -20,7 +20,8 @@ use serde::Serialize;
 pub const TOP: u32 = 21;
 
 /// Where the sun's shadow maps reach from the camera: full to `full`, fading linearly to nothing at `gone`
-/// (studs, by a point's distance from the camera, not its depth); past it the light grid's voxel sun.
+/// (studs, by a point's distance from the camera, not its depth); past it the light grid's voxel sun (within the chunks a
+/// client keeps round Camera.Focus: shaders/shadow.wgsl `light_grid_sun`).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SunReach {
