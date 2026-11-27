@@ -68,3 +68,5 @@ How `Part.Color`, mesh vertex colors (`FileMesh` or `EditableMesh` `AddColor`/`S
 ## Highlights
 
 Renders fill and outline passes over the `Adornee` (or parent) hierarchy respecting `DepthMode` (`AlwaysOnTop` or `Occluded`), `FillTransparency`, and `OutlineTransparency` (`render::highlights`).
+
+- The outline is a two-pixel band across the silhouette's edge. It holds one layer of the fill and the outline together, as opaque as the more opaque of the two, their colors mixed in linear light by the outline's share of that opacity, as a Roblox client draws it: a nearly transparent outline over an opaque fill shows mostly the fill (a white outline at `OutlineTransparency` 0.9 over a red fill reads (255, 81, 81)), and with `OutlineTransparency` 1 the fill covers the band.

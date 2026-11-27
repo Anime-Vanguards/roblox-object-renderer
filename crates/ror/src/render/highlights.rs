@@ -135,6 +135,46 @@ mod tests {
 		assert_eq!(at(0, 0), [100, 100, 100]);
 	}
 
+	/// The outline band is one layer of the fill and the outline (a Roblox client's cubes before walls
+	/// of their own colour: red fill, green outline; vfx-highlight-edges: red fill, white outline).
+	#[test]
+	fn an_almost_transparent_outline_shows_the_fill_under_its_band() {
+		let (w, h) = (6usize, 6usize);
+		let mut mask = vec![0u8; 4 * w * h];
+		for y in 2..10 {
+			for x in 2..10 {
+				mask[y * 2 * w + x] = 1;
+			}
+		}
+		let run = |background: u8, fill: [f32; 3], fill_transparency: f32, outline: [f32; 3], outline_transparency: f32| {
+			let style = Highlight { parts: vec![0], fill_color: glam::Vec3::from(fill), fill_transparency, outline_color: glam::Vec3::from(outline), outline_transparency, depth_mode: 0 };
+			let mut rgba = vec![background; w * h * 4];
+			for alpha in rgba.iter_mut().skip(3).step_by(4) {
+				*alpha = 255;
+			}
+			composite(&mut rgba, w as u32, h as u32, &mask, std::slice::from_ref(&style));
+			let at = |x: usize, y: usize| [rgba[(y * w + x) * 4], rgba[(y * w + x) * 4 + 1], rgba[(y * w + x) * 4 + 2]];
+			// the band's pixel inside the edge and the one past it alike; the interior is the fill alone
+			assert_eq!(at(1, 2), at(0, 2));
+			(at(0, 2), at(2, 2))
+		};
+		let (red, green, white) = ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 1.0]);
+		// a white outline at 0.9 and 0.99 over an opaque red fill: the outline's opacity's square root
+		assert_eq!(run(0, red, 0.0, white, 0.9).0, [255, 81, 81]);
+		assert_eq!(run(0, red, 0.0, white, 0.99).0, [255, 25, 25]);
+		// the client's values over black, gray 70 and white 168 (within 1)
+		let near = |got: [u8; 3], want: [u8; 3]| got.iter().zip(want).all(|(a, b)| a.abs_diff(b) <= 1);
+		assert!(near(run(0, red, 0.25, green, 0.5).0, [110, 156, 0]), "{:?}", run(0, red, 0.25, green, 0.5).0);
+		assert!(near(run(0, red, 0.5, green, 0.75).0, [90, 90, 0]));
+		assert!(near(run(70, red, 0.5, green, 0.9).0, [149, 92, 35]), "{:?}", run(70, red, 0.5, green, 0.9).0);
+		assert!(near(run(168, red, 0.75, green, 0.9).0, [176, 167, 127]), "{:?}", run(168, red, 0.75, green, 0.9).0);
+		// a half-transparent fill under a half-transparent outline shows the outline alone, and no
+		// outline leaves the fill on the band (and the interior to the fill)
+		assert!(near(run(77, red, 0.5, green, 0.5).0, [38, 166, 38]));
+		let (band, inside) = run(57, red, 0.5, green, 1.0);
+		assert!(near(band, [156, 28, 28]) && band == inside, "{band:?} {inside:?}");
+	}
+
 	/// Measured on Roblox client 0.748: a camera inside a single-sided Part sees neither that part's
 	/// Highlight (AlwaysOnTop or Occluded) nor Highlight occlusion from its back faces; a
 	/// DoubleSided part draws its Highlight and occludes Highlights behind it from inside.
@@ -329,9 +369,30 @@ mod tests {
 	}
 }
 
+/// What a Highlight draws on its outline band (the silhouette's rim and the pixel past it): one layer
+/// of its fill and its outline, as opaque as the more opaque of the two, in their colours mixed in
+/// linear light by the outline's share of that opacity (a Roblox client 0.747: cubes over black, gray
+/// and white walls of their own colour, a red fill at FillTransparency 0-0.75 and a green outline at
+/// OutlineTransparency 0-1, every band pixel within 1 of 255: fill 0.5 and outline 0.9 over 70 read
+/// (149, 92, 35); vfx-highlight-edges, Studio and the client alike: a red fill under a white outline
+/// at 0.9 / 0.99 shows (255, 81, 81) / (255, 25, 25), the outline's opacity's square root). Without
+/// an outline (Transparency 1) the fill covers the band (vfx-highlight-many, highlights fill-blue); a
+/// half-transparent fill under a half-transparent outline shows the outline alone (highlights half).
+fn band(style: &Highlight) -> (glam::Vec3, f32) {
+	let fill = 1.0 - style.fill_transparency;
+	let line = (1.0 - style.outline_transparency).max(0.0);
+	let opacity = fill.max(line);
+	if opacity <= 0.0 {
+		return (style.fill_color, 0.0);
+	}
+	let share = (line / opacity).clamp(0.0, 1.0);
+	let mixed = (style.fill_color * style.fill_color).lerp(style.outline_color * style.outline_color, share);
+	(glam::Vec3::new(mixed.x.sqrt(), mixed.y.sqrt(), mixed.z.sqrt()), opacity)
+}
+
 /// Blends the Highlights into the finished straight-alpha RGBA8 image (display values, as Studio:
-/// highlights, fill-blue, half: a lerp toward the colour by 1 - Transparency, the outline over the
-/// unfilled image).
+/// highlights, fill-blue, half: a lerp toward the colour by 1 - Transparency inside, [`band`] on the
+/// outline).
 pub fn composite(rgba: &mut [u8], width: u32, height: u32, mask: &[u8], styles: &[Highlight]) {
 	let (w, h) = (width as usize, height as usize);
 	// the Highlight owning each output pixel: two of its four samples (highlights: the edge pixels
@@ -389,17 +450,12 @@ pub fn composite(rgba: &mut [u8], width: u32, height: u32, mask: &[u8], styles: 
 			};
 			let index = x as usize * 4;
 			let pixel = &mut rgba_row[index..index + 4];
-			// a Highlight whose outline is wholly transparent draws none, and its fill covers the band
-			// the outline would have: the silhouette to its rim and one pixel beyond (vfx-highlight-many:
-			// cubes filled red to the pixel past their rims, where ror left the band showing the cubes
-			// and the sky; highlights fill-blue: the pixel outside the ball (35, 51, 246) in Studio, the
-			// fill at 0.75 over the sky)
-			let outlined = outline != 0 && styles[outline as usize - 1].outline_transparency < 1.0;
-			if outlined {
+			if outline != 0 {
 				let style = &styles[outline as usize - 1];
-				blend(pixel, style.outline_color, 1.0 - style.outline_transparency);
-			} else if own != 0 || outline != 0 {
-				let style = &styles[if own != 0 { own } else { outline } as usize - 1];
+				let (color, opacity) = band(style);
+				blend(pixel, color, opacity);
+			} else if own != 0 {
+				let style = &styles[own as usize - 1];
 				blend(pixel, style.fill_color, 1.0 - style.fill_transparency);
 			}
 		}
