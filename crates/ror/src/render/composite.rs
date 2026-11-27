@@ -29,7 +29,7 @@ pub(super) fn has_local_file(uri: &str) -> bool {
 	let Some(composite) = from_key(uri) else {
 		return false;
 	};
-	[&composite.pants, &composite.shirt, &composite.graphic].into_iter().flatten().any(|layer| super::names_local_file(&layer.image))
+	composite.layers().any(|layer| super::names_local_file(&layer.image))
 }
 
 /// Cache key for a composite URI: unchanged when all layers are remote assets, or with each local
@@ -42,7 +42,7 @@ pub(super) fn stamped_key_checked(uri: &str) -> (String, usize) {
 	};
 	let mut stamped = false;
 	let mut untrusted = 0usize;
-	for layer in [&mut composite.pants, &mut composite.shirt, &mut composite.graphic].into_iter().flatten() {
+	for layer in composite.layers_mut() {
 		if super::names_local_file(&layer.image) {
 			let (keyed, is_untrusted) = super::content_key_checked(&layer.image);
 			layer.image = keyed;
@@ -58,7 +58,7 @@ pub(super) fn stamped_key_checked(uri: &str) -> (String, usize) {
 pub(super) fn expected_stamped_key(uri: &str, local_keys: &std::collections::HashMap<String, String>) -> Option<String> {
 	let mut composite = from_key(uri)?;
 	let mut stamped = false;
-	for layer in [&mut composite.pants, &mut composite.shirt, &mut composite.graphic].into_iter().flatten() {
+	for layer in composite.layers_mut() {
 		if super::names_local_file(&layer.image) {
 			layer.image = local_keys.get(&layer.image)?.clone();
 			stamped = true;
@@ -75,7 +75,7 @@ pub(super) fn snapshot_layers(uri: &str) -> (String, std::collections::HashMap<S
 		return (uri.to_string(), snapshots);
 	};
 	let mut stamped = false;
-	for layer in [&mut composite.pants, &mut composite.shirt, &mut composite.graphic].into_iter().flatten() {
+	for layer in composite.layers_mut() {
 		if let Some((path, snap)) = super::local_snapshot_for(&layer.image) {
 			let raw = layer.image.clone();
 			layer.image = snap.stamp.stamp_uri(&raw);
@@ -345,7 +345,8 @@ fn canvas_checked(
 	for (uri, color) in sheets.bases.iter().zip(&composite.colors) {
 		draw(&mut canvas, &load_sheet(assets, uri).map_err(LoadError::Cached)?, units_high, scale, &Fill::Solid(*color));
 	}
-	// in the compositing meshes' order (their z): pants, shirt, the T-shirt
+	// in the compositing meshes' order (their z): pants, shirt, the T-shirt, then an R15 limb group's
+	// TextureID over the whole texture (its uv are the body meshes' own)
 	let graphic = match (&composite.graphic, &sheets.graphic) {
 		(Some(layer), GraphicSheet::Mesh(uri)) => Some((layer, load_sheet(assets, uri).map_err(LoadError::Cached)?)),
 		(Some(layer), GraphicSheet::Quad(rectangle)) => Some((layer, Sheet::quad(*rectangle))),
@@ -359,6 +360,9 @@ fn canvas_checked(
 		layers.push((layer, load_sheet(assets, sheets.shirt).map_err(LoadError::Cached)?));
 	}
 	layers.extend(graphic);
+	if let Some(layer) = &composite.overlay {
+		layers.push((layer, Sheet::quad([0.0, 0.0, units_wide, units_high])));
+	}
 	let mut all_verified = true;
 	for (layer, sheet) in layers {
 		let (source, verified) = load_source_checked(assets, &layer.image, snapshots)?;

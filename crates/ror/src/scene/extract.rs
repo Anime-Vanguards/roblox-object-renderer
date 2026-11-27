@@ -574,11 +574,12 @@ fn r6_limb_mesh(name: &str) -> Option<(&'static str, Vec3)> {
 	}
 }
 
-/// A Humanoid's body part as its character draws it: in its BodyColors colour, an R6 rig's block
-/// limbs as Studio's rounded limb meshes (or the character's CharacterMesh for the limb), and the
-/// composited texture of its body colours and clothing on R6 limb meshes and R15 MeshPart limbs.
+/// A Humanoid's body part as its character draws it: in its BodyColors colour (an R15 limb group in
+/// one colour), an R6 rig's block limbs as Studio's rounded limb meshes (or the character's
+/// CharacterMesh for the limb), and the composited texture of its body colours and clothing on R6
+/// limb meshes and R15 MeshPart limbs, an R15 limb group's TextureID over the clothing.
 fn dress(part: &mut Part, name: &str, character: &Character) {
-	if character.body_colors.is_some()
+	if (character.body_colors.is_some() || character.rig_type == 1)
 		&& let Some(color) = character.color(name)
 	{
 		part.color = color;
@@ -594,12 +595,16 @@ fn dress(part: &mut Part, name: &str, character: &Character) {
 		};
 		let mesh = character.limb_mesh(name).map(|limb| limb.mesh.clone()).unwrap_or_else(|| mesh.into());
 		part.geometry = Geometry::MeshPart { mesh, initial_size, fidelity: 0 };
-	} else if part.class != "MeshPart" || part.texture.is_some() {
-		// an R15 limb with a TextureID of its own keeps it (clothing over it is not modelled)
+	} else if part.class != "MeshPart" {
 		return;
 	}
+	// a SurfaceAppearance shows alone, without the clothing, its limb group's other parts dressed (a
+	// Roblox client: r15-sa, sarig); an R15 limb's TextureID is drawn by its group's composite
 	if part.surface_appearance.is_none() {
 		part.composite = character.composite(name);
+		if character.rig_type == 1 && part.composite.is_some() {
+			part.texture = None;
+		}
 	}
 }
 
@@ -1255,6 +1260,56 @@ mod tests {
 				_ => None,
 			};
 			assert_eq!(composite, expected, "{name}");
+		}
+	}
+
+	#[test]
+	fn r15_limb_groups_share_a_texture_and_a_colour() {
+		use rbx_dom_weak::types::Enum;
+
+		use crate::scene::build::PartSpec;
+		// a Roblox client: the first part of a group from the upper part down with a TextureID gives
+		// every part of the group its texture (over the clothing) and its colour; without one, the
+		// upper part's colour (ttwo, thand, tcolor, tcolorbare)
+		let mut model = ModelBuilder::new("Rig");
+		let root = model.model;
+		model.child(root, InstanceBuilder::new("Humanoid").with_property("RigType", Enum::from_u32(1)));
+		let limbs = [
+			("UpperTorso", [200, 30, 30], Some("rbxassetid://11")),
+			("LowerTorso", [30, 160, 60], Some("rbxassetid://12")),
+			("LeftUpperArm", [230, 200, 40], None),
+			("LeftLowerArm", [40, 200, 220], Some("rbxassetid://13")),
+			("LeftHand", [240, 240, 240], None),
+			("RightUpperLeg", [10, 20, 30], None),
+			("RightLowerLeg", [90, 90, 90], None),
+		];
+		for (name, color, texture) in limbs {
+			let part = model.part(&PartSpec { class: "MeshPart", name: name.into(), size: glam::Vec3::new(1.0, 2.0, 1.0), color, ..Default::default() });
+			if let Some(texture) = texture {
+				model.set(part, "TextureContent", Variant::Content(Content::from_uri(texture)));
+			}
+		}
+		let scene = super::extract(&model.into_document());
+		let part = |name: &str| scene.parts.iter().find(|part| part.path.ends_with(name)).expect(name);
+		let rgb = |color: [u8; 3]| glam::Vec3::new(color[0] as f32, color[1] as f32, color[2] as f32) / 255.0;
+		for (name, color, overlay) in [
+			("UpperTorso", [200, 30, 30], Some("rbxassetid://11")),
+			("LowerTorso", [200, 30, 30], Some("rbxassetid://11")),
+			("LeftUpperArm", [40, 200, 220], Some("rbxassetid://13")),
+			("LeftLowerArm", [40, 200, 220], Some("rbxassetid://13")),
+			("LeftHand", [40, 200, 220], Some("rbxassetid://13")),
+			("RightUpperLeg", [10, 20, 30], None),
+			("RightLowerLeg", [10, 20, 30], None),
+		] {
+			let part = part(name);
+			assert!((part.color - rgb(color)).length() < 1e-3, "{name}: {:?}", part.color);
+			let composite = part.composite.as_ref();
+			assert_eq!(composite.and_then(|composite| composite.overlay.as_ref()).map(|layer| layer.image.as_str()), overlay, "{name}");
+			if let Some(composite) = composite {
+				assert!((glam::Vec3::from(composite.colors[0]) - rgb(color)).length() < 1e-3, "{name}");
+			}
+			// the composite draws the texture: the part does not draw its own over it
+			assert_eq!(part.texture, None, "{name}");
 		}
 	}
 

@@ -61,7 +61,8 @@ How `Part.Color`, mesh vertex colors (`FileMesh` or `EditableMesh` `AddColor`/`S
 
 ## Characters and skinned meshes
 
-- R6 and R15 characters load base rigs from `rbxasset://avatar/...`, apply `CharacterMesh`es, and composite `BodyColors` beneath `Shirt`, `Pants`, and `ShirtGraphic` on classic clothing templates (`render::skinning`, `scene::extract`).
+- R6 and R15 characters load base rigs from `rbxasset://avatar/...`, apply `CharacterMesh`es, and composite `BodyColors` beneath `Shirt`, `Pants`, and `ShirtGraphic` on classic clothing templates (`render::composite`, `scene::character`).
+- An R15 limb group (the torso, an arm, a leg) draws as one texture: the first part from the upper one down with a `TextureID` gives every part of the group its colour and that texture, drawn over the clothing at the composite's resolution; without one, the upper part's colour. A part with a `SurfaceAppearance` shows it alone, without clothing.
 - Skinned meshes are posed by their `Bone` hierarchy on the CPU before drawing with their assigned materials. A part's Bones are its `Bone` children and theirs (not those under a nested part); among joined parts a `WeldConstraint`'s Bones win over a `Weld`'s and a `Weld`'s over a `Motor6D`'s. A vertex without weights lands on the world origin, as in a Roblox client.
 
 ## Highlights

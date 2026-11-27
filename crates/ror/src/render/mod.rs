@@ -878,6 +878,7 @@ mod surface_tests {
 			pants: None,
 			shirt: Some(crate::scene::character::Layer { image: uri.clone(), tint: [1.0, 1.0, 1.0] }),
 			graphic: None,
+			overlay: None,
 		};
 		let local_key = composite::key(&local_comp);
 		assert!(names_local_file(&local_key));
@@ -893,6 +894,7 @@ mod surface_tests {
 			pants: None,
 			shirt: Some(crate::scene::character::Layer { image: "rbxassetid://123".into(), tint: [1.0, 1.0, 1.0] }),
 			graphic: None,
+			overlay: None,
 		};
 		let remote_key = composite::key(&remote_comp);
 		assert!(!names_local_file(&remote_key));

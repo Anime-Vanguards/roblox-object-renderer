@@ -631,13 +631,13 @@ impl Key {
 		});
 		self.optional(*body_part, |key, part| key.number(part as u64));
 		self.optional(composite.as_ref(), |key, composite| {
-			let crate::scene::character::Composite { layout, colors, pants, shirt, graphic } = composite;
+			let crate::scene::character::Composite { layout, colors, pants, shirt, graphic, overlay } = composite;
 			key.number(*layout as u64);
 			key.number(colors.len() as u64);
 			for color in colors {
 				key.floats(color);
 			}
-			for layer in [pants, shirt, graphic] {
+			for layer in [pants, shirt, graphic, overlay] {
 				key.optional(layer.as_ref(), |key, layer| {
 					let crate::scene::character::Layer { image, tint } = layer;
 					key.content(image);
@@ -1373,6 +1373,7 @@ mod retry_tests {
 			pants: None,
 			shirt: Some(Layer { image: uri, tint: [1.0, 1.0, 1.0] }),
 			graphic: None,
+			overlay: None,
 		});
 
 		let key_a = super::key(&scene, 0.0, false);

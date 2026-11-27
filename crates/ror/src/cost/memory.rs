@@ -893,7 +893,7 @@ fn collect_scene_textures(
 			}
 		}
 		if let Some(composite) = &part.composite {
-			for layer in [&composite.pants, &composite.shirt, &composite.graphic].into_iter().flatten() {
+			for layer in composite.layers() {
 				add_uri(out, &layer.image, false, false);
 			}
 		}

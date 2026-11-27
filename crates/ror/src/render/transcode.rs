@@ -104,7 +104,7 @@ pub fn downloads(scene: &Scene) -> Vec<ror_assets::Download> {
 			image(&decal.texture, &mut out);
 		}
 		if let Some(composite) = &part.composite {
-			for layer in [&composite.pants, &composite.shirt, &composite.graphic].into_iter().flatten() {
+			for layer in composite.layers() {
 				out.push(Download::Asset(layer.image.clone()));
 			}
 		}

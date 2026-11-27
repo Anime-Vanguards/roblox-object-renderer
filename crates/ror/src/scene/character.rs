@@ -62,6 +62,22 @@ pub struct Composite {
 	pub pants: Option<Layer>,
 	pub shirt: Option<Layer>,
 	pub graphic: Option<Layer>,
+	/// An R15 limb group's TextureID, over the clothing across the whole texture (a Roblox client:
+	/// talpha, ttwo, thand; notes/render.md "Clothing").
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub overlay: Option<Layer>,
+}
+
+impl Composite {
+	/// The images it is drawn from, in drawing order: pants, shirt, the T-shirt graphic, the overlay.
+	pub fn layers(&self) -> impl Iterator<Item = &Layer> {
+		[&self.pants, &self.shirt, &self.graphic, &self.overlay].into_iter().flatten()
+	}
+
+	/// [`Composite::layers`], to rewrite their images.
+	pub fn layers_mut(&mut self) -> impl Iterator<Item = &mut Layer> {
+		[&mut self.pants, &mut self.shirt, &mut self.graphic, &mut self.overlay].into_iter().flatten()
+	}
 }
 
 /// A CharacterMesh: the mesh an R6 limb draws instead of its own (its BaseTextureId and
@@ -81,6 +97,8 @@ pub struct Character {
 	pub graphic: Option<Layer>,
 	/// The colour of each body part by name: the part's own, or its BodyColors colour.
 	pub colors: HashMap<String, Vec3>,
+	/// An R15 body part MeshPart's TextureID, by name.
+	pub textures: HashMap<String, String>,
 	/// BodyColors: head, torso, left arm, right arm, left leg, right leg (sRGB 0..1).
 	pub body_colors: Option<[Vec3; 6]>,
 	/// CharacterMeshes by `Enum.BodyPart` (0 Head, 1 Torso, 2 LeftArm, 3 RightArm, 4 LeftLeg, 5 RightLeg).
@@ -103,7 +121,7 @@ pub fn body_part_index(limb: &str) -> Option<usize> {
 impl Character {
 	fn read(document: &Document, model: &Instance, humanoid: &Instance) -> Character {
 		let rig_type = props::enum_value(humanoid, "RigType", 0);
-		let mut character = Character { rig_type, shirt: None, pants: None, graphic: None, colors: HashMap::new(), body_colors: None, meshes: HashMap::new() };
+		let mut character = Character { rig_type, shirt: None, pants: None, graphic: None, colors: HashMap::new(), textures: HashMap::new(), body_colors: None, meshes: HashMap::new() };
 		let layer = |instance: &Instance, names: &[&str]| -> Option<Layer> {
 			let image = props::content(instance, names)?;
 			let tint = props::color(instance, "Color3", Vec3::ONE);
@@ -125,8 +143,14 @@ impl Character {
 						character.meshes.entry(body_part).or_insert(LimbMesh { mesh });
 					}
 				}
-				_ if props::class_is_a(child.class.as_str(), "BasePart") && limbs.contains(&child.name.as_str()) => {
-					character.colors.entry(child.name.clone()).or_insert_with(|| props::color(child, "Color", Vec3::splat(163.0 / 255.0)));
+				_ if props::class_is_a(child.class.as_str(), "BasePart") && limbs.contains(&child.name.as_str()) && !character.colors.contains_key(&child.name) => {
+					character.colors.insert(child.name.clone(), props::color(child, "Color", Vec3::splat(163.0 / 255.0)));
+					if rig_type == 1
+						&& child.class == "MeshPart"
+						&& let Some(texture) = props::content(child, &["TextureContent", "TextureID"])
+					{
+						character.textures.insert(child.name.clone(), texture);
+					}
 				}
 				_ => {}
 			}
@@ -141,9 +165,20 @@ impl Character {
 		character
 	}
 
-	/// A body part's colour as the character shows it.
+	/// A body part's colour as the character shows it: an R15 limb group draws in one colour, its
+	/// representative's ([`Character::representative`]; a Roblox client: tcolorbare, tcolor).
 	pub fn color(&self, limb: &str) -> Option<Vec3> {
+		let limb = if self.rig_type == 1 { self.representative(limb).unwrap_or(limb) } else { limb };
 		self.colors.get(limb).copied()
+	}
+
+	/// The R15 body part that decides what its limb group (the torso, an arm, a leg) draws: the first
+	/// of the group, from the upper part down, with a TextureID, else its upper part (the first there).
+	/// The group draws in its colour, with its TextureID over the clothing across every part of the
+	/// group (a Roblox client, R15 rigs: ttwo, thand, tlower, tcolor, tcolorbare).
+	pub fn representative(&self, limb: &str) -> Option<&'static str> {
+		let group = r15_group(limb)?;
+		group.iter().copied().find(|name| self.textures.contains_key(*name)).or_else(|| group.iter().copied().find(|name| self.colors.contains_key(*name)))
 	}
 
 	/// The CharacterMesh an R6 limb draws, if any.
@@ -174,7 +209,7 @@ impl Character {
 				"RightUpperLeg" | "RightLowerLeg" | "RightFoot" => (Layout::R15RightLeg, None, legs),
 				_ => return None,
 			};
-			(layout, vec![color(limb)], shirt, pants)
+			(layout, vec![color(self.representative(limb).unwrap_or(limb))], shirt, pants)
 		} else {
 			if !matches!(limb, "Torso" | "Left Arm" | "Right Arm" | "Left Leg" | "Right Leg") {
 				return None;
@@ -183,11 +218,29 @@ impl Character {
 		};
 		// a ShirtGraphic on the torso's front, R6's or R15's (characters: r15-graphic)
 		let graphic = matches!(layout, Layout::R6 | Layout::R15Torso).then(|| self.graphic.clone()).flatten();
-		if shirt.is_none() && pants.is_none() && graphic.is_none() {
+		// an R15 limb group's TextureID, drawn into the composite over the clothing (blurred to the
+		// composite's resolution as a client shows it, even without clothing: fine, fineplain)
+		let overlay = (self.rig_type == 1)
+			.then(|| self.representative(limb).and_then(|name| self.textures.get(name)))
+			.flatten()
+			.map(|image| Layer { image: image.clone(), tint: [1.0; 3] });
+		if shirt.is_none() && pants.is_none() && graphic.is_none() && overlay.is_none() {
 			return None;
 		}
-		Some(Composite { layout, colors, pants: pants.cloned(), shirt: shirt.cloned(), graphic })
+		Some(Composite { layout, colors, pants: pants.cloned(), shirt: shirt.cloned(), graphic, overlay })
 	}
+}
+
+/// The R15 limb group a body part belongs to, from its upper part down (the head is none).
+fn r15_group(limb: &str) -> Option<&'static [&'static str]> {
+	const GROUPS: [&[&str]; 5] = [
+		&["UpperTorso", "LowerTorso"],
+		&["LeftUpperArm", "LeftLowerArm", "LeftHand"],
+		&["RightUpperArm", "RightLowerArm", "RightHand"],
+		&["LeftUpperLeg", "LeftLowerLeg", "LeftFoot"],
+		&["RightUpperLeg", "RightLowerLeg", "RightFoot"],
+	];
+	GROUPS.into_iter().find(|group| group.contains(&limb))
 }
 
 /// Characters found while extracting, by model.
