@@ -1079,6 +1079,17 @@ mod surface_tests {
 	}
 }
 
+/// `Enum.SurfaceType` values drawn as geometry of their own ([`Renderer::push_joints`]).
+const SURFACE_HINGE: u32 = 6;
+const SURFACE_MOTOR: u32 = 7;
+const SURFACE_STEPPING_MOTOR: u32 = 8;
+/// A joint's pieces: (length along the face normal, diameter, linear colour). The client's pin reads
+/// 127, 127, 0 and its disc 44 where a white face reads 182 under flat Ambient 0.7: SmoothPlastic of
+/// (0.7, 0.7, 0) and 0.345 gray (geo1 top, side and oblique views, within 1 of 255; under a low sun
+/// the client's read 5 % darker, 119 and 41).
+const JOINT_PIN: (f32, f32, Vec3) = (1.0, 0.4, Vec3::new(0.49, 0.49, 0.0));
+const JOINT_DISC: (f32, f32, Vec3) = (0.25, 0.8, Vec3::splat(0.119));
+
 /// The surface types a part shows (`InstanceData.flags.z`): per NormalId face 4 bits, 0 for none or
 /// 1 + the atlas group (Studs, Glue / Weld, Inlet, Universal). Only Plastic primitives draw them, on
 /// every face but a cylinder's caps (surfaces, surfaces-shapes: other materials, meshes and caps
@@ -1581,6 +1592,9 @@ struct DrawItem {
 	/// An invisible part a Highlight covers, drawn only into the Highlights' mask, or a shadow-only
 	/// part, drawn only into the shadow maps
 	highlight_only: bool,
+	/// Drawn into the ambient occlusion's depth and normals when opaque (not a joint's pin and disc:
+	/// [`Renderer::push_joints`])
+	occludes: bool,
 }
 
 impl DrawItem {
@@ -1597,8 +1611,8 @@ impl DrawItem {
 			&& runs
 			&& self.indices == other.indices
 			&& self.instance == other.instance
-			&& (self.transparent, self.double_sided, self.casts_shadow, self.casts_light_shadow, self.shadow_cutout, self.decal, self.forcefield, self.write_depth, self.glass, self.highlight_only)
-				== (other.transparent, other.double_sided, other.casts_shadow, other.casts_light_shadow, other.shadow_cutout, other.decal, other.forcefield, other.write_depth, other.glass, other.highlight_only)
+			&& (self.transparent, self.double_sided, self.casts_shadow, self.casts_light_shadow, self.shadow_cutout, self.decal, self.forcefield, self.write_depth, self.glass, self.highlight_only, self.occludes)
+				== (other.transparent, other.double_sided, other.casts_shadow, other.casts_light_shadow, other.shadow_cutout, other.decal, other.forcefield, other.write_depth, other.glass, other.highlight_only, other.occludes)
 			&& self.center.to_array().map(f32::to_bits) == other.center.to_array().map(f32::to_bits)
 			&& self.bound.0.to_array().map(f32::to_bits) == other.bound.0.to_array().map(f32::to_bits)
 			&& self.bound.1.to_bits() == other.bound.1.to_bits()
@@ -4378,6 +4392,7 @@ impl Renderer {
 					glass: false,
 					decal_order: (part_index, decal.z_index, decal_index as u32),
 					highlight_only: false,
+					occludes: true,
 				});
 			}
 			// an invisible part draws nothing, but a Highlight on it still draws (an invisible Glass part:
@@ -4554,9 +4569,89 @@ impl Renderer {
 				glass: params.shading == materials::SHADING_GLASS && opacity < 1.0 && !part.shadow_only,
 				decal_order: (0, 0, 0),
 				highlight_only: highlight_only || part.shadow_only,
+				occludes: true,
 			});
+			if !highlight_only && !part.shadow_only {
+				self.push_joints(part, instances, draws, missing);
+			}
 		}
 		(out, stable)
+	}
+
+	/// The geometry of a part's Hinge, Motor and SteppingMotor surfaces (notes/render.md "Surfaces"):
+	/// on each such face of the part's box, at its centre, a yellow pin 0.4 studs across reaching
+	/// 0.5 studs out of the face (and as far into it), and for a motor a dark disc 0.8 across standing
+	/// 0.125 studs out; opaque and the same size on every part (a Roblox client 0.747, fixture
+	/// geo1: blocks of 1 to 16 studs, a 0.2-stud plate the pin shows under, Balls, Cylinders and
+	/// wedges at their box's faces, every material, a part at Transparency 0.5; nothing at 1).
+	fn push_joints(&self, part: &Part, instances: &mut Vec<InstanceData>, draws: &mut Vec<DrawItem>, missing: &mut Vec<String>) {
+		if part.transparency >= 1.0 || !matches!(part.geometry, Geometry::Block | Geometry::Ball | Geometry::Cylinder | Geometry::Wedge | Geometry::CornerWedge) {
+			return;
+		}
+		if !part.surfaces.iter().any(|&surface| matches!(surface, SURFACE_HINGE | SURFACE_MOTOR | SURFACE_STEPPING_MOTOR)) {
+			return;
+		}
+		let mesh = self.primitives[&Primitive::Cylinder].clone();
+		let material = self.material_bind_group(&MaterialKey::default(), missing);
+		let params = materials::params(272);
+		for (face, surface) in part.surfaces.iter().enumerate() {
+			let pieces: &[(f32, f32, Vec3)] = match *surface {
+				SURFACE_HINGE => &[JOINT_PIN],
+				SURFACE_MOTOR | SURFACE_STEPPING_MOTOR => &[JOINT_PIN, JOINT_DISC],
+				_ => continue,
+			};
+			// NormalId order: Right, Top, Back, Left, Bottom, Front
+			let normal = [Vec3::X, Vec3::Y, Vec3::Z, Vec3::NEG_X, Vec3::NEG_Y, Vec3::NEG_Z][face];
+			let center = normal * (part.size * 0.5).dot(normal.abs());
+			let turn = glam::Quat::from_rotation_arc(Vec3::X, normal);
+			for &(length, diameter, color) in pieces {
+				// the cylinder primitive lies along X, 1 stud long and across, centred on the face
+				let world = part.cframe * Affine3A::from_scale_rotation_translation(Vec3::new(length, diameter, diameter), turn, center);
+				let index = instances.len() as u32;
+				instances.push(InstanceData {
+					model: Mat4::from(world).to_cols_array_2d(),
+					normal_matrix: Mat4::from_mat3(glam::Mat3::from(world.matrix3).inverse().transpose()).to_cols_array_2d(),
+					color: [color.x, color.y, color.z, 1.0],
+					params: [params.roughness, params.metalness, 0.0, 0.0],
+					size: [length, diameter, diameter, 4.0],
+					flags: [params.shading, 0, 0, UV_MESH],
+					tiling: [0.0; 4],
+					// its part's box, as a decal's: the part's shading tier and cluster (cluster_boxes)
+					part_inverse: Mat4::from(part.cframe * Affine3A::from_scale(part.size)).inverse().to_cols_array_2d(),
+					specular: specular_params(&params),
+					material: [0.0; 4],
+					texture: [0.0, 0.0, 1.0, 0.0],
+					tint: [1.0; 4],
+					lobe: [0.0; 4],
+					cluster_low: [0.0; 4],
+					cluster_high: [0.0; 4],
+				});
+				draws.push(DrawItem {
+					drawn_bounds: culling::Bounds::new(mesh.drawn, world),
+					mesh: mesh.clone(),
+					indices: draw_lod(&mesh),
+					runs: None,
+					instance: index,
+					material: material.clone(),
+					transparent: false,
+					double_sided: false,
+					casts_shadow: part.cast_shadow,
+					casts_light_shadow: part.cast_shadow,
+					shadow_cutout: false,
+					center: world.translation.into(),
+					bound: (world.translation.into(), 0.5 * length.max(diameter) * std::f32::consts::SQRT_2),
+					decal: false,
+					forcefield: false,
+					write_depth: false,
+					glass: false,
+					decal_order: (0, 0, 0),
+					highlight_only: false,
+					// the client's occlusion leaves joints out: the face round a pin stays as bright as the
+					// rest of it, and the pin as its top (geo1 top and side views: 182 and 127 to the edge)
+					occludes: false,
+				});
+			}
+		}
 	}
 
 	/// What a preparation of these draws holds that its caches own too (prepared::PreparedGeometry::held).
@@ -5395,7 +5490,7 @@ impl Renderer {
 		// as big as the main pass's, 95 MB beside them)
 		let coverage = samples > 1;
 		if let Some(targets) = &ao_targets {
-			let opaque = visible_draws.iter().copied().filter(|draw| !draw.transparent && !draw.decal).map(|draw| (&draw.mesh.vertex_buffer, &draw.mesh.index_buffer, draw.indices.clone(), draw.instance, draw.double_sided));
+			let opaque = visible_draws.iter().copied().filter(|draw| !draw.transparent && !draw.decal && draw.occludes).map(|draw| (&draw.mesh.vertex_buffer, &draw.mesh.index_buffer, draw.indices.clone(), draw.instance, draw.double_sided));
 			// and the parts drawn by coverage where they cover every sample (particle-sa-coverage: Studio's
 			// panel darkens beside the dome map's opaque texels 3 studs in front of it, not beside the cone
 			// map's texels on 3 samples or fewer)
@@ -7114,6 +7209,52 @@ mod decal_uv_tests {
 			assert!(extent.iter().zip(expected).all(|(got, want)| (got - want).abs() < 0.04), "UVOffset {offset:?} UVScale {scale:?}: the square over {extent:?} of the face, expected {expected:?}");
 		}
 		drop(texture);
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+}
+
+#[cfg(test)]
+mod joint_and_fallback_tests {
+	use super::*;
+
+	/// What a Roblox client draws for joint surfaces: a Motor's yellow pin and dark disc on its face (a
+	/// Hinge's pin alone, nothing on an invisible part).
+	#[test]
+	fn joints_draw_as_a_client_does() {
+		let state = std::env::temp_dir().join(format!("ror-joint-test-{}", std::process::id()));
+		std::fs::create_dir_all(&state).unwrap();
+		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let environment = crate::scene::Environment { brightness: 0.0, ambient: Vec3::splat(0.7), outdoor_ambient: Vec3::ZERO, environment_diffuse_scale: 0.0, environment_specular_scale: 0.0, global_shadows: false, ..Default::default() };
+		// straight down onto a 4-stud block's top from 20 studs: 64 pixels across 7.05 studs
+		let size = 64u32;
+		let request = ViewRequest { width: size, height: size, camera: CameraSpec::LookAt { eye: [0.0, 22.0, -0.01], target: [0.0, 2.0, 0.0], fov: 20.0 }, background: Background::Color([0.0; 3]), bloom: false, ..Default::default() };
+		let draw = |class: &'static str, setup: &dyn Fn(&mut crate::scene::Part)| -> Vec<[u8; 3]> {
+			let mut model = crate::scene::build::ModelBuilder::new("Joint");
+			model.part(&crate::scene::build::PartSpec { class, name: "Block".into(), size: Vec3::splat(4.0), color: [255, 255, 255], cast_shadow: false, ..Default::default() });
+			let mut scene = crate::scene::extract::extract(&model.into_document());
+			scene.environment = environment.clone();
+			setup(Arc::make_mut(&mut scene.parts[0]));
+			let (images, _) = renderer.render(&scene, std::slice::from_ref(&request)).unwrap();
+			images[0].rgba.chunks(4).map(|pixel| [pixel[0], pixel[1], pixel[2]]).collect()
+		};
+		// the pixel `studs` right of the face's centre
+		let at = |image: &[[u8; 3]], studs: f32| image[(size / 2 * size) as usize + (size as f32 * 0.5 + studs * size as f32 / 7.05) as usize];
+		let motor = draw("Part", &|part| part.surfaces[1] = SURFACE_MOTOR);
+		let (pin, disc, face) = (at(&motor, 0.05), at(&motor, 0.32), at(&motor, 1.2));
+		assert!(pin[0] > 100 && pin[0].abs_diff(pin[1]) < 4 && pin[2] < 10, "the pin: {pin:?}");
+		assert!(disc[0] < 60 && disc[0].abs_diff(disc[2]) < 4, "the disc: {disc:?}");
+		assert!(face[0] > 150, "the face: {face:?}");
+		let hinge = draw("Part", &|part| part.surfaces[1] = SURFACE_HINGE);
+		assert_eq!(at(&hinge, 0.05), pin);
+		assert!(at(&hinge, 0.32)[0] > 150, "a Hinge has no disc: {:?}", at(&hinge, 0.32));
+		let invisible = draw("Part", &|part| {
+			part.surfaces[1] = SURFACE_MOTOR;
+			part.transparency = 1.0;
+		});
+		assert_eq!(at(&invisible, 0.05), [0, 0, 0], "an invisible part's joint");
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
 	}
