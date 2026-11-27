@@ -29,6 +29,17 @@ const MAX_PARTICLES: usize = 4096;
 /// between 0.1 and 0.12, a little over 0.1 against rounding).
 const STUDIO_NEAR: f32 = 0.11;
 
+/// A VelocityParallel or VelocityPerpendicular particle moving at most this many studs a second draws
+/// nothing (particle-slow-orient: at Speed 0 Studio shows nothing, at 0.0635 they turn as faster ones;
+/// particle-slow-speeds: arrows at 0.0005 draw; `fixtures/particle-probes.luau` "slow" in a Roblox
+/// client, 0.747: none at 1e-4 or below and every one from 1.1e-4, along the world's axes, (1, 1, 1),
+/// towards the camera and across it, flying or frozen, parallel and perpendicular alike; along (1, 1, 0)
+/// one at 1e-4 a rounding over. By the speed it has then: ones slowed by Drag from 1 stud a second go
+/// once under it, Drag 13 kept at 1.06e-4 a second in, 13.3 gone at 8.6e-5). Effects in models scaled
+/// down keep their tiny speeds: a game's black hole, at Scale 0.01, has three Brightness-22 flipbooks
+/// at 1.8e-5 to 2.8e-5 studs a second that the client never draws, and ror drew them.
+const SLOWEST_ORIENTED: f32 = 1e-4;
+
 /// Random flipbooks step at floor(age · FlipbookFramerate + this) (particle-flipbook-clock half: a
 /// Loop grid beside the Random one pins the age at 0.4902-0.4906 s, where every Random cell fits a
 /// phase of 0.42-0.45 and none fits floor + 1 or rounding: framerates 46-52 would step at 0.5. With
@@ -1018,10 +1029,9 @@ pub fn quads_at(emitter: &ParticleEmitter, particles: &[Particle], camera: &Came
 			size *= moved / depth;
 		}
 		let velocity = particle.velocity.normalize_or_zero();
-		// a velocity-oriented particle at rest has no orientation and draws nothing (particle-slow-
-		// orient: VelocityParallel and VelocityPerpendicular at Speed 0 show nothing; at 0.0635 studs a
-		// second they turn as faster ones)
-		if matches!(emitter.orientation, 2 | 3) && velocity == Vec3::ZERO {
+		// a velocity-oriented particle at rest has no orientation and draws nothing, nor one slower than
+		// SLOWEST_ORIENTED
+		if matches!(emitter.orientation, 2 | 3) && particle.velocity.length_squared() <= SLOWEST_ORIENTED * SLOWEST_ORIENTED {
 			continue;
 		}
 		// the image's right (u) and up (-v) axes before the rotation
@@ -1509,6 +1519,28 @@ mod tests {
 		for orientation in [2, 3] {
 			assert!(fade_depth(orientation) < 0.01, "orientation {orientation}");
 		}
+	}
+
+	/// A Roblox client draws no velocity-oriented particle moving at 1e-4 studs a second or slower, by the
+	/// speed it has then (fixtures/particle-probes.luau "slow"); camera-facing ones draw at any speed
+	#[test]
+	fn velocity_oriented_particles_slower_than_the_least_speed_draw_nothing() {
+		let camera = super::super::camera::CameraSpec::LookAt { eye: [0.0, 20.0, -40.0], target: [0.0, 0.0, 0.0], fov: 20.0 }.place(None, 100, 100);
+		let drawn = |orientation: u32, speed: f32, drag: f32| {
+			// emitted a second before the render
+			let emitter = ParticleEmitter { orientation, speed: (speed, speed), drag, lifetime: (5.0, 5.0), size_keys: vec![(0.0, 1.0, 0.0), (1.0, 1.0, 0.0)], bursts: vec![(1.0, 1)], ..emitter() };
+			let mut vertices = Vec::new();
+			quads(&emitter, &simulate(&emitter), &camera, 1.0, None, &mut vertices);
+			!vertices.is_empty()
+		};
+		for orientation in [2, 3] {
+			// a game's black hole's flipbooks, at 2.8e-5 studs a second, and the client's cut
+			assert!(!drawn(orientation, 2.8e-5, 0.0) && !drawn(orientation, 1e-4, 0.0), "orientation {orientation}");
+			assert!(drawn(orientation, 1.1e-4, 0.0) && drawn(orientation, 1.5e-4, 0.0), "orientation {orientation}");
+		}
+		// one slowed under it by Drag goes too (from 1 stud a second, a second on: 2^-12 and 2^-14 of it left)
+		assert!(drawn(2, 1.0, 12.0) && !drawn(2, 1.0, 14.0));
+		assert!(drawn(0, 2.8e-5, 0.0) && drawn(0, 0.0, 0.0));
 	}
 
 	#[test]

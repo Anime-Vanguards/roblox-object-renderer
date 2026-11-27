@@ -23,6 +23,11 @@
 -- "smoke" (x 5000, seen from -Z): black Smoke (Opacity 1, no rise) 90 studs from the camera over a black
 --   Neon panel and over a black Neon wall 400 studs off, and opaque black ParticleEmitter squares beside
 --   them.
+-- "slow" (x 10000, seen from 45 degrees above -Z): velocity-oriented particles nearly at rest, one each,
+--   opaque white squares of Size 0.5 left to fly: VelocityParallel leaving along the world's up, (1, 1, 1),
+--   X, Z, towards the camera and (1, 1, 0), VelocityPerpendicular along up and towards the camera (rows),
+--   at Speed 0 to 0.001 studs a second (columns); VelocityParallel ones slowed by Drag 0 to 30 from 1 stud a
+--   second (last row); `slow-ref` measures the age.
 -- "taper" (x 6000 on, 100 studs apart along X, each seen alone from 400 studs off -Z at a field of view
 --   of 6, 2.5 part lengths either side): 12 x 2 x 2 Cylinders along X (EmissionDirection Top) at
 --   ShapePartial -2 to 5, Volume and Surface, 1000 or 3000 additive particles each where they spawn, as
@@ -259,6 +264,49 @@ return function(Context)
 				ShapeStyle = Enum.ParticleEmitterShapeStyle[Case[2]],
 			})
 		end
+	end
+
+	-- slow: velocity-oriented particles nearly at rest
+	do
+		local Center = Vector3.new(10000, 0, 0)
+		local Model = Group("slow", Center, { eye = { 10000, 28, -28 }, target = { 10000, 0, 0 }, fov = 40 })
+		Block(Model, "Floor", CFrame.new(Center + Vector3.new(0, -6, 0)), Vector3.new(200, 1, 200), Color3.new(0, 0, 0), Enum.Material.Neon)
+		local Speeds = { 0, 5e-5, 6e-5, 7e-5, 8e-5, 9e-5, 1e-4, 1.1e-4, 1.2e-4, 1.3e-4, 1.4e-4, 1.5e-4, 2e-4, 1e-3 }
+		-- the emitter's Top turned to the direction
+		local function Towards(Direction)
+			local Up = Direction.Unit
+			local Right = (if math.abs(Up.X) < 0.9 then Vector3.xAxis else Vector3.zAxis):Cross(Up).Unit
+			return CFrame.fromMatrix(Vector3.zero, Right, Up)
+		end
+		local Rows = {
+			{ "Parallel", "up", Vector3.new(0, 1, 0) }, { "Parallel", "diag", Vector3.new(1, 1, 1) }, { "Parallel", "x", Vector3.new(1, 0, 0) },
+			{ "Parallel", "z", Vector3.new(0, 0, 1) }, { "Parallel", "back", Vector3.new(0, 1, -1) }, { "Parallel", "xy", Vector3.new(1, 1, 0) },
+			{ "Perpendicular", "up", Vector3.new(0, 1, 0) }, { "Perpendicular", "back", Vector3.new(0, 1, -1) },
+		}
+		for Row, Spec in Rows do
+			for Column, Speed in Speeds do
+				local Position = Center + Vector3.new((Column - 7.5) * 2, 0, (Row - 4.5) * 2.5)
+				local At = Anchor(Model, `{Spec[1]}-{Spec[2]}-{Column}-anchor`, CFrame.new(Position) * Towards(Spec[3]))
+				Emitter(At, `{Spec[1]}-{Spec[2]}-{Column}`, 1, {
+					Size = Constant(0.5),
+					Speed = NumberRange.new(Speed, Speed),
+					Orientation = Enum.ParticleOrientation["Velocity" .. Spec[1]],
+				})
+			end
+		end
+		-- slowed by Drag from 1 stud a second: 2^-Drag of it left after a second
+		for Column, Drag in { 0, 10, 11, 12, 12.5, 13, 13.3, 13.6, 14, 15, 17, 20, 25, 30 } do
+			local At = Anchor(Model, `drag-{Column}-anchor`, CFrame.new(Center + Vector3.new((Column - 7.5) * 2, 0, (9 - 4.5) * 2.5)))
+			Emitter(At, `drag-{Column}`, 1, {
+				Size = Constant(0.5),
+				Speed = NumberRange.new(1, 1),
+				Drag = Drag,
+				Orientation = Enum.ParticleOrientation.VelocityParallel,
+			})
+		end
+		-- `ref` (camera-facing, 4 studs a second up from the floor's edge) measures the age
+		local Ref = Anchor(Model, "slow-ref-anchor", CFrame.new(Center + Vector3.new(-18, -5, 0)))
+		Emitter(Ref, "slow-ref", 1, { Size = Constant(0.3), Speed = NumberRange.new(4, 4) })
 	end
 
 	-- smoke: legacy Smoke in fog
