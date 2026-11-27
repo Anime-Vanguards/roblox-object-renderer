@@ -606,9 +606,12 @@ const VIEWPORT_LIGHT: f32 = 1.03;
 const VIEWPORT_AMBIENT: f32 = 1.03;
 const VIEWPORT_TOWARDS: f32 = 1.0;
 /// Neon in a ViewportFrame as a share of its emission in Lighting's world (`neon_emission`; Roblox
-/// draws Neon "at the lowest quality" there): the cards with Neon fit half (one card's
-/// shiny card: its 39,556 Neon pixels a mean 2.0 of 255 off at 0.5, 15.8 at 1).
-const VIEWPORT_NEON: f32 = 0.5;
+/// draws Neon "at the lowest quality" there): the cards with Neon fit about half (one card's
+/// shiny card: its 39,556 Neon pixels a mean 2.0 of 255 off at 0.5, 15.8 at 1); a Roblox client
+/// (0.747 and 0.748 at level 21, fixtures/screen-guis.luau "vp-neon-ladder": greys 0.2-0.5 and six
+/// colours, lit by the frame's light or not alike) fits 0.515, its channels below white a mean 0.6
+/// of 255 off (2.3 at 0.5).
+const VIEWPORT_NEON: f32 = 0.515;
 
 fn viewport_tune() -> [f32; 4] {
 	static TUNE: std::sync::OnceLock<[f32; 4]> = std::sync::OnceLock::new();

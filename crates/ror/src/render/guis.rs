@@ -2225,6 +2225,55 @@ mod tests {
 		let _ = std::fs::remove_dir_all(&state);
 	}
 
+	/// Neon in a ScreenGui's ViewportFrame emits 0.515 of what it emits in the world: a grey 0.5 plate (stored as 127)
+	/// reads 230 of 255 as in a Roblox client (fixtures/screen-guis.luau "vp-neon-ladder"); half read 227.
+	#[test]
+	fn neon_in_a_viewport_frame_glows_as_in_a_client() {
+		use crate::render::camera::CameraSpec;
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use rbx_dom_weak::InstanceBuilder;
+		use rbx_dom_weak::types::{CFrame, Color3, Enum, Matrix3, UDim, UDim2, Variant, Vector3};
+
+		let state = std::env::temp_dir().join(format!("ror-viewport-neon-test-{}", std::process::id()));
+		std::fs::create_dir_all(&state).unwrap();
+		let gpu = crate::render::test_gpu();
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let (width, height) = (64u32, 64u32);
+		let mut model = ModelBuilder::new("Scene");
+		let player_gui = model.child(model.model, InstanceBuilder::new("PlayerGui").with_name("PlayerGui"));
+		let view = model.child(player_gui, InstanceBuilder::new("ScreenGui").with_name("View").with_property("ScreenInsets", Enum::from_u32(1)));
+		let frame = model.child(
+			view,
+			InstanceBuilder::new("ViewportFrame")
+				.with_property("Size", UDim2::new(UDim::new(1.0, 0), UDim::new(1.0, 0)))
+				.with_property("BackgroundTransparency", 1.0f32)
+				.with_property("Ambient", Color3::new(0.0, 0.0, 0.0))
+				.with_property("LightColor", Color3::new(0.0, 0.0, 0.0)),
+		);
+		let world = model.child(frame, InstanceBuilder::new("WorldModel"));
+		let plate = model.part(&PartSpec { name: "Neon".into(), size: glam::Vec3::new(20.0, 20.0, 0.2), color: [127, 127, 127], material: 288, cast_shadow: false, ..Default::default() });
+		model.dom.transfer_within(plate, world);
+		let camera = model.child(frame, InstanceBuilder::new("Camera").with_property("CFrame", CFrame::new(Vector3::new(0.0, 0.0, 10.0), Matrix3::identity())).with_property("FieldOfView", 40.0f32));
+		model.set(frame, "CurrentCamera", Variant::Ref(camera));
+		let scene = crate::scene::extract::extract(&model.into_document());
+		let request = ViewRequest { width, height, camera: CameraSpec::LookAt { eye: [0.0, 0.0, 10.0], target: [0.0; 3], fov: 40.0 }, background: super::super::Background::Color([0.0, 0.0, 0.0]), bloom: false, gui_scale: Some(1.0), ..Default::default() };
+		let place = request.camera.place(None, width, height);
+		let mut images = Vec::new();
+		for draw in plan(&scene, &place, &request) {
+			let (columns, rows) = rur::image_size(draw.key.canvas(), draw.key.scale(), draw.key.margin());
+			images.push((draw.key, Arc::new(GuiImage::from_rgba(columns, rows, vec![0u8; (columns * rows * 4) as usize]).unwrap()), false));
+		}
+		let (mut textures, mut warnings, mut skipped) = (HashMap::new(), Vec::new(), HashMap::new());
+		renderer.upload_guis(images, &mut textures, &mut warnings, &mut skipped);
+		let (pending, mut stats) = renderer.submit_views(&scene, std::slice::from_ref(&request), None, None, Some((textures, skipped)), None, None).unwrap();
+		let image = pending.into_iter().next().unwrap().finish(&mut stats).unwrap().rgba;
+		let middle = image[((32 * width + 32) * 4) as usize];
+		assert!((229..=231).contains(&middle), "a grey 0.5 Neon plate in a frame reads {middle}, a client 230");
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
 	/// A Humanoid's name over its head is drawn over the finished image at the text size its distance gives, fading
 	/// out over the last tenth of NameDisplayDistance, and not while a part stands between the camera and the head
 	/// (fixtures/name-tags.luau in a Roblox client). Before, no name was drawn.

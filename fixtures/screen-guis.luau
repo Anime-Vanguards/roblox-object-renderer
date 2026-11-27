@@ -8,7 +8,8 @@
 -- "viewports": ViewportFrames holding Neon and Glass, a Sky, coloured light and ambient, what the world
 -- draws around parts (fog, Atmosphere, bloom, local lights, Highlights, GUIs, particles, beams), a UICorner, a
 -- wide and a tall frame (the field of view's axis), a UIGradient, Rotation, a vertex-alpha hole through a
--- framed one's background, a CanvasGroup, and studs on balls and cylinders.
+-- framed one's background, a CanvasGroup, studs on balls and cylinders, and ladders of Neon, Glass and
+-- Metal.
 --
 -- ror render fixtures/screen-guis.luau --context '{"Case":"inset-None"}' --size 1644x1116@1 --camera ...
 -- (ROR_REE, ROR_RUR; Lighting from a place with black light)
@@ -102,6 +103,36 @@ local function Tie(Order: string)
 	Frame(A, "Red", Color3.new(1, 0, 0), UDim2.fromOffset(200, 200), UDim2.fromOffset(300, 200))
 	Frame(B, "Green", Color3.new(0, 1, 0), UDim2.fromOffset(350, 280), UDim2.fromOffset(300, 200))
 	return { A, B }, Order
+end
+
+-- a mesh of quads whose every vertex has alpha 0 round an opening `Opening` studs across (half sizes), out to
+-- `Outer`, facing +Z: in a ViewportFrame's world it hides what lies behind it and is a hole through the picture
+local function Mask(Opening: Vector2, Outer: number): MeshPart
+	local AssetService = game:GetService("AssetService")
+	local Mesh = AssetService:CreateEditableMesh({})
+	local Clear = Mesh:AddColor(Color3.new(0, 0, 0), 0)
+	local function Quad(A: Vector2, B: Vector2)
+		local Corners = {
+			Mesh:AddVertex(Vector3.new(A.X, A.Y, 0)),
+			Mesh:AddVertex(Vector3.new(B.X, A.Y, 0)),
+			Mesh:AddVertex(Vector3.new(B.X, B.Y, 0)),
+			Mesh:AddVertex(Vector3.new(A.X, B.Y, 0)),
+		}
+		for _, Face in { Mesh:AddTriangle(Corners[1], Corners[2], Corners[3]), Mesh:AddTriangle(Corners[1], Corners[3], Corners[4]) } do
+			Mesh:SetFaceColors(Face, { Clear, Clear, Clear })
+		end
+	end
+	Quad(Vector2.new(-Outer, Opening.Y), Vector2.new(Outer, Outer))
+	Quad(Vector2.new(-Outer, -Outer), Vector2.new(Outer, -Opening.Y))
+	Quad(Vector2.new(-Outer, -Opening.Y), Vector2.new(-Opening.X, Opening.Y))
+	Quad(Vector2.new(Opening.X, -Opening.Y), Vector2.new(Outer, Opening.Y))
+	local Item = AssetService:CreateMeshPartAsync(Content.fromObject(Mesh))
+	Item.Name = "Mask"
+	Item.Anchored = true
+	Item.DoubleSided = true
+	Item.Color = Color3.new(0, 0, 0)
+	Item.Material = Enum.Material.SmoothPlastic
+	return Item
 end
 
 local Cases = {}
@@ -299,8 +330,7 @@ Cases.viewports = {
 		end
 		return { Gui }
 	end,
-	-- VPF-1: Rotation of a frame with a background, a vertex-alpha hole through a framed one's background,
-	-- and a CanvasGroup holding a frame over a ViewportFrame
+	-- VPF-1: Rotation of a frame with a background, and a CanvasGroup holding a frame over a ViewportFrame
 	["vp-rotation"] = function()
 		local Gui = Screen("Vp", { IgnoreGuiInset = true })
 		for Index, Angle in { 0, 20 } do
@@ -317,6 +347,108 @@ Cases.viewports = {
 		local _, World = Viewport(Group, "Grouped", { 0, 0, 300, 300 }, EYE3, 40, { Ambient = Color3.fromRGB(120, 120, 120), BackgroundColor3 = Color3.fromRGB(120, 40, 40), ZIndex = 2 })
 		Part("Big", Vector3.new(6, 6, 6), CFrame.new(), Color3.new(1, 1, 1), World)
 		Frame(Group, "Over", Color3.new(0, 1, 0), UDim2.fromOffset(150, 150), UDim2.fromOffset(200, 200)).ZIndex = 1
+		return { Gui }
+	end,
+	-- VPF-1b: a vertex-alpha mask with an opening in front of a red block, in frames whose background is opaque,
+	-- half transparent and transparent, over a green frame: what the mask's hole shows
+	["vp-hole"] = function()
+		local Gui = Screen("Vp", { IgnoreGuiInset = true })
+		Frame(Gui, "Under", Color3.new(0, 1, 0), UDim2.fromOffset(40, 160), UDim2.fromOffset(1560, 400))
+		for Index, Transparency in { 0, 0.5, 1 } do
+			local _, World = Viewport(Gui, "Hole" .. Index, { 60 + (Index - 1) * 520, 200, 480, 320 }, Vector3.new(0, 0, 12), 40, { Ambient = Color3.fromRGB(120, 120, 120), BackgroundColor3 = Color3.fromRGB(40, 60, 120), BackgroundTransparency = Transparency })
+			Part("Back", Vector3.new(10, 6, 1), CFrame.new(0, 0, -2), Color3.new(1, 0, 0), World)
+			local Cover = Mask(Vector2.new(1.5, 1), 3)
+			Cover.CFrame = CFrame.new()
+			Cover.Parent = World
+			Part("Ball", Vector3.new(1.5, 1.5, 1.5), CFrame.new(-3.5, 1.5, 1), Color3.new(1, 1, 1), World, BALL)
+		end
+		return { Gui }
+	end,
+	-- VPF-2b: Neon greys and colours in a frame, lit by white light (top) and by none (bottom)
+	["vp-neon-ladder"] = function()
+		local Gui = Screen("Vp", { IgnoreGuiInset = true })
+		local Greys = { 0.2, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.8, 0.9 }
+		local Colors = { Color3.new(1, 0.5, 0), Color3.new(0.5, 1, 0.25), Color3.new(0.25, 0.5, 1), Color3.new(1, 0.75, 0.5), Color3.new(0.6, 0.3, 0.15), Color3.new(0.75, 0.75, 0.75) }
+		for Index, Light in { Color3.new(1, 1, 1), Color3.new(0, 0, 0) } do
+			local _, World = Viewport(Gui, "Ladder" .. Index, { 40, 60 + (Index - 1) * 400, 1560, 360 }, Vector3.new(0, 0, 40), 12, { LightColor = Light })
+			for Column, Grey in Greys do
+				Part("Grey", Vector3.new(1.6, 1.6, 0.2), CFrame.new((Column - 6.5) * 2, 1.2, 0), Color3.new(Grey, Grey, Grey), World, { Material = Enum.Material.Neon })
+			end
+			for Column, Color in Colors do
+				Part("Color", Vector3.new(1.6, 1.6, 0.2), CFrame.new((Column - 6.5) * 2, -1.2, 0), Color, World, { Material = Enum.Material.Neon })
+			end
+		end
+		return { Gui }
+	end,
+	-- VPF-2b: Glass and SmoothPlastic at Transparency 0, 0.25, 0.5 and 0.75 before a red, a white and a black block
+	["vp-glass-ladder"] = function()
+		local Gui = Screen("Vp", { IgnoreGuiInset = true })
+		for Index, Back in { Color3.new(1, 0, 0), Color3.new(1, 1, 1), Color3.new(0, 0, 0) } do
+			local _, World = Viewport(Gui, "Glass" .. Index, { 40 + (Index - 1) * 520, 60, 500, 500 }, Vector3.new(0, 0, 20), 30, { Ambient = Color3.fromRGB(80, 80, 80) })
+			Part("Back", Vector3.new(12, 8, 1), CFrame.new(0, 0, -3), Back, World)
+			for Column, Transparency in { 0, 0.25, 0.5, 0.75 } do
+				for Row, Material in { Enum.Material.Glass, Enum.Material.SmoothPlastic } do
+					Part("Tile", Vector3.new(1.8, 1.8, 0.4), CFrame.new((Column - 2.5) * 2.4, Row == 1 and 1.4 or -1.4, 0), Color3.fromRGB(150, 200, 255), World, { Material = Material, Transparency = Transparency })
+				end
+			end
+		end
+		return { Gui }
+	end,
+	-- VPF-2b: Metal, Plastic, SmoothPlastic and DiamondPlate balls (top) and blocks (bottom) under a Sky child white
+	-- above (left) and without a Sky (right)
+	["vp-metal"] = function()
+		local Gui = Screen("Vp", { IgnoreGuiInset = true })
+		local Dark, White = "rbxasset://textures/AvatarEditorImages/DarkPixel.png", "rbxasset://textures/ui/InGameMenu/WhiteSquare.png"
+		for Index = 1, 2 do
+			local Item, World = Viewport(Gui, "Metal" .. Index, { 40 + (Index - 1) * 780, 60, 760, 600 }, Vector3.new(0, 1, 14), 45)
+			if Index == 1 then
+				local Sky = Instance.new("Sky")
+				Sky.SkyboxBk, Sky.SkyboxDn, Sky.SkyboxFt, Sky.SkyboxLf, Sky.SkyboxRt, Sky.SkyboxUp = Dark, Dark, Dark, Dark, Dark, White
+				Sky.CelestialBodiesShown = false
+				Sky.Parent = Item
+			end
+			for Column, Material in { Enum.Material.Plastic, Enum.Material.Metal, Enum.Material.SmoothPlastic, Enum.Material.DiamondPlate } do
+				Part("Ball", Vector3.new(2.4, 2.4, 2.4), CFrame.new((Column - 2.5) * 3, 1.8, 0), Color3.new(1, 1, 1), World, { Shape = Enum.PartType.Ball, Material = Material })
+				Part("Block", Vector3.new(2.4, 2.4, 2.4), CFrame.new((Column - 2.5) * 3, -1.4, 0), Color3.new(1, 1, 1), World, { Material = Material })
+			end
+		end
+		return { Gui }
+	end,
+	-- VPF-2b: white and pale blue Glass at Transparency 0.1 to 0.9 before a black and a white block
+	["vp-glass-fine"] = function()
+		local Gui = Screen("Vp", { IgnoreGuiInset = true })
+		for Index, Back in { Color3.new(0, 0, 0), Color3.new(1, 1, 1) } do
+			local _, World = Viewport(Gui, "Glass" .. Index, { 40, 60 + (Index - 1) * 500, 1560, 460 }, Vector3.new(0, 0, 30), 14, { Ambient = Color3.fromRGB(80, 80, 80) })
+			Part("Back", Vector3.new(30, 8, 1), CFrame.new(0, 0, -3), Back, World)
+			for Column = 1, 9 do
+				for Row, Color in { Color3.new(1, 1, 1), Color3.fromRGB(150, 200, 255) } do
+					Part("Tile", Vector3.new(1.8, 1.8, 0.4), CFrame.new((Column - 5) * 2.4, Row == 1 and 1.2 or -1.2, 0), Color, World, { Material = Enum.Material.Glass, Transparency = Column / 10 })
+				end
+			end
+		end
+		return { Gui }
+	end,
+	-- VPF-2b: Metal, DiamondPlate and Plastic blocks and a Metal ball under a Sky child white or dark all round, or
+	-- none, with the frame's light on (top) and off (bottom), Ambient grey
+	["vp-metal-sky"] = function()
+		local Gui = Screen("Vp", { IgnoreGuiInset = true })
+		local Dark, White = "rbxasset://textures/AvatarEditorImages/DarkPixel.png", "rbxasset://textures/ui/InGameMenu/WhiteSquare.png"
+		for Row, Light in { Color3.new(1, 1, 1), Color3.new(0, 0, 0) } do
+			for Column, Image in { White, Dark, false } do
+				local Item, World = Viewport(Gui, "Metal" .. Row .. Column, { 40 + (Column - 1) * 520, 60 + (Row - 1) * 500, 500, 460 }, Vector3.new(0, 0, 16), 30, { LightColor = Light, Ambient = Color3.fromRGB(100, 100, 100) })
+				if Image then
+					local Sky = Instance.new("Sky")
+					Sky.SkyboxBk, Sky.SkyboxDn, Sky.SkyboxFt, Sky.SkyboxLf, Sky.SkyboxRt, Sky.SkyboxUp = Image, Image, Image, Image, Image, Image
+					Sky.CelestialBodiesShown = false
+					Sky.Parent = Item
+				end
+				for Index, Material in { Enum.Material.Metal, Enum.Material.DiamondPlate, Enum.Material.Plastic } do
+					Part("Block", Vector3.new(2.4, 2.4, 2.4), CFrame.new((Index - 2) * 3, 1.6, 0), Color3.new(1, 1, 1), World, { Material = Material })
+				end
+				Part("Ball", Vector3.new(2.4, 2.4, 2.4), CFrame.new(-3, -1.6, 0), Color3.new(1, 1, 1), World, { Shape = Enum.PartType.Ball, Material = Enum.Material.Metal })
+				Part("Grey", Vector3.new(2.4, 2.4, 2.4), CFrame.new(0, -1.6, 0), Color3.new(0.5, 0.5, 0.5), World, { Material = Enum.Material.Metal })
+			end
+		end
 		return { Gui }
 	end,
 	-- VPF-3: studs on blocks, balls and cylinders in a frame (rur's viewport-models), and the same in the world
