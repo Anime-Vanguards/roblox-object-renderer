@@ -28,6 +28,8 @@
 --   X, Z, towards the camera and (1, 1, 0), VelocityPerpendicular along up and towards the camera (rows),
 --   at Speed 0 to 0.001 studs a second (columns); VelocityParallel ones slowed by Drag 0 to 30 from 1 stud a
 --   second (last row); `slow-ref` measures the age.
+-- "alive" (x 11000, seen from -Z): Rate 60 emitters of white squares leaving along +X at 30 studs a second, Lifetime
+--   0.05, 0.1 and 0.15 (rows of 8), each square's place its age: how many show and how old.
 -- "taper" (x 6000 on, 100 studs apart along X, each seen alone from 400 studs off -Z at a field of view
 --   of 6, 2.5 part lengths either side): 12 x 2 x 2 Cylinders along X (EmissionDirection Top) at
 --   ShapePartial -2 to 5, Volume and Surface, 1000 or 3000 additive particles each where they spawn, as
@@ -307,6 +309,25 @@ return function(Context)
 		-- `ref` (camera-facing, 4 studs a second up from the floor's edge) measures the age
 		local Ref = Anchor(Model, "slow-ref-anchor", CFrame.new(Center + Vector3.new(-18, -5, 0)))
 		Emitter(Ref, "slow-ref", 1, { Size = Constant(0.3), Speed = NumberRange.new(4, 4) })
+	end
+
+	-- alive: how long short-lived particles show, by where they are
+	do
+		local Center = Vector3.new(11000, 0, 0)
+		local Model = Group("alive", Center, { eye = { 11000, 0, -40 }, target = { 11000, 0, 0 }, fov = 50 })
+		Block(Model, "Backdrop", CFrame.new(Center + Vector3.new(0, 0, 30)), Vector3.new(200, 120, 1), Color3.new(0, 0, 0), Enum.Material.Neon)
+		for Row, Life in { 0.05, 0.1, 0.15 } do
+			for Column = 1, 8 do
+				local At = Anchor(Model, `alive-{Row}-{Column}-anchor`, CFrame.new(Center + Vector3.new((Column - 4.5) * 4 - 1, (2 - Row) * 4, 0)))
+				local E = Emitter(At, `alive-{Row}-{Column}`, 0, {
+					Size = Constant(0.12),
+					Speed = NumberRange.new(30, 30),
+					Lifetime = NumberRange.new(Life, Life),
+					EmissionDirection = Enum.NormalId.Right,
+				})
+				E.Rate = 60
+			end
+		end
 	end
 
 	-- smoke: legacy Smoke in fog
