@@ -712,6 +712,14 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 	let mut cost_document = None;
 	let mut input_untrusted = 0usize;
 	let playback = scene::Playback::resolve_source(job.playback.as_ref(), job.playback_file.as_deref(), job.playback_overlay.as_ref(), job.playback_time)?;
+	// trails space their points by the distance from the camera (scene::playback::Playback::trail_eye): a
+	// still's, its first view's
+	let playback = playback.map(|mut playback| {
+		if playback.viewer.is_empty() && playback.trail_eye.is_none() {
+			playback.trail_eye = job.views.iter().find_map(|view| view.view.camera.fixed_eye());
+		}
+		playback
+	});
 	let (scene, cached) = if playback.is_some() || job.map.is_some() || job.cost.is_some() {
 		// every such job has a document of its own: its parse and scene within the machine's free memory, as one load
 		let _budget = crate::budget::reserve(std::fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0));

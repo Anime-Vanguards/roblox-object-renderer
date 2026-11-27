@@ -27,6 +27,10 @@ pub const FRAME_RATE: f32 = 60.0;
 /// the next one; particle-rate-start).
 const EMISSION_STEP: f32 = 1.0 / 60.0;
 
+/// The least of the effects' level of detail (crate::render::distance_lod) a trail's MinLength is divided by:
+/// from 955 studs on Studio's trails spaced their points ten times MinLength (trail-lod).
+const TRAIL_LOD_FLOOR: f32 = 0.1;
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Playback {
@@ -61,6 +65,10 @@ pub struct Playback {
 	/// Empty: every emitter runs all along.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub viewer: Vec<ViewerKey>,
+	/// Where the picture is drawn from when there is no `viewer` (a still's camera): trails space their
+	/// points by their distance from it ([`Resolved::apply_history`]). None: as from up close.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub trail_eye: Option<[f32; 3]>,
 	/// Draws every emitter's random stream anew, as another cast of the same effect would show (how far
 	/// one draw strays from another: notes/render.md "Particles"); empty: the streams of every other render.
 	/// In the job, not the environment, so it reaches whichever service runs it.
@@ -1573,6 +1581,8 @@ struct TrailScan {
 	previous: f32,
 	fresh: bool,
 	points: Vec<TrailPoint>,
+	/// The newest point while it still follows the attachments (MinLength over 0).
+	pending: Option<TrailPoint>,
 }
 
 /// A beam's accumulated `TextureSpeed` scroll through `self.frames[..index]` (excluding the
@@ -2817,7 +2827,31 @@ impl Resolved<'_> {
 			};
 			let middle = |point: &TrailPoint| (point.position0 + point.position1) * 0.5;
 			let min_length = trail.min_length.max(1e-4);
-			let (mut points, mut previous, mut fresh, first) = {
+			// With MinLength over 0 the newest point follows the attachments, keeping the time it was made,
+			// until it is MinLength from the point before (or there is none): then it stays, and the next
+			// frame makes a new one where the attachments are, checked at once. So a point is as old as the
+			// frame after the one before it was left: a frame older than its place where MinLength is two
+			// frames of the motion, three where it is four, none where it is under a frame's. Far off the
+			// spacing grows as the effects' level of detail falls, MinLength / max(lod, 0.1) by the distance
+			// from the camera (trail-minlength, trail-lod: Studio's trails 40 to 2,365 studs off read so,
+			// rms 0.017-0.030 of their opacity along them where ror's points at their own frames read 0.044
+			// near and 0.40 far, the far ones' heads already half opaque and their tails cut short;
+			// `fixtures/draw-order.luau` "minlength" in a Roblox client: MinLength 2 and 4 at 60 studs 0.024-
+			// 0.034 against 0.055-0.11, MinLength 6 at 600 studs, spaced twice it, 0.027-0.031 against 0.12,
+			// MinLength 0.05 and 0 as before). MinLength 0 keeps a point each frame the attachments moved.
+			let dragged = trail.min_length > 0.0;
+			let viewer = &self.playback.viewer;
+			let trail_eye = self.playback.trail_eye.map(Vec3::from);
+			let spacing = |point: &TrailPoint, frame: f32| -> f32 {
+				let eye = if viewer.is_empty() {
+					trail_eye
+				} else {
+					let c = &viewer[viewer.partition_point(|key| key.at <= frame + 1e-4).saturating_sub(1)].cframe;
+					Some(Vec3::new(c[0], c[1], c[2]))
+				};
+				eye.map_or(min_length, |eye| min_length / crate::render::distance_lod(eye.distance(middle(point))).max(TRAIL_LOD_FLOOR))
+			};
+			let (mut points, mut previous, mut fresh, mut pending, first) = {
 				let scans = self.trails.lock();
 				match scans.get(&trail.referent) {
 					Some(scan)
@@ -2829,9 +2863,9 @@ impl Resolved<'_> {
 							&& scan.anchor0.bits_eq(&anchor0)
 							&& scan.anchor1.bits_eq(&anchor1) =>
 					{
-						(scan.points.clone(), scan.previous, scan.fresh, scan.index)
+						(scan.points.clone(), scan.previous, scan.fresh, scan.pending, scan.index)
 					}
-					_ => (Vec::new(), f32::NEG_INFINITY, true, 0usize),
+					_ => (Vec::new(), f32::NEG_INFINITY, true, None, 0usize),
 				}
 			};
 			#[cfg(test)]
@@ -2846,10 +2880,15 @@ impl Resolved<'_> {
 				// Clear() drops what the trail left so far
 				if timeline.cleared_between(previous, frame) {
 					points.clear();
+					pending = None;
 				}
 				previous = frame;
 				if !timeline.enabled_at(frame) {
 					fresh = true;
+					// a disabled trail keeps the point that was following its attachments where it was
+					if let Some(point) = pending.take() {
+						points.push(point);
+					}
 					// Fast-skip contiguous disabled spans while keeping Clear() state exact.
 					let next_idx = match timeline.next_enabled_after(frame) {
 						Some(next_on) => idx + 1 + self.frames[idx + 1..].partition_point(|&f| f < next_on - 1e-6),
@@ -2867,6 +2906,20 @@ impl Resolved<'_> {
 				}
 				idx += 1;
 				let mut point = sample(frame);
+				if dragged {
+					// the point following the attachments moves with them, or a new one starts there
+					let point = match pending.take() {
+						Some(following) => TrailPoint { position0: point.position0, position1: point.position1, ..following },
+						None => TrailPoint { starts_strip: fresh, ..point },
+					};
+					fresh = false;
+					if point.starts_strip || points.last().is_none_or(|last| middle(&point).distance(middle(last)) >= spacing(&point, frame)) {
+						points.push(point);
+					} else {
+						pending = Some(point);
+					}
+					continue;
+				}
 				// a new point once the attachments moved MinLength from the last one (their midpoint;
 				// trail-shape minlength: the circle's corners match)
 				if !fresh
@@ -2892,13 +2945,22 @@ impl Resolved<'_> {
 					previous,
 					fresh,
 					points: points.clone(),
+					pending,
 				},
 			);
 			// the head follows the attachments while enabled, unless the very next grid frame disables or
 			// clears the trail (a pooled part parked offscreen on its disable frame must not pull the head
 			// partway to the park position at moments just before that frame)
 			let stopping = next_frame.is_some_and(|next| !timeline.enabled_at(next) || timeline.cleared_between(previous, next));
-			if timeline.enabled_at(time)
+			if let Some(mut following) = pending {
+				// the point following the attachments is the head, as old as when it was made
+				if timeline.enabled_at(time) && !stopping {
+					let now = sample(time);
+					following.position0 = now.position0;
+					following.position1 = now.position1;
+				}
+				points.push(following);
+			} else if timeline.enabled_at(time)
 				&& !stopping
 				&& let Some(last) = points.last()
 				&& last.time < time - 1e-6
@@ -4421,6 +4483,60 @@ mod tests {
 		// a reference takes a path or null, and the path names an instance
 		assert!(Playback { actions: vec![set(0.1, "Attachment0", serde_json::json!(4))], ..Default::default() }.resolve(&document).is_err());
 		assert!(Playback { actions: vec![set(0.1, "Attachment0", serde_json::json!("Fx.Holder.C"))], ..Default::default() }.resolve(&document).is_err());
+	}
+
+	/// With MinLength over 0 a trail's newest point follows its attachments, keeping the time it was made, until
+	/// it is MinLength (over the effects' level of detail at its distance from the camera) from the point
+	/// before; the next frame makes a new one, checked at once (trail-minlength, trail-lod, and
+	/// `fixtures/draw-order.luau` "minlength" in a Roblox client).
+	#[test]
+	fn trail_points_follow_the_attachments_until_min_length_from_the_last() {
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use rbx_dom_weak::InstanceBuilder;
+		use rbx_dom_weak::types::{CFrame, Matrix3, Vector3};
+		// a trail sliding a stud a frame along X, drawn at 0.5 s; each point's place less where the
+		// attachments were at its time, in frames, and the steps between points (first and head left out)
+		let read = |min_length: f32, eye: Option<[f32; 3]>| -> (Vec<f32>, Vec<f32>, TrailPoint) {
+			let mut model = ModelBuilder::new("Fx");
+			let arm = model.part(&PartSpec { name: "Arm".into(), ..PartSpec::default() });
+			let a0 = model.child(arm, InstanceBuilder::new("Attachment").with_name("A0").with_property("CFrame", CFrame::new(Vector3::new(0.0, 0.5, 0.0), Matrix3::identity())));
+			let a1 = model.child(arm, InstanceBuilder::new("Attachment").with_name("A1").with_property("CFrame", CFrame::new(Vector3::new(0.0, -0.5, 0.0), Matrix3::identity())));
+			model.child(arm, InstanceBuilder::new("Trail").with_name("Ribbon").with_property("Attachment0", Variant::Ref(a0)).with_property("Attachment1", Variant::Ref(a1)).with_property("Enabled", true).with_property("Lifetime", 5.0f32).with_property("MinLength", min_length));
+			let mut document = model.into_document();
+			let motion = vec![Motion {
+				target: "Fx.Arm".into(),
+				keys: vec![MotionKey { at: 0.0, cframe: vec![0.0, 0.0, 0.0], ..Default::default() }, MotionKey { at: 1.0, cframe: vec![60.0, 0.0, 0.0], easing: Some("Linear".into()), ..Default::default() }],
+				..Default::default()
+			}];
+			let playback = Playback { time: 0.5, motion, trail_eye: eye, ..Default::default() };
+			let resolved = playback.resolve(&document).unwrap();
+			let undo = resolved.apply_state(&mut document).unwrap();
+			let mut scene = crate::scene::extract::extract(&document);
+			resolved.apply_history(&document, &mut scene);
+			undo.restore(&mut document);
+			let points = &scene.trails[0].points;
+			let inner = &points[1..points.len() - 1];
+			let lags = inner.iter().map(|point| point.position0.x - point.time * 60.0).collect();
+			let steps = inner.windows(2).map(|pair| pair[1].position0.x - pair[0].position0.x).collect();
+			(lags, steps, points[points.len() - 1])
+		};
+		let near = |values: &[f32], expected: f32| values.iter().all(|value| (value - expected).abs() < 1e-3);
+		// none, or under a frame's motion: a point each frame, as old as its place
+		for min_length in [0.0, 0.5] {
+			let (lags, steps, _) = read(min_length, None);
+			assert!(near(&lags, 0.0) && near(&steps, 1.0), "MinLength {min_length}: lags {lags:?}, steps {steps:?}");
+		}
+		// two frames' motion (a hair under): a point every two frames, a frame older than its place; four: three older
+		let (lags, steps, _) = read(1.99, None);
+		assert!(near(&lags, 1.0) && near(&steps, 2.0), "MinLength 2: lags {lags:?}, steps {steps:?}");
+		let (lags, steps, head) = read(3.99, None);
+		assert!(near(&lags, 3.0) && near(&steps, 4.0), "MinLength 4: lags {lags:?}, steps {steps:?}");
+		// 560 studs from the camera (level of detail 0.55) MinLength 1.99 spaces them as 3.62: every four frames
+		let (lags, steps, _) = read(1.99, Some([0.0, 0.0, -560.0]));
+		assert!(near(&lags, 3.0) && near(&steps, 4.0), "MinLength 2 at 560 studs: lags {lags:?}, steps {steps:?}");
+		// the head is where the attachments are, as old as the frame after the last point was left (28 studs
+		// at 28 frames, the head 30 studs at 29 frames)
+		assert!((head.position0.x - 30.0).abs() < 1e-3 && (head.time * 60.0 - 29.0).abs() < 1e-3, "head {head:?}");
 	}
 
 	#[test]

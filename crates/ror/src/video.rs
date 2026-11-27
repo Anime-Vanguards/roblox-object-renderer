@@ -285,6 +285,10 @@ fn watched_with(job: &VideoJob, track: Option<&[CameraKey]>) -> Result<Playback>
 		keys.sort_by(|a, b| a.at.total_cmp(&b.at));
 		playback.viewer = keys;
 	}
+	// a clip from one camera: its trails space their points by the distance from it
+	if playback.viewer.is_empty() && playback.trail_eye.is_none() {
+		playback.trail_eye = job.view.camera.fixed_eye();
+	}
 	Ok(playback)
 }
 

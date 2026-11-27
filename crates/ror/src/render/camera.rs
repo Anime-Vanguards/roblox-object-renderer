@@ -137,6 +137,15 @@ impl CameraSpec {
 		}
 	}
 
+	/// Where the camera stands when that does not depend on the scene's bounds (an orbit's does).
+	pub fn fixed_eye(&self) -> Option<[f32; 3]> {
+		match self {
+			CameraSpec::Orbit { .. } => None,
+			CameraSpec::LookAt { eye, .. } => Some(*eye),
+			CameraSpec::CFrame { components, .. } => Some([components[0], components[1], components[2]]),
+		}
+	}
+
 	/// Places the camera for a `width` x `height` view of `bounds`.
 	pub fn place(&self, bounds: Option<(Vec3, Vec3)>, width: u32, height: u32) -> Camera {
 		let aspect = width as f32 / height.max(1) as f32;
