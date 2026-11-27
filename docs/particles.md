@@ -10,7 +10,7 @@ Without a playback timeline, a model renders as authored:
 - Enabled `ParticleEmitter`s render in steady state (a deterministically seeded snapshot of `Rate * Lifetime` particles distributed across ages).
 - `Beam`s render at rest.
 - `Trail`s draw nothing, since trails require attachment movement.
-- Legacy effects (`Fire`, `Smoke`, `Sparkles`, `ForceField` shields, and `Explosion`) render as particle bursts using Roblox Studio's built-in particle textures.
+- Legacy effects (`Fire`, `Smoke`, `Sparkles`, `ForceField` shields, and `Explosion`) render as particle bursts using Roblox Studio's built-in particle textures. As in a Roblox client, each `Sparkles` star carries a small white core that does not take `SparkleColor` (black `Sparkles` show faint white stars).
 
 ## Timed renders (with playback)
 
