@@ -27,6 +27,11 @@ pub const FRAME_RATE: f32 = 60.0;
 /// the next one; particle-rate-start).
 const EMISSION_STEP: f32 = 1.0 / 60.0;
 
+/// How close a tween's steps must come to its delay or its iteration's length to reach it: the f32
+/// times of frames a minute or more into a playback are several microseconds off their 1/60 s grid,
+/// and an exact multiple of a frame (a delay of 0.25 s, 15 frames) must end on its frame.
+const FRAME_SLACK: f32 = 1e-4;
+
 /// The least of the effects' level of detail (crate::render::distance_lod) a trail's MinLength is divided by:
 /// from 955 studs on Studio's trails spaced their points ten times MinLength (trail-lod).
 const TRAIL_LOD_FLOOR: f32 = 0.1;
@@ -843,27 +848,47 @@ fn resolved_value(value: &serde_json::Value, current: Option<&serde_json::Value>
 	}
 }
 
-/// A TweenService tween started at `start` from `from`: its value at `t` (its end once it is done:
-/// `to`, or `from` again when it reverses).
-fn tweened(tween: &Tween, start: f32, from: &serde_json::Value, t: f32, initial: Option<&serde_json::Value>) -> serde_json::Value {
+/// A TweenService tween's value `elapsed` seconds into one of its iterations from `from` (to `to`, and
+/// back again within the iteration when it reverses), held at the iteration's end past it.
+fn tweened(tween: &Tween, from: &serde_json::Value, elapsed: f32, initial: Option<&serde_json::Value>) -> serde_json::Value {
 	let to = tween.to.as_ref().and_then(|to| resolved_value(to, Some(from), initial)).unwrap_or_else(|| from.clone());
 	let duration = tween.duration.max(0.0);
-	if duration <= 0.0 || tween_done(tween, start, t) {
+	let cycle = tween_cycle(tween);
+	if duration <= 0.0 || elapsed >= cycle {
 		return if tween.reverses { from.clone() } else { to };
 	}
-	let cycle = if tween.reverses { 2.0 * duration } else { duration };
-	let local = (t - start).max(0.0) % cycle;
-	let progress = if local <= duration { local / duration } else { (cycle - local) / duration };
+	let elapsed = elapsed.max(0.0);
+	// reversing, time carries through the turn: the way back is the same curve traced backwards
+	let progress = if elapsed <= duration { elapsed / duration } else { 2.0 - elapsed / duration };
 	lerp_value(from, &to, ease(progress, Some(tween.easing.as_deref().unwrap_or("Quad")), Some(tween.direction.as_deref().unwrap_or("Out"))))
 }
 
-/// Whether a TweenService tween started at `start` is done by `t` (one repeating for ever never is).
-fn tween_done(tween: &Tween, start: f32, t: f32) -> bool {
-	let cycle = tween.duration.max(0.0) * if tween.reverses { 2.0 } else { 1.0 };
-	if tween.repeat_count < 0 {
-		return cycle <= 0.0;
-	}
-	t - start >= cycle * (tween.repeat_count + 1) as f32 - 1e-6
+/// One iteration of a TweenService tween: its duration, twice that when it reverses.
+fn tween_cycle(tween: &Tween) -> f32 {
+	tween.duration.max(0.0) * if tween.reverses { 2.0 } else { 1.0 }
+}
+
+/// A TweenService tween as a Roblox client steps it, once a frame after the frame's scripts and before
+/// its render (TweenService's clock is the frames' steps; a headless and a rendered client step it by
+/// RenderStepped's deltaTime, 1/60 s each frame): in the frame it is played in it takes the property
+/// from every tween before (they write no more) and takes its first step, so that frame draws it a
+/// step in, from the value the property had then (that frame's sets before or after the Play
+/// included); a delay counts those steps until they reach it, its last frame writing nothing and its
+/// leftover dropped, and the playing steps start from that frame; an iteration ends at the first frame
+/// its steps reach its length (twice that reversing, the turn's time carried), writing its end, and a
+/// repeat starts again from the next frame, after the delay again when it has one, from the same start
+/// value. A set is lost in a frame the tween writes (fixtures: notes/render.md "Playback").
+struct Running<'a> {
+	tween: &'a Tween,
+	/// The value it goes from, taken at its first playing step.
+	from: Option<serde_json::Value>,
+	/// Where the steps of the current phase are counted from: the frame before the one the tween was
+	/// played in, the frame its delay ended in, or the frame its last iteration ended in.
+	origin: f32,
+	/// Counting its delay (no writes) rather than playing.
+	delaying: bool,
+	/// Iterations finished.
+	done: i32,
 }
 
 /// One property of one instance over a playback: what sets and tweens it, in time order, or a
@@ -887,6 +912,7 @@ struct Channel<'a> {
 
 enum ChannelState<'a> {
 	Value(Option<serde_json::Value>),
+	/// A TweenService tween's iteration: its value `t - start` into it from `from` ([`tweened`]).
 	Tween { start: f32, from: serde_json::Value, tween: &'a Tween },
 }
 
@@ -898,7 +924,7 @@ enum Event<'a> {
 }
 
 impl<'a> Channel<'a> {
-	fn finalize(&mut self) {
+	fn finalize(&mut self, grid: &[f32]) {
 		let initial = self.initial.as_ref();
 		if let Some(tween) = self.keyframes {
 			let mut keys: Vec<&TweenKey> = tween.keys.iter().collect();
@@ -912,35 +938,117 @@ impl<'a> Channel<'a> {
 				.collect();
 			return;
 		}
+		// sets and plays in time order, an action's before a tween's at one time; the tweens stepped frame
+		// by frame on the playback's grid as a Roblox client steps them ([`Running`])
 		self.events.sort_by(|a, b| a.0.total_cmp(&b.0));
+		let events = &self.events;
+		let current = |value: &Option<serde_json::Value>| value.clone().or_else(|| self.initial.clone());
+		let previous_frame = |t: f32| match grid.partition_point(|&frame| frame < t - 1e-5) {
+			0 => t - EMISSION_STEP,
+			index => grid[index - 1],
+		};
 		let mut value: Option<serde_json::Value> = None;
-		let mut running: Option<(f32, serde_json::Value, &'a Tween)> = None;
-		self.states.clear();
-		self.states.reserve(self.events.len());
-		for (time, event) in &self.events {
-			let now = match &running {
-				Some((start, from, tween)) => Some(tweened(tween, *start, from, *time, initial)),
-				None => value.clone().or_else(|| self.initial.clone()),
-			};
-			match event {
-				// a tween still running writes the property again the next frame: the set is lost
-				Event::Set(_) if running.as_ref().is_some_and(|(start, _, tween)| !tween_done(tween, *start, *time)) => {}
-				Event::Set(set) => {
-					running = None;
-					value = resolved_value(set, now.as_ref(), initial).or(value);
+		let mut running: Option<Running<'a>> = None;
+		let mut states: Vec<(f32, ChannelState<'a>)> = Vec::with_capacity(events.len());
+		let mut next = 0usize;
+		let mut last: Option<f32> = None;
+		loop {
+			// the next frame: the next event's, or the next one of the grid while a tween runs
+			let after = |t: f32| last.is_none_or(|last| t > last + 1e-6);
+			let event_time = events.get(next).map(|(time, _)| *time);
+			let time = if running.is_some() {
+				let index = grid.partition_point(|&frame| last.is_some_and(|last| frame <= last + 1e-6));
+				match (grid.get(index).copied(), event_time) {
+					(Some(frame), Some(event)) if event < frame - 1e-6 && after(event) => event,
+					(Some(frame), _) => frame,
+					(None, Some(event)) => event,
+					(None, None) => break,
 				}
-				// the tween before stops where it is, and this one goes on from there
-				Event::Tween(tween) => match now {
-					Some(from) => running = Some((*time, from, tween)),
-					None => value = tween.to.as_ref().and_then(|to| resolved_value(to, None, initial)),
-				},
-			}
-			let state = match &running {
-				Some((start, from, tween)) => ChannelState::Tween { start: *start, from: from.clone(), tween },
-				None => ChannelState::Value(value.clone()),
+			} else {
+				match event_time {
+					Some(event) => event,
+					None => break,
+				}
 			};
-			self.states.push((*time, state));
+			last = Some(time);
+			let first = next;
+			while next < events.len() && events[next].0 <= time + 1e-6 {
+				next += 1;
+			}
+			let here = &events[first..next];
+			// a tween played in the frame takes the property from the one before before either steps: that
+			// one writes no more (its value stays the last it wrote), and the frame's sets reach the new one
+			if here.iter().any(|(_, event)| matches!(event, Event::Tween(_))) {
+				running = None;
+			}
+			// a set is lost in a frame the running tween writes (its step comes after the frame's scripts)
+			let writes = running.as_ref().is_some_and(|run| !run.delaying);
+			for (_, event) in here {
+				match event {
+					Event::Set(set) => {
+						if !writes {
+							value = resolved_value(set, current(&value).as_ref(), initial).or(value);
+						}
+					}
+					Event::Tween(tween) => running = Some(Running { tween: *tween, from: None, origin: previous_frame(time), delaying: tween.delay > 0.0, done: 0 }),
+				}
+			}
+			// the frame's tween step
+			let mut piece = None;
+			if let Some(run) = running.as_mut() {
+				let tween = run.tween;
+				if run.delaying {
+					// the delay ends in the frame its steps reach it, which writes nothing
+					if time - run.origin >= tween.delay - FRAME_SLACK {
+						run.delaying = false;
+						run.origin = time;
+						if run.from.is_none() {
+							run.from = current(&value);
+						}
+					}
+				} else {
+					if run.from.is_none() {
+						run.from = current(&value);
+					}
+					match run.from.clone() {
+						// nothing to go from (a value ror cannot read): the end at once
+						None => {
+							value = tween.to.as_ref().and_then(|to| resolved_value(to, None, initial));
+							running = None;
+						}
+						Some(from) => {
+							let elapsed = time - run.origin;
+							let cycle = tween_cycle(tween);
+							if cycle <= 0.0 || elapsed >= cycle - FRAME_SLACK {
+								// the iteration ends: its end value, then the next one from the next frame
+								value = Some(tweened(tween, &from, cycle, initial));
+								run.done += 1;
+								if tween.repeat_count < 0 || run.done <= tween.repeat_count {
+									run.origin = time;
+									run.delaying = tween.delay > 0.0;
+								} else {
+									running = None;
+								}
+							} else {
+								value = Some(tweened(tween, &from, elapsed, initial));
+								piece = Some(ChannelState::Tween { start: run.origin, from, tween });
+							}
+						}
+					}
+				}
+			}
+			let state = piece.unwrap_or_else(|| ChannelState::Value(value.clone()));
+			// the same piece goes on: one state per change
+			let same = match (states.last().map(|(_, state)| state), &state) {
+				(Some(ChannelState::Value(a)), ChannelState::Value(b)) => a == b,
+				(Some(ChannelState::Tween { start: a, tween: ta, .. }), ChannelState::Tween { start: b, tween: tb, .. }) => a.to_bits() == b.to_bits() && std::ptr::eq(*ta, *tb),
+				_ => false,
+			};
+			if !same {
+				states.push((time, state));
+			}
 		}
+		self.states = states;
 	}
 
 	/// The property at `t`; None while nothing has changed it.
@@ -966,7 +1074,7 @@ impl<'a> Channel<'a> {
 		}
 		match &self.states[index - 1].1 {
 			ChannelState::Value(value) => value.clone(),
-			ChannelState::Tween { start, from, tween } => Some(tweened(tween, *start, from, t, self.initial.as_ref())),
+			ChannelState::Tween { start, from, tween } => Some(tweened(tween, from, t - start, self.initial.as_ref())),
 		}
 	}
 
@@ -2066,7 +2174,8 @@ impl Playback {
 				let at = if tween.at.is_finite() { tween.at.max(0.0) } else { 0.0 };
 				let delay = if tween.delay.is_finite() { tween.delay.max(0.0) } else { 0.0 };
 				let dur = if tween.duration.is_finite() { tween.duration.max(0.0) } else { 0.0 };
-				Some((at + delay + dur * (tween.repeat_count as f32 + 1.0), to as f32))
+				// each iteration after its delay ([`Running`])
+				Some((at + (delay + dur) * (tween.repeat_count as f32 + 1.0), to as f32))
 			} else {
 				None
 			};
@@ -2332,7 +2441,8 @@ impl Playback {
 			if tween.keys.is_empty() && tween.to.is_none() {
 				bail!("playback: tween {}.{} has neither keys nor to", tween.target, tween.property);
 			}
-			let start = quantize(&grid, tween.at) + tween.delay.max(0.0);
+			// played in the frame at or after `at` (its delay is counted from there: [`Running`])
+			let start = quantize(&grid, tween.at);
 			for referent in of_class(document, paths.get(&tween.target)?, tween.class.as_deref()) {
 				let index = channel(&mut channels, referent, &tween.property);
 				if tween.keys.is_empty() {
@@ -2343,7 +2453,7 @@ impl Playback {
 			}
 		}
 		for channel in &mut channels {
-			channel.finalize();
+			channel.finalize(&grid);
 		}
 		for (_, events) in &mut parents {
 			events.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -3636,29 +3746,133 @@ mod tests {
 			tweens: vec![spec::tween("Lighting.ExposureCompensation=initial@0.2+0.5").unwrap()],
 			..Default::default()
 		};
-		for (time, expected) in [(0.1, 0.0), (0.2, 4.0), (0.45, 4.0 * (1.0 - ease(0.5, Some("Quad"), Some("Out")))), (1.0, 0.0)] {
+		// (a tween takes its first step, 1/60 s, in the frame it is played in: 0.2 s draws it a step in)
+		for (time, expected) in [(0.1, 0.0), (0.2, 4.0 * (1.0 - ease(1.0 / 30.0, Some("Quad"), Some("Out")))), (0.45, 4.0 * (1.0 - ease((0.45 - 11.0 / 60.0) / 0.5, Some("Quad"), Some("Out")))), (1.0, 0.0)] {
 			let undo = state_at(&playback, &mut document, time);
 			let value = number(&document, "Lighting", "ExposureCompensation");
 			assert!((value - expected).abs() < 1e-4, "at {time} s: {value}, not {expected}");
 			undo.restore(&mut document);
 		}
 		assert_eq!(number(&document, "Lighting", "ExposureCompensation"), 0.0, "put back");
-		// a later tween takes over from where the one before is; a set while one runs is lost
+		// a later tween takes over from what the one before drew in the frame before; a set while one runs is
+		// lost
 		let playback = Playback {
 			actions: vec![spec::set("Lighting.Brightness=5@0.25").unwrap()],
 			tweens: vec![spec::tween("Lighting.Brightness=0@0+1:Linear").unwrap(), spec::tween("Lighting.Brightness=4@0.5+0.5:Linear").unwrap()],
 			..Default::default()
 		};
-		for (time, expected) in [(0.25, 1.5), (0.5, 1.0), (0.75, 2.5), (2.0, 4.0)] {
+		for (time, expected) in [(0.25, 2.0 * (1.0 - 16.0 / 60.0)), (0.5, 1.1), (0.75, 1.0 + 3.0 * (0.75 - 29.0 / 60.0) / 0.5), (2.0, 4.0)] {
 			let undo = state_at(&playback, &mut document, time);
 			assert!((number(&document, "Lighting", "Brightness") - expected).abs() < 1e-4, "at {time} s");
 			undo.restore(&mut document);
 		}
-		// there and back, twice
+		// there and back, twice: the second from the frame the first ended in (59/60 s)
 		let playback = Playback { tweens: vec![spec::tween("Lighting.Brightness=4@0+0.5:Linear:reverses:repeat=1").unwrap()], ..Default::default() };
-		for (time, expected) in [(0.25, 3.0), (0.5, 4.0), (0.75, 3.0), (1.25, 3.0), (2.5, 2.0)] {
+		for (time, expected) in [(0.25, 2.0 + 2.0 * (16.0 / 60.0) / 0.5), (0.5, 2.0 + 2.0 * (2.0 - (31.0 / 60.0) / 0.5)), (0.75, 2.0 + 2.0 * (2.0 - (46.0 / 60.0) / 0.5)), (1.25, 2.0 + 2.0 * (1.25 - 59.0 / 60.0) / 0.5), (2.5, 2.0)] {
 			let undo = state_at(&playback, &mut document, time);
 			assert!((number(&document, "Lighting", "Brightness") - expected).abs() < 1e-4, "at {time} s");
+			undo.restore(&mut document);
+		}
+	}
+
+	/// TweenService tweens and sets against a Roblox client (a headless client's frames, deltaTime 1/60 s,
+	/// each case its own NumberValue, five sessions alike; rendered sessions draw each frame the value after
+	/// its step, a set in Heartbeat never): what each frame drew, frames 9 to 71, plays and sets in a
+	/// render-step binding at the case's frames (`hb`: in a Heartbeat handler, after the frame's render).
+	/// The client's frame 10 is 0.5 s here.
+	#[test]
+	fn tweens_step_as_a_roblox_client_steps_them() {
+		use crate::scene::build::ModelBuilder;
+		use rbx_dom_weak::InstanceBuilder;
+		const CLIENT: [(&str, [f32; 63]); 17] = [
+			("play-rs", [0.0, 0.1667, 0.3333, 0.5, 0.6667, 0.8333, 1.0, 1.1667, 1.3333, 1.5, 1.6667, 1.8333, 2.0, 2.1667, 2.3333, 2.5, 2.6667, 2.8333, 3.0, 3.1667, 3.3333, 3.5, 3.6667, 3.8333, 4.0, 4.1667, 4.3333, 4.5, 4.6667, 4.8333, 5.0, 5.1667, 5.3333, 5.5, 5.6667, 5.8333, 6.0, 6.1667, 6.3333, 6.5, 6.6667, 6.8333, 7.0, 7.1667, 7.3333, 7.5, 7.6667, 7.8333, 8.0, 8.1667, 8.3333, 8.5, 8.6667, 8.8333, 9.0, 9.1667, 9.3333, 9.5, 9.6667, 9.8333, 10.0, 10.0, 10.0]),
+			("play-hb", [0.0, 0.0, 0.1667, 0.3333, 0.5, 0.6667, 0.8333, 1.0, 1.1667, 1.3333, 1.5, 1.6667, 1.8333, 2.0, 2.1667, 2.3333, 2.5, 2.6667, 2.8333, 3.0, 3.1667, 3.3333, 3.5, 3.6667, 3.8333, 4.0, 4.1667, 4.3333, 4.5, 4.6667, 4.8333, 5.0, 5.1667, 5.3333, 5.5, 5.6667, 5.8333, 6.0, 6.1667, 6.3333, 6.5, 6.6667, 6.8333, 7.0, 7.1667, 7.3333, 7.5, 7.6667, 7.8333, 8.0, 8.1667, 8.3333, 8.5, 8.6667, 8.8333, 9.0, 9.1667, 9.3333, 9.5, 9.6667, 9.8333, 10.0, 10.0]),
+			("takeover", [0.0, 0.1667, 0.3333, 0.5, 0.6667, 0.8333, 1.0, 1.1667, 1.3333, 1.5, 1.6667, 1.8333, 2.0, 2.1667, 2.3333, 2.5, 2.6667, 2.8333, 3.0, 3.1667, 3.3333, 3.5, 3.6667, 3.8333, 4.0, 4.1667, 4.3333, 4.5, 4.6667, 4.8333, 5.0, 4.75, 4.5, 4.25, 4.0, 3.75, 3.5, 3.25, 3.0, 2.75, 2.5, 2.25, 2.0, 1.75, 1.5, 1.25, 1.0, 0.75, 0.5, 0.25, 0.0, -0.25, -0.5, -0.75, -1.0, -1.25, -1.5, -1.75, -2.0, -2.25, -2.5, -2.75, -3.0]),
+			("set-during", [0.0, 0.1667, 0.3333, 0.5, 0.6667, 0.8333, 1.0, 1.1667, 1.3333, 1.5, 1.6667, 1.8333, 2.0, 2.1667, 2.3333, 2.5, 2.6667, 2.8333, 3.0, 3.1667, 3.3333, 3.5, 3.6667, 3.8333, 4.0, 4.1667, 4.3333, 4.5, 4.6667, 4.8333, 5.0, 5.1667, 5.3333, 5.5, 5.6667, 5.8333, 6.0, 6.1667, 6.3333, 6.5, 6.6667, 6.8333, 7.0, 7.1667, 7.3333, 7.5, 7.6667, 7.8333, 8.0, 8.1667, 8.3333, 8.5, 8.6667, 8.8333, 9.0, 9.1667, 9.3333, 9.5, 9.6667, 9.8333, 10.0, 10.0, 10.0]),
+			("set-end", [0.0, 0.6667, 1.3333, 2.0, 2.6667, 3.3333, 4.0, 4.6667, 5.3333, 6.0, 6.6667, 7.3333, 8.0, 8.6667, 9.3333, 10.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0, 51.0]),
+			("delay", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.2333, 3.4667, 3.7, 3.9333, 4.1667, 4.4, 4.6333, 4.8667, 5.1, 5.3333, 5.5667, 5.8, 6.0333, 6.2667, 6.5, 6.7333, 6.9667, 7.2, 7.4333, 7.6667, 7.9, 8.1333, 8.3667, 8.6, 8.8333, 9.0667, 9.3, 9.5333, 9.7667, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]),
+			("delay-odd", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3333, 0.6667, 1.0, 1.3333, 1.6667, 2.0, 2.3333, 2.6667, 3.0, 3.3333, 3.6667, 4.0, 4.3333, 4.6667, 5.0, 5.3333, 5.6667, 6.0, 6.3333, 6.6667, 7.0, 7.3333, 7.6667, 8.0, 8.3333, 8.6667, 9.0, 9.3333, 9.6667, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]),
+			("delay-takeover", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.3333, -0.6667, -1.0, -1.3333, -1.6667, -2.0, -2.3333, -2.6667, -3.0, -3.3333, -3.6667, -4.0, -4.3333, -4.6667, -5.0, -5.3333, -5.6667, -6.0, -6.3333, -6.6667, -7.0, -7.3333, -7.6667, -8.0, -8.3333, -8.6667, -9.0, -9.3333, -9.6667, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0]),
+			("delay-under", [0.0, -0.1667, -0.3333, -0.5, -0.6667, -0.8333, -1.0, -1.1667, -1.3333, -1.5, -1.6667, -1.8333, -2.0, -2.1667, -2.3333, -2.5, -2.5, -2.5, -2.5, -2.5, -2.5, -2.5, -2.5, -2.5, -2.5, -2.5, -2.5, -2.5, -2.5, -2.5, -2.5, -2.0833, -1.6667, -1.25, -0.8333, -0.4167, -0.0, 0.4167, 0.8333, 1.25, 1.6667, 2.0833, 2.5, 2.9167, 3.3333, 3.75, 4.1667, 4.5833, 5.0, 5.4167, 5.8333, 6.25, 6.6667, 7.0833, 7.5, 7.9167, 8.3333, 8.75, 9.1667, 9.5833, 10.0, 10.0, 10.0]),
+			("reverses", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.6667, 1.3333, 2.0, 2.6667, 3.3333, 4.0, 4.6667, 5.3333, 6.0, 6.6667, 7.3333, 8.0, 8.6667, 9.3333, 10.0, 9.3333, 8.6667, 8.0, 7.3333, 6.6667, 6.0, 5.3333, 4.6667, 4.0, 3.3333, 2.6667, 2.0, 1.3333, 0.6667, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.6667, 1.3333, 2.0, 2.6667, 3.3333, 4.0, 4.6667, 5.3333, 6.0, 6.6667, 7.3333, 8.0, 8.6667, 9.3333, 10.0, 9.3333, 8.6667, 8.0, 7.3333, 6.6667]),
+			("repeat-odd", [0.0, 0.0, 0.0, 0.6536, 1.3072, 1.9608, 2.6144, 3.268, 3.9216, 4.5752, 5.2288, 5.8824, 6.5359, 7.1895, 7.8431, 8.4967, 9.1503, 9.8039, 10.0, 10.0, 10.0, 0.6536, 1.3072, 1.9608, 2.6144, 3.268, 3.9216, 4.5752, 5.2288, 5.8824, 6.5359, 7.1895, 7.8431, 8.4967, 9.1503, 9.8039, 10.0, 10.0, 10.0, 0.6536, 1.3072, 1.9608, 2.6144, 3.268, 3.9216, 4.5752, 5.2288, 5.8824, 6.5359, 7.1895, 7.8431, 8.4967, 9.1503, 9.8039, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]),
+			("rev-odd", [0.0, 0.6536, 1.3072, 1.9608, 2.6144, 3.268, 3.9216, 4.5752, 5.2288, 5.8824, 6.5359, 7.1895, 7.8431, 8.4967, 9.1503, 9.8039, 9.5425, 8.8889, 8.2353, 7.5817, 6.9281, 6.2745, 5.6209, 4.9673, 4.3137, 3.6601, 3.0065, 2.3529, 1.6993, 1.0457, 0.3921, 0.0, 0.6536, 1.3072, 1.9608, 2.6144, 3.268, 3.9216, 4.5752, 5.2288, 5.8824, 6.5359, 7.1895, 7.8431, 8.4967, 9.1503, 9.8039, 9.5425, 8.8889, 8.2353, 7.5817, 6.9281, 6.2745, 5.6209, 4.9673, 4.3137, 3.6601, 3.0065, 2.3529, 1.6993, 1.0457, 0.3921, 0.0]),
+			("gap-set", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.6667, 1.3333, 2.0, 2.6667, 3.3333, 4.0, 4.6667, 5.3333, 6.0, 6.6667, 7.3333, 8.0, 8.6667, 9.3333, 10.0, 10.0, 10.0, 20.0, 20.0, 20.0, 20.0, 0.6667, 1.3333, 2.0, 2.6667, 3.3333, 4.0, 4.6667, 5.3333, 6.0, 6.6667, 7.3333, 8.0, 8.6667, 9.3333, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]),
+			("takeover-set", [0.0, 0.1667, 0.3333, 0.5, 0.6667, 0.8333, 1.0, 1.1667, 1.3333, 1.5, 1.6667, 1.8333, 2.0, 2.1667, 2.3333, 2.5, 2.6667, 2.8333, 3.0, 3.1667, 3.3333, 3.5, 3.6667, 3.8333, 4.0, 4.1667, 4.3333, 4.5, 4.6667, 4.8333, 5.0, 29.3333, 28.6667, 28.0, 27.3333, 26.6667, 26.0, 25.3333, 24.6667, 24.0, 23.3333, 22.6667, 22.0, 21.3333, 20.6667, 20.0, 19.3333, 18.6667, 18.0, 17.3333, 16.6667, 16.0, 15.3333, 14.6667, 14.0, 13.3333, 12.6667, 12.0, 11.3333, 10.6667, 10.0, 9.3333, 8.6667]),
+			("end-takeover", [0.0, 0.6667, 1.3333, 2.0, 2.6667, 3.3333, 4.0, 4.6667, 5.3333, 6.0, 6.6667, 7.3333, 8.0, 8.6667, 9.3333, 9.0111, 8.6889, 8.3667, 8.0444, 7.7222, 7.4, 7.0778, 6.7556, 6.4333, 6.1111, 5.7889, 5.4667, 5.1444, 4.8222, 4.5, 4.1778, 3.8556, 3.5333, 3.2111, 2.8889, 2.5667, 2.2444, 1.9222, 1.6, 1.2778, 0.9556, 0.6333, 0.3111, -0.0111, -0.3333, -0.6556, -0.9778, -1.3, -1.6222, -1.9444, -2.2667, -2.5889, -2.9111, -3.2333, -3.5556, -3.8778, -4.2, -4.5222, -4.8444, -5.1667, -5.4889, -5.8111, -6.1333]),
+			("zero", [0.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]),
+			("play-then-set", [0.0, 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 4.8, 4.9, 5.0, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 5.8, 5.9, 6.0, 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 6.7, 6.8, 6.9, 7.0, 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7, 7.8, 7.9, 8.0, 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7, 8.8, 8.9, 9.0, 9.1, 9.2, 9.3, 9.4, 9.5, 9.6, 9.7, 9.8, 9.9, 10.0, 10.0, 10.0]),
+		];
+		let mut model = ModelBuilder::new("Fx");
+		let root = model.model;
+		for (name, _) in &CLIENT {
+			model.child(root, InstanceBuilder::new("NumberValue").with_name(*name).with_property("Value", 0.0f64));
+		}
+		let mut document = model.into_document();
+		let frame = |f: f32| 0.5 + (f - 10.0) / 60.0;
+		// a Heartbeat handler's event: after the frame's render, so in the next frame
+		let hb = |f: f32| frame(f) + 0.001;
+		let tween = |name: &str, at: f32, to: f32, duration: f32, delay: f32, repeat_count: i32, reverses: bool| Tween {
+			target: format!("Fx.{name}"),
+			property: "Value".into(),
+			to: Some(serde_json::json!(to)),
+			at,
+			duration,
+			easing: Some("Linear".into()),
+			direction: Some("Out".into()),
+			repeat_count,
+			reverses,
+			delay,
+			..Default::default()
+		};
+		let set = |name: &str, at: f32, value: f32| Action { at, target: format!("Fx.{name}"), set: [("Value".to_string(), serde_json::json!(value))].into_iter().collect(), ..Default::default() };
+		let tweens = vec![
+			tween("play-rs", frame(10.0), 10.0, 1.0, 0.0, 0, false),
+			tween("play-hb", hb(10.0), 10.0, 1.0, 0.0, 0, false),
+			tween("takeover", frame(10.0), 10.0, 1.0, 0.0, 0, false),
+			tween("takeover", frame(40.0), -10.0, 1.0, 0.0, 0, false),
+			tween("set-during", frame(10.0), 10.0, 1.0, 0.0, 0, false),
+			tween("set-end", frame(10.0), 10.0, 0.25, 0.0, 0, false),
+			tween("delay", frame(10.0), 10.0, 0.5, 0.25, 0, false),
+			tween("delay-odd", frame(10.0), 10.0, 0.5, 0.26, 0, false),
+			tween("delay-takeover", frame(10.0), 10.0, 0.5, 0.5, 0, false),
+			tween("delay-takeover", frame(25.0), -10.0, 0.5, 0.0, 0, false),
+			tween("delay-under", frame(10.0), -10.0, 1.0, 0.0, 0, false),
+			tween("delay-under", frame(25.0), 10.0, 0.5, 0.25, 0, false),
+			tween("reverses", frame(10.0), 10.0, 0.25, 0.1, 1, true),
+			tween("repeat-odd", frame(10.0), 10.0, 0.255, 0.03, 2, false),
+			tween("rev-odd", frame(10.0), 10.0, 0.255, 0.0, 1, true),
+			tween("gap-set", frame(10.0), 10.0, 0.25, 0.1, 1, false),
+			tween("takeover-set", frame(10.0), 10.0, 1.0, 0.0, 0, false),
+			tween("takeover-set", frame(40.0), -10.0, 1.0, 0.0, 0, false),
+			tween("end-takeover", frame(10.0), 10.0, 0.25, 0.0, 0, false),
+			tween("end-takeover", frame(24.0), -10.0, 1.0, 0.0, 0, false),
+			tween("zero", frame(10.0), 10.0, 0.0, 0.0, 0, false),
+			tween("play-then-set", frame(10.0), 10.0, 1.0, 0.0, 0, false),
+		];
+		let actions = vec![
+			// lost: the tween writes in that frame (in the binding and after the render alike)
+			set("set-during", frame(30.0), 50.0),
+			set("set-during", hb(40.0), 60.0),
+			// the tween's last frame writes its end over a set; the frame after keeps it
+			set("set-end", frame(24.0), 50.0),
+			set("set-end", frame(25.0), 51.0),
+			// a set while the delay counts is the value the tween goes from
+			set("delay", frame(15.0), 3.0),
+			// between iterations the delay writes nothing; the next iteration goes from the first start
+			set("gap-set", frame(33.0), 20.0),
+			// a set in the frame a later tween is played in reaches it
+			set("takeover-set", frame(40.0), 30.0),
+			set("play-then-set", frame(10.0), 4.0),
+		];
+		let playback = Playback { actions, tweens, ..Default::default() };
+		for step in 9..=71 {
+			let undo = state_at(&playback, &mut document, frame(step as f32));
+			for (name, values) in &CLIENT {
+				let value = number(&document, &format!("Fx.{name}"), "Value");
+				let client = values[step - 9];
+				assert!((value - client).abs() < 2e-3, "{name} at the client's frame {step}: {value}, the client drew {client}");
+			}
 			undo.restore(&mut document);
 		}
 	}
@@ -3680,7 +3894,8 @@ mod tests {
 		assert_eq!(document.dom.get_by_ref(impact).unwrap().parent(), lighting);
 		let environment = crate::scene::extract::environment(&document).unwrap();
 		assert!(environment.effects.iter().any(|effect| matches!(effect, crate::scene::environment::PostEffect::ColorCorrection { contrast, .. } if *contrast == 1.0)));
-		assert!((number(&document, "Hit.Core.PointLight", "Brightness") - 3.6).abs() < 1e-4);
+		// (6 to 0 over 1 s from its first step, in the frame at 0)
+		assert!((number(&document, "Hit.Core.PointLight", "Brightness") - 6.0 * (1.0 - (0.4 + 1.0 / 60.0))).abs() < 1e-4);
 		undo.restore(&mut document);
 		assert_eq!(children(&document), before, "back in its place among its siblings");
 		let undo = state_at(&playback, &mut document, 0.6);
@@ -4686,7 +4901,7 @@ mod tests {
 			..Default::default()
 		};
 		let mut key_channel = Channel { referent: Ref::none(), property: "Transparency", alias: None, initial: Some(serde_json::json!(0.0)), events: Vec::new(), keyframes: Some(&tween), sorted_keyframes: Vec::new(), states: Vec::new() };
-		key_channel.finalize();
+		key_channel.finalize(&[]);
 		for step in -2..=24 {
 			let t = step as f32 * 0.05;
 			assert_eq!(key_channel.at(t), tween_at(&tween, t, Some(&serde_json::json!(0.0))), "keyframe channel at t={t}");

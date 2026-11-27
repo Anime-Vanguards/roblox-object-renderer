@@ -91,7 +91,7 @@ ror video Effect.rbxm \
   - `clear`: mimics `:Clear()` on emitters and trails.
   - `set`: map of properties to apply to `target` (or matching `class` descendants).
   - `parent`: destination path (`""` removes from world).
-- **`tweens`:** Property animations over time, defined either as `keys` (keyframe segments eased by the end key's `easing` and `direction`) or `to` (TweenService-style: `at`, `duration`, `easing`, `direction`, `repeatCount`, `reverses`, `delay`, interpolating from the property's value at `at`).
+- **`tweens`:** Property animations over time, defined either as `keys` (keyframe segments eased by the end key's `easing` and `direction`) or `to` (TweenService-style: `at`, `duration`, `easing`, `direction`, `repeatCount`, `reverses`, `delay`). A `to` tween steps once a frame as a Roblox client steps it: the frame it is played in draws it one frame's step in, from the value the property has then; a later tween of the property takes over from what the earlier one last wrote; a set is lost in a frame the tween writes; a delay comes before every iteration, and a repeat starts again from the same value.
 - **`motion`:** Animates a part's `CFrame`, a model's pivot, or an attachment's world `CFrame` (moving all descendants along with it). Set `"relative": true` to interpret keyframes relative to the target's rest transform.
 
 ### JSON value encodings
