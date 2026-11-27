@@ -3031,7 +3031,9 @@ impl Resolved<'_> {
 				let Some(frame) = rest_cframe(document, parent) else {
 					return;
 				};
-				frame
+				// a legacy effect's system keeps its own frame on the mount (its offset along the effect's up
+				// axis, the turn a system emitting outwards takes): scene::legacy made it from the same rest
+				if emitter.mount.is_some() { emitter.cframe } else { frame }
 			};
 			let track = if fixed { None } else { self.track_of(document, parent) };
 			let inv = track.map(|index| self.tracks[index].pose(time).inverse());
@@ -5135,5 +5137,33 @@ mod tests {
 		for run in &parallel {
 			assert_eq!(run, &forward, "parallel legacy Fire viewer mask must match serial deterministically");
 		}
+	}
+
+	/// A legacy effect's systems keep their own frame on the mount in a playback: Sparkles' stars leave
+	/// across the effect's up axis (their system is turned for it), as they do without one, not along
+	/// the part's X axis' circle (up and down).
+	#[test]
+	fn a_legacy_systems_frame_keeps_its_turn_in_a_playback() {
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use rbx_dom_weak::InstanceBuilder;
+
+		let mut model = ModelBuilder::new("LegacyFrame");
+		let part = model.part(&PartSpec { name: "Holder".into(), size: Vec3::splat(0.2), ..Default::default() });
+		model.child(part, InstanceBuilder::new("Sparkles").with_name("Sparkles").with_property("Enabled", true));
+		let doc = model.into_document();
+		let playback = Playback { time: 1.0, ..Default::default() };
+		let resolved = playback.resolve(&doc).unwrap();
+		let mut scene = crate::scene::extract::extract(&doc);
+		resolved.apply_history(&doc, &mut scene);
+		let stars = scene.particles.iter().find(|emitter| emitter.path.ends_with("#stars")).expect("Sparkles' stars");
+		let particles: Vec<_> = crate::render::particles::simulate(stars).into_iter().filter(|particle| particle.age > 0.15 && particle.age < 0.4).collect();
+		assert!(particles.len() > 4, "{} young stars", particles.len());
+		let spread = |axis: fn(Vec3) -> f32| {
+			let values: Vec<f32> = particles.iter().map(|particle| axis(particle.position)).collect();
+			let mean = values.iter().sum::<f32>() / values.len() as f32;
+			(values.iter().map(|value| (value - mean).powi(2)).sum::<f32>() / values.len() as f32).sqrt()
+		};
+		let (across, up) = (spread(|p| p.x).max(spread(|p| p.z)), spread(|p| p.y));
+		assert!(across > 2.0 * up, "stars spread {across} across the up axis and {up} along it");
 	}
 }
