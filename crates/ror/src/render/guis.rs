@@ -2787,6 +2787,23 @@ mod tests {
 		let (sun_and_sky, sky_only) = (against_at(false, 1.0, 2.0), against_at(false, 1.0, 0.0));
 		assert!((sun_and_sky - sky_only).abs() <= 1.0, "EnvironmentDiffuseScale 1: no light from behind ({sun_and_sky} against the sky's {sky_only})");
 
+		// a white SurfaceGui on the far side of a 6-stud slab turned 150 degrees from the sun: with GlobalShadows it keeps
+		// part of its back light, through the light grid's voxel sun (fixtures/world-guis.luau "backlit" in a client: 0.56
+		// in squared values); the shadow maps read from behind lit it whole or black in patches
+		let normal = (sun * 150f32.to_radians().cos() + across * 150f32.to_radians().sin()).normalize();
+		let behind = |global_shadows: bool| {
+			let mut model = ModelBuilder::new("Holder");
+			let part = model.part(&PartSpec { name: "Slab".into(), cframe: facing(Vec3::ZERO, normal), size: Vec3::new(12.0, 2.0, 6.0), color: [0, 0, 0], material: 272, ..Default::default() });
+			surface(&mut model, part, [600.0, 100.0], 1.0);
+			let mut scene = crate::scene::extract::extract(&model.into_document());
+			lighting(&mut scene, 2.0, global_shadows);
+			let request = view((normal + across * 0.3).normalize() * 30.0, Vec3::ZERO, 30.0, 128);
+			level(&draw(&scene, &request, &white), &request, normal * 3.0)
+		};
+		let (open, shadows) = (behind(false), behind(true));
+		let kept = (shadows / open.max(1.0)).powi(2);
+		assert!(open > 60.0 && (0.4..0.75).contains(&kept), "behind a 6-stud holder: {kept} of the back light ({shadows} against {open})");
+
 		// an unlit SurfaceGui of one-texel black lines every third texel on white, seen 2.7 times smaller than its image
 		let mut model = ModelBuilder::new("Lines");
 		let part = model.part(&PartSpec { name: "Board".into(), size: Vec3::new(12.0, 4.0, 0.5), color: [0, 0, 0], material: 272, ..Default::default() });

@@ -605,10 +605,15 @@ fn sun_reach(quality: &crate::quality::Quality, environment: &crate::scene::Envi
 
 /// The sun the light grid carries for `views` (lightgrid::grid_sun): only when one of them can see past its sun
 /// shadow maps (a level without them, or a camera farther than their reach from a corner of the scene's `bounds`),
-/// where it shades the sun. Carrying it doubled the grid's build on 30,000 blocks over 1,536 x 324 x 1,536 studs,
-/// for views that never read it.
+/// where it shades the sun, or when the scene has GUIs in the world the sun lights, whose sides turned from it take
+/// their back light through it (gui.wgsl `gui_light`). Carrying it doubled the grid's build on 30,000 blocks over
+/// 1,536 x 324 x 1,536 studs, for views that never read it.
 fn grid_sun_for(scene: &Scene, views: &[ViewRequest], bounds: Option<(Vec3, Vec3)>) -> Option<Vec3> {
 	let sun = lightgrid::grid_sun(scene)?;
+	let lit_guis = scene.guis.iter().any(|gui| matches!(gui.kind, crate::scene::guis::GuiKind::Surface(_) | crate::scene::guis::GuiKind::Billboard(_)) && gui.light_influence > 0.0);
+	if lit_guis {
+		return Some(sun);
+	}
 	let (min, max) = bounds?;
 	let environment = &scene.environment;
 	let past = |view: &ViewRequest| match sun_reach(&view_quality(view, environment), environment) {

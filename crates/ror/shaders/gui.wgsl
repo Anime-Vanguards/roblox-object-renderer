@@ -150,9 +150,13 @@ fn gui_light(input: GuiOutput) -> vec3<f32> {
 	// a Roblox client: with GlobalShadows frames on slabs facing the sun read as without them, whatever holds them
 	// (opaque, invisible, half transparent, without CastShadow, a block, a 0.05 plate), a roof's shadow falls across
 	// a frame as across the part beside it, and 700 studs off the light grid's sun shades both alike; Studio's edit
-	// viewport lights them from its light grid instead); from behind, the shadow as the side facing the sun takes it
+	// viewport lights them from its light grid instead). From behind, the light grid's voxel sun on the GUI's own side:
+	// with GlobalShadows a frame on a holder turned 120 / 150 degrees from the sun keeps 0.91 / 0.82 of its back light
+	// behind 0.05 studs, 0.90 / 0.78 behind 0.5, 0.85 / 0.69 behind 2 and 0.79 / 0.56 behind 6 (fixtures/world-guis.luau
+	// "backlit", 0.748 at level 21), the trend of the sun through the holder's voxels; the shadow maps from behind lit it
+	// whole or black in patches
 	let facing = n_dot_l >= 0.0;
-	let shade = sun_shade(input.world_position, select(-n, n, facing)) * cloud_sun(input.world_position);
+	let shade = select(light_grid_sun(input.world_position, n), sun_shade(input.world_position, n), facing) * cloud_sun(input.world_position);
 	// from behind shadow.wgsl `sun_back_share`, with GlobalShadows or not, wherever the GUI is (Studio's edit viewport: 0.39
 	// without them, none with them)
 	let sun = frame.sun_color.rgb / PI * select(sun_back_share(n_dot_l), n_dot_l, facing) * shade;
