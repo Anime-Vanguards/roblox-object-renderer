@@ -144,6 +144,99 @@ impl ParticleEmitter {
 		let envelopes: Vec<f32> = self.size_keys.iter().map(|key| key.2.abs()).collect();
 		(0..32).map(|k| number_at(&self.size_keys, k as f32 / 31.0, &envelopes)).fold(0.0, f32::max)
 	}
+
+	/// How far beyond its part's half diagonal (`size`) the emitter's particles can start: a Cylinder
+	/// past ShapePartial 1 or below 0 carries on past its wider end ([`cylinder_beyond`]), wider as it
+	/// goes; 0 for every other emitter.
+	pub fn spawn_spill(&self, size: glam::Vec3) -> f32 {
+		let partial = self.shape_partial;
+		if self.attachment || self.shape != 2 || (0.0..=1.0).contains(&partial) {
+			return 0.0;
+		}
+		// the Cylinder's axis by EmissionDirection (render::particles' SHAPE_FRAMES: Right and Left run
+		// along Z, the others along X), round across the other two sides
+		let axis = if matches!(self.emission_direction, 0 | 3) { 2 } else { 0 };
+		let length = size[axis];
+		let across = (0..3).filter(|&side| side != axis).map(|side| size[side] * 0.5).fold(0.0, f32::max);
+		let surface = self.shape_style == 1;
+		let reach = [cylinder_beyond(partial, surface, 0.0), cylinder_beyond(partial, surface, 1.0), 0.0, 1.0]
+			.iter()
+			.map(|&along| ((along - 0.5) * length).hypot((1.0 + (partial - 1.0) * along).abs() * across))
+			.fold(0.0, f32::max);
+		(reach - size.length() * 0.5).max(0.0)
+	}
+}
+
+/// Where a Roblox client puts a Cylinder's particles along its axis past ShapePartial 1 and below 0:
+/// the share k / 16 of them lies before each entry, in lengths from the full end (1 at the end
+/// ShapePartial scales), the radius growing on linearly from 1 to ShapePartial and on past it
+/// (`fixtures/particle-probes.luau` "taper": 1000 or 3000 particles in each of 29 12 x 2 x 2
+/// Cylinders, seen from 400 studs in four sessions of the client, 0.747, that agree within 0.05;
+/// ror's renders through the same reading within 0.02-0.1 of these, the most for the slabs of 1000).
+/// It does not stop at the ends: past 1 it carries on past the wide end, crowding a slab there
+/// densest at its far side (ShapePartial 2: 39 % of the particles, up to 0.1 of the length out; 3:
+/// 63 %, 0.43; 5: 79 %, 1.18), and below 0 past the full end (-0.5: 57 %, 0.12; -1: 69 %, 0.28; -2:
+/// 82 %, 0.64). The surface style carries on less (2: 2-4 %, 0.01; 3: 52 %, 0.14; 5: 75 %, 0.59).
+/// No closed law found; between rows the quantiles blend, towards the in-range law at 1 (an even
+/// spread) and at 0 (u³, the side's u²), and past the last row they hold.
+const CYLINDER_BEYOND_VOLUME: [(f32, [f32; 17]); 16] = [
+	(-2.00, [-0.639, -0.623, -0.611, -0.594, -0.564, -0.529, -0.483, -0.432, -0.373, -0.316, -0.247, -0.171, -0.090, -0.013, 0.238, 0.563, 1.000]),
+	(-1.50, [-0.459, -0.444, -0.434, -0.418, -0.398, -0.370, -0.337, -0.296, -0.253, -0.202, -0.147, -0.088, -0.028, 0.109, 0.348, 0.628, 1.000]),
+	(-1.00, [-0.280, -0.268, -0.261, -0.250, -0.240, -0.220, -0.195, -0.164, -0.123, -0.088, -0.043, -0.004, 0.118, 0.272, 0.468, 0.720, 1.000]),
+	(-0.75, [-0.199, -0.187, -0.180, -0.170, -0.158, -0.143, -0.124, -0.103, -0.082, -0.057, -0.034, -0.005, 0.103, 0.252, 0.445, 0.717, 1.000]),
+	(-0.50, [-0.120, -0.108, -0.102, -0.096, -0.087, -0.072, -0.056, -0.043, -0.027, -0.005, 0.049, 0.145, 0.246, 0.423, 0.594, 0.756, 1.000]),
+	(-0.25, [-0.050, -0.046, -0.041, -0.036, -0.030, -0.023, -0.015, -0.006, 0.012, 0.059, 0.118, 0.207, 0.314, 0.443, 0.585, 0.730, 1.000]),
+	(1.10, [0.000, 0.067, 0.140, 0.210, 0.273, 0.341, 0.406, 0.471, 0.531, 0.596, 0.659, 0.718, 0.780, 0.833, 0.887, 0.941, 0.998]),
+	(1.25, [0.000, 0.079, 0.160, 0.236, 0.306, 0.378, 0.446, 0.523, 0.591, 0.662, 0.724, 0.781, 0.834, 0.884, 0.927, 0.966, 0.999]),
+	(1.40, [0.000, 0.095, 0.180, 0.266, 0.347, 0.428, 0.506, 0.582, 0.652, 0.719, 0.779, 0.835, 0.883, 0.926, 0.958, 0.983, 1.002]),
+	(1.50, [0.000, 0.091, 0.193, 0.289, 0.376, 0.466, 0.556, 0.636, 0.712, 0.776, 0.832, 0.884, 0.925, 0.956, 0.981, 0.993, 1.008]),
+	(1.75, [0.000, 0.107, 0.213, 0.307, 0.407, 0.497, 0.595, 0.689, 0.774, 0.859, 0.919, 0.965, 0.997, 1.012, 1.021, 1.027, 1.039]),
+	(2.00, [0.000, 0.134, 0.266, 0.401, 0.512, 0.632, 0.735, 0.828, 0.903, 0.969, 1.010, 1.032, 1.051, 1.068, 1.081, 1.087, 1.099]),
+	(2.50, [0.000, 0.160, 0.313, 0.473, 0.624, 0.758, 0.885, 0.994, 1.048, 1.093, 1.134, 1.165, 1.194, 1.214, 1.231, 1.240, 1.250]),
+	(3.00, [0.000, 0.194, 0.373, 0.555, 0.722, 0.882, 1.015, 1.093, 1.160, 1.218, 1.272, 1.317, 1.352, 1.381, 1.401, 1.409, 1.425]),
+	(4.00, [0.000, 0.244, 0.503, 0.736, 0.959, 1.090, 1.211, 1.313, 1.406, 1.494, 1.563, 1.627, 1.684, 1.725, 1.754, 1.770, 1.797]),
+	(5.00, [0.000, 0.317, 0.641, 0.928, 1.116, 1.270, 1.422, 1.558, 1.676, 1.792, 1.883, 1.963, 2.030, 2.083, 2.120, 2.144, 2.184]),
+];
+
+/// [`CYLINDER_BEYOND_VOLUME`]'s rows for the surface style.
+const CYLINDER_BEYOND_SURFACE: [(f32, [f32; 17]); 8] = [
+	(-1.00, [-0.130, -0.125, -0.119, -0.111, -0.100, -0.090, -0.073, -0.052, -0.031, 0.010, 0.088, 0.181, 0.320, 0.460, 0.613, 0.785, 1.000]),
+	(-0.50, [-0.050, -0.043, -0.037, -0.031, -0.023, -0.011, 0.007, 0.045, 0.094, 0.170, 0.274, 0.389, 0.492, 0.617, 0.711, 0.850, 1.000]),
+	(1.25, [0.000, 0.077, 0.155, 0.227, 0.295, 0.362, 0.427, 0.493, 0.555, 0.618, 0.679, 0.738, 0.794, 0.852, 0.905, 0.953, 0.999]),
+	(1.40, [0.000, 0.091, 0.175, 0.253, 0.332, 0.407, 0.476, 0.542, 0.606, 0.671, 0.728, 0.783, 0.830, 0.877, 0.919, 0.959, 0.999]),
+	(1.50, [0.000, 0.094, 0.181, 0.264, 0.346, 0.413, 0.473, 0.534, 0.601, 0.669, 0.722, 0.779, 0.836, 0.877, 0.920, 0.956, 1.000]),
+	(2.00, [0.000, 0.130, 0.237, 0.344, 0.434, 0.531, 0.620, 0.687, 0.753, 0.810, 0.863, 0.903, 0.942, 0.968, 0.986, 0.995, 1.009]),
+	(3.00, [0.000, 0.193, 0.370, 0.520, 0.669, 0.800, 0.890, 0.975, 1.014, 1.042, 1.064, 1.087, 1.099, 1.110, 1.117, 1.124, 1.138]),
+	(5.00, [0.000, 0.333, 0.596, 0.832, 1.011, 1.111, 1.182, 1.252, 1.312, 1.360, 1.408, 1.456, 1.496, 1.525, 1.544, 1.559, 1.587]),
+];
+
+/// Where along a Cylinder's axis a particle starts for a uniform `u`, past ShapePartial 1 or below 0
+/// (`partial` outside 0..=1; [`CYLINDER_BEYOND_VOLUME`]): in lengths from the full end, outside
+/// 0..1 for the particles carried past an end.
+pub fn cylinder_beyond(partial: f32, surface: bool, u: f32) -> f32 {
+	let rows: &[(f32, [f32; 17])] = if surface { &CYLINDER_BEYOND_SURFACE } else { &CYLINDER_BEYOND_VOLUME };
+	let x = u.clamp(0.0, 1.0) * 16.0;
+	let index = (x as usize).min(15);
+	let quantile = |row: &[f32; 17]| row[index] + (row[index + 1] - row[index]) * (x - index as f32);
+	// the in-range law where this side meets it: an even spread at 1, u³ (the side's u²) at 0
+	let above = partial > 1.0;
+	let meeting = if above { (1.0, u) } else { (0.0, u.powi(if surface { 2 } else { 3 })) };
+	let mut below: Option<(f32, f32)> = None;
+	let mut over: Option<(f32, f32)> = None;
+	for (p, t) in rows.iter().filter(|(p, _)| (*p > 1.0) == above).map(|(p, row)| (*p, quantile(row))).chain(std::iter::once(meeting)) {
+		if p <= partial {
+			if below.is_none_or(|(nearest, _)| p > nearest) {
+				below = Some((p, t));
+			}
+		} else if over.is_none_or(|(nearest, _)| p < nearest) {
+			over = Some((p, t));
+		}
+	}
+	match (below, over) {
+		(Some((a, from)), Some((b, to))) => from + (to - from) * (partial - a) / (b - a),
+		(Some((_, t)), None) | (None, Some((_, t))) => t,
+		(None, None) => u,
+	}
 }
 
 /// A NumberSequence at `t` (0..1) with each keypoint moved by `offsets[k]` (its envelope's random
@@ -349,5 +442,26 @@ mod tests {
 		for bad in [[3.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [0.5, -2.0, 1.0], [f32::NAN, 0.0, 0.0]] {
 			assert_eq!(keys(&[[0.5; 3], bad]), vec![(0.0, Vec3::ONE)], "{bad:?}");
 		}
+	}
+
+	/// A Cylinder past ShapePartial 1 or below 0 spreads as the client's measured quantiles at the
+	/// measured values, blends between them and towards the in-range laws next to 1 and 0, and holds
+	/// past the last row
+	#[test]
+	fn cylinders_beyond_shape_partial_one_follow_the_measured_quantiles() {
+		// at a measured value: the row itself (ShapePartial 2's median 0.903, its far side 1.099)
+		assert!((cylinder_beyond(2.0, false, 0.5) - 0.903).abs() < 1e-6);
+		assert!((cylinder_beyond(2.0, false, 1.0) - 1.099).abs() < 1e-6);
+		// between rows, halfway
+		let half = (cylinder_beyond(2.0, false, 0.75) + cylinder_beyond(2.5, false, 0.75)) * 0.5;
+		assert!((cylinder_beyond(2.25, false, 0.75) - half).abs() < 1e-6);
+		// next to 1 towards an even spread, next to 0 towards u³ (the surface style's u²)
+		let near_one = cylinder_beyond(1.05, false, 0.3);
+		assert!((near_one - (0.3 + cylinder_beyond(1.1, false, 0.3)) * 0.5).abs() < 1e-6);
+		let near_zero = cylinder_beyond(-0.125, true, 0.6);
+		assert!((near_zero - (0.6f32.powi(2) + cylinder_beyond(-0.25, true, 0.6)) * 0.5).abs() < 1e-3);
+		// past the last rows they hold
+		assert_eq!(cylinder_beyond(8.0, false, 0.9), cylinder_beyond(5.0, false, 0.9));
+		assert_eq!(cylinder_beyond(-3.0, false, 0.1), cylinder_beyond(-2.0, false, 0.1));
 	}
 }

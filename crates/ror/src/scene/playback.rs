@@ -2500,7 +2500,8 @@ impl Resolved<'_> {
 		let mut viewer_idx = 0usize;
 		let static_emitter = track.is_none() && size_channel.is_none();
 		let static_center = Vec3::from(parent_now.translation);
-		let static_radius = emitter.size.length() * 0.5 + reach_a + reach_b + reach_c;
+		// a Cylinder past ShapePartial 1 or below 0 starts particles past its part's ends (0 for the rest)
+		let static_radius = emitter.size.length() * 0.5 + emitter.spawn_spill(emitter.size) + reach_a + reach_b + reach_c;
 		let mut last_viewer_idx = usize::MAX;
 		let mut last_seen = 0.0f32;
 		for (index, &frame) in self.grid.iter().enumerate() {
@@ -2519,7 +2520,7 @@ impl Resolved<'_> {
 					None => static_center,
 				};
 				let size = size_channel.and_then(|channel| channel.at_vec3(frame)).unwrap_or(emitter.size);
-				let radius = size.length() * 0.5 + reach_a + reach_b + reach_c;
+				let radius = size.length() * 0.5 + emitter.spawn_spill(size) + reach_a + reach_b + reach_c;
 				if viewer[viewer_idx].sees(center, radius) { 1.0 } else { 0.0 }
 			};
 			let from = if index == 0 { f32::NEG_INFINITY } else { self.grid[index - 1] };

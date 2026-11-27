@@ -13,7 +13,7 @@ use glam::{Mat4, Quat, Vec3};
 use super::camera::Camera;
 use super::pipelines::{DEPTH_FORMAT, HDR_FORMAT, SAMPLE_COUNTS};
 use super::resources::TextureUse;
-use crate::scene::particles::{ParticleEmitter, color_at, number_at};
+use crate::scene::particles::{ParticleEmitter, color_at, cylinder_beyond, number_at};
 use crate::scene::Scene;
 
 const COMMON: &str = include_str!("../../shaders/common.wgsl");
@@ -189,9 +189,11 @@ const SHAPE_FRAMES: [[Vec3; 3]; 6] = [
 /// 0.5 / 0.7 / 0.9 where u³ gives 0.001 / 0.027 / 0.125 / 0.343 / 0.729 and an even spread 0.035 /
 /// 0.112 / 0.206 / 0.331 / 0.536; the side's u²: 0.013 / 0.085 / 0.239 / 0.470 / 0.811 against
 /// 0.01 / 0.09 / 0.25 / 0.49 / 0.81), and near 1 it is all but even (0.75 and 0.9 within 0.02 of an
-/// even spread's quantiles). Past 1 and below 0 the even spread stays: Studio's there crowd a slab of
-/// two to three fifths of the particles up to a tenth of the length beyond the wide end, not
-/// modelled (14 of one game's Cylinders are above 1, none below 0).
+/// even spread's quantiles). Past 1 and below 0 a client carries the Cylinder on past its wider end,
+/// the radius still growing linearly, and crowds particles there, densest at the far side
+/// ([`cylinder_beyond`]'s measured quantiles; 14 of one game's Cylinders are above 1, none below
+/// 0): ShapePartial 2 puts 39 % of them up to a tenth of the length past its wide end, where an even
+/// spread over the volume kept them all inside.
 fn taper(partial: f32, surface: bool, u: f32) -> (f32, f32) {
 	if (partial - 1.0).abs() < 1e-3 {
 		return (u, 1.0);
@@ -202,14 +204,8 @@ fn taper(partial: f32, surface: bool, u: f32) -> (f32, f32) {
 		let along = (sigma.powi(power) - partial.powi(power)) / (1.0 - partial.powi(power));
 		return (along, 1.0 + (partial - 1.0) * along);
 	}
-	let scale = if surface {
-		// s |s| / 2, a primitive of |s|, from its value at 1 to its value at ShapePartial
-		let primitive = 0.5 + u * (partial * partial.abs() * 0.5 - 0.5);
-		primitive.signum() * (2.0 * primitive.abs()).sqrt()
-	} else {
-		(1.0 + u * (partial.powi(3) - 1.0)).cbrt()
-	};
-	((scale - 1.0) / (partial - 1.0), scale)
+	let along = cylinder_beyond(partial, surface, u);
+	(along, 1.0 + (partial - 1.0) * along)
 }
 
 /// Where a particle starts (emitter space) and the direction it leaves in, before the spread.
@@ -1216,11 +1212,32 @@ mod tests {
 		// Studio's cone crowds its full end as u³: half of its particles within an eighth of its length
 		let near = (0..2000).filter(|_| taper(0.0, false, rng.unit()).0 < 0.125).count();
 		assert!((900..1100).contains(&near), "{near}");
-		// near ShapePartial 1 the spread is all but even, and past 1 it is even over the volume
+		// near ShapePartial 1 the spread is all but even
 		let (along, scale) = taper(0.999_9, false, 0.5);
 		assert!((along - 0.5).abs() < 1e-3 && (scale - 1.0).abs() < 1e-3);
-		let wide = (0..2000).filter(|_| taper(2.0, false, rng.unit()).0 < (1.0 + 0.5 * 7.0f32).cbrt() - 1.0).count();
-		assert!((900..1100).contains(&wide), "{wide}");
+		// past 1 a client carries the Cylinder on past its wide end, the radius growing on: at 2, 39 % of
+		// the particles up to 0.1 of the length out; below 0 past its full end: at -0.5, 57 % up to 0.12
+		// (fixtures/particle-probes.luau "taper"), where an even spread over the volume kept them inside
+		let draws: Vec<(f32, f32)> = (0..4000).map(|_| taper(2.0, false, rng.unit())).collect();
+		let past = draws.iter().filter(|(along, _)| *along > 1.0).count();
+		assert!((1470..1650).contains(&past), "{past}");
+		assert!(draws.iter().all(|&(along, scale)| (0.0..=1.1).contains(&along) && (scale - (1.0 + along)).abs() < 1e-5));
+		let draws: Vec<f32> = (0..4000).map(|_| taper(-0.5, false, rng.unit()).0).collect();
+		let past = draws.iter().filter(|along| **along < 0.0).count();
+		assert!((2180..2370).contains(&past), "{past}");
+		assert!(draws.iter().all(|along| (-0.121..=1.0).contains(along)));
+		// the surface style carries on less: at 3, 52 % up to 0.14 out
+		let past = (0..4000).filter(|_| taper(3.0, true, rng.unit()).0 > 1.0).count();
+		assert!((2000..2180).contains(&past), "{past}");
+		// only such Cylinders start particles past their part (what a viewer's culling must allow): a 12 x 2 x
+		// 2 one at ShapePartial 5 up to 1.18 lengths past its wide end, 9.7 studs from its axis there
+		let size = Vec3::new(12.0, 2.0, 2.0);
+		assert_eq!(part(2, 0.5, 1).spawn_spill(size), 0.0);
+		assert_eq!(part(1, 5.0, 1).spawn_spill(size), 0.0);
+		let spill = part(2, 5.0, 1).spawn_spill(size);
+		assert!((spill - (20.21f32.hypot(9.736) - size.length() * 0.5)).abs() < 0.05, "{spill}");
+		let reach = (0..2000).map(|_| spawn(&part(2, 5.0, 1), size, &mut rng).0.length()).fold(0.0, f32::max);
+		assert!(reach <= size.length() * 0.5 + spill + 1e-3 && reach > size.length() * 0.5 + spill - 1.0, "{reach}");
 		// across a flat part a Cylinder's particles leave along the stretched radius, mostly along its
 		// wide side (a 2 x 1 x 8 part from Top: 92 % of them nearer Z than Y)
 		let flat = part(2, 1.0, 1);

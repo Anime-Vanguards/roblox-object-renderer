@@ -23,6 +23,11 @@
 -- "smoke" (x 5000, seen from -Z): black Smoke (Opacity 1, no rise) 90 studs from the camera over a black
 --   Neon panel and over a black Neon wall 400 studs off, and opaque black ParticleEmitter squares beside
 --   them.
+-- "taper" (x 6000 on, 100 studs apart along X, each seen alone from 400 studs off -Z at a field of view
+--   of 6, 2.5 part lengths either side): 12 x 2 x 2 Cylinders along X (EmissionDirection Top) at
+--   ShapePartial -2 to 5, Volume and Surface, 1000 or 3000 additive particles each where they spawn, as
+--   bright as each case's densest column allows, for the share of particles along the axis; 0, 0.5 and 1
+--   check the reading against the known spread.
 --
 -- Measured in a Roblox client (0.747, quality level 21, 1644 x 1116) against ror's render of the same
 -- place: the job returns the camera; ror's side emits the same counts (`--emit <path>=<count>@0`) and
@@ -218,6 +223,37 @@ return function(Context)
 				Size = Constant(0.05),
 				LightEmission = 1,
 				Transparency = Constant(0.8),
+				Shape = Enum.ParticleEmitterShape.Cylinder,
+				ShapePartial = Case[1],
+				ShapeStyle = Enum.ParticleEmitterShapeStyle[Case[2]],
+			})
+		end
+	end
+
+	-- taper: Cylinders from ShapePartial -2 to 5, wide views
+	do
+		local Model = Group("taper", Vector3.new(6000, 0, 0), nil)
+		-- { ShapePartial, style, Transparency, count }: each case as bright as it can be without its
+		-- densest columns clipping, so that faint particles are not lost to rounding (a renderer that
+		-- does not dither loses the faintest); the cases with dense slabs take fewer, brighter particles
+		local Cases = {
+			{ 1, "Volume", 0.55, 3000 }, { 0, "Volume", 0.88, 1000 }, { 0.5, "Volume", 0.75, 3000 }, { 1.1, "Volume", 0.65, 3000 },
+			{ 1.25, "Volume", 0.65, 3000 }, { 1.4, "Volume", 0.8, 3000 }, { 1.5, "Volume", 0.85, 3000 }, { 1.75, "Volume", 0.76, 1000 },
+			{ 2, "Volume", 0.64, 1000 }, { 2.5, "Volume", 0.8, 3000 }, { 3, "Volume", 0.7, 3000 }, { 4, "Volume", 0.3, 3000 },
+			{ 5, "Volume", 0.2, 3000 }, { -0.25, "Volume", 0.88, 1000 }, { -0.5, "Volume", 0.85, 1000 }, { -0.75, "Volume", 0.85, 1000 },
+			{ -1, "Volume", 0.7, 1000 }, { -1.5, "Volume", 0.8, 3000 }, { -2, "Volume", 0.75, 3000 }, { 1, "Surface", 0.7, 3000 },
+			{ 0, "Surface", 0.88, 1000 }, { 1.25, "Surface", 0.8, 3000 }, { 1.4, "Surface", 0.8, 3000 }, { 1.5, "Surface", 0.64, 1000 },
+			{ 2, "Surface", 0.85, 1000 }, { 3, "Surface", 0.85, 1000 }, { 5, "Surface", 0.64, 1000 }, { -0.5, "Surface", 0.88, 1000 },
+			{ -1, "Surface", 0.88, 1000 },
+		}
+		for Index, Case in Cases do
+			-- a backdrop each: a part is at most 2048 studs long
+			Block(Model, `t{Case[1]}-{Case[2]}-backdrop`, CFrame.new(6000 + (Index - 1) * 100, 0, 80), Vector3.new(110, 100, 1), Color3.new(0, 0, 0), Enum.Material.Neon)
+			local Part = Block(Model, `t{Case[1]}-{Case[2]}-part`, CFrame.new(6000 + (Index - 1) * 100, 0, 0), Vector3.new(12, 2, 2), nil, nil, 1)
+			Emitter(Part, `t{Case[1]}-{Case[2]}`, Case[4], {
+				Size = Constant(0.05),
+				LightEmission = 1,
+				Transparency = Constant(Case[3]),
 				Shape = Enum.ParticleEmitterShape.Cylinder,
 				ShapePartial = Case[1],
 				ShapeStyle = Enum.ParticleEmitterShapeStyle[Case[2]],
