@@ -1,10 +1,10 @@
--- ScreenGuis and ViewportFrames as a Roblox client draws them (0.747, graphics quality 21, 1644 x 1116 at GUI
--- scale 1; notes/render.md "ScreenGuis" and "ViewportFrames"). Context.Case builds one case into the local
+-- ScreenGuis and ViewportFrames as a Roblox client draws them (0.747 and 0.748, graphics quality 21, 1644 x 1116 at
+-- GUI scale 1; notes/render.md "ScreenGuis" and "ViewportFrames"). Context.Case builds one case into the local
 -- player's PlayerGui in front of a black wall (Lighting black: the wall reads 0) and returns what it made (to
 -- destroy) and its camera; without a Case it returns the cases' names, in Context.Phase's group:
 --
--- "screen": ScreenInsets (None, DeviceSafeInsets, CoreUISafeInsets, TopbarSafeInsets, IgnoreGuiInset), two
--- ScreenGuis of one DisplayOrder parented in either order, and a fine pattern of one-pixel lines.
+-- "screen": ScreenInsets (None, DeviceSafeInsets, CoreUISafeInsets, TopbarSafeInsets, IgnoreGuiInset), frames outside
+-- an inset canvas, two ScreenGuis of one DisplayOrder parented in either order, and a fine pattern of one-pixel lines.
 -- "viewports": ViewportFrames holding Neon and Glass, a Sky, coloured light and ambient, what the world
 -- draws around parts (fog, Atmosphere, bloom, local lights, Highlights, GUIs, particles, beams), a UICorner, a
 -- wide and a tall frame (the field of view's axis), a UIGradient, Rotation, a vertex-alpha hole through a
@@ -120,6 +120,26 @@ Cases.screen = {
 	end,
 	["inset-ignore"] = function()
 		return Insets(nil, true)
+	end,
+	-- frames outside a TopbarSafeInsets canvas: left of it (over Roblox's buttons), below it, through it, past
+	-- its right edge and above it; a client draws them all, the screen's edges alone clipping
+	["topbar-overflow"] = function()
+		local Gui = Screen("Overflow", { ScreenInsets = Enum.ScreenInsets.TopbarSafeInsets })
+		Frame(Gui, "Left", Color3.new(1, 0, 0), UDim2.fromOffset(-150, 10), UDim2.fromOffset(100, 30))
+		Frame(Gui, "Below", Color3.new(0, 1, 0), UDim2.fromOffset(100, 70), UDim2.fromOffset(100, 60))
+		Frame(Gui, "Tall", Color3.new(0, 0, 1), UDim2.fromOffset(300, 0), UDim2.fromOffset(50, 300))
+		Frame(Gui, "Right", Color3.new(1, 1, 0), UDim2.new(1, 20, 0, 10), UDim2.fromOffset(100, 30), Vector2.new(1, 0))
+		Frame(Gui, "Past", Color3.new(1, 0, 1), UDim2.new(1, -40, 0, 10), UDim2.fromOffset(100, 30))
+		Frame(Gui, "Above", Color3.new(0, 1, 1), UDim2.fromOffset(500, -20), UDim2.fromOffset(60, 40))
+		return { Gui }
+	end,
+	-- frames outside a CoreUISafeInsets canvas: above it (into the top bar's band), left of it, past its bottom
+	["inset-overflow"] = function()
+		local Gui = Screen("Overflow", { ScreenInsets = Enum.ScreenInsets.CoreUISafeInsets })
+		Frame(Gui, "Up", Color3.new(1, 0, 0), UDim2.fromOffset(300, -40), UDim2.fromOffset(100, 80))
+		Frame(Gui, "Left", Color3.new(0, 1, 0), UDim2.fromOffset(-50, 100), UDim2.fromOffset(100, 40))
+		Frame(Gui, "Under", Color3.new(0, 0, 1), UDim2.new(0, 500, 1, -20), UDim2.fromOffset(100, 80))
+		return { Gui }
 	end,
 	["tie-a-then-b"] = function()
 		return Tie("ab")

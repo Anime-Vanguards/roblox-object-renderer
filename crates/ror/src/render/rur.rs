@@ -459,6 +459,50 @@ fn rewrite_staged_uris(dom: &mut WeakDom, root: rbx_dom_weak::types::Ref, staged
 	}
 }
 
+/// A GUI's content (a model whose root holds the GUI) with what its GUI holds laid out in `layout` (x,
+/// y, width, height in GUI pixels of a canvas of `canvas`) and drawn wherever it reaches in the canvas:
+/// its children moved into a Frame of that rect that draws nothing and does not clip. A ScreenGui below
+/// the top bar or in its band is laid out so and drawn over the whole view, as a Roblox client draws it
+/// (render::guis). Children that only shape their parent ([`ROOT_ONLY`]) stay on the GUI, where the
+/// atlas leaves them out as before.
+pub fn inset_content(content: &[u8], layout: [f32; 4], canvas: [f32; 2]) -> Result<Vec<u8>> {
+	let mut dom = rbx_binary::from_reader(content).map_err(|error| anyhow!("GUI content: {error}"))?;
+	let gui = dom.root().children().first().copied().context("GUI content without the GUI")?;
+	let children: Vec<_> = dom
+		.get_by_ref(gui)
+		.context("GUI content")?
+		.children()
+		.iter()
+		.copied()
+		.filter(|&child| dom.get_by_ref(child).is_some_and(|instance| !ROOT_ONLY.contains(&instance.class.as_str())))
+		.collect();
+	// per axis: its start as whole GUI pixels, its length to the canvas's far edge by scale (a view's
+	// width in GUI pixels need not be whole) or else as whole GUI pixels
+	let axis = |start: f32, length: f32, side: f32| {
+		let start = start.round();
+		let size = if (start + length - side).abs() < 1.0 / 1024.0 { UDim::new(1.0, -(start as i32)) } else { UDim::new(0.0, length.round() as i32) };
+		(UDim::new(0.0, start as i32), size)
+	};
+	let (x, width) = axis(layout[0], layout[2], canvas[0]);
+	let (y, height) = axis(layout[1], layout[3], canvas[1]);
+	let inset = dom.insert(
+		gui,
+		InstanceBuilder::new("Frame")
+			.with_name("RorInset")
+			.with_property("Position", UDim2::new(x, y))
+			.with_property("Size", UDim2::new(width, height))
+			.with_property("BackgroundTransparency", 1.0f32)
+			.with_property("BorderSizePixel", 0i32)
+			.with_property("ClipsDescendants", false),
+	);
+	for child in children {
+		dom.transfer_within(child, inset);
+	}
+	let mut model = Vec::new();
+	rbx_binary::to_writer(&mut model, &dom, &[gui]).map_err(|error| anyhow!("writing the GUI content: {error}"))?;
+	Ok(model)
+}
+
 /// The atlas model: a ScreenGui per request at its cell, holding the GUI's children. rur draws an
 /// atlas's GUIs a little differently by where they fall in it (an edge pixel 2-9 levels off here and
 /// there: its sizes and places are fractions of the atlas, and its vertices are scaled into the
@@ -1018,6 +1062,32 @@ mod direct {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// A ScreenGui laid out in the top bar's band keeps its GUI objects in a Frame of the band that draws
+	/// nothing and does not clip (a client draws what lies outside its canvas), its width to the canvas's
+	/// right edge by scale; what shapes a GUI root alone stays on the ScreenGui.
+	#[test]
+	fn a_gui_laid_out_in_an_inset_keeps_its_objects_in_a_frame_of_the_inset() {
+		let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+		let root = dom.root_ref();
+		let gui = dom.insert(root, InstanceBuilder::new("ScreenGui").with_name("Bar"));
+		dom.insert(gui, InstanceBuilder::new("Frame").with_name("Icon"));
+		dom.insert(gui, InstanceBuilder::new("UIListLayout"));
+		dom.insert(gui, InstanceBuilder::new("UIPadding"));
+		let mut content = Vec::new();
+		rbx_binary::to_writer(&mut content, &dom, &[gui]).unwrap();
+		let inset = inset_content(&content, [164.0, 0.0, 1001.5 - 164.0, 58.0], [1001.5, 700.25]).unwrap();
+		let dom = rbx_binary::from_reader(inset.as_slice()).unwrap();
+		let gui = dom.get_by_ref(dom.root().children()[0]).unwrap();
+		let names = |instance: &rbx_dom_weak::Instance| instance.children().iter().map(|child| dom.get_by_ref(*child).unwrap().class.to_string()).collect::<Vec<_>>();
+		assert_eq!(names(gui), ["UIPadding", "Frame"], "the padding stays on the ScreenGui");
+		let frame = dom.get_by_ref(gui.children()[1]).unwrap();
+		assert_eq!(frame.name.as_str(), "RorInset");
+		assert_eq!(names(frame), ["Frame", "UIListLayout"], "the GUI's objects and their layout in the inset");
+		assert_eq!(frame.properties.get(&rbx_dom_weak::ustr("Position")), Some(&Variant::UDim2(UDim2::new(UDim::new(0.0, 164), UDim::new(0.0, 0)))));
+		assert_eq!(frame.properties.get(&rbx_dom_weak::ustr("Size")), Some(&Variant::UDim2(UDim2::new(UDim::new(1.0, -164), UDim::new(0.0, 58)))));
+		assert_eq!(frame.properties.get(&rbx_dom_weak::ustr("ClipsDescendants")), Some(&Variant::Bool(false)));
+	}
 
 	#[test]
 	fn sha256_matches_the_standard() {

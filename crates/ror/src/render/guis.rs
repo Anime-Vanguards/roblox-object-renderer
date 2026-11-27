@@ -120,7 +120,8 @@ impl GuiVertex {
 }
 
 /// What a GUI's texture holds: its content, canvas size (1/1024 GUI pixel), scale (1/1024) and
-/// whether it clips (else the texture keeps margins for what overflows the canvas).
+/// whether it clips (else the texture keeps margins for what overflows the canvas), and where in the
+/// canvas the GUI is laid out (a ScreenGui below the top bar or in its band: [`GuiKey::laid_out_in`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GuiKey {
 	content: u64,
@@ -128,6 +129,8 @@ pub struct GuiKey {
 	height: u32,
 	scale: u32,
 	clips: bool,
+	/// The layout's rect in the canvas (x, y, width, height, 1/1024 GUI pixel); all zero: the canvas.
+	inner: [u32; 4],
 }
 
 impl GuiKey {
@@ -145,11 +148,33 @@ impl GuiKey {
 		let quantize = |value: f32, steps: f32| (value * steps).round().clamp(1.0, u32::MAX as f32) as u32;
 		// the scale rounded down, so a capped one stays within the limit
 		let scale = (scale * 1024.0).floor().max(1.0) as u32;
-		Self { content, width: quantize(canvas[0], 1024.0), height: quantize(canvas[1], 1024.0), scale, clips }
+		Self { content, width: quantize(canvas[0], 1024.0), height: quantize(canvas[1], 1024.0), scale, clips, inner: [0; 4] }
+	}
+
+	/// The key with its GUI laid out in `layout` (x, y, width, height in GUI pixels of the canvas) and
+	/// drawn over the whole canvas: a ScreenGui's inset canvas within the view (render::rur::inset_content).
+	fn laid_out_in(self, layout: [f32; 4]) -> Self {
+		let inner = layout.map(|value| (value * 1024.0).round().clamp(0.0, u32::MAX as f32) as u32);
+		let whole = inner == [0, 0, self.width, self.height];
+		Self { inner: if whole { [0; 4] } else { inner }, ..self }
 	}
 
 	fn canvas(&self) -> [f32; 2] {
 		[self.width as f32 / 1024.0, self.height as f32 / 1024.0]
+	}
+
+	/// Where the GUI is laid out in the canvas (x, y, width, height in GUI pixels): the canvas itself, or
+	/// the rect [`GuiKey::laid_out_in`] gave.
+	fn inner(&self) -> [f32; 4] {
+		self.inset().unwrap_or_else(|| {
+			let [width, height] = self.canvas();
+			[0.0, 0.0, width, height]
+		})
+	}
+
+	/// The rect [`GuiKey::laid_out_in`] gave, when the GUI is not laid out in the whole canvas.
+	fn inset(&self) -> Option<[f32; 4]> {
+		(self.inner != [0; 4]).then(|| self.inner.map(|value| value as f32 / 1024.0))
 	}
 
 	fn scale(&self) -> f32 {
@@ -178,7 +203,8 @@ impl GuiKey {
 	}
 
 	fn stem(&self) -> String {
-		format!("{:016x}-{}x{}-{}{}", self.content, self.width, self.height, self.scale, if self.clips { "" } else { "-overflow" })
+		let inset = if self.inner == [0; 4] { String::new() } else { format!("-in{}_{}_{}_{}", self.inner[0], self.inner[1], self.inner[2], self.inner[3]) };
+		format!("{:016x}-{}x{}-{}{}{inset}", self.content, self.width, self.height, self.scale, if self.clips { "" } else { "-overflow" })
 	}
 }
 
@@ -528,8 +554,9 @@ fn plan_framed(gui: &Gui, canvas: [f32; 2], key: &GuiKey, height: &dyn Fn([f32; 
 			let ViewportKind::Framed(framed) = &viewport.kind else {
 				return None;
 			};
-			let rect = viewport.rect(canvas);
-			let pixels = viewport.pixels(canvas);
+			let layout = key.inner();
+			let rect = viewport.rect_within(layout, canvas);
+			let pixels = viewport.pixels_within(layout);
 			let (width, tall) = (pixels[2], pixels[3]);
 			if !(width > 0.0 && tall > 0.0) {
 				return None;
@@ -551,6 +578,15 @@ fn plan_framed(gui: &Gui, canvas: [f32; 2], key: &GuiKey, height: &dyn Fn([f32; 
 			Some(FramedDraw { viewport: index, rect, size: (columns as u32, rows as u32), over, over_snaps, plane })
 		})
 		.collect()
+}
+
+/// A GUI's content as rur draws it for `key`: laid out in the key's inner rect when it has one
+/// ([`GuiKey::laid_out_in`], render::rur::inset_content), else as it is.
+fn laid_out(key: &GuiKey, content: &Arc<Vec<u8>>) -> Arc<Vec<u8>> {
+	match key.inset() {
+		Some(layout) => rur::inset_content(content, layout, key.canvas()).map(Arc::new).unwrap_or_else(|_| content.clone()),
+		None => content.clone(),
+	}
 }
 
 /// Whether `scene` has GUIs to draw (ROR_NO_GUIS: the image without them, for before / after
@@ -693,24 +729,30 @@ pub(super) fn plan_with_skips(scene: &Scene, camera: &Camera, request: &ViewRequ
 				});
 			}
 			GuiKind::Screen(screen) => {
-				// the view in GUI pixels (whole 1/1024 steps of the scale), below the top bar when inset;
-				// drawn 1:1 into the image's pixels over everything (screen-gui-post: no post effect touches it)
+				// the view in GUI pixels (whole 1/1024 steps of the scale); drawn 1:1 into the image's pixels over
+				// everything (screen-gui-post: no post effect touches it)
 				let gui_scale = (request.gui_scale.filter(|scale| *scale > 0.0).unwrap_or(height as f32 / REFERENCE_HEIGHT) * 1024.0).floor().max(1.0) / 1024.0;
-				// its canvas from `top` to `bottom`: the whole view, below the top bar, or inside it (in Studio's
-				// edit viewport, which has no top bar, the whole view)
-				let bar = (crate::scene::guis::top_bar_inset(scene.play) * gui_scale).min(height as f32);
-				let (top, bottom) = match screen.area {
-					ScreenArea::Whole => (0.0, height as f32),
-					ScreenArea::BelowTopBar => (bar, height as f32),
-					ScreenArea::TopBar if scene.play => (0.0, bar),
-					ScreenArea::TopBar => (0.0, height as f32),
+				let view = [width as f32 / gui_scale, height as f32 / gui_scale];
+				// laid out in its canvas: the whole view, below the top bar, or in the top bar's band right of
+				// Roblox's buttons (in Studio's edit viewport, which has no top bar, the whole view); drawn over
+				// the whole view, as a client clips none of them to their canvas (0.748, fixtures/screen-guis.luau
+				// "topbar-overflow", "inset-overflow": frames left of, below and past a TopbarSafeInsets canvas and
+				// above a CoreUISafeInsets one draw)
+				let bar = crate::scene::guis::top_bar_inset(scene.play).min(view[1]);
+				let layout = match screen.area {
+					ScreenArea::BelowTopBar if scene.play => [0.0, bar, view[0], view[1] - bar],
+					ScreenArea::TopBar if scene.play => {
+						let left = crate::scene::guis::top_bar_buttons_end(scene.play).min(view[0]);
+						[left, 0.0, view[0] - left, bar]
+					}
+					_ => [0.0, 0.0, view[0], view[1]],
 				};
-				if (bottom - top) < 1.0 {
+				if layout[2] * gui_scale < 1.0 || layout[3] * gui_scale < 1.0 {
 					skipped.push(crate::scene::guis::SkippedGui { path: gui.path.clone(), reason: "zero pixel size".into() });
 					continue;
 				}
 				let (content_hash, local_snaps) = crate::scene::guis::stamp_gui_hash(gui.base_content_hash, &gui.local_files);
-				let key = GuiKey::within(content_hash, [width as f32 / gui_scale, (bottom - top) / gui_scale], gui_scale, true, MAX_SCREEN_TEXTURE);
+				let key = GuiKey::within(content_hash, view, gui_scale, true, MAX_SCREEN_TEXTURE).laid_out_in(layout);
 				// the canvas as the texture holds it (a canvas past MAX_SCREEN_TEXTURE is drawn smaller and magnified)
 				let [canvas_width, canvas_height] = key.canvas().map(|size| size * gui_scale);
 				let focal = height as f32 * 0.5 / tan;
@@ -728,7 +770,7 @@ pub(super) fn plan_with_skips(scene: &Scene, camera: &Camera, request: &ViewRequ
 					gui: index,
 					key,
 					local_snaps: Arc::from(local_snaps),
-					corners: [corner(0.0, top), corner(canvas_width, top), corner(0.0, top + canvas_height), corner(canvas_width, top + canvas_height)],
+					corners: [corner(0.0, 0.0), corner(canvas_width, 0.0), corner(0.0, canvas_height), corner(canvas_width, canvas_height)],
 					normal: back,
 					params: [0.0, 1.0, 0.0, 0.0],
 					center: camera.eye - back * depth,
@@ -1234,7 +1276,7 @@ impl Renderer {
 						};
 						let requests: Vec<rur::Request> = members
 							.iter()
-							.map(|(key, gui, content, snaps)| rur::Request { content: (*content).clone(), canvas: key.canvas(), margin: key.margin(), z_index_behavior: gui.z_index_behavior, local_snaps: (*snaps).clone() })
+							.map(|(key, gui, content, snaps)| rur::Request { content: laid_out(key, content), canvas: key.canvas(), margin: key.margin(), z_index_behavior: gui.z_index_behavior, local_snaps: (*snaps).clone() })
 							.collect();
 						match rur::render(&rur, &requests, *scale as f32 / 1024.0, &directory, offline) {
 							Ok((pieces, report)) => {
@@ -1671,7 +1713,7 @@ impl Renderer {
 				let Some(viewport) = scene.guis.get(draw.gui).and_then(|gui| gui.viewports.get(framed.viewport)) else {
 					continue;
 				};
-				let mut corner = corner_uv(viewport.corner(draw.key.canvas()));
+				let mut corner = corner_uv(viewport.corner_within(draw.key.inner(), draw.key.canvas()));
 				// its Rotation, and the quad's pixels per uv across over down (it turns in the canvas's pixels)
 				let canvas = draw.key.canvas();
 				corner[2] = viewport.rotation.to_radians();
@@ -2007,7 +2049,9 @@ mod tests {
 			let sizes: Vec<(u32, u32)> = draw.framed.iter().map(|framed| framed.size).collect();
 			// (5120 x 1440: the whole frame's 2646 x 744 GUI pixels drawn 2048 x 576, its proportions kept)
 			assert_eq!(sizes, [whole, half], "{width} x {height}, inset {inset}");
-			assert!(draw.framed[1].rect.iter().zip([0.5, 0.0, 1.0, 1.0]).all(|(a, b)| (a - b).abs() < 1e-5), "{:?}", draw.framed[1].rect);
+			// (in the canvas of the whole view its image covers, from the top bar's foot down when inset)
+			let top = if inset { 58.0 * draw.key.scale() / height as f32 } else { 0.0 };
+			assert!(draw.framed[1].rect.iter().zip([0.5, top, 1.0, 1.0]).all(|(a, b)| (a - b).abs() < 1e-5), "{:?}", draw.framed[1].rect);
 			assert!(draw.overlay && draw.screen == Some(-5));
 		}
 	}
@@ -2283,9 +2327,10 @@ mod tests {
 
 	#[test]
 	fn screen_guis_cover_the_view_below_the_top_bar() {
-		// a fade over the whole view and a HUD below the top bar, in a recording of play (58 GUI pixels)
-		// and in Studio's edit viewport (none); drawn 1:1 into the image's pixels, in the overlay layer,
-		// at the view's GUI scale (744 GUI pixels tall, as billboards)
+		// a fade over the whole view and a HUD laid out below the top bar, in a recording of play (58 GUI
+		// pixels) and in Studio's edit viewport (none); each drawn 1:1 into the image's pixels over the whole
+		// view (a client clips none to its canvas), in the overlay layer, at the view's GUI scale (744 GUI
+		// pixels tall, as billboards)
 		use crate::render::camera::CameraSpec;
 		use crate::scene::guis::ScreenGui;
 
@@ -2310,8 +2355,8 @@ mod tests {
 			let clip = camera.view_projection(request.width as f32 / request.height as f32) * point.extend(1.0);
 			((clip.x / clip.w + 1.0) * 0.5 * request.width as f32, (1.0 - clip.y / clip.w) * 0.5 * request.height as f32)
 		};
-		// and a bar inside the top bar (TopbarSafeInsets: in a client the top 58 GUI pixels; in Studio's edit
-		// viewport, which has none, the whole view)
+		// and a bar in the top bar's band (TopbarSafeInsets: in a client the top 58 GUI pixels right of
+		// Roblox's buttons, from 164; in Studio's edit viewport, which has none, the whole view)
 		for play in [true, false] {
 			let scene = Scene { guis: vec![screen("Transition", 3, ScreenArea::Whole), screen("Hud", 0, ScreenArea::BelowTopBar), screen("Bar", 1, ScreenArea::TopBar)], play, ..Default::default() };
 			let draws = plan(&scene, &camera, &request);
@@ -2319,19 +2364,69 @@ mod tests {
 			let scale = draws[0].key.scale();
 			assert!((scale - 862.0 / 744.0).abs() < 1e-3 && draws.iter().all(|draw| draw.overlay && draw.key.clips), "the view's scale, whatever the supersampling");
 			assert_eq!((draws[0].screen, draws[1].screen, draws[2].screen), (Some(3), Some(0), Some(1)));
-			let bar = if play { 58.0 * scale } else { 0.0 };
-			for (draw, top, bottom) in [(&draws[0], 0.0, 862.0), (&draws[1], bar, 862.0), (&draws[2], 0.0, if play { bar } else { 862.0 })] {
+			let view = [1572.0 / scale, 862.0 / scale];
+			let layouts = if play {
+				[None, Some([0.0, 58.0, view[0], view[1] - 58.0]), Some([164.0, 0.0, view[0] - 164.0, 58.0])]
+			} else {
+				[None, None, None]
+			};
+			for (draw, layout) in draws.iter().zip(layouts) {
 				let [width, height] = draw.key.canvas().map(|size| size * scale);
-				assert!((width - 1572.0).abs() < 0.01 && (height - (bottom - top)).abs() < 0.01, "canvas {width} x {height} at play {play}");
+				assert!((width - 1572.0).abs() < 0.01 && (height - 862.0).abs() < 0.01, "canvas {width} x {height} at play {play}");
 				let (left, upper) = pixel(draw.corners[0]);
 				let (right, lower) = pixel(draw.corners[3]);
-				assert!(left.abs() < 0.02 && (upper - top).abs() < 0.02 && (right - 1572.0).abs() < 0.02 && (lower - bottom).abs() < 0.02, "{left},{upper} - {right},{lower}");
+				assert!(left.abs() < 0.02 && upper.abs() < 0.02 && (right - 1572.0).abs() < 0.02 && (lower - 862.0).abs() < 0.02, "{left},{upper} - {right},{lower}");
+				match (draw.key.inset(), layout) {
+					(None, None) => {}
+					(Some(found), Some(expected)) => assert!(found.iter().zip(expected).all(|(a, b)| (a - b).abs() < 1e-3), "laid out in {found:?}, not {expected:?}"),
+					(found, expected) => panic!("laid out in {found:?}, not {expected:?} at play {play}"),
+				}
 			}
 		}
 		// the world's AlwaysOnTop GUIs far to near, then the ScreenGuis by DisplayOrder (a tie keeps the scene's order)
 		let mut layer = vec![(Some(2), 0.0), (None, 4.0), (Some(1), 0.0), (None, 9.0), (Some(1), 1.0)];
 		layer.sort_by(|a, b| overlay_order(*a, *b));
 		assert_eq!(layer, vec![(None, 9.0), (None, 4.0), (Some(1), 0.0), (Some(1), 1.0), (Some(2), 0.0)]);
+	}
+
+	/// A ScreenGui's ViewportFrame in a recording of play lies where its ScreenGui is laid out: below the top bar
+	/// (CoreUISafeInsets) or in its band right of Roblox's buttons (TopbarSafeInsets), in the canvas of the whole
+	/// view its image covers.
+	#[test]
+	fn a_screen_guis_viewport_frame_lies_in_its_inset() {
+		use crate::render::camera::CameraSpec;
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use rbx_dom_weak::InstanceBuilder;
+		use rbx_dom_weak::types::{CFrame, Enum, Matrix3, UDim, UDim2, Variant, Vector3};
+
+		for (insets, origin) in [(2, [0.0, 58.0]), (3, [164.0, 0.0])] {
+			let mut model = ModelBuilder::new("Scene");
+			let player_gui = model.child(model.model, InstanceBuilder::new("PlayerGui").with_name("PlayerGui"));
+			let screen = model.child(player_gui, InstanceBuilder::new("ScreenGui").with_name("Hud").with_property("ScreenInsets", Enum::from_u32(insets)));
+			let frame = model.child(
+				screen,
+				InstanceBuilder::new("ViewportFrame").with_property("Position", UDim2::new(UDim::new(0.0, 10), UDim::new(0.0, 20))).with_property("Size", UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 50))),
+			);
+			let world = model.child(frame, InstanceBuilder::new("WorldModel"));
+			let part = model.part(&PartSpec { name: "Block".into(), ..Default::default() });
+			model.dom.transfer_within(part, world);
+			let camera = model.child(frame, InstanceBuilder::new("Camera").with_property("CFrame", CFrame::new(Vector3::new(0.0, 0.0, 10.0), Matrix3::identity())));
+			model.set(frame, "CurrentCamera", Variant::Ref(camera));
+			let mut scene = crate::scene::extract::extract(&model.into_document());
+			scene.play = true;
+			let request = ViewRequest { width: 800, height: 600, camera: CameraSpec::LookAt { eye: [0.0, 0.0, 10.0], target: [0.0; 3], fov: 40.0 }, gui_scale: Some(1.0), ..Default::default() };
+			let camera = request.camera.place(None, request.width, request.height);
+			let draws = plan(&scene, &camera, &request);
+			let [draw] = draws.as_slice() else {
+				panic!("one ScreenGui: {:?}", scene.warnings);
+			};
+			assert_eq!(draw.key.canvas(), [800.0, 600.0], "the whole view");
+			let [framed] = draw.framed.as_slice() else {
+				panic!("one framed ViewportFrame");
+			};
+			let expected = [(origin[0] + 10.0) / 800.0, (origin[1] + 20.0) / 600.0, (origin[0] + 110.0) / 800.0, (origin[1] + 70.0) / 600.0];
+			assert!(framed.rect.iter().zip(expected).all(|(a, b)| (a - b).abs() < 1e-5), "ScreenInsets {insets}: {:?}, not {expected:?}", framed.rect);
+		}
 	}
 
 	/// A Scene kept warm in SceneCache is not re-extracted when a local PNG referenced by one of its

@@ -200,22 +200,38 @@ impl Placement {
 impl Viewport {
 	/// The frame's rect (x, y, width, height) in a canvas of `canvas` GUI pixels.
 	pub fn pixels(&self, canvas: [f32; 2]) -> [f32; 4] {
-		self.placement.iter().fold([0.0, 0.0, canvas[0], canvas[1]], |rect, placement| placement.layout(rect))
+		self.pixels_within([0.0, 0.0, canvas[0], canvas[1]])
+	}
+
+	/// The frame's rect (x, y, width, height) when its GUI is laid out in `layout` (x, y, width, height in
+	/// GUI pixels of a larger canvas: a ScreenGui's inset canvas within the view).
+	pub fn pixels_within(&self, layout: [f32; 4]) -> [f32; 4] {
+		self.placement.iter().fold(layout, |rect, placement| placement.layout(rect))
 	}
 
 	/// The frame's rect in canvas fractions: left, top, right, bottom.
 	pub fn rect(&self, canvas: [f32; 2]) -> [f32; 4] {
-		let [x, y, width, height] = self.pixels(canvas);
+		self.rect_within([0.0, 0.0, canvas[0], canvas[1]], canvas)
+	}
+
+	/// [`Viewport::rect`] with the GUI laid out in `layout` within `canvas` ([`Viewport::pixels_within`]).
+	pub fn rect_within(&self, layout: [f32; 4], canvas: [f32; 2]) -> [f32; 4] {
+		let [x, y, width, height] = self.pixels_within(layout);
 		[x / canvas[0], y / canvas[1], (x + width) / canvas[0], (y + height) / canvas[1]]
 	}
 
 	/// Its corners' radius in canvas fractions (across, down), as rur rounds the background: the scale of
 	/// the frame's shorter side plus the offset, at most half that side; zero without a UICorner.
 	pub fn corner(&self, canvas: [f32; 2]) -> [f32; 2] {
+		self.corner_within([0.0, 0.0, canvas[0], canvas[1]], canvas)
+	}
+
+	/// [`Viewport::corner`] with the GUI laid out in `layout` within `canvas` ([`Viewport::pixels_within`]).
+	pub fn corner_within(&self, layout: [f32; 4], canvas: [f32; 2]) -> [f32; 2] {
 		let Some([scale, offset]) = self.corner_radius else {
 			return [0.0, 0.0];
 		};
-		let [_, _, width, height] = self.pixels(canvas);
+		let [_, _, width, height] = self.pixels_within(layout);
 		let shortest = width.min(height).max(0.0);
 		let radius = (scale * shortest + offset).clamp(0.0, shortest / 2.0);
 		[radius / canvas[0].max(1e-6), radius / canvas[1].max(1e-6)]
@@ -556,23 +572,35 @@ pub struct ScreenGui {
 	pub area: ScreenArea,
 }
 
-/// The part of the view a ScreenGui's canvas covers, by its ScreenInsets (a Roblox client, 0.747:
-/// fixtures/screen-guis.luau "screen", AbsolutePosition and AbsoluteSize read in the client).
+/// The part of the view a ScreenGui's canvas covers, by its ScreenInsets (a Roblox client, 0.747 and
+/// 0.748: fixtures/screen-guis.luau "screen", AbsolutePosition and AbsoluteSize read in the client). The
+/// canvas is where the GUI is laid out; what lies outside it still draws, over the whole view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScreenArea {
 	/// None and DeviceSafeInsets (IgnoreGuiInset on): the whole view (a desktop has no device insets).
 	Whole,
 	/// CoreUISafeInsets (IgnoreGuiInset off, the default): below the top bar.
 	BelowTopBar,
-	/// TopbarSafeInsets: inside the top bar (GuiService.TopbarInset), clipped to it.
+	/// TopbarSafeInsets: inside the top bar's free band (GuiService.TopbarInset), right of Roblox's buttons.
 	TopBar,
 }
 
 /// The top bar's height in GUI pixels a ScreenGui below it leaves free: GuiService:GetGuiInset() in a
-/// running game (Roblox's GetInsetArea samples, -58 at the top; not measured here), 0 in Studio's
-/// edit viewport (screen-gui-inset: GetGuiInset 0, 0 and a frame at (0, 0) drawn at the top edge).
+/// running game (58 in a client running Roblox's core scripts, whatever CoreGui a script turns off or
+/// TopbarEnabled; 0.748, fixtures/screen-guis.luau "screen"), 0 in Studio's edit viewport
+/// (screen-gui-inset: GetGuiInset 0, 0 and a frame at (0, 0) drawn at the top edge).
 pub fn top_bar_inset(play: bool) -> f32 {
 	if play { 58.0 } else { 0.0 }
+}
+
+/// Where the top bar's free band starts across, in GUI pixels: GuiService.TopbarInset's left edge, the
+/// right edge of Roblox's menu button and Unibar. A Roblox client running its core scripts (0.748, at
+/// any view size and device scale) reads TopbarInset (164, 0) to (the view's width, 58): the menu button
+/// 44 wide at 16, the Unibar 96 wide at 68 holding the menu and chat buttons. With chat turned off
+/// (SetCoreGuiEnabled Chat or All false) the Unibar holds one button and the band starts at 120; a
+/// recording does not say so, and the default is taken. 0 in Studio's edit viewport, which has no top bar.
+pub fn top_bar_buttons_end(play: bool) -> f32 {
+	if play { 164.0 } else { 0.0 }
 }
 
 #[derive(Clone, Debug, PartialEq)]
