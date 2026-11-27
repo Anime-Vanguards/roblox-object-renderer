@@ -888,7 +888,7 @@ mod tests {
 	#[test]
 	fn the_loop_finds_the_unseen_part_and_a_trial_measures_hiding_the_sheet() {
 		let state = std::env::temp_dir().join(format!("ror-loop-test-{}", std::process::id()));
-		let gpu = std::sync::Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = crate::render::Renderer::new(gpu, assets).expect("a renderer");
 		let document = map();
@@ -937,7 +937,7 @@ mod tests {
 	fn desktop_preset_prices_cpu_as_desktop_and_refuses_gpu_ms() {
 		let state = std::env::temp_dir().join(format!("ror-desktop-pricing-test-{}", std::process::id()));
 		let _ = std::fs::remove_dir_all(&state);
-		let gpu = std::sync::Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = crate::render::Renderer::new(gpu, assets).expect("a renderer");
 		let mut model = ModelBuilder::new("Map");
@@ -1055,7 +1055,7 @@ mod tests {
 		);
 		let document = model.into_document();
 		let scene = crate::scene::extract::extract(&document);
-		let gpu = std::sync::Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(state.join("cache")) });
 		let renderer = crate::render::Renderer::new(gpu, assets).expect("a renderer");
 
@@ -1136,7 +1136,7 @@ mod tests {
 		);
 		let document = model.into_document();
 		let scene = crate::scene::extract::extract(&document);
-		let gpu = std::sync::Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(state.join("cache")) });
 		let renderer = crate::render::Renderer::new(gpu, assets).expect("a renderer");
 

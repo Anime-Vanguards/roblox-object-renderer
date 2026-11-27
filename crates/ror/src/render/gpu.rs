@@ -38,6 +38,8 @@ pub struct Gpu {
 	poller: Mutex<Option<std::thread::JoinHandle<()>>>,
 	/// What the whole adapter has in use, opened by the first [`Gpu::free_memory`]
 	adapter_memory: std::sync::OnceLock<Option<AdapterMemory>>,
+	/// The pipelines renderers on this device draw with, while one holds them ([`super::Renderer::new`])
+	pub(super) pipelines: Mutex<super::DevicePipelines>,
 }
 
 /// The adapter's own memory in use by every program, as Windows counts it (the "GPU Adapter Memory"
@@ -617,6 +619,7 @@ impl Gpu {
 			tracker,
 			poller: Mutex::new(None),
 			adapter_memory: std::sync::OnceLock::new(),
+			pipelines: Mutex::default(),
 		})
 	}
 

@@ -738,8 +738,6 @@ fn white(view: &wgpu::TextureView) -> Option<wgpu::RenderPassColorAttachment<'_>
 
 #[cfg(test)]
 mod tests {
-	use std::sync::Arc;
-
 	use glam::{Affine3A, Vec3};
 
 	use super::super::camera::CameraSpec;
@@ -749,7 +747,7 @@ mod tests {
 	fn a_clip_s_kept_occlusion_is_its_frames_drawn_whole() {
 		let state = std::env::temp_dir().join(format!("ror-ao-history-test-{}", std::process::id()));
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(super::super::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		// a floor and a wall, and a block moving along the crease between them, from a still camera

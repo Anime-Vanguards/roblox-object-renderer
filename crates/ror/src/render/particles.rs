@@ -1342,7 +1342,7 @@ mod tests {
 		let white = state.join("white.png");
 		crate::output::write_png(&white, 8, 8, &[255u8; 4].repeat(64), false).unwrap();
 		let white = format!("file:///{}", white.display().to_string().replace('\\', "/"));
-		let gpu = Arc::new(super::super::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = super::super::Renderer::new(gpu, assets).expect("a renderer");
 		let constant = |value: f32| NumberSequence { keypoints: vec![NumberSequenceKeypoint::new(0.0, value, 0.0), NumberSequenceKeypoint::new(1.0, value, 0.0)] };

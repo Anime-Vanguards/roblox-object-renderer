@@ -981,7 +981,7 @@ mod surface_tests {
 		let state = std::env::temp_dir().join(format!("ror-material-stamp-test-{}", std::process::id()));
 		let _ = std::fs::remove_dir_all(&state);
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let file = state.join("paint.png");
@@ -1457,7 +1457,7 @@ pub struct Renderer {
 /// share every compiled pipeline and cached GPU resource while differing only in [`Renderer::assets`].
 #[doc(hidden)]
 pub struct RendererInner {
-	pipelines: Pipelines,
+	pipelines: Arc<Pipelines>,
 	defaults: Defaults,
 	primitives: HashMap<Primitive, Arc<GpuMesh>>,
 	meshes: Cache<String, GpuMesh>,
@@ -1468,14 +1468,14 @@ pub struct RendererInner {
 	materials: Mutex<HashMap<MaterialKey, std::sync::Weak<MaterialBinding>>>,
 	/// Skinned meshes posed by their Bones (skinning.rs)
 	skins: skinning::Skins,
-	beams: beams::BeamPipelines,
+	beams: Arc<beams::BeamPipelines>,
 	/// Per-part id and Highlight mask pipelines, built lazily the first time a scene draws
 	/// Highlights, `--ids`, or `--layers` so plain renders neither compile nor cache them.
 	ids: std::sync::OnceLock<ids::IdPipelines>,
-	particles: particles::ParticlePipelines,
+	particles: Arc<particles::ParticlePipelines>,
 	/// Image-space post effects (post.rs)
-	post: post::PostPipelines,
-	guis: guis::GuiPipelines,
+	post: Arc<post::PostPipelines>,
+	guis: Arc<guis::GuiPipelines>,
 	/// SurfaceGui / BillboardGui content drawn by rur (guis.rs)
 	gui_textures: Cache<guis::GuiKey, guis::GuiTexture>,
 	gui_failures: guis::GuiFailures,
@@ -2089,8 +2089,30 @@ fn shared_graze_ranges(lights: &mut [LightData]) {
 	}
 }
 
-impl Renderer {
-	pub fn new(gpu: Arc<Gpu>, assets: ror_assets::Assets) -> Result<Self> {
+/// The pipelines a [`Renderer`] draws with, compiled for its device. Renderers made on one [`Gpu`] share them: the
+/// device keeps them only while a renderer holds them (a renderer's pipelines hold its device, which goes with the
+/// last of them), and a renderer made beside a living one compiles none (on a software adapter, as on CI's runners,
+/// [`Pipelines::new`] and the effects' compile on the CPU: 28 s on four of a desktop's cores, 30-50 s on a runner).
+/// They are the compiled shaders and their layouts alone: what a renderer caches stays its own.
+#[derive(Default)]
+pub(crate) struct DevicePipelines {
+	pipelines: std::sync::Weak<Pipelines>,
+	post: std::sync::Weak<post::PostPipelines>,
+	beams: std::sync::Weak<beams::BeamPipelines>,
+	particles: std::sync::Weak<particles::ParticlePipelines>,
+	guis: std::sync::Weak<guis::GuiPipelines>,
+}
+
+/// [`DevicePipelines`] held
+type SharedPipelines = (Arc<Pipelines>, Arc<post::PostPipelines>, Arc<beams::BeamPipelines>, Arc<particles::ParticlePipelines>, Arc<guis::GuiPipelines>);
+
+impl DevicePipelines {
+	/// The pipelines of the renderers on `gpu`, compiled when none holds them
+	fn take(gpu: &Gpu) -> SharedPipelines {
+		let mut kept = gpu.pipelines.lock();
+		if let (Some(pipelines), Some(post), Some(beams), Some(particles), Some(guis)) = (kept.pipelines.upgrade(), kept.post.upgrade(), kept.beams.upgrade(), kept.particles.upgrade(), kept.guis.upgrade()) {
+			return (pipelines, post, beams, particles, guis);
+		}
 		let device = &gpu.device;
 		let cache = gpu.pipeline_cache.as_ref();
 		// the pipelines on threads of their own (Pipelines::new), the effects' after the frame layout
@@ -2106,6 +2128,33 @@ impl Renderer {
 			let made = "the effects' pipelines' threads";
 			(beams.join().expect(made), particles.join().expect(made), guis)
 		});
+		let shared = (Arc::new(pipelines), Arc::new(post), Arc::new(beams), Arc::new(particles), Arc::new(guis));
+		*kept = Self { pipelines: Arc::downgrade(&shared.0), post: Arc::downgrade(&shared.1), beams: Arc::downgrade(&shared.2), particles: Arc::downgrade(&shared.3), guis: Arc::downgrade(&shared.4) };
+		shared
+	}
+}
+
+/// One device for the tests that only draw, with its pipelines kept from test to test ([`DevicePipelines`]): their
+/// renderers are fresh but for the compiled shaders, so they draw and report what renderers on devices of their own
+/// do, and the software adapter compiles the pipelines once a process instead of once a test. Tests of the device's
+/// memory, its counters or its end make their own.
+#[cfg(test)]
+pub(crate) fn test_gpu() -> Arc<Gpu> {
+	static SHARED: std::sync::OnceLock<(Arc<Gpu>, SharedPipelines)> = std::sync::OnceLock::new();
+	SHARED
+		.get_or_init(|| {
+			let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+			let pipelines = DevicePipelines::take(&gpu);
+			(gpu, pipelines)
+		})
+		.0
+		.clone()
+}
+
+impl Renderer {
+	pub fn new(gpu: Arc<Gpu>, assets: ror_assets::Assets) -> Result<Self> {
+		let device = &gpu.device;
+		let (pipelines, post, beams, particles, guis) = DevicePipelines::take(&gpu);
 		let white = GpuTexture::solid(&gpu, "white", [255, 255, 255, 255], TextureUse::Color);
 		let normal = GpuTexture::solid(&gpu, "flat normal", [128, 128, 255, 255], TextureUse::Data);
 		let black = GpuTexture::solid(&gpu, "black", [0, 0, 0, 255], TextureUse::Data);
@@ -7073,7 +7122,7 @@ mod sky_tests {
 	#[test]
 	fn frames_whose_skybox_fails_share_the_gradient_sky() {
 		let state = std::env::temp_dir().join(format!("ror-sky-test-{}", std::process::id()));
-		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Arc::new(Renderer::new(gpu, assets).expect("a renderer"));
 		let mut scene = Scene::default();
@@ -7182,7 +7231,7 @@ mod decal_uv_tests {
 	fn a_decals_uv_offset_and_scale_map_the_face_to_its_image() {
 		let state = std::env::temp_dir().join(format!("ror-decal-uv-test-{}", std::process::id()));
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		// a 64-texel image, clear but for an opaque red square from 0.375 to 0.625 on both axes
@@ -7236,7 +7285,7 @@ mod joint_and_fallback_tests {
 	fn joints_draw_and_missing_meshes_fall_back_as_a_client_does() {
 		let state = std::env::temp_dir().join(format!("ror-joint-test-{}", std::process::id()));
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let environment = crate::scene::Environment { brightness: 0.0, ambient: Vec3::splat(0.7), outdoor_ambient: Vec3::ZERO, environment_diffuse_scale: 0.0, environment_specular_scale: 0.0, global_shadows: false, ..Default::default() };
@@ -7291,7 +7340,7 @@ mod tint_mask_tests {
 	fn a_tint_mask_mixes_color_into_the_stored_texel() {
 		let state = std::env::temp_dir().join(format!("ror-tint-mask-test-{}", std::process::id()));
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let (texel, color) = ([204u8, 128, 77], Vec3::new(0.3, 0.6, 0.9));
@@ -7348,7 +7397,7 @@ mod tint_mask_tests {
 	fn a_tint_mask_glows_in_the_tinted_colour() {
 		let state = std::env::temp_dir().join(format!("ror-tint-mask-emission-test-{}", std::process::id()));
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let size = 32u32;
@@ -7442,7 +7491,7 @@ mod vertex_colour_tests {
 	fn vertex_colours_tint_a_mesh_parts_colour_map() {
 		let state = std::env::temp_dir().join(format!("ror-vertex-colour-map-test-{}", std::process::id()));
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let uri = |path: &std::path::Path| format!("file:///{}", path.display().to_string().replace('\\', "/"));
@@ -7547,7 +7596,7 @@ mod reflectance_tests {
 	fn reflectance_weights_diffuse_evenly_keeps_direct_specular_and_scales_glass_sky_diffuse() {
 		let state = std::env::temp_dir().join(format!("ror-reflectance-test-{}", std::process::id()));
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let sky_uri = |name: &str, rgb: [u8; 3]| -> String {
@@ -7673,7 +7722,7 @@ mod viewport_frame_tests {
 		let state = std::env::temp_dir().join(format!("ror-viewport-frame-sky-test-{}", std::process::id()));
 		let no_install = state.join("no-roblox-install");
 		std::fs::create_dir_all(&no_install).unwrap();
-		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, studio_content: Some(no_install), ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let mut model = crate::scene::build::ModelBuilder::new("Plate");
@@ -7697,7 +7746,7 @@ mod viewport_frame_tests {
 	#[test]
 	fn a_viewport_frames_target_is_cleared_to_its_background() {
 		let state = std::env::temp_dir().join(format!("ror-viewport-frame-test-{}", std::process::id()));
-		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let mut model = crate::scene::build::ModelBuilder::new("Plate");
@@ -7749,7 +7798,7 @@ mod shadow_caster_tests {
 	#[test]
 	fn transparency_cuts_a_parts_shadows_and_a_shadow_only_part_casts_unseen() {
 		let state = std::env::temp_dir().join(format!("ror-shadow-caster-test-{}", std::process::id()));
-		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		// (Material, Transparency, CastShadow, the shadow-only attribute)
@@ -7823,7 +7872,7 @@ mod shadow_caster_tests {
 	#[test]
 	fn without_the_suns_shadow_maps_only_the_light_grid_stops_the_sun() {
 		let state = std::env::temp_dir().join(format!("ror-no-sun-shadow-maps-test-{}", std::process::id()));
-		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let scene = |roof: Option<f32>, maps: bool| {
@@ -7877,7 +7926,7 @@ mod lighting_style_tests {
 	#[test]
 	fn soft_lighting_style_lights_surfaces_from_the_voxels() {
 		let state = std::env::temp_dir().join(format!("ror-lighting-style-test-{}", std::process::id()));
-		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let scene = |soft: bool, shadows: bool, placed: bool| {
@@ -7925,7 +7974,7 @@ mod lighting_style_tests {
 	#[test]
 	fn a_quality_level_lights_per_pixel_only_to_its_reach() {
 		let state = std::env::temp_dir().join(format!("ror-quality-lights-test-{}", std::process::id()));
-		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let mut model = ModelBuilder::new("Reach");
@@ -7958,7 +8007,7 @@ mod lighting_style_tests {
 	#[test]
 	fn soft_lighting_style_darkens_contacts_less() {
 		let state = std::env::temp_dir().join(format!("ror-soft-occlusion-test-{}", std::process::id()));
-		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let scene = |soft: bool, cube: bool| {
@@ -8013,7 +8062,7 @@ mod lighting_style_tests {
 	#[test]
 	fn the_closed_grid_reflects_a_grey_sky() {
 		let state = std::env::temp_dir().join(format!("ror-closed-specular-test-{}", std::process::id()));
-		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let mut model = ModelBuilder::new("Roofed");
@@ -8087,7 +8136,7 @@ mod surface_light_shadow_tests {
 	#[test]
 	fn surface_light_shadows() {
 		let state = std::env::temp_dir().join(format!("ror-surface-shadow-test-{}", std::process::id()));
-		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		// nothing behind the face casts: a face down from the underside of a carrier 8 studs up (Bottom),
@@ -8221,7 +8270,7 @@ mod shadow_cutout_tests {
 	fn a_surface_appearances_alpha_cuts_its_shadow_in_view_and_out() {
 		let state = std::env::temp_dir().join(format!("ror-shadow-cutout-test-{}", std::process::id()));
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let uri = |path: &std::path::Path| format!("file:///{}", path.display().to_string().replace('\\', "/"));
@@ -8293,7 +8342,7 @@ mod camera_reuse_tests {
 	/// A renderer reading Roblox's built-in content from an empty folder, as on a machine without Studio or
 	/// the Player (CI's): the default sky's textures and the sun's cannot load wherever the tests run.
 	fn renderer(state: &std::path::Path) -> Renderer {
-		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let no_install = state.join("no-roblox-install");
 		std::fs::create_dir_all(&no_install).unwrap();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, studio_content: Some(no_install), ..ror_assets::AssetConfig::new(state) });
@@ -8449,7 +8498,7 @@ mod camera_reuse_tests {
 		let state = std::env::temp_dir().join(format!("ror-offline-mesh-wiring-{}", std::process::id()));
 		let _ = std::fs::remove_dir_all(&state);
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(super::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let config = ror_assets::AssetConfig { offline: false, store: None, studio_content: Some(state.join("no-studio")), ..ror_assets::AssetConfig::new(&state) };
 		let online_assets = ror_assets::Assets::new(config);
 		let online = Renderer::new(gpu, online_assets.clone()).expect("a renderer");
@@ -8469,7 +8518,7 @@ mod camera_reuse_tests {
 		let state = std::env::temp_dir().join(format!("ror-silent-pack-fallback-{}", std::process::id()));
 		let _ = std::fs::remove_dir_all(&state);
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(super::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let config = ror_assets::AssetConfig { offline: false, store: None, studio_content: Some(state.join("no-studio")), ..ror_assets::AssetConfig::new(&state) };
 		let online_assets = ror_assets::Assets::new(config);
 		let online = Renderer::new(gpu, online_assets.clone()).expect("a renderer");
@@ -8512,7 +8561,7 @@ mod camera_reuse_tests {
 		let state = std::env::temp_dir().join(format!("ror-silent-pack-clip-reusable-{}", std::process::id()));
 		let _ = std::fs::remove_dir_all(&state);
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(super::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let config = ror_assets::AssetConfig { offline: false, store: None, studio_content: Some(state.join("no-studio")), ..ror_assets::AssetConfig::new(&state) };
 		let online_assets = ror_assets::Assets::new(config);
 		let online = Renderer::new(gpu, online_assets.clone()).expect("a renderer");
@@ -8574,7 +8623,7 @@ mod camera_reuse_tests {
 		let _ = std::fs::remove_dir_all(&state);
 		std::fs::create_dir_all(&state).unwrap();
 		let store = state.join("store");
-		let gpu = Arc::new(super::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let config = ror_assets::AssetConfig { offline: false, store: Some(store.clone()), studio_content: Some(state.join("no-studio")), ..ror_assets::AssetConfig::new(&state) };
 		let online_assets = ror_assets::Assets::new(config);
 		let online = Renderer::new(gpu, online_assets.clone()).expect("a renderer");
@@ -8916,7 +8965,7 @@ mod blend_order_tests {
 	#[test]
 	fn a_see_through_part_and_effects_order_by_depth_along_the_cameras_forward_axis() {
 		let state = std::env::temp_dir().join(format!("ror-blend-order-test-{}", std::process::id()));
-		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		const ROWS: [f32; 4] = [-15.0, -5.0, 5.0, 15.0];
@@ -9015,7 +9064,7 @@ mod blend_order_tests {
 	fn an_effect_behind_an_occluder_is_culled_before_its_zoffset() {
 		let state = std::env::temp_dir().join(format!("ror-zoffset-cull-test-{}", std::process::id()));
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let white = state.join("white.png");
@@ -9067,7 +9116,7 @@ mod blend_order_tests {
 		let state = std::env::temp_dir().join(format!("ror-lazy-ids-test-{}", std::process::id()));
 		let _ = std::fs::remove_dir_all(&state);
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		assert!(renderer.ids.get().is_none(), "IdPipelines should not compile before first use");
@@ -9102,7 +9151,7 @@ mod star_tests {
 		let content = state.join("content");
 		std::fs::create_dir_all(content.join("textures")).unwrap();
 		crate::output::write_png(&content.join("textures").join("black.png"), 1, 1, &[0, 0, 0, 255], true).unwrap();
-		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, studio_content: Some(content), ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let mut model = crate::scene::build::ModelBuilder::new("Plate");

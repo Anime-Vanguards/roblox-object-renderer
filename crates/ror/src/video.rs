@@ -3399,7 +3399,7 @@ mod tests {
 		use rbx_dom_weak::InstanceBuilder;
 		let state = std::env::temp_dir().join(format!("ror-sheet-first-test-{}", std::process::id()));
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let mut model = ModelBuilder::new("Glow");
@@ -3471,7 +3471,7 @@ mod tests {
 		};
 		let state = std::env::temp_dir().join(format!("ror-copy-test-{}", std::process::id()));
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let mut model = ModelBuilder::new("Block");
@@ -3538,7 +3538,7 @@ mod tests {
 		use rbx_dom_weak::{InstanceBuilder, types::Content};
 		let state = std::env::temp_dir().join(format!("ror-frame-reuse-test-{}", std::process::id()));
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		// the emitter's own texture: the default one is Studio's, which a machine without Studio lacks
@@ -3714,7 +3714,7 @@ mod tests {
 		use glam::{Affine3A, Quat};
 		let state = std::env::temp_dir().join(format!("ror-camera-rides-part-{}", std::process::id()));
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let mut model = ModelBuilder::new("Scene");
@@ -3905,7 +3905,7 @@ mod tests {
 		model.part(&crate::scene::build::PartSpec { name: "Box".into(), size: Vec3::splat(2.0), ..Default::default() });
 		let rbxm = dir.join("box.rbxm");
 		std::fs::write(&rbxm, model.to_rbxm().unwrap()).unwrap();
-		let gpu = std::sync::Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&dir) });
 		let renderer = crate::render::Renderer::new(gpu, assets).expect("a renderer");
 		let scenes = crate::job::SceneCache::default();
@@ -4060,7 +4060,7 @@ mod tests {
 		let state = std::env::temp_dir().join(format!("ror-sparse-frame-stats-{}", std::process::id()));
 		let _ = std::fs::remove_dir_all(&state);
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 

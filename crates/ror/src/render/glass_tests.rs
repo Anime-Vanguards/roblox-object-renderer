@@ -24,7 +24,7 @@ impl Bench {
 	fn new(name: &str) -> Self {
 		let state = std::env::temp_dir().join(format!("ror-glass-test-{name}-{}", std::process::id()));
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let face = |name: &str, level: u8| {

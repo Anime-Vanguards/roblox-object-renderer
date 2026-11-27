@@ -636,7 +636,7 @@ mod tests {
 		let mesh_path = state.join("rig.mesh");
 		let uri = format!("file:///{}", mesh_path.display().to_string().replace('\\', "/").replace(' ', "%20"));
 
-		let gpu = Arc::new(super::super::gpu::Gpu::new().expect("a GPU (or software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("renderer");
 

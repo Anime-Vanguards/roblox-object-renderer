@@ -29,7 +29,7 @@ Search open issues before filing a new one.
    (Run `cargo test --release -p ror -- --test-threads=1` to test just the `ror` crate.)
 3. **What different test suites need:**
    - **No extra dependencies:** `ror-image`, synthetic `ror-mesh` tests, `ror-assets` unit/mock-server tests, and most `ror` scene, playback, lint, budget, and cost tests.
-   - **GPU or software adapter:** `ror` render, video, service, and job tests (falls back to WARP on Windows if no hardware GPU is available).
+   - **GPU or software adapter:** `ror` render, video, service, and job tests (falls back to WARP on Windows if no hardware GPU is available). Tests that only draw share one device and its compiled pipelines (`render::test_gpu`): a software adapter compiles them on the CPU, 30-50 s on a CI runner. A test of the device's memory, its counters or its end makes a device of its own.
    - **Installed Roblox Player or Studio:** one `ror-assets` test (auto-skips if absent) and renders relying on built-in skies, avatar meshes, or fonts.
    - **Local Roblox client cache:** `ror-mesh`'s `local_cache` test (auto-skips if absent).
    - **Running Studio + MCP bridge:** not required by `cargo test`; only needed for parity work ([docs/parity.md](docs/parity.md)).

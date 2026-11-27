@@ -189,7 +189,7 @@ mod tests {
 		use crate::scene::build::{ModelBuilder, PartSpec};
 
 		let state = std::env::temp_dir().join(format!("ror-inside-highlight-test-{}", std::process::id()));
-		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 
@@ -265,8 +265,6 @@ mod tests {
 	///   culled, back drawn).
 	#[test]
 	fn negative_scale_special_mesh_matches_roblox_culling() {
-		use std::sync::Arc;
-
 		use glam::{Affine3A, Vec3};
 		use rbx_dom_weak::InstanceBuilder;
 		use rbx_dom_weak::types::{ContentId, Enum, Vector3};
@@ -278,7 +276,7 @@ mod tests {
 		let state = std::env::temp_dir().join(format!("ror-neg-scale-special-{}", std::process::id()));
 		let _ = std::fs::remove_dir_all(&state);
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 

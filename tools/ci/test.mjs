@@ -7,7 +7,8 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { RUN_MS, chunks, parseTestList, readWeights, run, shares } from "./test-shard.mjs";
+import { refresh, testSeconds } from "./refresh-weights.mjs";
+import { RUN_MS, chunks, parseTestList, readWeights, run, shares, unmeasured } from "./test-shard.mjs";
 
 const WORKFLOW = fs.readFileSync(new URL("../../.github/workflows/ci.yml", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 const binary = path.resolve("target/release/deps/ror-0123abcd.exe");
@@ -34,13 +35,50 @@ test("the shares hold every listed test exactly once, for any number of jobs", (
 
 test("the slow tests are spread longest first, each to the job with the least time so far", () => {
 	const names = parseTestList(["s1", "s2", "s3", "s4", "f1", "f2"].map((name) => `${name}: test`).join("\n"));
-	const weights = new Map([["s1", 100000], ["s2", 60000], ["s3", 50000], ["s4", 40000]]);
+	const weights = new Map([["s1", 100000], ["s2", 60000], ["s3", 50000], ["s4", 40000], ["f1", 25], ["f2", 25]]);
 	const [first, second] = shares(names, weights, 2);
 	// 100 alone; 60 + 50 next to it; 40 goes to the first job (100 < 110), the two fast tests to the second (110 + 25 + 25 < 140)
 	assert.deepEqual(first.names, ["s1", "s4"]);
 	assert.deepEqual(second.names, ["f1", "f2", "s2", "s3"]);
 	assert.equal(first.ms, 140000);
-	assert.equal(second.ms, 110000 + 2 * RUN_MS);
+	assert.equal(second.ms, 110000 + 2 * 25);
+});
+
+test("a test without a measured time counts as the mean of the measured ones, so new tests spread over the jobs", () => {
+	const fresh = Array.from({ length: 12 }, (_, i) => `new::test_${String(i).padStart(2, "0")}`);
+	const names = parseTestList([...fresh, "old::a", "old::b", "old::c", "old::d", "old::slow"].map((name) => `${name}: test`).join("\n"));
+	// a measured time for a test that is gone counts for nothing
+	const weights = new Map([["old::a", 1000], ["old::b", 1000], ["old::c", 1000], ["old::d", 1000], ["old::slow", 60000], ["gone::test", 900000]]);
+	assert.equal(unmeasured(names, weights), 12800);
+	const all = shares(names, weights, 3);
+	// counted as fast tests, all twelve went to one job; at 12.8 s each they go round the jobs
+	assert.deepEqual(all.map((share) => share.names.filter((name) => name.startsWith("new::")).length), [1, 6, 5]);
+	assert.deepEqual(all.map((share) => share.ms), [72800, 76800, 68000]);
+	assert.equal(unmeasured(names, new Map()), RUN_MS);
+});
+
+test("the weights' refresh reads each test's time from a job's log and takes the median over runs", () => {
+	// a job's log as the API gives it, and as `gh run view --log` does (job and step before each line)
+	const log = [
+		"2026-11-27T05:30:05.6265409Z running 3 tests",
+		"2026-11-27T05:30:06.1265409Z test a::fast ... ok",
+		"2026-11-27T05:31:06.1265409Z test a::slow ... FAILED",
+		"2026-11-27T05:31:16.1265409Z some output a test printed",
+		"2026-11-27T05:31:21.1265409Z test a::needs_studio ... ignored, needs a Studio install",
+		"2026-11-27T05:31:21.2Z test result: FAILED. 1 passed; 1 failed; 1 ignored; 0 measured; 9 filtered out; finished in 75.6s",
+		"2026-11-27T05:40:00.0Z some line between the runs",
+		"Test ror's library, part 1 of 6\tTest ror's library (this job's share)\t2026-11-27T05:41:00.0Z running 1 test",
+		"Test ror's library, part 1 of 6\tTest ror's library (this job's share)\t2026-11-27T05:41:02.5Z test b::other ... ok",
+		// a test cancelled before it ended has no line of its own
+		"2026-11-27T05:42:00.0Z test b::unfinished ... ",
+	].join("\r\n");
+	const times = testSeconds(log);
+	assert.deepEqual([...times], [["a::fast", 0.5], ["a::slow", 60], ["a::needs_studio", 15], ["b::other", 2.5]]);
+	const old = { "a::fast": 9, "b::unfinished": 40, "c::gone": 3 };
+	const second = new Map([["a::slow", 50], ["a::fast", 0.7]]);
+	const third = new Map([["a::slow", 70.04]]);
+	assert.deepEqual(refresh(old, [times, second, third]), { "a::fast": 0.6, "a::needs_studio": 15, "a::slow": 60, "b::other": 2.5, "b::unfinished": 40, "c::gone": 3 });
+	assert.deepEqual(Object.keys(refresh(old, [times], { prune: true })), ["a::fast", "a::needs_studio", "a::slow", "b::other"]);
 });
 
 test("the measured times are read as milliseconds, and a time that is not a number of seconds fails", (t) => {
@@ -63,7 +101,7 @@ test("a list that is empty, repeats a name or does not read as libtest's fails, 
 
 test("a job lists the binary, runs its share by exact name with the given options and exits with the tests' code", () => {
 	const listing = "a: test\nb: test\nc: test\n";
-	const weights = new Map([["b", 5000]]);
+	const weights = new Map([["b", 5000], ["a", 25], ["c", 25]]);
 	const { calls, spawn } = fakeSpawn(listing, 101);
 	const code = run(["1", "2", binary, "--test-threads=1"], { spawn, log: () => {}, weights });
 	assert.equal(code, 101);

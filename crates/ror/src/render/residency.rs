@@ -513,7 +513,7 @@ mod tests {
 	fn maps_held_from_a_coarser_level_draw_as_whole_ones() {
 		let state = std::env::temp_dir().join(format!("ror-residency-test-{}", std::process::id()));
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(super::super::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu.clone(), assets).expect("a renderer");
 		// every render's maps through the feedback, however few
@@ -553,7 +553,7 @@ mod tests {
 	fn a_clip_skips_the_feedback_for_what_it_saw_and_reads_the_rest_whole() {
 		let state = std::env::temp_dir().join(format!("ror-clip-residency-test-{}", std::process::id()));
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(super::super::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu.clone(), assets).expect("a renderer");
 		renderer.residency_from.store(0, std::sync::atomic::Ordering::Relaxed);

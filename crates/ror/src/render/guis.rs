@@ -2025,7 +2025,7 @@ mod tests {
 
 		let state = std::env::temp_dir().join(format!("ror-screen-viewport-test-{}", std::process::id()));
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(super::super::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let mask_mesh = state.join("mask.mesh");
@@ -2118,7 +2118,7 @@ mod tests {
 
 		let state = std::env::temp_dir().join(format!("ror-screen-viewport-turn-test-{}", std::process::id()));
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(super::super::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let (width, height) = (160u32, 160u32);
@@ -2423,7 +2423,7 @@ mod tests {
 		let dir = std::env::temp_dir().join(format!("ror-gui-retry-test-{}", std::process::id()));
 		let _ = std::fs::remove_dir_all(&dir);
 		std::fs::create_dir_all(&dir).unwrap();
-		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&dir) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 
@@ -2540,7 +2540,7 @@ mod tests {
 
 		let state = std::env::temp_dir().join(format!("ror-world-gui-test-{}", std::process::id()));
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(super::super::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let sun = crate::render::environment::sun_direction(14.5, 0.0);

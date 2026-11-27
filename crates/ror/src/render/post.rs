@@ -530,8 +530,6 @@ impl<'a> PostPasses<'a> {
 
 #[cfg(test)]
 mod tests {
-	use std::sync::Arc;
-
 	use glam::{Affine3A, Vec3};
 	use rbx_dom_weak::InstanceBuilder;
 	use rbx_dom_weak::types::{Color3, ColorSequence, ColorSequenceKeypoint, NumberSequence, NumberSequenceKeypoint, Variant};
@@ -557,7 +555,7 @@ mod tests {
 	fn what_blends_takes_the_far_blur_of_its_own_depth() {
 		let state = std::env::temp_dir().join(format!("ror-dof-blended-test-{}", std::process::id()));
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(super::super::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let mut model = ModelBuilder::new("BlendedField");

@@ -17,7 +17,7 @@ impl Tone {
 	fn new() -> Self {
 		let state = std::env::temp_dir().join(format!("ror-tone-test-{}", std::process::id()));
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		Self { renderer: Renderer::new(gpu, assets).expect("a renderer"), state }
 	}

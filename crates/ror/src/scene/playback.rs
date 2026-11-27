@@ -4879,8 +4879,6 @@ mod tests {
 	/// stepped densely (60 fps), sparsely (4 fps), alone, or inside a full `video::run_with` clip.
 	#[test]
 	fn moving_trail_renders_identical_png_bytes_dense_sparse_alone_and_in_clip() {
-		use std::sync::Arc;
-
 		use crate::render::camera::CameraSpec;
 		use crate::render::{Background, Renderer, ViewRequest};
 		use crate::scene::build::{ModelBuilder, PartSpec, cframe};
@@ -4933,7 +4931,7 @@ mod tests {
 		};
 
 		let target_t = 0.75f32;
-		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&dir) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let view = ViewRequest {

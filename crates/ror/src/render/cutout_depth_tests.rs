@@ -23,7 +23,7 @@ impl Cards {
 	fn new(name: &str) -> Self {
 		let state = std::env::temp_dir().join(format!("ror-cutout-depth-{name}-{}", std::process::id()));
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let mesh_path = state.join("card.mesh");
 		std::fs::write(&mesh_path, super::vertex_colour_tests::quad_mesh([255; 4])).unwrap();

@@ -1220,8 +1220,6 @@ mod tests {
 
 #[cfg(test)]
 mod clip_tests {
-	use std::sync::Arc;
-
 	use glam::{Affine3A, Vec3};
 
 	use super::super::camera::CameraSpec;
@@ -1234,7 +1232,7 @@ mod clip_tests {
 	fn a_clip_frame_from_the_last_one_draws_as_it_alone() {
 		let state = std::env::temp_dir().join(format!("ror-clip-geometry-test-{}", std::process::id()));
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(super::super::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let scene_at = |x: f32, see_through: bool, extra: bool| {
@@ -1288,7 +1286,7 @@ mod retry_tests {
 	#[test]
 	fn a_scene_kept_with_failed_loads_is_prepared_again_when_they_are_retried() {
 		let state = std::env::temp_dir().join(format!("ror-retry-test-{}", std::process::id()));
-		let gpu = Arc::new(super::super::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let mut model = crate::scene::build::ModelBuilder::new("Yard");
@@ -1329,7 +1327,7 @@ mod retry_tests {
 		let state = std::env::temp_dir().join(format!("ror-prepared-offline-isolation-{}", std::process::id()));
 		let _ = std::fs::remove_dir_all(&state);
 		std::fs::create_dir_all(&state).unwrap();
-		let gpu = Arc::new(super::super::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let online_assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: false, ..ror_assets::AssetConfig::new(&state) });
 		let online = Renderer::new(gpu, online_assets.clone()).expect("a renderer");
 		let offline = online.with_assets(online_assets.with_offline(true));

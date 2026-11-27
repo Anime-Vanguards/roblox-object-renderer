@@ -4,19 +4,20 @@
 //   node tools/ci/test-entry.mjs <index> <count> <binary> [test arguments]
 //
 // It lists the binary's tests, takes this job's share of them and runs it, one test at a time (--test-threads=1 comes
-// from the workflow, after `--`). Fourteen tests that draw on the software adapter take nearly all of the time, so the
-// shares are cut by time, not by count: test-weights.json holds the seconds a CI run measured for each slow test, and
-// every other test counts as RUN_MS. The tests are dealt out longest first, each to the job with the least time so far
-// (ties to the lowest job), so every job computes the same shares from the same list, and the shares together hold
-// every listed test exactly once. A new test needs no change here; a new slow one runs in some job either way, and its
-// time in test-weights.json only evens the jobs out again (the file says how to refresh it).
+// from the workflow, after `--`). The tests that draw on the software adapter take nearly all of the time, so the
+// shares are cut by time, not by count: test-weights.json holds the seconds each test takes as a CI job runs it
+// (refresh-weights.mjs writes it from a run's logs), and a test it does not list yet counts as the mean of those it
+// lists (unmeasured()). The tests are dealt out longest first, each to the job with the least time so far (ties to the
+// lowest job), so every job computes the same shares from the same list, and the shares together hold every listed
+// test exactly once. A new test needs no change here: it runs in some job either way, and its time in
+// test-weights.json only evens the jobs out again.
 //
 // The exit code is the test binary's (the last failing one when the share runs in several commands), so a failing
 // test fails the job. A list that is empty, has a duplicate or does not read as libtest's fails the job too.
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 
-// What a test without a measured time counts as, in milliseconds: the 364 fast tests take about 9 s together
+// What a test counts as, in milliseconds, when no listed test has a measured time
 export const RUN_MS = 25;
 // The names go on the command line, and Windows allows 32767 UTF-16 characters there. A command holds at most this many
 // characters of names (each name and 3 for its quotes and the space), which leaves room for the binary and its options.
@@ -58,10 +59,20 @@ export function readWeights(file = new URL("./test-weights.json", import.meta.ur
 	return weights;
 }
 
+// What a test of `names` without a measured time counts as: the mean of the measured ones (RUN_MS if there are none).
+// A new test is as likely to draw as the ones before it. Counted as a fast test, every one without a time went to the
+// job with the least: the 80-odd tests that drew and had no time yet all ran in one job, which passed the 90-minute
+// limit.
+export function unmeasured(names, weights) {
+	const measured = names.filter((name) => weights.has(name)).map((name) => weights.get(name));
+	return measured.length ? Math.round(measured.reduce((sum, ms) => sum + ms, 0) / measured.length) : RUN_MS;
+}
+
 // The `count` shares of `names`: longest first, each to the job with the least time so far
 export function shares(names, weights, count) {
 	checkShard(0, count);
-	const items = names.map((name) => ({ name, ms: weights.get(name) ?? RUN_MS }));
+	const fallback = unmeasured(names, weights);
+	const items = names.map((name) => ({ name, ms: weights.get(name) ?? fallback }));
 	items.sort((a, b) => b.ms - a.ms || byCode(a.name, b.name));
 	const loads = new Array(count).fill(0);
 	const result = Array.from({ length: count }, () => []);

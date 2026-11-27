@@ -418,7 +418,7 @@ mod tests {
 	#[test]
 	fn layers_count_the_see_through_fragments_in_front_of_the_opaque_part() {
 		let state = std::env::temp_dir().join(format!("ror-layers-test-{}", std::process::id()));
-		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let mut model = ModelBuilder::new("Layers");
@@ -465,7 +465,7 @@ mod tests {
 	#[test]
 	fn camera_inside_single_sided_part_culls_back_faces_in_ids_and_layers() {
 		let state = std::env::temp_dir().join(format!("ror-inside-ids-test-{}", std::process::id()));
-		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let mut model = ModelBuilder::new("Inside");

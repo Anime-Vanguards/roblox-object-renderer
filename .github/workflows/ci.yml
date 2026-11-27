@@ -147,9 +147,11 @@ jobs:
   # test in a process, so each runner runs its tests one at a time (--test-threads=1), as before the split.
   #
   # Cargo starts the test binary through tools/ci/test-entry.mjs. Its runner (tools/ci/test-shard.mjs)
-  # lists the tests and runs this job's share: fourteen tests that draw on the software adapter take
-  # nearly all of the time, so the shares are cut by the times in tools/ci/test-weights.json, longest
-  # first, each to the job with the least so far. Together the six shares hold every test exactly once.
+  # lists the tests and runs this job's share: the tests that draw on the software adapter take nearly
+  # all of the time, so the shares are cut by the times in tools/ci/test-weights.json, longest first,
+  # each to the job with the least so far (a test without a time counts as the mean of those with one;
+  # tools/ci/refresh-weights.mjs rewrites them from a run's logs). Together the six shares hold every
+  # test exactly once.
   ror:
     if: ${{ !github.event.repository.private }}
     name: Test ror's library, part ${{ matrix.part }} of 6 (windows-latest)

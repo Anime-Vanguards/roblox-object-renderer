@@ -1132,7 +1132,7 @@ mod tests {
 				alone: None,
 			}
 		};
-		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(state.join("cache")) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let scenes = SceneCache::default();
@@ -1209,7 +1209,7 @@ mod tests {
 			input
 		};
 		let inputs = [("none", None), ("seen", Some((0.0, true))), ("invisible", Some((1.0, true))), ("ghost", Some((1.0, false)))].map(|(name, wall)| (name, model(name, wall)));
-		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(state.join("cache")) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let scenes = SceneCache::default();
@@ -1262,7 +1262,7 @@ mod tests {
 		model.part(&PartSpec { name: "Wall".into(), cframe: glam::Affine3A::from_translation(Vec3::new(3.0, 0.0, -4.0)), size: Vec3::new(6.0, 6.0, 0.5), ..Default::default() });
 		let input = state.join("model.rbxm");
 		std::fs::write(&input, model.to_rbxm().unwrap()).unwrap();
-		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(state.join("cache")) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let view = |name: &str, z: f32| NamedView { name: name.into(), view: ViewRequest { width: 96, height: 96, ids: true, camera: CameraSpec::LookAt { eye: [0.0, 0.0, z], target: [0.0; 3], fov: 40.0 }, ..Default::default() } };
@@ -1361,7 +1361,7 @@ mod tests {
 		// Age past the 2 s recent window so change time must distinguish same-size, same-mtime files.
 		std::thread::sleep(std::time::Duration::from_millis(2200));
 
-		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(state.join("cache")) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let scenes = SceneCache::default();
@@ -1557,7 +1557,7 @@ mod tests {
 		let playback_path = state.join("playback.json");
 		std::fs::write(&playback_path, r#"{"time":0.5,"actions":[{"at":0.25,"target":"Model.Box","set":{"Transparency":0.5}}]}"#).unwrap();
 
-		let gpu = std::sync::Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or software adapter)"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
 		let renderer = Renderer::new(gpu, assets).expect("a renderer");
 		let scenes = SceneCache::default();

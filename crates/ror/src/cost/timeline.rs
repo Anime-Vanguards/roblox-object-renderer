@@ -1356,7 +1356,6 @@ pub fn compare_timelines(after: &serde_json::Value, before_dir: &Path) -> Result
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::render::gpu::Gpu;
 	use crate::scene::build::{ModelBuilder, PartSpec};
 	use crate::scene::playback::{Action, Emit, Motion, MotionKey, Tween};
 	use glam::Affine3A;
@@ -1364,7 +1363,7 @@ mod tests {
 	use rbx_dom_weak::types::NumberRange;
 
 	fn make_test_renderer(state: &Path) -> Renderer {
-		let gpu = Arc::new(Gpu::new().expect("a GPU or software adapter"));
+		let gpu = crate::render::test_gpu();
 		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(state) });
 		Renderer::new(gpu, assets).expect("renderer")
 	}
