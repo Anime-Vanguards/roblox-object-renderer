@@ -1252,7 +1252,18 @@ fn shade(input: VertexOutput, front_facing: bool, occluded: bool, is_decal: bool
 fn fs_opaque(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> @location(0) vec4<f32> {
 	let shaded = shade(input, front_facing, true, false);
 	let alpha = select(1.0, input.color.a, (instances[input.instance].flags.y & TEX_VERTEX_ALPHA) != 0u);
-	return vec4<f32>(sqrt(max(shaded.rgb, vec3<f32>(0.0))) * alpha, alpha);
+	let color = glass_vertex_sky(input, shaded.rgb);
+	return vec4<f32>(sqrt(max(color, vec3<f32>(0.0))) * alpha, alpha);
+}
+
+// A Glass MeshPart in the world shows the sky along the view in 1 - a of its place, a its FileMesh's vertex
+// alpha, whatever lies behind it (render::TEX_GLASS_VERTEX_SKY)
+fn glass_vertex_sky(input: VertexOutput, color: vec3<f32>) -> vec3<f32> {
+	if ((instances[input.instance].flags.y & TEX_GLASS_VERTEX_SKY) == 0u || input.color.a >= 1.0) {
+		return color;
+	}
+	let sky = textureSampleLevel(environment_map, linear_sampler, normalize(input.world_position - frame.camera_position.xyz), 0.0).rgb;
+	return mix(sky, color, input.color.a);
 }
 
 // a decal's opacity, 1 - Transparency times its texel's alpha, stops at 1 (vfx-decal-negative)
@@ -1429,6 +1440,7 @@ fn fs_glass(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> @
 		let shown = cover * max(body - 2.0 * t * glass_sky_diffuse, vec3<f32>(0.0));
 		color = shown + (1.0 - 2.0 * t) * glass_specular + pow(1.0 - 2.0 * t, GLASS_MIRROR_FADE) * glass_mirror + 2.0 * t * (1.0 - fresnel) * c * d + reflected * glass_sky + glass_glint;
 	}
+	color = glass_vertex_sky(input, color);
 	// at most EXPOSED_CAP once exposed, as every surface (`shade`)
 	color = clamp(color, vec3<f32>(0.0), vec3<f32>(EXPOSED_CAP / frame.environment.z));
 	return vec4<f32>(sqrt(color), max(behind.a, saturate(1.0 - 2.0 * t)));

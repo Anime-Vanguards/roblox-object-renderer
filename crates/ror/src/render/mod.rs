@@ -768,6 +768,7 @@ const TEX_DECAL_UV: u32 = 33554432;
 const TEX_DECAL_DOMINANT: u32 = 67108864;
 const TEX_EMISSIVE_RED: u32 = 134217728;
 const TEX_VERTEX_TINT_MAP: u32 = 268435456;
+const TEX_GLASS_VERTEX_SKY: u32 = 1073741824;
 
 /// Colour textures land this much darker than their decode (texture-decode; the shader's
 /// TEXTURE_ALBEDO_SCALE), and so do Humanoid body parts' colours.
@@ -4258,6 +4259,13 @@ impl Renderer {
 			// Destruction's opaque mask mesh in the Workspace draws opaque)
 			if is_mesh && matches!(part.geometry, Geometry::MeshPart { .. }) && (context.viewport || transparency > 0.0) {
 				flags |= TEX_VERTEX_ALPHA;
+			}
+			// a Glass MeshPart's in the world, at any Transparency, is the sky's share in its place, over whatever
+			// lies behind it (glass-zero in a Roblox client as in Studio: a flat square and a rock whose every
+			// vertex has alpha 0, as Glass at Transparency 0 and 0.5, show the sky in their place even before a
+			// wall, a SmoothPlastic one at 0.5 nothing; the inside-out sphere, alpha 1, draws as any Glass)
+			if is_mesh && matches!(part.geometry, Geometry::MeshPart { .. }) && !context.viewport && params.shading == materials::SHADING_GLASS {
+				flags |= TEX_GLASS_VERTEX_SKY;
 			}
 			let opacity = if forcefield || kept_glass { 1.0 - part.transparency } else { 1.0 - transparency.clamp(0.0, 1.0) };
 			let emissive = if params.shading == materials::SHADING_NEON { neon_emission(part.color) * neon_share } else { params.emissive };

@@ -298,6 +298,8 @@ const TEX_DECAL_FACE_ONLY: u32 = 4194304u;
 // a MeshPart in a ViewportFrame: its FileMesh's vertex alpha is the frame image's alpha (render::guis
 // windows)
 const TEX_VERTEX_ALPHA: u32 = 8388608u;
+// a Glass MeshPart in the world: its FileMesh's vertex alpha a leaves 1 - a of the sky in its place (mesh.wgsl glass_vertex_sky)
+const TEX_GLASS_VERTEX_SKY: u32 = 1073741824u;
 // a decal on a posed skinned mesh: projected from the bind pose (`vs_decal_bind`)
 const TEX_DECAL_BIND: u32 = 16777216u;
 // a Decal's UVOffset / UVScale (in `tiling`: scale, offset): its image at uv * scale + offset

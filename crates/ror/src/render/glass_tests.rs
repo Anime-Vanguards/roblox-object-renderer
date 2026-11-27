@@ -1,12 +1,14 @@
 //! Glass against a Roblox 0.747 client's frames (fixtures/glass-client.luau; notes/materials.md "Glass"): the
 //! sky it reflects by its own Fresnel whatever EnvironmentSpecularScale and tinted by its colour, the light
-//! opaque Glass gives up at grazing angles, its Reflectance's mirror image whatever the light, the push off
-//! the view's axis, and no refraction below graphics quality level 16. Each scene has a uniform white or black Sky of its own (8 x 8 file faces), so nothing
+//! opaque Glass gives up at grazing angles, its Reflectance's mirror image whatever the light, the sky in
+//! place of a Glass MeshPart's vertex alpha, the push off the view's axis, and no refraction below graphics
+//! quality level 16. Each scene has a uniform white or black Sky of its own (8 x 8 file faces), so nothing
 //! waits on Roblox's built-in textures.
 
 use super::*;
 use crate::scene::build::{ModelBuilder, PartSpec};
 use rbx_dom_weak::InstanceBuilder;
+use rbx_dom_weak::types::{Content, Vector3};
 
 const GLASS: u32 = 1568;
 const SMOOTH_PLASTIC: u32 = 272;
@@ -32,6 +34,12 @@ impl Bench {
 		};
 		let (white, black) = (face("white-sky", 255), face("black-sky", 0));
 		Self { renderer, state, white, black }
+	}
+
+	fn file(&self, name: &str, bytes: &[u8]) -> String {
+		let path = self.state.join(name);
+		std::fs::write(&path, bytes).unwrap();
+		format!("file:///{}", path.display().to_string().replace('\\', "/"))
 	}
 
 	/// The model's scene under the white Sky (`white`, else a black one), in the dark unless `light` changes it
@@ -71,9 +79,10 @@ fn ball(model: &mut ModelBuilder, name: &str, color: [u8; 3], transparency: f32)
 /// Glass reflects the sky by its own Fresnel at EnvironmentSpecularScale 0 as at 1, a black Ball 0.48 of
 /// what a white one does, and from Transparency 0.5 more of it at a lower Transparency, (1 - T); opaque Glass
 /// keeps 0.35-0.5 of SmoothPlastic's light from a PointLight where it is seen at a grazing angle; its
-/// Reflectance's mirror image reads the same lit by Ambient alone as on a face no light reaches. Before, the
-/// sky's reflection scaled with EnvironmentSpecularScale and took no tint, opaque Glass shaded as
-/// SmoothPlastic and the mirror was lit by half the diffuse light.
+/// Reflectance's mirror image reads the same lit by Ambient alone as on a face no light reaches; a Glass
+/// MeshPart whose vertex alpha is 0 shows the sky in its place before a black wall. Before, the sky's
+/// reflection scaled with EnvironmentSpecularScale and took no tint, opaque Glass shaded as SmoothPlastic,
+/// the mirror was lit by half the diffuse light, and the MeshPart drew as opaque black Glass.
 #[test]
 fn glass_reflects_tints_and_gives_up_light_as_a_client_draws_it() {
 	let bench = Bench::new("shading");
@@ -126,6 +135,22 @@ fn glass_reflects_tints_and_gives_up_light_as_a_client_draws_it() {
 	let by_sun = mirror(0.0, 2.0);
 	assert!(by_sun[0] > 40.0, "the mirror image shows on a face no light reaches: {by_sun:?}");
 	assert!((0..3).all(|c| (by_ambient[c] - by_sun[c]).abs() <= 2.0), "and reads the same lit by Ambient: {by_ambient:?} against {by_sun:?}");
+
+	// a black Glass quad before a black wall, its vertices at alpha 0 (the sky in its place) or 1 (dark)
+	let quad = |alpha: u8| {
+		let mesh = bench.file(&format!("quad-{alpha}.mesh"), &super::vertex_colour_tests::quad_mesh([255, 255, 255, alpha]));
+		let mut model = ModelBuilder::new("Quad");
+		let part = model.part(&PartSpec { class: "MeshPart", name: "Quad".into(), size: Vec3::new(4.0, 4.0, 0.05), color: [0, 0, 0], material: GLASS, cast_shadow: false, ..Default::default() });
+		model.set(part, "MeshContent", Content::from_uri(mesh.as_str()));
+		model.set(part, "InitialSize", Vector3::new(4.0, 4.0, 0.05));
+		model.part(&PartSpec { name: "Wall".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, 0.0, 6.0)), size: Vec3::new(30.0, 30.0, 1.0), color: [0, 0, 0], material: SMOOTH_PLASTIC, cast_shadow: false, ..Default::default() });
+		let scene = bench.scene(model, true, |env| env.ambient = Vec3::splat(0.7));
+		pixel(&bench.image(&scene, [0.0, 0.0, -20.0], [0.0; 3], 15.0, size, size, None), size, size / 2, size / 2)
+	};
+	let hole = quad(0);
+	let solid = quad(255);
+	assert!(solid[0] < 40.0, "the quad at vertex alpha 1 is dark Glass: {solid:?}");
+	assert!(hole[0] > 150.0, "at vertex alpha 0 the sky shows in its place, before the wall: {hole:?}");
 }
 
 /// What Glass shows behind it moves off the view's axis (a pane facing the camera 10 studs aside moves the
