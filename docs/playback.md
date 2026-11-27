@@ -86,7 +86,7 @@ ror video Effect.rbxm \
 - **`prewarm`:** Seconds to pre-simulate emitters and trails that start enabled in the file before `t = 0`.
 - **`actions`:** Events firing at `at` seconds on `target` and matching descendants (optionally filtered by `class`, including subclasses):
   - `emit`: integer burst count or an [emit mode](#emit-modes). Numeric bursts may also include `cframe` (12-component world CFrame of the part/attachment at emit time) and `partSize`, as recordings write them; they are checked but not drawn from. A Roblox client spawns an `Emit`'s particles at the frame's particle step, from where the emitter is then: several emits in one frame from an attachment moved between them all leave from its last place, and a burst leaves from where the playback has its part or attachment at the burst's frame.
-  - `enabled`: boolean toggle.
+  - `enabled`: boolean toggle. A Rate emitter switched on counts `Rate` × each later frame's step and emits a particle once its count passes a whole one (Rate 60 from the second frame after it is switched on, Rate 30 every second frame from the third).
   - `timeScale`: emitter `TimeScale`.
   - `clear`: mimics `:Clear()` on emitters and trails.
   - `set`: map of properties to apply to `target` (or matching `class` descendants).

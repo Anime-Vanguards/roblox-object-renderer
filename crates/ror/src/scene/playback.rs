@@ -32,6 +32,26 @@ const EMISSION_STEP: f32 = 1.0 / 60.0;
 /// and an exact multiple of a frame (a delay of 0.25 s, 15 frames) must end on its frame.
 const FRAME_SLACK: f32 = 1e-4;
 
+/// How far a Rate emitter's count must pass a whole particle before it emits one. A Roblox client
+/// emits a particle once its count is past a whole one, not on reaching it: on the sim's exact
+/// 60-frames-a-second clock Rate 60 emits from the second frame after it is switched on and Rate 30
+/// every second frame from the third, Rate 15 waits from the eighth to the ninth (fixtures/
+/// playback-timing.luau "rate", Rates 1-60 switched on and parented in, two sessions alike).
+const RATE_WHOLE: f64 = 1e-9;
+
+/// A frame's step of particle time `step` (its wall step `wall`) as Rate emission counts it: the part
+/// that counts in that frame (at most 1/60 s of wall time's worth) and the rest, which counts with the
+/// next frame (particle-rate-start). Steps within 0.1 ms of 1/60 s are a 60-frames-a-second grid's and
+/// count exactly 1/60 s: the f32 times of a long playback are a few microseconds apart from their frames,
+/// which would decide a whole particle reached exactly (Rate 60, 30, 20...) one way or the other.
+fn emission_step(step: f32, wall: f32) -> (f64, f64) {
+	const STEP: f64 = 1.0 / 60.0;
+	let snap = |value: f64| if (value - STEP).abs() < 1e-4 { STEP } else { value };
+	let (step, wall) = (snap(f64::from(step)), snap(f64::from(wall)));
+	let counted = step * (STEP / wall.max(1e-6)).min(1.0);
+	(counted, step - counted)
+}
+
 /// The least of the effects' level of detail (crate::render::distance_lod) a trail's MinLength is divided by:
 /// from 955 studs on Studio's trails spaced their points ten times MinLength (trail-lod).
 const TRAIL_LOD_FLOOR: f32 = 0.1;
@@ -1631,8 +1651,8 @@ struct RateScan {
 	rate: f32,
 	longest: f32,
 	index: usize,
-	accumulated: f32,
-	deferred: f32,
+	accumulated: f64,
+	deferred: f64,
 	on: bool,
 	previous: Option<f32>,
 	stream: u64,
@@ -3223,8 +3243,9 @@ impl Resolved<'_> {
 				};
 				let (mut accumulated, mut deferred, mut on, mut previous, mut stream, mut live, mut index) = match resume {
 					Some(scan) => (scan.accumulated, scan.deferred, scan.on, scan.previous, scan.stream, scan.live, scan.index),
-					None => (0.0f32, 0.0f32, false, None, 0u64, std::collections::VecDeque::new(), 0usize),
+					None => (0.0f64, 0.0f64, false, None, 0u64, std::collections::VecDeque::new(), 0usize),
 				};
+				let rate = f64::from(emitter.rate);
 				while live.front().is_some_and(|birth| birth.frame < cleared || (now - birth.pt).max(0.0) > longest) {
 					live.pop_front();
 				}
@@ -3263,14 +3284,13 @@ impl Resolved<'_> {
 						let prev_s = previous_spawn.unwrap_or_else(|| timeline.spawn_time(start, prev));
 						let cur_s = timeline.spawn_time(start, frame);
 						frame_spawn = Some(cur_s);
-						let step = cur_s - prev_s;
-						let counted = step * (EMISSION_STEP / (frame - prev).max(1e-6)).min(1.0);
-						accumulated += emitter.rate * (deferred + counted);
-						deferred = step - counted;
-						if accumulated >= 1.0 {
+						let (counted, rest) = emission_step(cur_s - prev_s, frame - prev);
+						accumulated += rate * (deferred + counted);
+						deferred = rest;
+						if accumulated > 1.0 + RATE_WHOLE {
 							let pt = timeline.particle_time(start, frame);
 							let age = (now - pt).max(0.0);
-							while accumulated >= 1.0 {
+							while accumulated > 1.0 + RATE_WHOLE {
 								accumulated -= 1.0;
 								stream += 1;
 								if frame >= cleared && age <= longest {
@@ -3303,8 +3323,7 @@ impl Resolved<'_> {
 								let prev_s = previous_spawn.unwrap_or_else(|| timeline.spawn_time(start, prev));
 								let cur_s = frame_spawn.unwrap_or_else(|| timeline.spawn_time(start, frame));
 								frame_spawn = Some(cur_s);
-								let step = cur_s - prev_s;
-								step - step * (EMISSION_STEP / (frame - prev).max(1e-6)).min(1.0)
+								emission_step(cur_s - prev_s, frame - prev).1
 							}
 							None => 0.0,
 						};
@@ -4865,6 +4884,67 @@ mod tests {
 		let burst_births = burst.births.as_ref().unwrap();
 		assert_eq!(burst_births.len(), 3, "Burst within 1e-6 tolerance was dropped: {burst_births:?}");
 		assert!(burst_births.iter().all(|birth| birth.age == 0.0));
+	}
+
+	/// Rate emitters switched on in a frame of a 60-frames-a-second grid and frozen (TimeScale 0) 24
+	/// frames later: the ages in frames of what each draws, as a Roblox client drew them on the sim's
+	/// exact frame clock (fixtures/playback-timing.luau "rate", two sessions alike). A particle comes once
+	/// the count is past a whole one, not on reaching it (ror emitted Rate 60 from the first frame, Rate 30
+	/// in the second, fourth...), the freezing frame still spawning. Switched on at 0.2 s and a minute
+	/// and a half in, where f32 frame times are microseconds off their grid.
+	#[test]
+	fn rate_emitters_emit_once_their_count_passes_a_whole_particle() {
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use rbx_dom_weak::InstanceBuilder;
+		use rbx_dom_weak::types::NumberRange;
+		let client: Vec<(f32, Vec<u32>)> = vec![
+			(1.0, vec![]),
+			(2.0, vec![]),
+			(3.0, vec![2]),
+			(4.0, vec![7]),
+			(5.0, vec![10]),
+			(6.0, vec![2, 12]),
+			(7.0, vec![5, 14]),
+			(10.0, vec![4, 10, 16]),
+			(12.0, vec![2, 7, 12, 17]),
+			(13.0, vec![0, 4, 9, 13, 18]),
+			(15.0, vec![2, 6, 10, 14, 18]),
+			(16.0, vec![0, 4, 7, 11, 15, 19]),
+			(20.0, vec![1, 4, 7, 10, 13, 16, 19]),
+			(30.0, (0..=20).step_by(2).collect()),
+			(60.0, (0..=21).collect()),
+		];
+		let mut model = ModelBuilder::new("Fx");
+		let part = model.part(&PartSpec { name: "Part".into(), ..PartSpec::default() });
+		for (rate, _) in &client {
+			model.child(
+				part,
+				InstanceBuilder::new("ParticleEmitter")
+					.with_name(format!("R{rate}"))
+					.with_property("Enabled", false)
+					.with_property("Rate", *rate)
+					.with_property("Lifetime", NumberRange::new(5.0, 5.0)),
+			);
+		}
+		let mut document = model.into_document();
+		for on in [12u32, 5700] {
+			let frame = |index: u32| index as f32 / 60.0;
+			let mut actions: Vec<Action> = client.iter().map(|(rate, _)| Action { at: frame(on), target: format!("Fx.Part.R{rate}"), enabled: Some(true), ..Default::default() }).collect();
+			actions.push(Action { at: frame(on + 24), target: "Fx.Part".into(), time_scale: Some(0.0), class: Some("ParticleEmitter".into()), ..Default::default() });
+			let playback = Playback { time: frame(on + 30), actions, ..Default::default() };
+			let resolved = playback.resolve(&document).unwrap();
+			let undo = resolved.apply_state(&mut document).unwrap();
+			let mut scene = crate::scene::extract::extract(&document);
+			resolved.apply_history(&document, &mut scene);
+			undo.restore(&mut document);
+			for (rate, ages) in &client {
+				let emitter = scene.particles.iter().find(|emitter| emitter.path.ends_with(&format!(".R{rate}"))).unwrap();
+				let mut drawn: Vec<u32> = emitter.births.as_ref().unwrap().iter().map(|birth| (birth.age * 60.0).round() as u32).collect();
+				drawn.sort_unstable();
+				drawn.dedup();
+				assert_eq!(&drawn, ages, "Rate {rate} switched on at frame {on}");
+			}
+		}
 	}
 
 	#[test]
