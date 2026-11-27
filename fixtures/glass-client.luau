@@ -10,6 +10,8 @@
 -- "sides": Glass EditableMeshes with and without DoubleSided, a quad seen from both sides and a closed sphere, and a
 -- Fire, Sparkles and Smoke behind (and a Fire before) panes at Transparency 0.5, before black and white stripes.
 -- "sides2": Glass quads of the built-in quad mesh with and without DoubleSided, facing the camera and turned away.
+-- "past": Glass past Transparency 1 under disabled Highlights: a flat disc at 65, a Block, a Cylinder and a Ball at 3, a
+-- 45-stud cube at 5.
 -- "fresnel": 6-stud Balls at Transparency 0 to 0.9 (columns), black Glass and white Glass before a black wall and white
 -- Glass before gray Neon panels (rows), seen from 100 studs under flat light at EnvironmentSpecularScale 0, 0.5 and 1
 -- and the default lighting: what Glass reflects and passes by angle.
@@ -318,6 +320,37 @@ return function(Context)
 			end
 		end
 		View("Sides2", Origin + Vector3.new(0, 1, 40), Origin + Vector3.new(0, 1, 0), 45, "default")
+	end
+
+	if Phase == "all" or Phase == "past" then
+		-- Glass past Transparency 1, each under a disabled Highlight (which keeps it drawn), before stripes of six
+		-- colours 1.5 studs wide 8 studs behind: a flat disc 7.8 studs across at 65 (a Cylinder 0.2 thick, its face
+		-- to the camera), a Block, a Cylinder and a Ball 6 studs across at 3, and a 45-stud cube at 5
+		local Origin = Vector3.new(7000, 50, 0)
+		local COLOURS = { { 230, 60, 60 }, { 240, 200, 50 }, { 60, 190, 80 }, { 50, 170, 220 }, { 70, 70, 210 }, { 200, 80, 200 } }
+		local function Backdrop(Name, Center, Width, Count)
+			for Index = 0, Count - 1 do
+				local C = COLOURS[Index % #COLOURS + 1]
+				Block(`{Name}{Index}`, CFrame.new(Center + Vector3.new((Index - (Count - 1) / 2) * Width, 0, 0)), Vector3.new(Width, Width * Count * 0.7, 0.5), Enum.Material.SmoothPlastic, Color3.fromRGB(C[1], C[2], C[3]))
+			end
+		end
+		local function Kept(Part)
+			local Highlight = Instance.new("Highlight")
+			Highlight.Enabled = false
+			Highlight.Parent = Part
+			return Part
+		end
+		local WHITE = Color3.new(1, 1, 1)
+		Backdrop("Past-stripe", Origin + Vector3.new(0, 0, -8), 1.5, 40)
+		Kept(Block("Past-disc", CFrame.new(Origin + Vector3.new(-12, 0, 0)) * CFrame.Angles(0, math.pi / 2, 0), Vector3.new(0.2, 7.8, 7.8), Enum.Material.Glass, WHITE, 65)).Shape = Enum.PartType.Cylinder
+		Kept(Block("Past-block", CFrame.new(Origin + Vector3.new(-3, 0, 0)), Vector3.new(6, 6, 6), Enum.Material.Glass, WHITE, 3))
+		Kept(Block("Past-cylinder", CFrame.new(Origin + Vector3.new(5, 0, 0)), Vector3.new(6, 6, 6), Enum.Material.Glass, WHITE, 3)).Shape = Enum.PartType.Cylinder
+		Kept(Block("Past-ball", CFrame.new(Origin + Vector3.new(13, 0, 0)), Vector3.new(6, 6, 6), Enum.Material.Glass, WHITE, 3)).Shape = Enum.PartType.Ball
+		View("Past", Origin + Vector3.new(0, 0, 40), Origin, 50, "flat")
+		local Cube = Vector3.new(7000, 50, 600)
+		Backdrop("PastCube-stripe", Cube + Vector3.new(0, 0, -40), 6, 40)
+		Kept(Block("PastCube", CFrame.new(Cube), Vector3.new(45, 45, 45), Enum.Material.Glass, WHITE, 5))
+		View("PastCube", Cube + Vector3.new(0, 0, 120), Cube, 50, "flat")
 	end
 
 	if Phase ~= "all" and #Views == 0 then
