@@ -344,11 +344,16 @@ fn about(h: Vec3, normal: Vec3, tangent: Vec3, bitangent: Vec3) -> Vec3 {
 /// the chain. Studio's sky reflections have that shape (ibl-spheres, split sky: a sharp core and a
 /// halo that widens with roughness, past 90 degrees at roughness 1): 6 levels from 128, looked up at
 /// lod 0.375 + 4.5 · roughness (shaders/mesh.wgsl), explain metal spheres of roughness 0..1 within
-/// 5-10 % rms each (levels filtered from the sky alone at lod 5 · roughness: 8-37 %). Every level is
-/// kept as Studio keeps it, [`stored`]: the loss accumulates down the chain, twice as fast in blue
-/// (ibl-spheres' white metals: Studio's blue / green against ror's unstored chain 0.995 at lod 0.4 down
-/// to 0.967 at 4.9; with it 0.993-1.003, and the 6 % less a sky specular at roughness 1 that ror had
-/// fitted is gone).
+/// 5-10 % rms each (levels filtered from the sky alone at lod 5 · roughness: 8-37 %). Every filtered
+/// level is kept as Studio keeps it, [`stored`]: the loss accumulates down the chain, twice as fast in
+/// blue (ibl-spheres' white metals: Studio's blue / green against ror's unstored chain 0.995 at lod 0.4
+/// down to 0.967 at 4.9; with it 0.993-1.003, and the 6 % less a sky specular at roughness 1 that ror
+/// had fitted is gone; a Roblox client's blue falls with roughness even under a uniform white sky,
+/// 208 / 206 of 255 at roughness 1). Level 0 is the sky as it is: a client's mirror reflections show
+/// none of that loss (ibl-spheres' model under 14 skies in roblox-sim's client, P17b: white metal
+/// spheres off the client's by 1.4-2.1 % on average with level 0 stored, 0.8-1.3 % without; the client's
+/// reflection of a white sky is smooth where a stored level 0 steps by 1/64; no storage at all: rough
+/// reflections 2-6 % too blue).
 pub fn prefilter_specular(source: &CubeImage, levels: u32) -> Vec<CubeImage> {
 	let [chain] = prefilter_specular_all([source], levels);
 	chain
@@ -358,7 +363,7 @@ pub fn prefilter_specular(source: &CubeImage, levels: u32) -> Vec<CubeImage> {
 /// for all of them, and every level's rows are filtered in parallel (a clip whose Lighting changes
 /// filters a chain, and the haze's, each frame).
 pub fn prefilter_specular_all<const N: usize>(sources: [&CubeImage; N], levels: u32) -> [Vec<CubeImage>; N] {
-	let mut chains: [Vec<CubeImage>; N] = sources.map(|source| vec![CubeImage { size: source.size, faces: source.faces.clone().map(|face| face.into_iter().map(stored).collect()) }]);
+	let mut chains: [Vec<CubeImage>; N] = sources.map(|source| vec![source.clone()]);
 	let samples = 128u32;
 	for level in 1..levels as usize {
 		let roughness = level as f32 / (levels - 1) as f32;
@@ -1058,10 +1063,22 @@ mod tests {
 	}
 
 	#[test]
+	fn the_chain_starts_from_the_sky_as_it_is() {
+		// a client's mirror reflections keep the sky unrounded; the filtered levels are stored
+		let white = Vec3::splat(1.935);
+		let sky = cube_from(8, |_, _, _| white);
+		let chain = prefilter_specular(&sky, 3);
+		assert!(chain[0].faces.iter().flatten().all(|&texel| texel == white), "level 0: {:?}", chain[0].faces[0][0]);
+		let kept = stored(white);
+		assert!(kept.z < kept.x && kept.x < white.x);
+		assert!(chain[1].faces.iter().flatten().all(|&texel| (texel - kept).abs().max_element() < 1e-6), "level 1: {:?}", chain[1].faces[0][0]);
+	}
+
+	#[test]
 	fn prefiltering_cubes_together_changes_no_texel() {
 		// the chain as it was filtered: face by face, one cube at a time, each sample turned anew
 		fn one_at_a_time(source: &CubeImage, levels: u32) -> Vec<CubeImage> {
-			let mut chain = vec![CubeImage { size: source.size, faces: source.faces.clone().map(|face| face.into_iter().map(stored).collect()) }];
+			let mut chain = vec![source.clone()];
 			for level in 1..levels {
 				let roughness = level as f32 / (levels - 1) as f32;
 				let previous = &chain[level as usize - 1];
