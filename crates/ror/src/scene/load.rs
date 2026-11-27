@@ -19,6 +19,10 @@ pub struct Document {
 	/// The instances whose subtrees are drawn: a model's top-level instances, a place's Workspace
 	/// children (without Terrain and the Camera), or the `select`ed instance.
 	pub roots: Vec<Ref>,
+	/// A place's StarterGui LayerCollectors, which a client copies into its player's PlayerGui once its
+	/// character spawns and draws as its ScreenGuis ([`Document::starter_guis`]); none for a model, a
+	/// `select`ed instance, or a place whose Players do not load characters.
+	starter_guis: Vec<Ref>,
 	/// The place's Lighting service, if any.
 	pub lighting: Option<Ref>,
 	/// The place's MaterialService, if any.
@@ -306,6 +310,8 @@ impl Document {
 		let mut workspace = None;
 		let mut lighting = None;
 		let mut material_service = None;
+		let mut starter_gui = None;
+		let mut loads_characters = true;
 		for &child in root.children() {
 			let Some(instance) = dom.get_by_ref(child) else {
 				continue;
@@ -314,9 +320,23 @@ impl Document {
 				"Workspace" => workspace = Some(child),
 				"Lighting" => lighting = Some(child),
 				"MaterialService" => material_service = Some(child),
+				"StarterGui" => starter_gui = Some(child),
+				"Players" => loads_characters = super::props::bool(instance, "CharacterAutoLoads", true),
+				// a recording's own PlayerGui holds what the player saw
+				"PlayerGui" => loads_characters = false,
 				_ => {}
 			}
 		}
+		// what a client shows of StarterGui once its character spawns: every LayerCollector in it, copied
+		// into PlayerGui (fixtures/screen-guis.luau's places in a Roblox client, 0.747: the ScreenGuis drawn
+		// whatever ShowDevelopmentGui says, a disabled one not; with CharacterAutoLoads off nothing is
+		// copied until a script loads a character)
+		let starter_guis = match starter_gui.and_then(|service| dom.get_by_ref(service)) {
+			Some(service) if workspace.is_some() && loads_characters => {
+				service.children().iter().copied().filter(|&child| dom.get_by_ref(child).is_some_and(|child| super::props::class_is_a(child.class.as_str(), "LayerCollector"))).collect()
+			}
+			_ => Vec::new(),
+		};
 		let is_place = workspace.is_some();
 		let roots = match workspace {
 			Some(workspace) => dom
@@ -332,7 +352,13 @@ impl Document {
 				.unwrap_or_default(),
 			None => root.children().to_vec(),
 		};
-		Self { dom, salt: String::new(), is_place, roots, lighting, material_service, setting: None, seeds: HashMap::new(), play: false, relative_to: None, keep_invisible: false, notes: Vec::new() }
+		Self { dom, salt: String::new(), is_place, roots, starter_guis, lighting, material_service, setting: None, seeds: HashMap::new(), play: false, relative_to: None, keep_invisible: false, notes: Vec::new() }
+	}
+
+	/// The place's StarterGui ScreenGuis a client shows once its character spawns (its PlayerGui's
+	/// copies of them), drawn over the view as a PlayerGui's are (notes/render.md "ScreenGuis").
+	pub fn starter_guis(&self) -> &[Ref] {
+		&self.starter_guis
 	}
 
 	/// Reads its content's relative local paths from `folder` (a job's caller's working directory: a
@@ -439,7 +465,7 @@ impl Document {
 				queue.extend(instance.children().iter().copied());
 			}
 		}
-		Document { dom, salt: self.salt.clone(), is_place: self.is_place, roots: self.roots.clone(), lighting: self.lighting, material_service: self.material_service, setting: self.setting.clone(), seeds: self.seeds.clone(), play: self.play, relative_to: self.relative_to.clone(), keep_invisible: self.keep_invisible, notes: self.notes.clone() }
+		Document { dom, salt: self.salt.clone(), is_place: self.is_place, roots: self.roots.clone(), starter_guis: self.starter_guis.clone(), lighting: self.lighting, material_service: self.material_service, setting: self.setting.clone(), seeds: self.seeds.clone(), play: self.play, relative_to: self.relative_to.clone(), keep_invisible: self.keep_invisible, notes: self.notes.clone() }
 	}
 
 	/// Gives the document a Lighting for a playback to change, in place of its own: a copy of
@@ -534,6 +560,7 @@ impl Document {
 			}
 		}
 		self.roots = vec![current];
+		self.starter_guis.clear();
 		Ok(())
 	}
 

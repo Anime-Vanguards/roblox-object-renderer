@@ -231,8 +231,20 @@ pub enum GuiKind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScreenGui {
 	pub display_order: i32,
-	/// Below the top bar (ScreenInsets CoreUISafeInsets, IgnoreGuiInset off), else the whole view.
-	pub inset: bool,
+	/// The part of the view its canvas covers (ScreenInsets).
+	pub area: ScreenArea,
+}
+
+/// The part of the view a ScreenGui's canvas covers, by its ScreenInsets (a Roblox client, 0.747:
+/// fixtures/screen-guis.luau "screen", AbsolutePosition and AbsoluteSize read in the client).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScreenArea {
+	/// None and DeviceSafeInsets (IgnoreGuiInset on): the whole view (a desktop has no device insets).
+	Whole,
+	/// CoreUISafeInsets (IgnoreGuiInset off, the default): below the top bar.
+	BelowTopBar,
+	/// TopbarSafeInsets: inside the top bar (GuiService.TopbarInset), clipped to it.
+	TopBar,
 }
 
 /// The top bar's height in GUI pixels a ScreenGui below it leaves free: GuiService:GetGuiInset() in a
@@ -787,15 +799,26 @@ pub fn read(document: &Document, referent: Ref, instance: &Instance, warnings: &
 		return None;
 	}
 	let kind = match instance.class.as_str() {
-		// only a PlayerGui's: a ScreenGui anywhere else (the Workspace, a model) draws nothing
+		// only a PlayerGui's (a place's StarterGui's are its copies there): a ScreenGui anywhere else (the
+		// Workspace, a model) draws nothing
 		"ScreenGui" => {
-			if !document.dom.get_by_ref(instance.parent()).is_some_and(|parent| parent.class == "PlayerGui") {
+			if !document.dom.get_by_ref(instance.parent()).is_some_and(|parent| parent.class == "PlayerGui" || (parent.class == "StarterGui" && document.starter_guis().contains(&referent))) {
 				skipped.push(SkippedGui { path, reason: "ScreenGui outside PlayerGui".into() });
 				return None;
 			}
 			// IgnoreGuiInset is a view of ScreenInsets: off is CoreUISafeInsets (2), on DeviceSafeInsets (1)
+			// (a file without ScreenInsets, an older one, keeps IgnoreGuiInset alone)
 			let fallback = if props::bool(instance, "IgnoreGuiInset", false) { 1 } else { 2 };
-			GuiKind::Screen(ScreenGui { display_order: props::i32(instance, "DisplayOrder", 0), inset: props::enum_value(instance, "ScreenInsets", fallback) == 2 })
+			let insets = match instance.properties.get(&rbx_dom_weak::ustr("ScreenInsets")) {
+				Some(Variant::Enum(value)) => value.to_u32(),
+				_ => fallback,
+			};
+			let area = match insets {
+				2 => ScreenArea::BelowTopBar,
+				3 => ScreenArea::TopBar,
+				_ => ScreenArea::Whole,
+			};
+			GuiKind::Screen(ScreenGui { display_order: props::i32(instance, "DisplayOrder", 0), area })
 		}
 		"SurfaceGui" => {
 			let target = props::reference(instance, "Adornee").unwrap_or_else(|| instance.parent());
@@ -973,12 +996,51 @@ mod tests {
 			})
 			.collect();
 		assert_eq!(screens.len(), 2, "{:?}", scene.guis.iter().map(|gui| &gui.path).collect::<Vec<_>>());
-		assert!(screens[0].0.ends_with("PlayerGui.Transition") && screens[0].1 == &super::ScreenGui { display_order: 3, inset: false });
-		assert!(screens[1].0.ends_with("PlayerGui.Hud") && screens[1].1 == &super::ScreenGui { display_order: 0, inset: true });
+		assert!(screens[0].0.ends_with("PlayerGui.Transition") && screens[0].1 == &super::ScreenGui { display_order: 3, area: super::ScreenArea::Whole });
+		assert!(screens[1].0.ends_with("PlayerGui.Hud") && screens[1].1 == &super::ScreenGui { display_order: 0, area: super::ScreenArea::BelowTopBar });
 		assert!(scene.skipped_guis.iter().any(|entry| entry.path.ends_with("PlayerGui.Off") && entry.reason == "disabled"), "{:?}", scene.skipped_guis);
 		assert!(scene.skipped_guis.iter().any(|entry| entry.path.ends_with("Stray") && entry.reason == "ScreenGui outside PlayerGui"), "{:?}", scene.skipped_guis);
 		assert!(scene.warnings.is_empty(), "{:?}", scene.warnings);
 		assert_eq!((super::top_bar_inset(true), super::top_bar_inset(false)), (58.0, 0.0));
+	}
+
+	#[test]
+	fn a_places_starter_gui_draws_as_a_clients_player_gui() {
+		// a place's StarterGui, which a client copies into its PlayerGui once its character spawns
+		// (fixtures/screen-guis.luau's places in a client): its enabled ScreenGuis draw, a disabled one and a
+		// loose Frame not; with CharacterAutoLoads off, or the place's Workspace part selected, none
+		let place = |loads: bool| {
+			let mut dom = rbx_dom_weak::WeakDom::new(InstanceBuilder::new("DataModel"));
+			let root = dom.root_ref();
+			let workspace = dom.insert(root, InstanceBuilder::new("Workspace").with_name("Workspace"));
+			dom.insert(workspace, InstanceBuilder::new("Part").with_name("Floor").with_property("Anchored", true));
+			dom.insert(root, InstanceBuilder::new("Players").with_name("Players").with_property("CharacterAutoLoads", loads));
+			let starter = dom.insert(root, InstanceBuilder::new("StarterGui").with_name("StarterGui").with_property("ShowDevelopmentGui", false));
+			let hud = dom.insert(starter, InstanceBuilder::new("ScreenGui").with_name("Hud"));
+			dom.insert(hud, InstanceBuilder::new("Frame").with_name("Bar"));
+			dom.insert(starter, InstanceBuilder::new("ScreenGui").with_name("Fade").with_property("IgnoreGuiInset", true).with_property("DisplayOrder", 2i32));
+			dom.insert(starter, InstanceBuilder::new("ScreenGui").with_name("Off").with_property("Enabled", false));
+			dom.insert(starter, InstanceBuilder::new("Frame").with_name("Loose"));
+			crate::scene::load::Document::new(dom)
+		};
+		let screens = |document: &crate::scene::load::Document| -> Vec<(String, super::ScreenGui)> {
+			crate::scene::extract::extract(document)
+				.guis
+				.into_iter()
+				.filter_map(|gui| match gui.kind {
+					GuiKind::Screen(screen) => Some((gui.path, screen)),
+					_ => None,
+				})
+				.collect()
+		};
+		let drawn = screens(&place(true));
+		assert_eq!(drawn.len(), 2, "{drawn:?}");
+		assert!(drawn[0].0.ends_with("StarterGui.Hud") && drawn[0].1 == super::ScreenGui { display_order: 0, area: super::ScreenArea::BelowTopBar }, "{drawn:?}");
+		assert!(drawn[1].0.ends_with("StarterGui.Fade") && drawn[1].1 == super::ScreenGui { display_order: 2, area: super::ScreenArea::Whole }, "{drawn:?}");
+		assert!(screens(&place(false)).is_empty());
+		let mut selected = place(true);
+		selected.select("Workspace.Floor").unwrap();
+		assert!(screens(&selected).is_empty());
 	}
 
 	/// A BillboardGui as an emote builds its portrait: a backdrop, a ViewportFrame holding a
@@ -1093,7 +1155,7 @@ mod tests {
 		let [gui] = scene.guis.as_slice() else {
 			panic!("one GUI: {:?}", scene.guis.iter().map(|gui| &gui.path).collect::<Vec<_>>());
 		};
-		assert_eq!(gui.kind, GuiKind::Screen(super::ScreenGui { display_order: -5, inset: false }));
+		assert_eq!(gui.kind, GuiKind::Screen(super::ScreenGui { display_order: -5, area: super::ScreenArea::Whole }));
 		let [viewport] = gui.viewports.as_slice() else {
 			panic!("one ViewportFrame: {}", gui.viewports.len());
 		};

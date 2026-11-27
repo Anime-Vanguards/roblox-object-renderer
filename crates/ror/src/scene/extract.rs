@@ -38,9 +38,18 @@ pub fn extract(document: &Document) -> Scene {
 }
 
 /// A scene of the whole document with what reading its file left out ([`Document::notes`]) ahead of
-/// its own warnings: the scene is drawn without those values.
+/// its own warnings: the scene is drawn without those values. A place's StarterGui ScreenGuis join its
+/// GUIs, after its own, as a client's PlayerGui holds them once its character spawns.
 fn noted(document: &Document, mut scene: Scene) -> Scene {
 	scene.warnings.splice(0..0, document.notes.iter().cloned());
+	for &referent in document.starter_guis() {
+		if let Some(instance) = document.dom.get_by_ref(referent)
+			&& instance.class == "ScreenGui"
+			&& let Some(gui) = super::guis::read(document, referent, instance, &mut scene.warnings, &mut scene.skipped_guis)
+		{
+			scene.guis.push(gui);
+		}
+	}
 	scene
 }
 

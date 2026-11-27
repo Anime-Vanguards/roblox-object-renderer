@@ -31,7 +31,7 @@ use super::gui_files::{GUI_CHUNK, GuiImage};
 use super::resources::{GpuTexture, Weighed};
 use super::{Prepared, Renderer, ViewRequest, rur};
 use crate::scene::Scene;
-use crate::scene::guis::{GRADIENT_KEYS, Gui, GuiKind, ViewportKind};
+use crate::scene::guis::{GRADIENT_KEYS, Gui, GuiKind, ScreenArea, ViewportKind};
 
 const COMMON: &str = include_str!("../../shaders/common.wgsl");
 const GUI: &str = include_str!("../../shaders/gui.wgsl");
@@ -66,6 +66,10 @@ pub const REFERENCE_HEIGHT: f32 = 744.0;
 /// The largest GUI texture side (device pixels, margins included); bigger canvases are drawn at a
 /// smaller scale.
 const MAX_TEXTURE: f32 = 2048.0;
+/// A ScreenGui's: a whole 4K view at its own pixels, as a client draws it (fixtures/screen-guis.luau
+/// "fine" at 3840 x 2160 in a Roblox client: one-pixel lines whole; drawn at 2048 and magnified they
+/// were 27 % within 2 of 255), within one of rur's atlases (render::rur, 4096 a side).
+const MAX_SCREEN_TEXTURE: f32 = 4088.0;
 /// Device pixels of GUI content drawn by one rur call at most, and how many calls run at once: rur
 /// draws a call's atlas on the GPU in one frame, kept about the size of a screen (a long GPU
 /// submission can make the driver reset the device, every other app's included).
@@ -128,11 +132,16 @@ pub struct GuiKey {
 
 impl GuiKey {
 	fn new(content: u64, canvas: [f32; 2], scale: f32, clips: bool) -> Self {
+		Self::within(content, canvas, scale, clips, MAX_TEXTURE)
+	}
+
+	/// [`GuiKey::new`] with a texture side of at most `largest` device pixels.
+	fn within(content: u64, canvas: [f32; 2], scale: f32, clips: bool, largest: f32) -> Self {
 		// a canvas bigger than a texture can hold is drawn at a smaller scale (the margins: a quarter of
 		// the canvas and 8 GUI pixels on each side, up to a device pixel more each when rounded up)
 		let side = canvas[0].max(canvas[1]);
 		let extent = if clips { side } else { side * 1.5 + 16.0 };
-		let scale = scale.min((MAX_TEXTURE - 3.0) / extent.max(1.0));
+		let scale = scale.min((largest - 3.0) / extent.max(1.0));
 		let quantize = |value: f32, steps: f32| (value * steps).round().clamp(1.0, u32::MAX as f32) as u32;
 		// the scale rounded down, so a capped one stays within the limit
 		let scale = (scale * 1024.0).floor().max(1.0) as u32;
@@ -681,14 +690,22 @@ pub(super) fn plan_with_skips(scene: &Scene, camera: &Camera, request: &ViewRequ
 				// the view in GUI pixels (whole 1/1024 steps of the scale), below the top bar when inset;
 				// drawn 1:1 into the image's pixels over everything (screen-gui-post: no post effect touches it)
 				let gui_scale = (request.gui_scale.filter(|scale| *scale > 0.0).unwrap_or(height as f32 / REFERENCE_HEIGHT) * 1024.0).floor().max(1.0) / 1024.0;
-				let top = if screen.inset { (crate::scene::guis::top_bar_inset(scene.play) * gui_scale).min(height as f32) } else { 0.0 };
-				if (height as f32 - top) < 1.0 {
+				// its canvas from `top` to `bottom`: the whole view, below the top bar, or inside it (in Studio's
+				// edit viewport, which has no top bar, the whole view)
+				let bar = (crate::scene::guis::top_bar_inset(scene.play) * gui_scale).min(height as f32);
+				let (top, bottom) = match screen.area {
+					ScreenArea::Whole => (0.0, height as f32),
+					ScreenArea::BelowTopBar => (bar, height as f32),
+					ScreenArea::TopBar if scene.play => (0.0, bar),
+					ScreenArea::TopBar => (0.0, height as f32),
+				};
+				if (bottom - top) < 1.0 {
 					skipped.push(crate::scene::guis::SkippedGui { path: gui.path.clone(), reason: "zero pixel size".into() });
 					continue;
 				}
 				let (content_hash, local_snaps) = crate::scene::guis::stamp_gui_hash(gui.base_content_hash, &gui.local_files);
-				let key = GuiKey::new(content_hash, [width as f32 / gui_scale, (height as f32 - top) / gui_scale], gui_scale, true);
-				// the canvas as the texture holds it (a canvas past MAX_TEXTURE is drawn smaller and magnified)
+				let key = GuiKey::within(content_hash, [width as f32 / gui_scale, (bottom - top) / gui_scale], gui_scale, true, MAX_SCREEN_TEXTURE);
+				// the canvas as the texture holds it (a canvas past MAX_SCREEN_TEXTURE is drawn smaller and magnified)
 				let [canvas_width, canvas_height] = key.canvas().map(|size| size * gui_scale);
 				let focal = height as f32 * 0.5 / tan;
 				// (any depth past the near plane: the layer has no depth test; ten studs keep the corners'
@@ -1785,6 +1802,11 @@ mod tests {
 			assert!(width.max(height) as f32 <= MAX_TEXTURE, "{canvas:?}: {width} x {height}");
 		}
 		assert_ne!(GuiKey::new(7, [100.0, 50.0], 1.5, true), GuiKey::new(7, [100.5, 50.0], 1.5, true));
+		// a ScreenGui over a 4K view at GUI scale 1 keeps its own pixels, within one of rur's atlases
+		let key = GuiKey::within(7, [3840.0, 2160.0], 1.0, true, MAX_SCREEN_TEXTURE);
+		assert_eq!(key.scale(), 1.0);
+		let (width, height) = rur::image_size(key.canvas(), key.scale(), key.margin());
+		assert!(width as f32 <= MAX_SCREEN_TEXTURE && height == 2160, "{width} x {height}");
 	}
 
 	#[test]
@@ -1890,7 +1912,7 @@ mod tests {
 		};
 		let gui = |inset: bool| Gui {
 			path: "PlayerGui.View".into(),
-			kind: GuiKind::Screen(ScreenGui { display_order: -5, inset }),
+			kind: GuiKind::Screen(ScreenGui { display_order: -5, area: if inset { ScreenArea::BelowTopBar } else { ScreenArea::Whole } }),
 			content: Arc::new(Vec::new()),
 			base_content_hash: 7,
 			content_hash: 7,
@@ -2069,9 +2091,9 @@ mod tests {
 		use crate::render::camera::CameraSpec;
 		use crate::scene::guis::ScreenGui;
 
-		let screen = |name: &str, display_order: i32, inset: bool| Gui {
+		let screen = |name: &str, display_order: i32, area: ScreenArea| Gui {
 			path: format!("PlayerGui.{name}"),
-			kind: GuiKind::Screen(ScreenGui { display_order, inset }),
+			kind: GuiKind::Screen(ScreenGui { display_order, area }),
 			content: Arc::new(Vec::new()),
 			base_content_hash: display_order as u64,
 			content_hash: display_order as u64,
@@ -2090,20 +2112,22 @@ mod tests {
 			let clip = camera.view_projection(request.width as f32 / request.height as f32) * point.extend(1.0);
 			((clip.x / clip.w + 1.0) * 0.5 * request.width as f32, (1.0 - clip.y / clip.w) * 0.5 * request.height as f32)
 		};
+		// and a bar inside the top bar (TopbarSafeInsets: in a client the top 58 GUI pixels; in Studio's edit
+		// viewport, which has none, the whole view)
 		for play in [true, false] {
-			let scene = Scene { guis: vec![screen("Transition", 3, false), screen("Hud", 0, true)], play, ..Default::default() };
+			let scene = Scene { guis: vec![screen("Transition", 3, ScreenArea::Whole), screen("Hud", 0, ScreenArea::BelowTopBar), screen("Bar", 1, ScreenArea::TopBar)], play, ..Default::default() };
 			let draws = plan(&scene, &camera, &request);
-			assert_eq!(draws.len(), 2);
+			assert_eq!(draws.len(), 3);
 			let scale = draws[0].key.scale();
 			assert!((scale - 862.0 / 744.0).abs() < 1e-3 && draws.iter().all(|draw| draw.overlay && draw.key.clips), "the view's scale, whatever the supersampling");
-			assert_eq!((draws[0].screen, draws[1].screen), (Some(3), Some(0)));
-			let top = if play { 58.0 * scale } else { 0.0 };
-			for (draw, top) in [(&draws[0], 0.0), (&draws[1], top)] {
+			assert_eq!((draws[0].screen, draws[1].screen, draws[2].screen), (Some(3), Some(0), Some(1)));
+			let bar = if play { 58.0 * scale } else { 0.0 };
+			for (draw, top, bottom) in [(&draws[0], 0.0, 862.0), (&draws[1], bar, 862.0), (&draws[2], 0.0, if play { bar } else { 862.0 })] {
 				let [width, height] = draw.key.canvas().map(|size| size * scale);
-				assert!((width - 1572.0).abs() < 0.01 && (height - (862.0 - top)).abs() < 0.01, "canvas {width} x {height} at play {play}");
+				assert!((width - 1572.0).abs() < 0.01 && (height - (bottom - top)).abs() < 0.01, "canvas {width} x {height} at play {play}");
 				let (left, upper) = pixel(draw.corners[0]);
 				let (right, lower) = pixel(draw.corners[3]);
-				assert!(left.abs() < 0.02 && (upper - top).abs() < 0.02 && (right - 1572.0).abs() < 0.02 && (lower - 862.0).abs() < 0.02, "{left},{upper} - {right},{lower}");
+				assert!(left.abs() < 0.02 && (upper - top).abs() < 0.02 && (right - 1572.0).abs() < 0.02 && (lower - bottom).abs() < 0.02, "{left},{upper} - {right},{lower}");
 			}
 		}
 		// the world's AlwaysOnTop GUIs far to near, then the ScreenGuis by DisplayOrder (a tie keeps the scene's order)
