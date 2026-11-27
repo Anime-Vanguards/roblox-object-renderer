@@ -25,9 +25,6 @@ pub const PARTICLE_RADIANCE: f32 = 1.935;
 
 /// No emitter keeps more particles than this in a snapshot.
 const MAX_PARTICLES: usize = 4096;
-/// Studio's near plane, studs from the camera: what ZOffset brings this close is not drawn (cut
-/// between 0.1 and 0.12, a little over 0.1 against rounding).
-const STUDIO_NEAR: f32 = 0.11;
 
 /// A VelocityParallel or VelocityPerpendicular particle moving at most this many studs a second draws
 /// nothing (particle-slow-orient: at Speed 0 Studio shows nothing, at 0.0635 they turn as faster ones;
@@ -106,10 +103,13 @@ pub struct ParticleVertex {
 	/// colour (legacy effects), z and w the width and threshold of the texel alpha that shows (z 0:
 	/// the alpha as is).
 	pub extra: [f32; 4],
+	/// The emitter's ZOffset: how far towards the camera, along its axis, the shader moves this
+	/// corner's depth (`vs_particle`), the corner staying where it is on screen.
+	pub z_offset: f32,
 }
 
 impl ParticleVertex {
-	const ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4];
+	const ATTRIBUTES: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32];
 
 	fn layout() -> wgpu::VertexBufferLayout<'static> {
 		wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<ParticleVertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &Self::ATTRIBUTES }
@@ -1011,20 +1011,24 @@ pub fn quads_at(emitter: &ParticleEmitter, particles: &[Particle], camera: &Came
 		if particle.size <= 0.0 || particle.opacity <= 0.0 || fade <= 0.0 {
 			continue;
 		}
+		// A positive ZOffset leaves the quad where it is (the same size and place on screen) and moves each
+		// corner's depth along the camera's axis from z to z - ZOffset, the GPU clipping what that brings to
+		// the near plane or past it (`vs_particle`; the corners are dropped below once all of them are behind
+		// the eye or past the near plane). A negative one moves the particle along its view ray by view
+		// depth, keeping its size on screen (particle-zoffset-close: one 1 stud above the camera and 0.05-0.3
+		// before it goes behind a wall 6 studs off at ZOffset -10, so to depth 10, and at 0.05 without
+		// ZOffset shows nothing; its corners' own depths, measured only for positive ZOffset in a client,
+		// drew an effect's long VelocityParallel streaks at ZOffset -3 over its fist where Studio shows them
+		// behind it). A particle whose middle is behind the eye draws nothing.
 		let mut center = particle.position;
 		let mut size = particle.size;
-		// ZOffset moves the particle along its view ray by view depth, keeping its size on screen: its
-		// depth along the camera's axis goes from z to z - ZOffset; one in front of the camera that this
-		// brings to Studio's near plane, 0.1 studs, or past it is not drawn, at any ZOffset
-		// (particle-zoffset-near: a square 10 studs off shows at ZOffset 9.88, 0.12 off, not at 9.9;
-		// particle-zoffset-close: one 1 stud above the camera and 0.05-0.3 before it goes behind a wall
-		// 6 studs off at ZOffset -10, so to depth 10, and at 0.05 without ZOffset shows nothing)
 		let depth = (center - camera.eye).dot(-camera_back);
-		let moved = depth - emitter.z_offset;
-		if depth <= 0.0 || moved <= STUDIO_NEAR {
+		if depth <= 0.0 {
 			continue;
 		}
-		if emitter.z_offset != 0.0 {
+		let z_offset = emitter.z_offset.max(0.0);
+		if emitter.z_offset < 0.0 {
+			let moved = depth - emitter.z_offset;
 			center = camera.eye + (center - camera.eye) * (moved / depth);
 			size *= moved / depth;
 		}
@@ -1116,9 +1120,10 @@ pub fn quads_at(emitter: &ParticleEmitter, particles: &[Particle], camera: &Came
 			normal: [normal.x, normal.y, normal.z, if matches!(emitter.orientation, 2 | 3) { FLAT_SOFT_DEPTH } else { particle.size * SOFT_DEPTH }],
 			params: [params3[0], params3[1], params3[2], blend],
 			extra: [emitter.cap, if emitter.premultiplied { 1.0 } else { 0.0 }, emitter.alpha_ramp.1, emitter.alpha_ramp.0],
+			z_offset,
 		};
 		let corners = [center - half_right + half_up, center + half_right + half_up, center - half_right - half_up, center + half_right - half_up];
-		if view.is_some_and(|view| off_view(view, &corners)) {
+		if view.is_some_and(|view| off_view(view, &corners)) || behind(camera, z_offset, &corners) {
 			continue;
 		}
 		let top_left = corner(corners[0], 0.0, 0.0);
@@ -1127,6 +1132,16 @@ pub fn quads_at(emitter: &ParticleEmitter, particles: &[Particle], camera: &Came
 		let bottom_right = corner(corners[3], 1.0, 1.0);
 		out.extend_from_slice(&[top_left, bottom_left, bottom_right, top_left, bottom_right, top_right]);
 	}
+}
+
+/// Whether no pixel of a quad can show for its corners' depths (along `camera`'s axis): all of them at or
+/// behind the eye, or all of them brought to it or past it by `z_offset` (`vs_particle` then clips the
+/// whole quad). A quad some of whose corners reach in front draws the share the GPU's clipping leaves
+/// (particle ZOffset in a Roblox client, `fixtures/draw-order.luau` "zcut", "zcut2").
+fn behind(camera: &Camera, z_offset: f32, corners: &[Vec3; 4]) -> bool {
+	let forward = -Vec3::from(camera.world.matrix3.z_axis);
+	let depths = corners.map(|corner| (corner - camera.eye).dot(forward));
+	depths.iter().all(|&depth| depth <= 0.0) || depths.iter().all(|&depth| depth - z_offset <= 0.0)
 }
 
 /// Whether a quad's corners all lie beyond one side of the view's clip volume (left, right, bottom or
@@ -1500,6 +1515,34 @@ mod tests {
 		let xs: Vec<f32> = vertices.iter().map(|vertex| vertex.position[0]).collect();
 		let width = xs.iter().cloned().fold(f32::MIN, f32::max) - xs.iter().cloned().fold(f32::MAX, f32::min);
 		assert!((width - 8.0).abs() < 1e-4, "{width}");
+	}
+
+	/// ZOffset leaves a particle's quad where it is, the same size on screen, and hands the shader the offset
+	/// for its corners' depths; a quad is dropped only once every corner is behind the eye or brought past
+	/// it, a flat one whose middle the offset brings past the eye keeping the corners still in front
+	/// (`fixtures/draw-order.luau` "zcut" in a Roblox client: such squares show their far part).
+	#[test]
+	fn zoffset_moves_only_the_corners_depth() {
+		// the camera 10 studs above the emitter looking down at it 30 studs ahead
+		let camera = super::super::camera::CameraSpec::LookAt { eye: [0.0, 10.0, -30.0], target: [0.0, 0.0, 0.0], fov: 40.0 }.place(None, 100, 100);
+		let draw = |orientation: u32, z_offset: f32| {
+			let emitter = ParticleEmitter { orientation, z_offset, speed: (0.01, 0.01), size_keys: vec![(0.0, 2.0, 0.0), (1.0, 2.0, 0.0)], bursts: vec![(0.0, 1)], ..emitter() };
+			let mut vertices = Vec::new();
+			quads(&emitter, &simulate(&emitter), &camera, 1.0, None, &mut vertices);
+			vertices
+		};
+		let depth = camera.depth(Vec3::ZERO);
+		let plain = draw(3, 0.0);
+		let offset = draw(3, depth - 0.5);
+		assert_eq!(plain.len(), 6);
+		assert_eq!(plain.iter().map(|vertex| vertex.position).collect::<Vec<_>>(), offset.iter().map(|vertex| vertex.position).collect::<Vec<_>>());
+		assert!(offset.iter().all(|vertex| vertex.z_offset == depth - 0.5));
+		// a flat square (moving up, lying on the ground) whose middle goes 0.5 studs past the eye still draws:
+		// its far corners stay in front; one facing the camera, all at one depth, does not
+		assert_eq!(draw(3, depth + 0.5).len(), 6);
+		assert!(draw(0, depth + 0.5).is_empty());
+		// all four corners brought past the eye: nothing
+		assert!(draw(3, depth + 5.0).is_empty());
 	}
 
 	#[test]

@@ -25,6 +25,8 @@ struct ParticleInput {
 	// x the most light emitted per channel, y 1 for a texture of premultiplied colour, z and w the width
 	// and threshold of the texel alpha that shows (z 0: the alpha as is)
 	@location(5) extra: vec4<f32>,
+	// the emitter's ZOffset
+	@location(6) z_offset: f32,
 }
 
 struct ParticleOutput {
@@ -43,6 +45,18 @@ struct ParticleOutput {
 fn vs_particle(input: ParticleInput) -> ParticleOutput {
 	var output: ParticleOutput;
 	output.clip = frame.view_proj * vec4<f32>(input.position, 1.0);
+	// A positive ZOffset keeps the corner where it is on screen and gives it the depth of its own depth along the
+	// view less the offset (the reversed projection's near / (w - ZOffset)), so the GPU clips the quad where
+	// that depth reaches the near plane or passes it, between corners as it clips any triangle: a square
+	// facing the camera shows once ZOffset leaves its middle 0.1 studs or more in front of the eye
+	// (particle-zoffset-near: 10 studs off at ZOffset 9.88, not 9.9), and a flat or tilted one only the
+	// share its corners' depths leave between those bounds (`fixtures/draw-order.luau` "zcut", "zcut2"
+	// in a Roblox client: Size 3 squares lying flat with ZOffset 30 show their far part from 2.5 studs
+	// short of it to 1.5 past, nothing from 2 past; Size 1.5 ones whole from 2 studs past, nothing at 1)
+	if (input.z_offset != 0.0) {
+		let moved = output.clip.w - input.z_offset;
+		output.clip.z = output.clip.z * output.clip.w / select(moved, -1e-6, abs(moved) < 1e-6);
+	}
 	output.uv = input.uv;
 	output.color = input.color;
 	output.normal = input.normal;
