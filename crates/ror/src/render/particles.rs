@@ -690,6 +690,11 @@ pub struct PreparedParticles {
 }
 
 impl PreparedParticles {
+	/// One emitter's particles.
+	pub(super) fn of(&self, emitter: usize) -> &[Particle] {
+		self.particles.get(emitter).map_or(&[], Vec::as_slice)
+	}
+
 	/// How many particles draw (any opacity).
 	pub(super) fn drawn(&self) -> usize {
 		self.particles.iter().flatten().filter(|particle| particle.opacity > 0.0).count()

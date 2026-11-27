@@ -1617,6 +1617,54 @@ enum BlendRun {
 	Legacy(std::ops::Range<usize>),
 }
 
+/// The box a Roblox client's occlusion culling tests an effect by, where it stands before its ZOffset (as
+/// `ror cost` boxes it): an emitter's particles, each a square of twice its size round its place.
+fn particles_box(particles: &[particles::Particle]) -> Option<(Vec3, Vec3)> {
+	particles.iter().fold(None, |bounds, particle| {
+		let half = Vec3::splat(particle.size.max(0.0));
+		let (low, high) = (particle.position - half, particle.position + half);
+		Some(bounds.map_or((low, high), |(min, max): (Vec3, Vec3)| (min.min(low), max.max(high))))
+	})
+}
+
+/// A beam's box for the occlusion culling: its ends, widened by half its width and half its CurveSize
+/// either way (cost::Analysis's).
+fn beam_box(beam: &crate::scene::Beam) -> (Vec3, Vec3) {
+	let (a, b) = (Vec3::from(beam.attachment0.translation), Vec3::from(beam.attachment1.translation));
+	let reach = (beam.width0.abs().max(beam.width1.abs()) + beam.curve_size0.abs().max(beam.curve_size1.abs())) * 0.5;
+	(a.min(b) - Vec3::splat(reach), a.max(b) + Vec3::splat(reach))
+}
+
+/// Of `effects` (an emitter's or a beam's index and its box), those whose box lies wholly behind what a
+/// Roblox client's occlusion culling rasterizes from `camera` (cost::occluding, of the scene's parts that
+/// stand in the view nearer than the farthest effect; `meshes` loads their meshes).
+fn hidden_effects(scene: &Scene, effects: &[(usize, (Vec3, Vec3))], camera: &Camera, aspect: f32, meshes: impl FnOnce(&[Arc<Part>]) -> crate::cost::meshes::Meshes) -> Vec<usize> {
+	if effects.is_empty() {
+		return Vec::new();
+	}
+	let forward = -Vec3::from(camera.world.matrix3.z_axis);
+	let depths = |(low, high): (Vec3, Vec3)| {
+		(0..8).map(|corner| Vec3::new(if corner & 1 == 0 { low.x } else { high.x }, if corner & 2 == 0 { low.y } else { high.y }, if corner & 4 == 0 { low.z } else { high.z })).map(|point| (point - camera.eye).dot(forward)).fold((f32::INFINITY, f32::NEG_INFINITY), |(near, far), depth| (near.min(depth), far.max(depth)))
+	};
+	let farthest = effects.iter().map(|(_, bounds)| depths(*bounds).1).fold(f32::NEG_INFINITY, f32::max);
+	let view = crate::cost::cull::Culler::new(camera, aspect);
+	let near: Vec<&Arc<Part>> = scene
+		.parts
+		.iter()
+		.filter(|part| {
+			let bounds = crate::cost::cull::world_box(&part.cframe, part.size);
+			view.in_frustum(bounds) && depths(bounds).0 < farthest
+		})
+		.collect();
+	let meshes = meshes(&near.iter().filter(|part| matches!(part.geometry, Geometry::MeshPart { .. })).map(|part| Arc::clone(part)).collect::<Vec<_>>());
+	let occluders: Vec<crate::cost::Occluder> = near.iter().filter_map(|part| crate::cost::part_occluder(part, &meshes)).collect();
+	if occluders.is_empty() {
+		return Vec::new();
+	}
+	let culler = crate::cost::occluding(&occluders, camera, aspect);
+	effects.iter().filter(|(_, bounds)| !culler.visible(*bounds)).map(|(index, _)| *index).collect()
+}
+
 /// The blend order cut into runs (`legacy[i]`: whether its i-th draw is a legacy effect's): what blends up
 /// to the first legacy effect (drawn with the scene, perhaps nothing), then each run of legacy effects and
 /// each run of what blends after one, in order.
@@ -5049,6 +5097,20 @@ impl Renderer {
 		let particle_view = self.particle_geometry(scene, &prepared.particles, &camera, width as f32 / height as f32, quality.particle_rate, &mut particle_missing, lease);
 		let beam_view = self.beam_geometry(scene, &camera, lease);
 		let trail_view = self.trail_geometry(scene, &camera, lease);
+		// emitters and beams that ZOffset brings in front of what hides them where they stand are dropped by
+		// a Roblox client's occlusion culling, which tests where they stand (`fixtures/draw-order.luau`
+		// "cull", "cull2": a beam and a square 36 studs out with ZOffset 10 behind a 10 x 10 block at 30, head-on
+		// and from 6 studs aside, show nothing; reaching past the block's edge, over 1-stud blocks, or flying
+		// out in front of it, they show; notes/occlusion.md)
+		let (hidden_emitters, hidden_beams) = {
+			let aspect = width as f32 / height as f32;
+			let emitters: Vec<(usize, (Vec3, Vec3))> = particle_view.draws.iter().filter(|draw| scene.particles[draw.emitter].z_offset > 0.0).filter_map(|draw| particles_box(prepared.particles.of(draw.emitter)).map(|bounds| (draw.emitter, bounds))).collect();
+			let beams: Vec<(usize, (Vec3, Vec3))> = beam_view.draws.iter().filter(|draw| scene.beams[draw.beam].z_offset > 0.0).map(|draw| (draw.beam, beam_box(&scene.beams[draw.beam]))).collect();
+			let load = |parts: &[Arc<Part>]| crate::cost::meshes::Meshes::load(parts, &self.assets);
+			let hidden_emitters = hidden_effects(scene, &emitters, &camera, aspect, load);
+			let hidden_beams = hidden_effects(scene, &beams, &camera, aspect, load);
+			(hidden_emitters, hidden_beams)
+		};
 		// the lights' voxels where those with LightInfluence read them, baked once (voxel_field), as far
 		// from the camera as they take any (VOXEL_LIGHT_REACH)
 		let lit = voxel_field::union(voxel_field::union(particle_view.lit, beam_view.lit), trail_view.lit).map(|(low, high)| {
@@ -5340,12 +5402,12 @@ impl Renderer {
 		let mut see_through_decals: Vec<&DrawItem> = visible_draws.iter().copied().filter(|draw| draw.decal && draw.transparent).collect();
 		see_through_decals.sort_by_key(|draw| draw.decal_order);
 		transparent.extend(see_through_decals.into_iter().map(|draw| (camera.depth(draw.center), Blended::Decal(draw))));
-		transparent.extend(beam_view.draws.iter().filter(|draw| prepared.beam_textures[draw.beam].is_some()).map(|draw| (camera.depth(draw.center), Blended::Beam(draw))));
+		transparent.extend(beam_view.draws.iter().filter(|draw| prepared.beam_textures[draw.beam].is_some() && !hidden_beams.contains(&draw.beam)).map(|draw| (camera.depth(draw.center), Blended::Beam(draw))));
 		transparent.extend(trail_view.draws.iter().filter(|draw| prepared.trail_textures[draw.trail].is_some()).map(|draw| (camera.depth(draw.center), Blended::Trail(draw))));
 		stats.missing.extend(particle_missing);
 		// particles by their emitter's position moved towards the camera by ZOffset (particle-sort
 		// glass-zoffset: a particle behind a glass block's centre pulled out in front of it draws over it)
-		transparent.extend(particle_view.draws.iter().filter(|draw| !scene.particles[draw.emitter].linear).map(|draw| (camera.depth(draw.center) - scene.particles[draw.emitter].z_offset, Blended::Particles(draw))));
+		transparent.extend(particle_view.draws.iter().filter(|draw| !scene.particles[draw.emitter].linear && !hidden_emitters.contains(&draw.emitter)).map(|draw| (camera.depth(draw.center) - scene.particles[draw.emitter].z_offset, Blended::Particles(draw))));
 		// legacy effects take their place in the order too (`fixtures/draw-order.luau` "legacy", "legacy2" in a
 		// Roblox client: a Fire 2.5 studs behind a SmoothPlastic pane at Transparency 0.2, 0.5 or 0.8, a beam
 		// or a ParticleEmitter square at 0.5 shows through it, one 2.5 studs in front over it, two either side
@@ -8727,6 +8789,61 @@ mod blend_order_tests {
 		assert_eq!(blend_runs(&[false, false]), vec![BlendRun::Blended(0..2)]);
 		assert_eq!(blend_runs(&[true, false]), vec![BlendRun::Blended(0..0), BlendRun::Legacy(0..1), BlendRun::Blended(1..2)]);
 		assert_eq!(blend_runs(&[false, true, true, false, true]), vec![BlendRun::Blended(0..1), BlendRun::Legacy(1..3), BlendRun::Blended(3..4), BlendRun::Legacy(4..5)]);
+	}
+
+	/// A red square 36 studs out with ZOffset 10 behind a 10 x 10 opaque block 30 studs out: a Roblox
+	/// client's occlusion culling drops it where it stands, before its offset would bring it in front
+	/// (`fixtures/draw-order.luau` "cull"); one reaching past the block's edge draws over it; without the
+	/// block it draws.
+	#[test]
+	fn an_effect_behind_an_occluder_is_culled_before_its_zoffset() {
+		let state = std::env::temp_dir().join(format!("ror-zoffset-cull-test-{}", std::process::id()));
+		std::fs::create_dir_all(&state).unwrap();
+		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let white = state.join("white.png");
+		crate::output::write_png(&white, 8, 8, &[255u8; 4].repeat(64), false).unwrap();
+		let white = format!("file:///{}", white.display().to_string().replace('\\', "/"));
+		let red = Color3::new(1.0, 0.0, 0.0);
+		// (the square's place across the view, whether the block stands)
+		let scene = |x: f32, wall: bool| {
+			let mut model = ModelBuilder::new("Cull");
+			if wall {
+				model.part(&PartSpec { name: "Wall".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, 0.0, 30.0)), size: Vec3::new(10.0, 10.0, 1.0), color: [128, 128, 128], cast_shadow: false, ..Default::default() });
+			}
+			let holder = model.part(&PartSpec { name: "Holder".into(), cframe: Affine3A::from_translation(Vec3::new(x, 0.0, 36.0)), size: Vec3::splat(0.2), transparency: 1.0, cast_shadow: false, ..Default::default() });
+			model.child(
+				holder,
+				InstanceBuilder::new("ParticleEmitter")
+					.with_property("Texture", ContentId::from(white.clone()))
+					.with_property("Color", ColorSequence { keypoints: vec![ColorSequenceKeypoint::new(0.0, red), ColorSequenceKeypoint::new(1.0, red)] })
+					.with_property("Size", NumberSequence { keypoints: vec![NumberSequenceKeypoint::new(0.0, 1.0, 0.0), NumberSequenceKeypoint::new(1.0, 1.0, 0.0)] })
+					.with_property("Lifetime", NumberRange::new(5.0, 5.0))
+					.with_property("Speed", NumberRange::new(0.0, 0.0))
+					.with_property("Rate", 2.0f32)
+					.with_property("ZOffset", 10.0f32)
+					.with_property("LightEmission", 0.0f32)
+					.with_property("LightInfluence", 0.0f32),
+			);
+			crate::scene::extract::extract(&model.into_document())
+		};
+		const SIZE: (u32, u32) = (160, 120);
+		let spec = CameraSpec::LookAt { eye: [0.0, 0.0, 0.0], target: [0.0, 0.0, 1.0], fov: 50.0 };
+		let project = spec.place(None, SIZE.0, SIZE.1).view_projection(SIZE.0 as f32 / SIZE.1 as f32);
+		let red_at = |x: f32, wall: bool| {
+			let view = ViewRequest { width: SIZE.0, height: SIZE.1, camera: spec.clone(), background: Background::Color([0.0, 0.0, 0.0]), bloom: false, ..Default::default() };
+			let (images, _) = renderer.render(&scene(x, wall), &[view]).unwrap();
+			let clip = project * Vec3::new(x, 0.0, 36.0).extend(1.0);
+			let (column, row) = (((clip.x / clip.w * 0.5 + 0.5) * SIZE.0 as f32) as usize, ((0.5 - clip.y / clip.w * 0.5) * SIZE.1 as f32) as usize);
+			let pixel = &images[0].rgba[(row * SIZE.0 as usize + column) * 4..][..3];
+			pixel[0] > 120 && pixel[1] < 60
+		};
+		assert!(red_at(0.0, false), "the square in the open");
+		assert!(!red_at(0.0, true), "the square wholly behind the block");
+		assert!(red_at(5.0, true), "the square reaching past the block's edge, over it");
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
 	}
 
 	#[test]

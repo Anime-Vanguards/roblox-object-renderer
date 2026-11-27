@@ -324,7 +324,7 @@ pub struct Item {
 }
 
 /// A part that hides what is behind it.
-struct Occluder {
+pub(crate) struct Occluder {
 	bounds: (Vec3, Vec3),
 	/// Its own box, to leave it out when the camera is inside (oc1: a camera inside a block
 	/// sees everything behind its far side).
@@ -759,40 +759,16 @@ impl Analysis {
 				// unions "can be occluded but are not used to occlude"); notes/occlusion.md "Occluders"
 				let cutout = part.surface_appearance.as_ref().is_some_and(|appearance| appearance.alpha_mode == ALPHA_TRANSPARENCY);
 				if !transparent && !cutout && cluster == Cluster::Static && !forcefield {
-					let (triangles, positions): (Option<Vec<[Vec3; 3]>>, Option<u32>) = match &part.geometry {
-						Geometry::Block | Geometry::Wedge | Geometry::CornerWedge => (Some(cull::block_triangles(&part.cframe, part.size).to_vec()), None),
-						// a ball and a cylinder by the box inside them (oc1: both hid a wall's worth)
-						Geometry::Ball => {
-							let side = part.size.min_element() / 3f32.sqrt();
-							(Some(cull::block_triangles(&part.cframe, Vec3::splat(side)).to_vec()), None)
+					match occluder_shape(part, &meshes) {
+						Ok((triangles, positions)) => {
+							let mesh = match &part.geometry {
+								Geometry::MeshPart { mesh, .. } => Some(short(mesh)),
+								_ => None,
+							};
+							occluders.push(Occluder { bounds, cframe: part.cframe, size: part.size, triangles, positions, path: part.path.clone(), mesh });
 						}
-						Geometry::Cylinder => {
-							let side = part.size.y.min(part.size.z) / 2f32.sqrt();
-							(Some(cull::block_triangles(&part.cframe, Vec3::new(part.size.x, side, side)).to_vec()), None)
-						}
-						Geometry::MeshPart { .. } => match meshes.of(&part.geometry) {
-							Some(stats) => (mesh_occluder(stats, part), Some(stats.positions)),
-							None => (None, None),
-						},
-						_ => (None, None),
-					};
-					if let Some(triangles) = triangles {
-						let mesh = match &part.geometry {
-							Geometry::MeshPart { mesh, .. } => Some(short(mesh)),
-							_ => None,
-						};
-						occluders.push(Occluder { bounds, cframe: part.cframe, size: part.size, triangles, positions, path: part.path.clone(), mesh });
-					} else {
-						let reason = match &part.geometry {
-							Geometry::Union { .. } => Some("a union (unions never occlude)".to_string()),
-							Geometry::Truss { .. } => Some("a truss".to_string()),
-							Geometry::MeshPart { .. } => meshes.of(&part.geometry).map(|stats| format!("a mesh of {} vertex positions (over 2,048)", stats.positions)),
-							Geometry::Special { .. } => Some("a SpecialMesh".to_string()),
-							_ => None,
-						};
-						if let Some(reason) = reason {
-							not_occluders.push(NotOccluder { bounds, cframe: part.cframe, size: part.size, reason, path: part.path.clone() });
-						}
+						Err(Some(reason)) => not_occluders.push(NotOccluder { bounds, cframe: part.cframe, size: part.size, reason, path: part.path.clone() }),
+						Err(None) => {}
 					}
 				}
 			}
@@ -1044,6 +1020,100 @@ impl Analysis {
 }
 
 /// A cheap mesh's triangles placed in the world as a part draws them (its box scaled to the Size).
+/// What Roblox's occlusion culling rasterizes of an opaque part (notes/occlusion.md "Occluders"): a block's,
+/// wedge's or corner wedge's box, a ball's or cylinder's box inside it (oc1: both hid a wall's worth), a mesh
+/// cheap enough its own triangles (and its distinct vertex positions); else why a solid never occludes (a
+/// missed occluder), or nothing to say.
+fn occluder_shape(part: &Part, meshes: &Meshes) -> Result<(Vec<[Vec3; 3]>, Option<u32>), Option<String>> {
+	match &part.geometry {
+		Geometry::Block | Geometry::Wedge | Geometry::CornerWedge => Ok((cull::block_triangles(&part.cframe, part.size).to_vec(), None)),
+		Geometry::Ball => {
+			let side = part.size.min_element() / 3f32.sqrt();
+			Ok((cull::block_triangles(&part.cframe, Vec3::splat(side)).to_vec(), None))
+		}
+		Geometry::Cylinder => {
+			let side = part.size.y.min(part.size.z) / 2f32.sqrt();
+			Ok((cull::block_triangles(&part.cframe, Vec3::new(part.size.x, side, side)).to_vec(), None))
+		}
+		Geometry::MeshPart { .. } => match meshes.of(&part.geometry) {
+			Some(stats) => mesh_occluder(stats, part).map(|triangles| (triangles, Some(stats.positions))).ok_or_else(|| Some(format!("a mesh of {} vertex positions (over 2,048)", stats.positions))),
+			None => Err(None),
+		},
+		Geometry::Union { .. } => Err(Some("a union (unions never occlude)".to_string())),
+		Geometry::Truss { .. } => Err(Some("a truss".to_string())),
+		// a Brick SpecialMesh hides as a block of its own size does (`fixtures/draw-order.luau` "cull": in a Roblox
+		// client a 10 x 10 one 30 studs off dropped a beam and a square standing behind it, head-on and from aside,
+		// as a block did); other kinds never occlude (staff: cylinder ones)
+		Geometry::Special { mesh_type: mesh_type::BRICK, scale, offset, .. } => Ok((cull::block_triangles(&(part.cframe * glam::Affine3A::from_translation(*offset)), part.size * scale.abs()).to_vec(), None)),
+		Geometry::Special { .. } => Err(Some("a SpecialMesh".to_string())),
+		_ => Err(None),
+	}
+}
+
+/// A part's occluder for a picture (render: effects ZOffset brings in front of what hides them): what
+/// [`occluder_shape`] gives of an opaque part (Transparency 0, no SurfaceAppearance cutting holes, not
+/// ForceField, nor a character's body part or a skinned mesh, which cull with their clusters).
+pub(crate) fn part_occluder(part: &Part, meshes: &Meshes) -> Option<Occluder> {
+	let cutout = part.surface_appearance.as_ref().is_some_and(|appearance| appearance.alpha_mode == ALPHA_TRANSPARENCY);
+	if part.transparency > 0.0 || cutout || part.material == FORCEFIELD || part.skeleton.is_some() || part.body_part.is_some() {
+		return None;
+	}
+	let (triangles, positions) = occluder_shape(part, meshes).ok()?;
+	Some(Occluder { bounds: world_box(&part.cframe, part.size), cframe: part.cframe, size: part.size, triangles, positions, path: part.path.clone(), mesh: None })
+}
+
+/// The occluders Roblox's culling rasterizes from `camera`, those covering most of the view first: in the
+/// view, not around the camera, large enough, and a mesh simple enough for its size on screen (one too
+/// detailed for its size goes to `too_detailed` with its pixels and positions).
+fn ranked_occluders<'a>(occluders: &'a [Occluder], culler: &Culler, camera: &Camera, mut too_detailed: impl FnMut(f32, &'a Occluder, u32)) -> Vec<(f32, &'a Occluder)> {
+	let mut ranked: Vec<(f32, &Occluder)> = occluders
+		.iter()
+		.filter(|occluder| {
+			let local = occluder.cframe.inverse().transform_point3(camera.eye).abs();
+			if local.cmple(occluder.size * 0.5).all() || !culler.in_frustum(occluder.bounds) {
+				return false;
+			}
+			let (pixels, side) = culler.screen_extent(occluder.bounds);
+			match occluder.positions {
+				Some(positions) if positions as f32 > OCCLUDER_POSITIONS_PER_PIXEL * pixels => {
+					too_detailed(pixels, *occluder, positions);
+					false
+				}
+				_ => side >= OCCLUDER_MIN_PIXELS,
+			}
+		})
+		.map(|occluder| {
+			// how much of the view it covers: each face pair's area as seen from the camera
+			let center = Vec3::from(occluder.cframe.translation);
+			let to = center - camera.eye;
+			let distance = to.length().max(1.0);
+			let direction = to / distance;
+			let half = occluder.size * 0.5;
+			let axes = [Vec3::from(occluder.cframe.matrix3.x_axis), Vec3::from(occluder.cframe.matrix3.y_axis), Vec3::from(occluder.cframe.matrix3.z_axis)];
+			let area = half.y * half.z * direction.dot(axes[0]).abs() + half.x * half.z * direction.dot(axes[1]).abs() + half.x * half.y * direction.dot(axes[2]).abs();
+			(area / (distance * distance), occluder)
+		})
+		.collect();
+	ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+	ranked
+}
+
+/// The occluders a view rasterizes at most (`ROR_COST_OCCLUDERS`, else [`OCCLUDER_BUDGET`]).
+fn occluder_budget() -> usize {
+	std::env::var("ROR_COST_OCCLUDERS").ok().and_then(|value| value.parse().ok()).unwrap_or(OCCLUDER_BUDGET)
+}
+
+/// A culler for `camera` (a view of `aspect`) with what Roblox's occlusion culling rasterizes of
+/// `occluders` from there, as a view's cost takes them ([`Analysis::view`]).
+pub(crate) fn occluding(occluders: &[Occluder], camera: &Camera, aspect: f32) -> Culler {
+	let mut culler = Culler::new(camera, aspect);
+	let ranked: Vec<&Occluder> = ranked_occluders(occluders, &culler, camera, |_, _, _| {}).into_iter().take(occluder_budget()).map(|(_, occluder)| occluder).collect();
+	for (rank, occluder) in ranked.into_iter().enumerate() {
+		culler.occlude_as(&occluder.triangles, rank.min(u16::MAX as usize - 1) as u16);
+	}
+	culler
+}
+
 fn mesh_occluder(stats: &MeshStats, part: &Part) -> Option<Vec<[Vec3; 3]>> {
 	let triangles = stats.occluder.as_ref()?;
 	let (low, high) = stats.bounds;
@@ -1423,39 +1493,9 @@ impl Analysis {
 		// meshes in the view too detailed for their size there (missed occluders)
 		let too_detailed: std::cell::RefCell<Vec<(f32, &Occluder, u32)>> = std::cell::RefCell::new(Vec::new());
 		if !options.no_occlusion {
-			// the occluders covering most of the view, as many as Roblox's budget takes: in the view, not
-			// around the camera, large enough, and a mesh simple enough for its size on screen
-			let mut ranked: Vec<(f32, &Occluder)> = self
-				.occluders
-				.iter()
-				.filter(|occluder| {
-					let local = occluder.cframe.inverse().transform_point3(camera.eye).abs();
-					if local.cmple(occluder.size * 0.5).all() || !culler.in_frustum(occluder.bounds) {
-						return false;
-					}
-					let (pixels, side) = culler.screen_extent(occluder.bounds);
-					match occluder.positions {
-						Some(positions) if positions as f32 > OCCLUDER_POSITIONS_PER_PIXEL * pixels => {
-							too_detailed.borrow_mut().push((pixels, occluder, positions));
-							false
-						}
-						_ => side >= OCCLUDER_MIN_PIXELS,
-					}
-				})
-				.map(|occluder| {
-					// how much of the view it covers: each face pair's area as seen from the camera
-					let center = Vec3::from(occluder.cframe.translation);
-					let to = center - camera.eye;
-					let distance = to.length().max(1.0);
-					let direction = to / distance;
-					let half = occluder.size * 0.5;
-					let axes = [Vec3::from(occluder.cframe.matrix3.x_axis), Vec3::from(occluder.cframe.matrix3.y_axis), Vec3::from(occluder.cframe.matrix3.z_axis)];
-					let area = half.y * half.z * direction.dot(axes[0]).abs() + half.x * half.z * direction.dot(axes[1]).abs() + half.x * half.y * direction.dot(axes[2]).abs();
-					(area / (distance * distance), occluder)
-				})
-				.collect();
-			ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
-			let budget: usize = std::env::var("ROR_COST_OCCLUDERS").ok().and_then(|value| value.parse().ok()).unwrap_or(OCCLUDER_BUDGET);
+			// the occluders covering most of the view, as many as Roblox's budget takes
+			let ranked = ranked_occluders(&self.occluders, &culler, camera, |pixels, occluder, positions| too_detailed.borrow_mut().push((pixels, occluder, positions)));
+			let budget = occluder_budget();
 			occlusion.candidates = ranked.len() as u64;
 			for (_, occluder) in &ranked {
 				if occluder.positions.is_some() {

@@ -16,6 +16,9 @@ use crate::render::camera::Camera;
 /// Width of the occlusion buffer (its height follows the view's aspect).
 pub const BUFFER_WIDTH: u32 = 256;
 
+/// How far outside a triangle (in barycentric weight) a pixel centre still counts as inside it.
+const EDGE: f32 = 1e-5;
+
 /// The view as the culling sees it: world-to-view transform, projection and the depth buffer.
 #[derive(Clone)]
 pub struct Culler {
@@ -150,7 +153,10 @@ impl Culler {
 				let w0 = ((b.0 - px) * (c.1 - py) - (b.1 - py) * (c.0 - px)) / area;
 				let w1 = ((c.0 - px) * (a.1 - py) - (c.1 - py) * (a.0 - px)) / area;
 				let w2 = 1.0 - w0 - w1;
-				if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+				// a pixel centre on an edge two triangles share belongs to both: by exact signs a rounding
+				// either way left it to neither, a crack the wall's diagonal let a box behind it show through
+				// (a 4:3 view's centre column and row run through pixel centres)
+				if w0 < -EDGE || w1 < -EDGE || w2 < -EDGE {
 					continue;
 				}
 				let depth = 1.0 / (w0 * inverse[0] + w1 * inverse[1] + w2 * inverse[2]);
@@ -344,6 +350,14 @@ mod tests {
 		assert!(culler.in_frustum((Vec3::new(-1.0, -1.0, -12.0), Vec3::new(1.0, 1.0, -10.0))));
 		// far off to the side
 		assert!(!culler.in_frustum((Vec3::new(200.0, -1.0, -12.0), Vec3::new(202.0, 1.0, -10.0))));
+	}
+
+	#[test]
+	fn a_walls_diagonal_hides_what_is_behind_it() {
+		// a 4:3 view, the wall's two triangles meeting on a diagonal through the buffer's pixel centres
+		let mut culler = Culler::new(&camera(), 4.0 / 3.0);
+		culler.occlude_as(&block_triangles(&Affine3A::from_translation(Vec3::new(0.0, 0.0, -30.0)), Vec3::new(10.0, 10.0, 1.0)), 0);
+		assert!(!culler.visible((Vec3::new(-1.1, -1.1, -37.1), Vec3::new(1.1, 1.1, -34.9))));
 	}
 
 	#[test]
