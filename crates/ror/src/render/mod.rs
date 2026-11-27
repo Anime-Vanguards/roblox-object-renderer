@@ -1079,6 +1079,12 @@ mod surface_tests {
 	}
 }
 
+/// A MeshPart without a mesh draws its box at this share of its albedo, as a vertex colour of 0.8
+/// would (a Roblox client 0.747 and Studio alike: blue (60, 160, 230) 15, 82, 133 against a block's
+/// 22, 112, 167 under flat Ambient, white 149 against 182, red 112 / 146, gray 58 / 82, Plastic and
+/// SmoothPlastic; a FileMesh without a MeshId draws its box as bright as a block).
+const MESHLESS_BOX_ALBEDO: f32 = 0.64;
+
 /// `Enum.SurfaceType` values drawn as geometry of their own ([`Renderer::push_joints`]).
 const SURFACE_HINGE: u32 = 6;
 const SURFACE_MOTOR: u32 = 7;
@@ -4212,6 +4218,8 @@ impl Renderer {
 				_ => None,
 			};
 			let local_mesh = mesh_uri.is_some_and(names_local_file);
+			// a MeshPart without a mesh draws its box darker (MESHLESS_BOX_ALBEDO)
+			let box_albedo = if part.class == "MeshPart" && matches!(part.geometry, Geometry::Block) { MESHLESS_BOX_ALBEDO } else { 1.0 };
 			let (mesh, local, is_mesh) = match mesh {
 				Ok((mesh, skin_stable)) => {
 					stable &= skin_stable;
@@ -4220,17 +4228,20 @@ impl Renderer {
 					}
 					mesh
 				}
-				// a MeshPart's or a FileMesh's mesh Studio cannot load draws nothing, decals and all
-				// (texture-missing "meshpart-no-mesh", "specialmesh-no-mesh")
-				Err(error) if part.body_part.is_none() && matches!(&part.geometry, Geometry::MeshPart { .. } | Geometry::Special { mesh_type: crate::scene::extract::mesh_type::FILE_MESH, mesh: Some(_), .. }) => {
+				// a MeshPart's, a FileMesh's or a union's mesh the client cannot load draws nothing, decals and
+				// all (texture-missing "meshpart-no-mesh", "specialmesh-no-mesh"; a Roblox client 0.747: a
+				// union whose asset fails, an R15 limb whose MeshId fails)
+				Err(error) if matches!(&part.geometry, Geometry::Union { .. } | Geometry::Special { mesh_type: crate::scene::extract::mesh_type::FILE_MESH, mesh: Some(_), .. }) || (part.class == "MeshPart" && matches!(&part.geometry, Geometry::MeshPart { .. })) => {
 					missing.push(format!("{}: {error:#} (not drawn)", part.path));
 					return (out, stable && !local_mesh);
 				}
 				Err(error) => {
 					missing.push(format!("{}: {error:#}", part.path));
 					stable &= !local_mesh;
-					// a union's, a body part's (Studio's own limbs) or a FileMesh's without a MeshId: the
-					// part's box, so the shape is still there (texture-missing "specialmesh-empty-mesh")
+					// an R6 limb's mesh (Studio's own, or a CharacterMesh's) or a FileMesh's without a MeshId:
+					// the part's box, so the shape is still there (texture-missing "specialmesh-empty-mesh"; a
+					// Roblox client drew a limb whose CharacterMesh fails as its box, plain in one session and
+					// darker in another)
 					(self.primitives[&Primitive::Block].clone(), Affine3A::from_scale(part.size), false)
 				}
 			};
@@ -4469,7 +4480,7 @@ impl Renderer {
 				// 143.8 against a Plastic block's 146.0)
 				_ if part.body_part.is_some() && part.material == 256 => linear(part.color) * COMPOSITED_ALBEDO,
 				_ => linear(part.color) * albedo,
-			};
+			} * box_albedo;
 			// SurfaceAppearance.Color tints the colour map in AlphaMode Overlay too, squared like any
 			// colour (a ship model's SA parts: Studio / ror radiance 0.66-0.68 at Color 0.82 (0.672), 0.49-0.53
 			// at 0.71 (0.504))
@@ -7218,10 +7229,11 @@ mod decal_uv_tests {
 mod joint_and_fallback_tests {
 	use super::*;
 
-	/// What a Roblox client draws for joint surfaces: a Motor's yellow pin and dark disc on its face (a
-	/// Hinge's pin alone, nothing on an invisible part).
+	/// What a Roblox client draws for joint surfaces and for meshes that are not there: a Motor's yellow
+	/// pin and dark disc on its face (a Hinge's pin alone, nothing on an invisible part), a MeshPart
+	/// without a mesh as its box at 0.64 of a block's albedo, and nothing for a union whose data fails.
 	#[test]
-	fn joints_draw_as_a_client_does() {
+	fn joints_draw_and_missing_meshes_fall_back_as_a_client_does() {
 		let state = std::env::temp_dir().join(format!("ror-joint-test-{}", std::process::id()));
 		std::fs::create_dir_all(&state).unwrap();
 		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
@@ -7255,6 +7267,14 @@ mod joint_and_fallback_tests {
 			part.transparency = 1.0;
 		});
 		assert_eq!(at(&invisible, 0.05), [0, 0, 0], "an invisible part's joint");
+		// a MeshPart without a mesh: its box, darker than a block of its colour
+		let block = draw("Part", &|_| ());
+		let meshless = draw("MeshPart", &|part| assert!(matches!(part.geometry, Geometry::Block)));
+		let (lit, dark) = (at(&block, 1.2)[0] as f32, at(&meshless, 1.2)[0] as f32);
+		assert!((0.78..0.86).contains(&(dark / lit)), "a MeshPart without a mesh {dark} against a block's {lit}");
+		// a union whose asset cannot be loaded draws nothing
+		let union = draw("Part", &|part| part.geometry = Geometry::Union { asset: Some("rbxassetid://1".into()), mesh_data: None, initial_size: Vec3::splat(4.0), use_part_color: true });
+		assert_eq!(at(&union, 1.2), [0, 0, 0], "a union whose data fails");
 		drop(renderer);
 		let _ = std::fs::remove_dir_all(&state);
 	}
