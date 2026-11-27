@@ -6,9 +6,11 @@
 //! sits at Size / InitialSize · (bind position - mesh centre) with the bind rotation; the scope's
 //! Bone of the same name gives its CFrame relative to the part, and M = pose · bind⁻¹. A vertex
 //! blends its four bones' matrices by weight (linear blend skinning, skin-pose "pose": the forearm
-//! twist matches). A bone without a Bone moves with its nearest ancestor that has one ("missing-hand");
-//! unweighted vertices stay with the part. The result is stored back in mesh space, so the part's
-//! mesh transform (and the shader) stay as for the bind mesh.
+//! twist matches). A bone without a Bone moves with its nearest ancestor that has one ("missing-hand").
+//! A Roblox client blends the bones' matrices in world space as stored, so a vertex without any weight
+//! lands on the world origin (a client: a skinned mesh with 1,500 vertices' weights zeroed, doctor-unw),
+//! posed or not. The result is stored back in mesh space, so the part's mesh transform (and the
+//! shader) stay as for the bind mesh.
 //!
 //! Saved models mostly keep their Bones at the bind pose (the importer and Model:ScaleTo put them
 //! there): those draw the cached bind mesh at no cost. Other poses are skinned once per (mesh, part
@@ -49,6 +51,8 @@ pub struct SkinSource {
 	bones: Vec<SkinBone>,
 	/// The vertices LOD0 draws (the only ones skinned).
 	used: Vec<u32>,
+	/// Whether any of them has no weight (it lands on the world origin, even in the bind pose).
+	unweighted: bool,
 	bytes: u64,
 	pub(super) proof: StampProof,
 }
@@ -232,21 +236,26 @@ impl Renderer {
 			return Ok((None, stable));
 		};
 		let matrices = bone_matrices(&source.bones, skeleton, &part.cframe, mesh_scale);
-		if matrices.iter().all(is_identity) {
+		if matrices.iter().all(is_identity) && !source.unweighted {
 			return Ok((None, stable));
 		}
+		// where the world origin is in the part (unweighted vertices land there)
+		let origin = part.cframe.inverse().translation;
 		let mut hash = 0xcbf29ce484222325u64;
 		hash_values(&mut hash, mesh_scale.scale.to_array().into_iter().chain(mesh_scale.centre.to_array()));
+		if source.unweighted {
+			hash_values(&mut hash, origin.to_array());
+		}
 		for matrix in &matrices {
 			hash_values(&mut hash, matrix.to_cols_array());
 		}
 		if let Some(index) = live {
-			return Ok((Some(self.live_mesh(&stamped, index, hash, &source, &matrices, mesh_scale, bind, proof)), stable));
+			return Ok((Some(self.live_mesh(&stamped, index, hash, &source, &matrices, mesh_scale, origin, bind, proof)), stable));
 		}
 		let key = format!("{stamped}#{hash:016x}");
 		let pose = || {
 			let start = std::time::Instant::now();
-			let vertices = skin(&source, &matrices, mesh_scale);
+			let vertices = skin(&source, &matrices, mesh_scale, origin);
 			let skinned = start.elapsed();
 			let vertex_buffer = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
 				label: Some("skinned mesh"),
@@ -300,7 +309,7 @@ impl Renderer {
 	/// (Ruler) scrubbing its idle (two skinned parts, 1.17 MB a pose) the submit took 1.40 ms a frame
 	/// against 0.34 with the camera turning; written over, the vertices are the only upload.
 	#[allow(clippy::too_many_arguments)]
-	fn live_mesh(&self, uri: &str, index: usize, pose: u64, source: &SkinSource, matrices: &[Affine3A], mesh_scale: MeshScale, bind: &Arc<GpuMesh>, proof: StampProof) -> Arc<GpuMesh> {
+	fn live_mesh(&self, uri: &str, index: usize, pose: u64, source: &SkinSource, matrices: &[Affine3A], mesh_scale: MeshScale, origin: Vec3A, bind: &Arc<GpuMesh>, proof: StampProof) -> Arc<GpuMesh> {
 		let stable = !matches!(proof, StampProof::Moved);
 		let slot = (uri.to_string(), index);
 		if stable
@@ -310,7 +319,7 @@ impl Renderer {
 			return part.mesh.clone();
 		}
 		let start = std::time::Instant::now();
-		let vertices = skin(source, matrices, mesh_scale);
+		let vertices = skin(source, matrices, mesh_scale, origin);
 		let skinned = start.elapsed();
 		let bytes: &[u8] = bytemuck::cast_slice(&vertices);
 		let mut live = self.skins.live.lock();
@@ -372,7 +381,7 @@ impl Renderer {
 		};
 		let Some(skinning) = mesh.skinning.as_ref().filter(|skinning| !skinning.bones.is_empty() && skinning.joints.len() == mesh.vertex_count()) else {
 			return Ok(LoadOutcome {
-				value: SkinSource { vertices: Vec::new(), joints: Vec::new(), weights: Vec::new(), bones: Vec::new(), used: Vec::new(), bytes: 64, proof },
+				value: SkinSource { vertices: Vec::new(), joints: Vec::new(), weights: Vec::new(), bones: Vec::new(), used: Vec::new(), unweighted: false, bytes: 64, proof },
 				keep,
 				offline_fallback: false,
 			});
@@ -386,8 +395,9 @@ impl Renderer {
 		let bones: Vec<SkinBone> =
 			skinning.bones.iter().map(|bone| SkinBone { name: bone.name.clone(), bind: bind_cframe(bone), parent: bone.parent.map(usize::from).filter(|&parent| parent < count) }).collect();
 		let bytes = (std::mem::size_of_val(cpu.vertices.as_slice()) + skinning.joints.len() * 24 + used.len() * 4) as u64;
+		let unweighted = used.iter().any(|&index| skinning.weights.get(index as usize).is_some_and(|weights| weights.iter().sum::<f32>() <= 0.0));
 		Ok(LoadOutcome {
-			value: SkinSource { vertices: cpu.vertices, joints: skinning.joints.clone(), weights: skinning.weights.clone(), bones, used, bytes, proof },
+			value: SkinSource { vertices: cpu.vertices, joints: skinning.joints.clone(), weights: skinning.weights.clone(), bones, used, unweighted, bytes, proof },
 			keep,
 			offline_fallback: false,
 		})
@@ -406,8 +416,9 @@ fn drawn_bounds(source: &SkinSource, vertices: &[Vertex]) -> Option<(Vec3, Vec3)
 
 /// Linear blend skinning in the part's space of the vertices LOD0 draws (the rest keep their bind
 /// pose), stored back in mesh space: positions through the inverse of the mesh scale, normals and
-/// tangents so that the shader's transforms of the part's matrix give the skinned directions.
-fn skin(source: &SkinSource, matrices: &[Affine3A], mesh_scale: MeshScale) -> Vec<Vertex> {
+/// tangents so that the shader's transforms of the part's matrix give the skinned directions. A vertex
+/// without weights goes to `origin`, the world origin in the part's space.
+fn skin(source: &SkinSource, matrices: &[Affine3A], mesh_scale: MeshScale, origin: Vec3A) -> Vec<Vertex> {
 	let MeshScale { scale, centre } = mesh_scale;
 	let mut vertices = source.vertices.clone();
 	for &index in &source.used {
@@ -426,8 +437,9 @@ fn skin(source: &SkinSource, matrices: &[Affine3A], mesh_scale: MeshScale) -> Ve
 				total += weight;
 			}
 		}
-		// unweighted vertices stay with the part
+		// unweighted: a client blends in world space, so nothing moves the vertex off the world origin
 		if total <= 0.0 {
+			vertices[index].position = (origin / scale + centre).to_array();
 			continue;
 		}
 		let vertex = &mut vertices[index];
@@ -468,6 +480,7 @@ mod tests {
 				SkinBone { name: "Tip".into(), bind: Affine3A::from_translation(Vec3::Y), parent: Some(0) },
 			],
 			used,
+			unweighted: false,
 			bytes: 0,
 			proof: super::StampProof::Remote,
 		}
@@ -501,15 +514,15 @@ mod tests {
 		);
 		let tip = part * Affine3A::from_translation(Vec3::Y) * Affine3A::from_rotation_z(std::f32::consts::FRAC_PI_2);
 		let matrices = bone_matrices(&source.bones, &skeleton(&[("Root", part), ("Tip", tip)]), &part, UNSCALED);
-		let skinned = skin(&source, &matrices, UNSCALED);
+		let skinned = skin(&source, &matrices, UNSCALED, Vec3A::new(-5.0, 0.0, 0.0));
 		assert!(close(skinned[0].position, [0.0, 0.5, 0.0]));
 		// one stud above the joint, turned a quarter about Z
 		assert!(close(skinned[1].position, [-1.0, 1.0, 0.0]));
 		assert!(close(skinned[1].normal, [0.0, 1.0, 0.0]));
 		// the joint itself stays put whatever the blend
 		assert!(close(skinned[2].position, [0.0, 1.0, 0.0]));
-		// unweighted: with the part
-		assert!(close(skinned[3].position, [1.0, 1.0, 0.0]));
+		// unweighted: on the world origin (doctor-unw), five studs left of the part
+		assert!(close(skinned[3].position, [-5.0, 0.0, 0.0]));
 	}
 
 	#[test]
@@ -518,7 +531,7 @@ mod tests {
 		let source = chain(vec![vertex([0.0, 2.0, 0.0], [1.0, 0.0, 0.0])], vec![[1, 0, 0, 0]], vec![[1.0, 0.0, 0.0, 0.0]]);
 		let root = Affine3A::from_rotation_z(std::f32::consts::FRAC_PI_2);
 		let matrices = bone_matrices(&source.bones, &skeleton(&[("Root", root)]), &part, UNSCALED);
-		assert!(close(skin(&source, &matrices, UNSCALED)[0].position, [-2.0, 0.0, 0.0]));
+		assert!(close(skin(&source, &matrices, UNSCALED, Vec3A::ZERO)[0].position, [-2.0, 0.0, 0.0]));
 		// nothing found: the bind pose
 		assert!(bone_matrices(&source.bones, &skeleton(&[]), &part, UNSCALED).iter().all(is_identity));
 	}
@@ -532,7 +545,7 @@ mod tests {
 		let source = chain(vec![vertex([1.0, 1.0, 0.0], [1.0, 0.0, 0.0])], vec![[1, 0, 0, 0]], vec![[1.0, 0.0, 0.0, 0.0]]);
 		let tip = Affine3A::from_translation(Vec3::Y) * Affine3A::from_rotation_z(std::f32::consts::FRAC_PI_2);
 		let matrices = bone_matrices(&source.bones, &skeleton(&[("Root", part), ("Tip", tip)]), &part, scale);
-		let skinned = skin(&source, &matrices, scale);
+		let skinned = skin(&source, &matrices, scale, Vec3A::ZERO);
 		// part space (0, 3, 0), stored in mesh space
 		assert!(close(skinned[0].position, [0.0, 3.0, 0.0]));
 		// the part's normal (1, 0, 0) turned to +Y; in mesh space a normal scales by S (still +Y)

@@ -4,11 +4,16 @@
 //! it and under the parts joined to it by a Motor6D, Weld or WeldConstraint, in either direction,
 //! that share its nearest Model ancestor (skin-joints, skin-partners2). A Bone of the same name
 //! under a joined part wins over the MeshPart's own ("dup-own-and-motor", "split"); among joined
-//! parts a weld's wins over a Motor6D's, and of one kind the later joint's (skin-partners2). Bones
-//! elsewhere in the model, under parts two joints away or in another Model are not used
-//! ("pose-sibling", "motor-chain", "animator-no-joint", "partner-in-other-model"). A Bone's world
-//! CFrame is its parent's (a part's CFrame, or the parent Bone's world CFrame) times its own CFrame:
-//! `Bone.Transform`, the animation offset, is not saved in files.
+//! parts a WeldConstraint's wins over a Weld's and a Weld's over a Motor6D's, in either order, and of
+//! one kind the later joint's (skin-partners2; a Roblox client: kweld1/2, kwcm1/2). Bones elsewhere in
+//! the model, under parts two joints away or in another Model are not used ("pose-sibling",
+//! "motor-chain", "animator-no-joint", "partner-in-other-model"), nor those under a part nested in
+//! the part (a client: knested, kownnested): a part's Bones are its Bone children and theirs. A Bone
+//! under anything else (an Attachment, a Model) makes a Roblox client refuse the whole file ("Bones
+//! must be parented to a BasePart or another Bone"), so such Bones are ignored. A Bone's world CFrame
+//! is its parent's (the part's CFrame, or the parent Bone's world CFrame) times its own CFrame:
+//! `Bone.Transform`, the animation offset, is not saved in files (a client composes CFrame ·
+//! Transform: ktransform; recordings carry it in the Bones' motion).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,12 +31,24 @@ pub struct Skeleton {
 	pub bones: HashMap<String, Affine3A>,
 }
 
-/// A part joined to another: the joint's precedence (welds over Motor6Ds, then document order).
+/// A part joined to another: the joint's precedence (WeldConstraints over welds over Motor6Ds and
+/// other joints, then document order).
 #[derive(Clone, Copy)]
 struct Joined {
 	part: Ref,
-	weld: bool,
+	rank: u8,
 	order: usize,
+}
+
+/// A joint's precedence among the parts joined to a skinned MeshPart: a WeldConstraint's Bones win
+/// over a Weld's (a Roblox client, either order: kweld1, kweld2) and a Weld's over a Motor6D's
+/// (skin-partners2).
+fn joint_rank(class: &str) -> u8 {
+	match class {
+		"WeldConstraint" => 2,
+		"Weld" | "ManualWeld" => 1,
+		_ => 0,
+	}
 }
 
 /// Joints and Bones of a document, indexed for the MeshParts that look them up.
@@ -50,13 +67,13 @@ impl Skeletons {
 	/// to it. `None` when there are none.
 	pub fn for_part(&mut self, document: &Document, part: Ref) -> Option<Arc<Skeleton>> {
 		let joined = self.joined.get_or_insert_with(|| joints(document));
-		// lowest precedence first: the MeshPart's own Bones, then its joined parts of the same Model,
-		// Motor6Ds before welds, each kind in joint order
+		// lowest precedence first: the MeshPart's own Bones, then its joined parts of the same Model:
+		// Motor6Ds, then welds, then WeldConstraints, each kind in joint order
 		let mut sources = vec![part];
 		if let Some(others) = joined.get(&part) {
 			let model = nearest_model(document, part);
 			let mut others: Vec<Joined> = others.iter().copied().filter(|other| other.part != part && nearest_model(document, other.part) == model).collect();
-			others.sort_by_key(|other| (other.weld, other.order));
+			others.sort_by_key(|other| (other.rank, other.order));
 			sources.extend(others.iter().map(|other| other.part));
 		}
 		let with_bones: Vec<Ref> = sources.into_iter().filter(|&source| self.bones_under(document, source).is_some()).collect();
@@ -101,9 +118,9 @@ fn joints(document: &Document) -> HashMap<Ref, Vec<Joined>> {
 				_ => None,
 			};
 			if let (Some(part0), Some(part1)) = (part("Part0"), part("Part1")) {
-				let weld = matches!(instance.class.as_str(), "Weld" | "ManualWeld" | "WeldConstraint");
-				joined.entry(part0).or_default().push(Joined { part: part1, weld, order });
-				joined.entry(part1).or_default().push(Joined { part: part0, weld, order });
+				let rank = joint_rank(instance.class.as_str());
+				joined.entry(part0).or_default().push(Joined { part: part1, rank, order });
+				joined.entry(part1).or_default().push(Joined { part: part0, rank, order });
 				order += 1;
 			}
 		}
@@ -124,34 +141,26 @@ fn nearest_model(document: &Document, referent: Ref) -> Option<Ref> {
 	None
 }
 
-/// Every Bone under a part with its world CFrame; the first Bone of a name in depth-first order
-/// wins.
+/// Every Bone of a part with its world CFrame: its Bone children and theirs, down the chain (a client
+/// uses no other: a part nested in the part brings none, knested and kownnested); the first Bone of a
+/// name in depth-first order wins.
 fn collect(document: &Document, part: Ref) -> Option<Skeleton> {
 	let instance = document.dom.get_by_ref(part)?;
 	let frame = props::cframe(instance, "CFrame")?;
 	let mut skeleton = Skeleton::default();
-	// each entry carries the frame its attachments are relative to (None: not in the world)
-	let mut stack: Vec<(Ref, Option<Affine3A>)> = instance.children().iter().rev().map(|&child| (child, Some(frame))).collect();
+	// each entry carries the world CFrame of the part or Bone it hangs from
+	let mut stack: Vec<(Ref, Affine3A)> = instance.children().iter().rev().map(|&child| (child, frame)).collect();
 	while let Some((referent, parent)) = stack.pop() {
 		let Some(instance) = document.dom.get_by_ref(referent) else {
 			continue;
 		};
-		let own = if props::is_a(instance, "Attachment") {
-			let world = parent.map(|parent| parent * props::cframe(instance, "CFrame").unwrap_or(Affine3A::IDENTITY));
-			if let Some(world) = world
-				&& instance.class == "Bone"
-			{
-				skeleton.bones.entry(instance.name.clone()).or_insert(world);
-			}
-			world
-		} else if props::is_a(instance, "BasePart") {
-			// a part nested in the part: its Bones are descendants too, relative to it
-			props::cframe(instance, "CFrame")
-		} else {
-			None
-		};
+		if instance.class != "Bone" {
+			continue;
+		}
+		let world = parent * props::cframe(instance, "CFrame").unwrap_or(Affine3A::IDENTITY);
+		skeleton.bones.entry(instance.name.clone()).or_insert(world);
 		for &child in instance.children().iter().rev() {
-			stack.push((child, own));
+			stack.push((child, world));
 		}
 	}
 	(!skeleton.bones.is_empty()).then_some(skeleton)
@@ -230,8 +239,16 @@ mod tests {
 
 	#[test]
 	fn welds_win_over_motors_and_later_joints_over_earlier() {
-		// skin-partners2: two-partners, weld-then-motor, two-motors, two-welds
-		for (first, second, winner) in [("Motor6D", "Weld", 2.0), ("Weld", "Motor6D", 1.0), ("Motor6D", "Motor6D", 2.0), ("Weld", "Weld", 2.0)] {
+		// skin-partners2: two-partners, weld-then-motor, two-motors, two-welds; a Roblox client: a
+		// WeldConstraint's Bones over a Weld's in either order (kweld1, kweld2)
+		for (first, second, winner) in [
+			("Motor6D", "Weld", 2.0),
+			("Weld", "Motor6D", 1.0),
+			("Motor6D", "Motor6D", 2.0),
+			("Weld", "Weld", 2.0),
+			("Weld", "WeldConstraint", 2.0),
+			("WeldConstraint", "Weld", 1.0),
+		] {
 			let mut model = ModelBuilder::new("Test");
 			let root = model.model;
 			let part = mesh_part(&mut model, root, Vec3::ZERO, true);
@@ -265,6 +282,24 @@ mod tests {
 		let elsewhere = rig(&mut model, other, Vec3::ZERO);
 		bone(&mut model, elsewhere, "Elsewhere", Vec3::ZERO);
 		joint(&mut model, "Weld", elsewhere, part);
+		assert!(body_bones(&extract::extract(&model.into_document())).is_empty());
+	}
+
+	#[test]
+	fn ignores_bones_under_nested_parts_and_attachments() {
+		// a Roblox client uses no Bones under a part nested in the MeshPart or in a joined part
+		// (kownnested, knested), and refuses a file with a Bone under an Attachment
+		let mut model = ModelBuilder::new("Test");
+		let root = model.model;
+		let part = mesh_part(&mut model, root, Vec3::ZERO, true);
+		let nested = model.child(part, InstanceBuilder::new("Part").with_name("Inner").with_property("CFrame", cframe(Affine3A::from_translation(Vec3::X))));
+		bone(&mut model, nested, "OwnNested", Vec3::ZERO);
+		let holder = model.child(part, InstanceBuilder::new("Attachment").with_name("Holder"));
+		bone(&mut model, holder, "UnderAttachment", Vec3::ZERO);
+		let rig = rig(&mut model, root, Vec3::new(0.0, 0.0, 5.0));
+		let inner = model.child(rig, InstanceBuilder::new("Part").with_name("Inner").with_property("CFrame", cframe(Affine3A::from_translation(Vec3::Z))));
+		bone(&mut model, inner, "JoinedNested", Vec3::ZERO);
+		joint(&mut model, "Motor6D", rig, part);
 		assert!(body_bones(&extract::extract(&model.into_document())).is_empty());
 	}
 }
