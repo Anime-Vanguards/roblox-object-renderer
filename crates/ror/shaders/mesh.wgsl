@@ -649,44 +649,35 @@ fn decal_left_out(input: VertexOutput, instance: Instance, coordinates: Material
 // `occluded`: opaque surfaces take the ambient occlusion (render::ao); transparent ones are not in it.
 // The entry point fixes `is_decal`, so ordinary surfaces have no decal discard path and can
 // reject hidden fragments before material sampling and lighting.
-// The inverse of a 3x3 matrix (shading_tier: a part's box back to studs)
-fn inverse3(m: mat3x3<f32>) -> mat3x3<f32> {
-	let a = m[0];
-	let b = m[1];
-	let c = m[2];
-	let r0 = cross(b, c);
-	let r1 = cross(c, a);
-	let r2 = cross(a, b);
-	let det = dot(a, r0);
-	return transpose(mat3x3<f32>(r0, r1, r2)) * (1.0 / select(det, 1e-12, abs(det) < 1e-12));
+// How far the view's focus is from the box round the part's cluster (render::cluster_boxes): a Roblox client decides how a
+// part is lit near the focus by its cluster, the parts whose middles share a 128 x 64 x 128-stud cell of the world
+// (fixtures/quality-levels.luau `kinds` focus sweeps at levels 5-21: the clusters' boxes separate every plate, top and side
+// lit per pixel or by vertex, the parts' own boxes 2-32 of 75-165 of them; `chunk`, `cluster`)
+fn cluster_distance(instance: Instance) -> f32 {
+	let focus = frame.quality_focus.xyz;
+	return length(max(instance.cluster_low.xyz - focus, vec3<f32>(0.0)) + max(focus - instance.cluster_high.xyz, vec3<f32>(0.0)));
 }
 
 // The view's graphics quality shading at a surface (notes/render.md "Graphics quality levels", frame.quality_shading):
 // x the share of the high-quality shading (1 within 3/4 of the level's radius from the camera, 0 past 5/4 of it), y 1
-// where the surface's part is farther from the focus than the level lights per pixel (its box's distance), so it takes
-// the lowest shading (no specular, the sky's light the same from every side)
+// where the surface's cluster is farther from the focus than the level lights per pixel, so it takes the lowest shading
+// (no specular, the sky's light the same from every side)
 fn shading_tier(world_position: vec3<f32>, instance: Instance) -> vec2<f32> {
 	let q = frame.quality_shading;
 	let distance = length(world_position - frame.camera_position.xyz);
 	let high = saturate((q.y - distance) / max(q.y - q.x, 1e-3));
 	var lowest = 0.0;
 	if (q.z < 1e8) {
-		// the focus in the part's box (-0.5..0.5), its nearest point in it, the gap back in studs
-		let local = (instance.part_inverse * vec4<f32>(frame.quality_focus.xyz, 1.0)).xyz;
-		let gap = local - clamp(local, vec3<f32>(-0.5), vec3<f32>(0.5));
-		let box = mat3x3<f32>(instance.part_inverse[0].xyz, instance.part_inverse[1].xyz, instance.part_inverse[2].xyz);
-		lowest = select(0.0, 1.0, length(inverse3(box) * gap) >= q.z);
+		lowest = select(0.0, 1.0, cluster_distance(instance) >= q.z);
 	}
 	return vec2<f32>(select(high, 0.0, lowest > 0.5), lowest);
 }
 
-// Whether a part takes the sun as the parts round the view's focus do, faces turned away from it unlit: its cluster's box
-// (render::cluster_boxes) within frame.quality_focus.w of the focus (crate::quality::Quality::back_light_radius; notes/
-// render.md "Graphics quality levels", "Faces turned from the sun")
+// Whether a part takes the sun as the parts round the view's focus do, faces turned away from it unlit: its cluster within
+// frame.quality_focus.w of the focus (crate::quality::Quality::back_light_radius; notes/render.md "Graphics quality
+// levels", "Faces turned from the sun")
 fn near_sun(instance: Instance) -> bool {
-	let focus = frame.quality_focus.xyz;
-	let gap = max(instance.cluster_low.xyz - focus, vec3<f32>(0.0)) + max(focus - instance.cluster_high.xyz, vec3<f32>(0.0));
-	return length(gap) < frame.quality_focus.w;
+	return cluster_distance(instance) < frame.quality_focus.w;
 }
 
 // The sun's share on a face turned away from it, past the near sun's radius: shadow.wgsl `sun_back_share` through the light

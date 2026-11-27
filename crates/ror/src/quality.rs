@@ -48,10 +48,11 @@ pub struct Quality {
 	/// infinite everywhere. Past it, within `lit_radius` of the focus, the low-quality shading: per pixel with the
 	/// direct specular, without the sky's specular, normal maps or metalness.
 	pub shading_radius: f32,
-	/// How far a part's box may be from the view's focus (Camera.Focus) and still be lit per pixel, with the
-	/// direct specular (the low-quality shading, and the high-quality one within `shading_radius`): none at
-	/// levels 1-4, 10 studs at 5, 36 at 6, 70 at 7 ... 581 at 14, 1,180 at 21; past it the lowest shading (lit by
-	/// vertex: no specular per pixel, the sky's light the same from every side).
+	/// How far a part's cluster (`back_light_radius`) may be from the view's focus (Camera.Focus) and still be lit per
+	/// pixel, with the direct specular (the low-quality shading, and the high-quality one within `shading_radius`): none
+	/// at levels 1-4, 9.85 studs at 5, 34 at 6, 73 at 7 ... 581 at 14, 935 at 17, 1,200 from 19; under
+	/// PrioritizeLightingQuality false none through 6, 2.1 at 7 ... 98 at 12; past it the lowest shading (lit by vertex:
+	/// no specular per pixel, the sky's light the same from every side).
 	pub lit_radius: f32,
 	/// How far a part's cluster may be from the view's focus and still take the sun as the parts round the focus do,
 	/// faces turned away from it unlit. Past it a face turned away from the sun takes 0.41 · |n·l| of the sun's light
@@ -169,15 +170,21 @@ const SHADING_RADIUS: [f32; 11] = [55.0, 94.0, 142.0, 191.0, 246.0, 310.0, 382.0
 /// Under false, from 12: ~73, 126, 186 at 12-14, 15 not measured (between 14's and 16's), 367, 525, 755 at 16-18.
 const SHADING_RADIUS_UNPRIORITIZED: [f32; 7] = [73.0, 126.0, 186.0, 276.0, 367.0, 525.0, 755.0];
 
-/// The per-pixel lighting's radius around the focus by level (the `shading` station under the sun alone with
-/// Camera.Focus moved along the view and up to 3,000 studs behind it: halfway between the farthest part's box lit per
-/// pixel and the nearest lit by vertex): none at 1-4; 10.4 studs at 5 (9.6 / 11.2), 36 at 6 (34.1 / 38.0), 70 at 7
-/// (67.6 / 72.1), 122 at 8 (117 / 127), 177 at 9 (167 / 187), 257 at 10 (237 / 277), 307 at 11 (287 / 327), 382 at 12
-/// (337 / 427), 482 at 13 (437 / 527), 581 at 14 (537 / 625), 676 at 15 (625 / 727), 775 at 16 (724 / 827), 1,075 at 18
-/// (1,022 / 1,127) and 1,180 at 21 (1,137 / 1,222): about 11.5 (level - 4)^1.7 through 18, levelling off by 21. 17,
-/// 19 and 20 between their neighbours (not measured). Under PrioritizeLightingQuality false two levels later (the
-/// floor 13 studs from the focus by vertex at 6 and 7, per pixel at 12; the specular's start moves from 5 to 7 alike).
-const LIT_RADIUS: [f32; 17] = [10.4, 36.0, 70.0, 122.0, 177.0, 257.0, 307.0, 382.0, 482.0, 581.0, 676.0, 775.0, 925.0, 1075.0, 1110.0, 1145.0, 1180.0];
+/// The per-pixel lighting's radius around the focus by level, by the distance of a part's cluster's box (the box round
+/// the parts whose middles share its 128 x 64 x 128-stud cell, as `back_light_radius`'s): halfway between the farthest
+/// cluster lit per pixel and the nearest lit by vertex. P23c (the `kinds` station's plates, tops and the cylinder's
+/// glare, Camera.Focus moved along the view and behind it; the clusters' boxes separate every case, the parts' own
+/// misplace 2-34 of 75-340): 9.85 studs at 5 (9.7 / 10.0), 34 at 6 (32.6 / 35.2), 73 at 7 (71.9 / 73.9), 175 at 9
+/// (173.6 / 176.6), 935 at 17 (933.3 / 936.4), 1,200 at 19, 20 and 21 (1,198.5 / 1,201.2); P23b's from the `shading`
+/// station by the parts' boxes at the others (122 at 8, 257, 307, 382, 482, 581, 676 and 775 at 10-16, 1,075 at 18; 12
+/// and 16 within P23c's 336 / 424 and 736 / 823). About 11.5 (level - 4)^1.7 through 18, levelling off by 19.
+const LIT_RADIUS: [f32; 17] = [9.85, 34.0, 73.0, 122.0, 175.0, 257.0, 307.0, 382.0, 482.0, 581.0, 676.0, 775.0, 935.0, 1075.0, 1200.0, 1200.0, 1200.0];
+/// Under PrioritizeLightingQuality false, from 7 (P23c, the same sweeps under false): 2.1 at 7 (2.0 / 2.2), 5.3 at 8
+/// (4.6 / 6.1), 14.8 at 9 (14.4 / 15.1), 30 at 10 (28.9 / 31.4), 57 at 11 (56.5 / 57.1), 98 at 12 (96.8 / 100), 155 at
+/// 13 (153.8 / 156.6), 240 at 14 (236.5 / 243.8), 350 at 15 (346.5 / 353), 490 at 16 (486.5 / 492.8), 680 at 17 (676.4 / 683.3), 910 at 18
+/// (906.5 / 912.6), 1,200 at 19 and 21 (1,196.4 / 1,203.2; 20 taken as them); none below 7. Not two levels after true's,
+/// as P23b took it from one floor 13 studs from the focus (by vertex at 6 and 7, per pixel at 12).
+const LIT_RADIUS_UNPRIORITIZED: [f32; 15] = [2.1, 5.3, 14.8, 30.0, 57.0, 98.0, 155.0, 240.0, 350.0, 490.0, 680.0, 910.0, 1200.0, 1200.0, 1200.0];
 
 /// The radius round the focus past which a part's cluster takes the sun on faces turned from it (the `chunk` station:
 /// 4-stud white balls in 128 x 64 x 128-stud cells under the sun alone, Camera.Focus moved along a line out of a
@@ -203,10 +210,11 @@ fn back_light_radius(level: u32, prioritize: bool) -> f32 {
 	}
 }
 
-fn lit_radius(level: u32) -> f32 {
-	match level {
-		0..=4 => 0.0,
-		_ => LIT_RADIUS[(level.min(TOP) - 5) as usize],
+fn lit_radius(level: u32, prioritize: bool) -> f32 {
+	match (prioritize, level) {
+		(true, 0..=4) | (false, 0..=6) => 0.0,
+		(true, _) => LIT_RADIUS[(level.min(TOP) - 5) as usize],
+		(false, _) => LIT_RADIUS_UNPRIORITIZED[(level.min(TOP) - 7) as usize],
 	}
 }
 
@@ -254,7 +262,7 @@ impl Quality {
 			sun_shadows,
 			light_reach,
 			shading_radius,
-			lit_radius: lit_radius(if prioritize { level } else { level.saturating_sub(2) }),
+			lit_radius: lit_radius(level, prioritize),
 			back_light_radius: back_light_radius(level, prioritize),
 			glow: match level {
 				0..=5 => 0,
@@ -419,20 +427,20 @@ mod tests {
 		assert_eq!(Quality::new(18, false, true).shading_radius, f32::INFINITY);
 		assert_eq!(Quality::new(11, false, false).shading_radius, 0.0);
 		assert_eq!(Quality::new(18, false, false).shading_radius, 755.0);
-		// per pixel within 10.4 studs of the focus at 5, 36 at 6, 581 at 14, 1,180 at 21; under false two levels
-		// later; none below
-		assert_eq!([4, 5, 6, 14, 15, 21].map(|level| Quality::new(level, false, true).lit_radius), [0.0, 10.4, 36.0, 581.0, 676.0, 1180.0]);
-		assert_eq!([6, 7, 8, 16, 21].map(|level| Quality::new(level, false, false).lit_radius), [0.0, 10.4, 36.0, 581.0, 1110.0]);
+		// per pixel within 9.85 studs of the focus at 5, 34 at 6, 581 at 14, 935 at 17, 1,200 from 19; under false 2.1
+		// at 7 ... 98 at 12; none below
+		assert_eq!([4, 5, 6, 14, 15, 17, 19, 21].map(|level| Quality::new(level, false, true).lit_radius), [0.0, 9.85, 34.0, 581.0, 676.0, 935.0, 1200.0, 1200.0]);
+		assert_eq!([6, 7, 8, 12, 13].map(|level| Quality::new(level, false, false).lit_radius), [0.0, 2.1, 5.3, 98.0, 155.0]);
 		for level in 1..=21 {
 			for prioritize in [true, false] {
 				let quality = Quality::new(level, false, prioritize);
 				assert_eq!(quality.specular, quality.lit_radius > 0.0, "level {level}: specular where any part is lit per pixel");
 			}
 		}
-		// about 11.5 (level - 4)^1.7 studs, the measured levels within 11 %
-		for (level, radius) in [(5, 10.4), (6, 36.0), (7, 70.0), (8, 122.0), (9, 177.0), (10, 257.0), (11, 307.0), (12, 382.0), (13, 482.0), (14, 581.0), (15, 676.0), (16, 775.0), (18, 1075.0)] {
+		// about 11.5 (level - 4)^1.7 studs, the measured levels within 17 % (level 5's 9.85 the farthest: the fit 17 % over it)
+		for (level, radius) in [(5, 9.85), (6, 34.0), (7, 73.0), (8, 122.0), (9, 175.0), (10, 257.0), (11, 307.0), (12, 382.0), (13, 482.0), (14, 581.0), (15, 676.0), (16, 775.0), (17, 935.0), (18, 1075.0)] {
 			let fit = 11.5 * ((level - 4) as f32).powf(1.7);
-			assert!((fit / radius - 1.0).abs() < 0.11, "level {level}: {radius} against {fit}");
+			assert!((fit / radius - 1.0).abs() < 0.17, "level {level}: {radius} against {fit}");
 			assert_eq!(Quality::new(level, false, true).lit_radius, radius);
 		}
 		// faces turned from the sun lit past a radius of the focus: every part at 1-5 (1-9 under false), 19.5 studs at
