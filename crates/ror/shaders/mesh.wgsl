@@ -1239,7 +1239,13 @@ fn fs_transparent(input: VertexOutput, @builtin(front_facing) front_facing: bool
 // whatever their size, distance and how far behind the background is; per ring of the ball k 0.49
 // at its centre falling to 0.40 at n⊥ 0.93 at Transparency 0.7, fitted k = 1.7 (1 - T), p = 0.25
 // over T 0.6 / 0.7 / 0.8; panes turned 15, 35 and 55 degrees shift it by that times the sine of the
-// turn; an inside-out sphere mesh draws its far half, whose inward normals shrink it). Past
+// turn; an inside-out sphere mesh draws its far half, whose inward normals shrink it). Off the view's
+// axis GLASS_OFF_AXIS of what taking n⊥ across the direction to the camera adds on the screen is added,
+// each screen coordinate times 1 - |x|³ of the pixel's own place x on that axis (glass-client "offaxis":
+// 3-stud panes facing the camera 5-15 studs aside and 4.5-9 up or down from 30 studs move the stripes
+// behind them outward, 4.4 / 6.3 / 2.4 px at 0.31 / 0.62 / 0.94 of the screen's half-width at T 0.6,
+// 3.9 / 3.3 px at 0.41 / 0.83 of its half-height, as (1 - T); glass-refraction-law pane-offaxis 4.4 px in
+// Studio, ror 0 before, 4.75 now). Below graphics quality level 16 nothing moves. Past
 // Transparency 1 (a Highlight keeps such Glass drawn, scene::extract) it pushes what is behind
 // outward, k = -2.36 (T - 1) min(1 + 0.32 (T - 1), sqrt(1 + 0.95 (T - 1))), p = 0.3 + 0.3 (T - 1)
 // up to T 4 and 0.15 more per unit of T beyond, at most 3.5, θ then the normal's angle to the
@@ -1274,6 +1280,7 @@ const GLASS_PAST_FALLOFF: f32 = 0.15;
 const GLASS_PAST_FALLOFF_MAX: f32 = 3.5;
 const GLASS_REACH: f32 = 0.18;
 const GLASS_REACH_CENTRE: f32 = 0.25;
+const GLASS_OFF_AXIS: f32 = 0.82;
 
 // From T = 0.5 up Glass multiplies the radiance behind by mix(c, 1, 2T - 1) per channel, c its
 // colour (0..1 as stored), and adds no surface (material-glass: 5-stud panes over coloured stripes,
@@ -1322,6 +1329,17 @@ fn fs_glass(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> @
 	let size = vec2<f32>(textureDimensions(scene_color));
 	let own = input.clip.xy / size;
 	var uv = vec2<f32>(0.5, -0.5) * (moved.xy / max(moved.w, 1e-6)) + vec2<f32>(0.5);
+	if (t <= 1.0) {
+		// off the view's axis the push is partly across the direction to the camera: GLASS_OFF_AXIS of what
+		// that adds on the screen, each coordinate less towards the screen's edges by 1 - |x|³ of the pixel's
+		// own place x on that axis (-1 to 1)
+		let to_camera = normalize(frame.camera_position.xyz - input.world_position);
+		let across_view = glass_normal - to_camera * glass_facing;
+		let moved_view = frame.view_proj * vec4<f32>(input.world_position - across_view * (strength * pow(max(glass_facing, 1e-4), falloff)), 1.0);
+		let uv_view = vec2<f32>(0.5, -0.5) * (moved_view.xy / max(moved_view.w, 1e-6)) + vec2<f32>(0.5);
+		let place = abs(own * 2.0 - vec2<f32>(1.0));
+		uv += (uv_view - uv) * GLASS_OFF_AXIS * (vec2<f32>(1.0) - place * place * place);
+	}
 	// each screen coordinate that leaves the screen takes the pixel's own, the other kept; under the
 	// bubbles' law (past T 4) one on it is held within GLASS_REACH of the point a quarter of the way
 	// from the screen's centre to the pixel
@@ -1331,6 +1349,10 @@ fn fs_glass(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> @
 		uv = clamp(uv, centre - vec2<f32>(GLASS_REACH), centre + vec2<f32>(GLASS_REACH));
 	}
 	uv = select(uv, own, off);
+	// below graphics quality level 16 nothing moves (frame.counts.w bit 3; render::quality::Quality::glass_refraction)
+	if ((frame.counts.w & 4u) != 0u) {
+		uv = own;
+	}
 	if (moved.w <= 0.0 || textureLoad(scene_depth, vec2<i32>(min(uv * size, size - 1.0)), 0) > input.clip.z) {
 		uv = own;
 	}

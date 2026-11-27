@@ -53,7 +53,7 @@ pub struct Quality {
 	pub ambient_occlusion: bool,
 	/// Anti-aliasing samples: 1 at levels 1-16, 2 at 17, 4 from 18. Not followed yet.
 	pub msaa: u32,
-	/// Glass refracts what is behind it (from 16; plain blending below). Not followed yet.
+	/// Glass refracts what is behind it (from 16; plain blending below; mesh.wgsl `fs_glass`).
 	pub glass_refraction: bool,
 	/// SunRaysEffect and DepthOfFieldEffect (from 16). Not followed yet.
 	pub sun_rays_depth_of_field: bool,

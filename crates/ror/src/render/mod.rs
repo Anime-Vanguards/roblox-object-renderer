@@ -37,6 +37,8 @@ mod culling;
 #[cfg(test)]
 mod cutout_depth_tests;
 #[cfg(test)]
+mod glass_tests;
+#[cfg(test)]
 mod sun_shadow_tests;
 #[cfg(test)]
 mod post_tests;
@@ -4839,8 +4841,9 @@ impl Renderer {
 		});
 
 		let mut frame = self.frame_uniform(Some(&camera), render_width, render_height, lights.len() as u32);
-		// bit 1: every surface from the voxels; bit 2: LightingStyle Soft's ambient occlusion (mesh.wgsl)
-		frame.counts[3] = u32::from(soft) | u32::from(environment.soft_lighting()) << 1;
+		// bit 1: every surface from the voxels; bit 2: LightingStyle Soft's ambient occlusion; bit 3: Glass
+		// moves nothing behind it, below quality level 16 (mesh.wgsl)
+		frame.counts[3] = u32::from(soft) | u32::from(environment.soft_lighting()) << 1 | u32::from(!quality.glass_refraction) << 2;
 		if (far_start, far_end) != (LOCAL_LIGHT_FAR_START, LOCAL_LIGHT_FAR_END) {
 			frame.local_light_far = [far_start, far_end, 0.0, 0.0];
 		}
