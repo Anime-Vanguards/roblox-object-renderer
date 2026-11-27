@@ -118,17 +118,17 @@ fn light_grid_visibility(position: vec3<f32>, normal: vec3<f32>) -> f32 {
 	return textureSampleLevel(light_grid, linear_sampler, uvw, 0.0).r;
 }
 
-// how far along its normal a surface reads the grid's sun (render::lightgrid propagate_sun's fit against the engine's
-// voxel shadows under a sun 26 and 70 degrees up)
-const LIGHT_GRID_SUN_OFFSET: f32 = 2.0;
-
-// the sun's light through the grid (frame.light_grid.w 2; render::lightgrid propagate_sun), trilinear between
-// voxel centres; 1 without a grid or its sun channel
+// the sun's light through the grid (frame.light_grid.w 2; render::lightgrid propagate_sun), trilinear between voxel
+// centres 6 studs along the normal, as the sky's (fixtures/quality-levels.luau `sunfield`: a block one layer tall on a
+// floor leaves the floor open, thin plates on it their own tops lit, a block two layers tall shades the floor beside
+// it; faces turned from the sun read 6 studs out, the bounce walls' backs 35 / 65 / 103 of 255 1 / 4 / 7 studs up); 1
+// without a grid or its sun channel
 fn light_grid_sun(position: vec3<f32>, normal: vec3<f32>) -> f32 {
 	if (frame.light_grid.w < 1.5) {
 		return 1.0;
 	}
-	let uvw = (position + normal * LIGHT_GRID_SUN_OFFSET - frame.light_grid.xyz) * frame.light_grid_scale.xyz;
+	let point = position + normal * LIGHT_GRID_OFFSET;
+	let uvw = (point - frame.light_grid.xyz) * frame.light_grid_scale.xyz;
 	return textureSampleLevel(light_grid, linear_sampler, uvw, 0.0).g;
 }
 

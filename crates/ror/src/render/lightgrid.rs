@@ -10,9 +10,10 @@
 //! the shape it draws in its mesh's box. Parts side by side add up (their union, kept per stud of the
 //! cross-section). MeshParts, FileMesh SpecialMeshes, unions and parts without CastShadow do not count.
 //! Surfaces read it trilinearly between voxel centres 6 studs along their normal (shaders/mesh.wgsl).
-//! A second channel carries the sun's light down along its direction ([`propagate_sun`]): what shades the sun
-//! where a view's shadow maps do not reach (past their reach from the camera at every graphics quality level, and
-//! everywhere below the levels that draw them: crate::quality).
+//! A second channel carries the sun's light through the voxels from their neighbours towards the sun
+//! ([`propagate_sun`]; upright sheets fill it as a whole share where their top edge stands): what shades the sun where
+//! a view's shadow maps do not reach (past their reach from the camera at every graphics quality level, and everywhere
+//! below the levels that draw them: crate::quality).
 
 use glam::{Mat3A, Vec3, Vec3A};
 use rayon::prelude::*;
@@ -203,8 +204,8 @@ impl Filler {
 	}
 
 	/// The share of each stud cell of the voxel at `corner` (its minimum) the part fills, cell
-	/// (i, k) at i + CELLS k.
-	fn cells(&self, corner: Vec3A) -> [f32; CELLS * CELLS] {
+	/// (i, k) at i + CELLS k; an upright sheet fills `top` of its share in the voxel its top edge stands in.
+	fn cells(&self, corner: Vec3A, top: f32) -> [f32; CELLS * CELLS] {
 		let mut cells = [0.0f32; CELLS * CELLS];
 		let cell = VOXEL / CELLS as f32;
 		match self.fill {
@@ -296,7 +297,7 @@ impl Filler {
 			}
 		}
 		// an upright sheet's share where it is more than its coverage, over the whole cross-section
-		let sheet = self.sheet_share(corner);
+		let sheet = self.sheet_share(corner, top);
 		if sheet > cells.iter().sum::<f32>() / (CELLS * CELLS) as f32 {
 			cells = [sheet; CELLS * CELLS];
 		}
@@ -304,14 +305,15 @@ impl Filler {
 	}
 
 	/// What an upright sheet fills of the voxel at `corner` across the whole cross-section: the share of the voxel's side
-	/// its middle line and height cover, SHEET of it in the voxel its top edge stands in. The light-grid fixture's
+	/// its middle line and height cover, `top` of it in the voxel its top edge stands in (SHEET for the sky's light, the
+	/// whole share for the sun's: [`SUN_SHEET`]). The light-grid fixture's
 	/// "shapes" in the engine (0.747): sheets 0.5 thick and 4 tall through one layer, one in each column of voxels,
 	/// darken the floor under them as voxels 0.67 full would, alike turned 30 or 45 degrees and from a voxel's length
 	/// up; 3 studs long about 0.45 (2 long or 2 tall 0.3: the floor all but open); sheets as tall across two layers as
 	/// the one-layer ones (horizontal coverage alone, 0.125, left the floor open; filling the voxels across the sheet's
 	/// thickness closed it). Its "walls" and lg-specular: down the face of an 80 x 40 x 0.5-stud wall (0.5 to 2 thick,
 	/// 20 or 40 tall) OutdoorAmbient falls as in front of a wall whose voxels are full.
-	fn sheet_share(&self, corner: Vec3A) -> f32 {
+	fn sheet_share(&self, corner: Vec3A, top: f32) -> f32 {
 		let Some(sheet) = self.sheet else {
 			return 0.0;
 		};
@@ -339,20 +341,23 @@ impl Filler {
 		}
 		let length = (t1 - t0) * (sheet.to[0] - sheet.from[0]).hypot(sheet.to[1] - sheet.from[1]);
 		// the voxel its top edge stands in SHEET full, those it rises through above whole
-		let fill = if sheet.top <= corner.y + VOXEL + 1e-3 { tune().sheet } else { 1.0 };
+		let fill = if sheet.top <= corner.y + VOXEL + 1e-3 { top } else { 1.0 };
 		fill * (length / VOXEL).min(1.0) * height
 	}
 }
 
-/// The grid's fitted constants: `ROR_TUNE_GRID="sheet=0.6"` overrides them (the fits' renders).
+/// The grid's fitted constants: `ROR_TUNE_GRID="sheet=0.6,sunpower=1.4,sunsheet=0.9"` overrides them (the fits'
+/// renders).
 struct Tune {
 	sheet: f32,
+	sun_power: f32,
+	sun_sheet: f32,
 }
 
 fn tune() -> &'static Tune {
 	static TUNE: std::sync::OnceLock<Tune> = std::sync::OnceLock::new();
 	TUNE.get_or_init(|| {
-		let mut tune = Tune { sheet: SHEET };
+		let mut tune = Tune { sheet: SHEET, sun_power: SUN_SHARE_POWER, sun_sheet: SUN_SHEET };
 		for pair in std::env::var("ROR_TUNE_GRID").unwrap_or_default().split(',') {
 			let Some((key, value)) = pair.split_once('=') else {
 				continue;
@@ -360,8 +365,11 @@ fn tune() -> &'static Tune {
 			let Ok(value) = value.trim().parse::<f32>() else {
 				continue;
 			};
-			if key.trim() == "sheet" {
-				tune.sheet = value;
+			match key.trim() {
+				"sheet" => tune.sheet = value,
+				"sunpower" => tune.sun_power = value,
+				"sunsheet" => tune.sun_sheet = value,
+				_ => {}
 			}
 		}
 		tune
@@ -540,8 +548,9 @@ fn corner(voxel: usize, min: Vec3, [nx, _, nz]: [usize; 3]) -> Vec3A {
 	Vec3A::from(min) + Vec3A::new(x as f32, y as f32, z as f32) * VOXEL
 }
 
-/// The voxels a filler covers (index x + nx (z + nz y), ascending) and the share of each.
-fn voxels(filler: &Filler, min: Vec3, dims: [usize; 3]) -> Vec<(u32, f32)> {
+/// The voxels a filler covers (index x + nx (z + nz y), ascending) and the share of each, an upright sheet `top` of
+/// its share in the voxel its top edge stands in ([`Filler::sheet_share`]).
+fn voxels(filler: &Filler, min: Vec3, dims: [usize; 3], top: f32) -> Vec<(u32, f32)> {
 	let [nx, ny, nz] = dims;
 	let mut voxels = Vec::new();
 	let first = ((Vec3::from(filler.center - filler.extent) - min) / VOXEL).floor().max(Vec3::ZERO);
@@ -553,7 +562,7 @@ fn voxels(filler: &Filler, min: Vec3, dims: [usize; 3]) -> Vec<(u32, f32)> {
 		for z in first.z as usize..=last.z as usize {
 			for x in first.x as usize..=last.x as usize {
 				let voxel = x + nx * (z + nz * y);
-				let share = filler.cells(corner(voxel, min, dims)).iter().sum::<f32>() / (CELLS * CELLS) as f32;
+				let share = filler.cells(corner(voxel, min, dims), top).iter().sum::<f32>() / (CELLS * CELLS) as f32;
 				if share > 0.0 {
 					voxels.push((voxel as u32, share));
 				}
@@ -564,11 +573,11 @@ fn voxels(filler: &Filler, min: Vec3, dims: [usize; 3]) -> Vec<(u32, f32)> {
 }
 
 /// Several parts covering a voxel in part, combined per cell: its transmission's factor.
-fn partial_cover(voxel: usize, group: impl Iterator<Item = usize>, fillers: &[Filler], min: Vec3, dims: [usize; 3]) -> f32 {
+fn partial_cover(voxel: usize, group: impl Iterator<Item = usize>, fillers: &[Filler], min: Vec3, dims: [usize; 3], top: f32) -> f32 {
 	let mut cells = [1.0f32; CELLS * CELLS];
 	for number in group {
 		let filler = &fillers[number];
-		for (cell, share) in cells.iter_mut().zip(filler.cells(corner(voxel, min, dims))) {
+		for (cell, share) in cells.iter_mut().zip(filler.cells(corner(voxel, min, dims), top)) {
 			*cell *= 1.0 - (share * filler.opacity).min(1.0);
 		}
 	}
@@ -577,15 +586,27 @@ fn partial_cover(voxel: usize, group: impl Iterator<Item = usize>, fillers: &[Fi
 
 fn full(fillers: &[Filler], (keys, ranges): (Vec<u8>, Vec<std::ops::Range<usize>>), (min, dims): (Vec3, [usize; 3]), keep: bool, sun: Option<Vec3>) -> GridState {
 	let [nx, ny, nz] = dims;
-	// transmission per voxel, 1 open; index x + nx (z + nz y) (layer-major for the propagation)
+	let top = tune().sheet;
+	let filled: Vec<Vec<(u32, f32)>> = fillers.par_iter().map(|filler| voxels(filler, min, dims, top)).collect();
+	let transmission = combine(fillers, &filled, (min, dims), top);
+	let mut entering = keep.then(|| vec![0.0f32; nx * ny * nz]);
+	let values = propagate(&transmission, dims, entering.as_deref_mut());
+	let sun = sun.map(|sun| propagate_sun(&sun_transmission(fillers, &filled, &transmission, (min, dims)), dims, sun));
+	let filled = keep.then_some(filled);
+	let detail = filled.zip(entering).map(|(filled, entering)| Detail { keys, ranges, filled, transmission, entering });
+	GridState { origin: min, dims, values, sun, fillers: fillers.len(), detail }
+}
+
+/// Every voxel's transmission (1 open; index x + nx (z + nz y), layer-major for the propagation) from the voxels each
+/// filler covers: a filler covering a voxel's whole cross-section multiplies its transmission alone; the voxels fillers
+/// cover in part are combined per cell once every filler is known ([`partial_cover`]).
+fn combine<V: AsRef<[(u32, f32)]>>(fillers: &[Filler], filled: &[V], (min, dims): (Vec3, [usize; 3]), top: f32) -> Vec<f32> {
+	let [nx, ny, nz] = dims;
 	let mut transmission = vec![1.0f32; nx * ny * nz];
-	// a part covering a voxel's whole cross-section multiplies its transmission alone; the voxels
-	// parts cover in part are combined per cell once every part is known
-	let filled: Vec<Vec<(u32, f32)>> = fillers.par_iter().map(|filler| voxels(filler, min, dims)).collect();
 	let mut partial: Vec<(u32, u32, f32)> = Vec::new();
 	for (number, voxels) in filled.iter().enumerate() {
 		let opacity = fillers[number].opacity;
-		for &(voxel, share) in voxels {
+		for &(voxel, share) in voxels.as_ref() {
 			if share >= 1.0 - 1e-6 {
 				transmission[voxel as usize] *= 1.0 - opacity;
 			} else {
@@ -593,7 +614,6 @@ fn full(fillers: &[Filler], (keys, ranges): (Vec<u8>, Vec<std::ops::Range<usize>
 			}
 		}
 	}
-	let filled = keep.then_some(filled);
 	partial.par_sort_unstable_by_key(|&(voxel, number, _)| (voxel, number));
 	for group in partial.chunk_by(|a, b| a.0 == b.0) {
 		let voxel = group[0].0 as usize;
@@ -601,18 +621,27 @@ fn full(fillers: &[Filler], (keys, ranges): (Vec<u8>, Vec<std::ops::Range<usize>
 			transmission[voxel] *= 1.0 - (share * fillers[*number as usize].opacity).min(1.0);
 			continue;
 		}
-		transmission[voxel] *= partial_cover(voxel, group.iter().map(|&(_, number, _)| number as usize), fillers, min, dims);
+		transmission[voxel] *= partial_cover(voxel, group.iter().map(|&(_, number, _)| number as usize), fillers, min, dims, top);
 	}
-	let mut entering = keep.then(|| vec![0.0f32; nx * ny * nz]);
-	let values = propagate(&transmission, dims, entering.as_deref_mut());
-	let sun = sun.map(|sun| propagate_sun(&transmission, dims, sun));
-	let detail = filled.zip(entering).map(|(filled, entering)| Detail { keys, ranges, filled, transmission, entering });
-	GridState { origin: min, dims, values, sun, fillers: fillers.len(), detail }
+	transmission
+}
+
+/// The transmissions the sun's light passes through: the sky's (`transmission`, from `filled`), but an upright sheet
+/// fills the voxel its top edge stands in by the whole share it covers ([`SUN_SHEET`]); the sky's own when no filler is a
+/// sheet.
+fn sun_transmission<'a>(fillers: &[Filler], filled: &[Vec<(u32, f32)>], transmission: &'a [f32], (min, dims): (Vec3, [usize; 3])) -> std::borrow::Cow<'a, [f32]> {
+	let top = tune().sun_sheet;
+	if top == tune().sheet || fillers.iter().all(|filler| filler.sheet.is_none()) {
+		return std::borrow::Cow::Borrowed(transmission);
+	}
+	let sheets: Vec<Option<Vec<(u32, f32)>>> = fillers.par_iter().map(|filler| filler.sheet.is_some().then(|| voxels(filler, min, dims, top))).collect();
+	let lists: Vec<&[(u32, f32)]> = sheets.iter().zip(filled).map(|(sheet, filled)| sheet.as_deref().unwrap_or(filled)).collect();
+	std::borrow::Cow::Owned(combine(fillers, &lists, (min, dims), top))
 }
 
 /// The transmission [`full`] gives one voxel: the parts covering all of it in their order, then
 /// those covering some of it together.
-fn voxel_transmission(voxel: u32, fillers: &[Filler], filled: &[Vec<(u32, f32)>], min: Vec3, dims: [usize; 3]) -> f32 {
+fn voxel_transmission(voxel: u32, fillers: &[Filler], filled: &[Vec<(u32, f32)>], min: Vec3, dims: [usize; 3], top: f32) -> f32 {
 	let mut transmission = 1.0f32;
 	let mut partial: Vec<(usize, f32)> = Vec::new();
 	for (number, voxels) in filled.iter().enumerate() {
@@ -634,7 +663,7 @@ fn voxel_transmission(voxel: u32, fillers: &[Filler], filled: &[Vec<(u32, f32)>]
 	match partial.as_slice() {
 		[] => {}
 		[(number, share)] => transmission *= 1.0 - (share * fillers[*number].opacity).min(1.0),
-		group => transmission *= partial_cover(voxel as usize, group.iter().map(|&(number, _)| number), fillers, min, dims),
+		group => transmission *= partial_cover(voxel as usize, group.iter().map(|&(number, _)| number), fillers, min, dims, top),
 	}
 	transmission
 }
@@ -678,7 +707,8 @@ impl Columns {
 fn update(fillers: &[Filler], (keys, ranges): (&[u8], &[std::ops::Range<usize>]), (min, dims): (Vec3, [usize; 3]), mut values: Vec<u8>, mut detail: Detail, keep: bool, sun: Option<Vec3>) -> Option<GridState> {
 	let [nx, ny, nz] = dims;
 	let changed: Vec<usize> = (0..fillers.len()).filter(|&number| keys[ranges[number].clone()] != detail.keys[detail.ranges[number].clone()]).collect();
-	let fresh: Vec<Vec<(u32, f32)>> = changed.par_iter().map(|&number| voxels(&fillers[number], min, dims)).collect();
+	let top = tune().sheet;
+	let fresh: Vec<Vec<(u32, f32)>> = changed.par_iter().map(|&number| voxels(&fillers[number], min, dims, top)).collect();
 	let covered: usize = changed.iter().zip(&fresh).map(|(&number, voxels)| detail.filled[number].len() + voxels.len()).sum();
 	if covered > nx * nz {
 		return None;
@@ -689,7 +719,7 @@ fn update(fillers: &[Filler], (keys, ranges): (&[u8], &[std::ops::Range<usize>])
 	for (&number, voxels) in changed.iter().zip(fresh) {
 		detail.filled[number] = voxels;
 	}
-	let transmissions: Vec<f32> = affected.par_iter().map(|&voxel| voxel_transmission(voxel, fillers, &detail.filled, min, dims)).collect();
+	let transmissions: Vec<f32> = affected.par_iter().map(|&voxel| voxel_transmission(voxel, fillers, &detail.filled, min, dims, top)).collect();
 	let mut columns: Vec<Option<Columns>> = vec![None; ny];
 	for (&voxel, transmission) in affected.iter().zip(transmissions) {
 		let old = &mut detail.transmission[voxel as usize];
@@ -722,8 +752,8 @@ fn update(fillers: &[Filler], (keys, ranges): (&[u8], &[std::ops::Range<usize>])
 		detail.keys = keys.to_vec();
 		detail.ranges = ranges.to_vec();
 	}
-	// (the sun's light is propagated anew: its shifted reads reach further than the sky's columns)
-	let sun = sun.map(|sun| propagate_sun(&detail.transmission, dims, sun));
+	// (the sun's light is propagated anew: it reaches along every axis, further than the sky's columns)
+	let sun = sun.map(|sun| propagate_sun(&sun_transmission(fillers, &detail.filled, &detail.transmission, (min, dims)), dims, sun));
 	Some(GridState { origin: min, dims, values, sun, fillers: fillers.len(), detail: keep.then_some(detail) })
 }
 
@@ -796,111 +826,72 @@ fn propagate(transmission: &[f32], dims: [usize; 3], mut kept: Option<&mut [f32]
 	values
 }
 
-/// How much of the sun's light a voxel takes from its 8 neighbours across the sweep each step (the rest its own
-/// goes straight on): [`propagate_sun`]'s fit.
-const SUN_SPREAD: f32 = 0.5;
+/// How a voxel shares out where its sun light comes from among its three neighbours towards the sun: by each of the sun's
+/// components' magnitude to this power ([`propagate_sun`]'s fit).
+const SUN_SHARE_POWER: f32 = 1.5;
+/// What an upright sheet fills of the voxel its top edge stands in, for the sun's light: the whole share of the voxel's
+/// side it covers (the sky's light passes a third of it there: [`SHEET`]).
+const SUN_SHEET: f32 = 1.0;
 
-/// The sun's light per voxel (0..255 linear, X fastest, then Y, then Z): swept through the grid along the sun's
-/// largest component (down the layers for a sun higher than 45 degrees, across them along X or Z for a lower one).
-/// Each slice's light is read from the slice before it towards the sun, the sun's offset over one step away
-/// (bilinearly: the sun's other components over its largest), as that slice passed it on: 1 - SUN_SPREAD of each
-/// voxel's own light and SUN_SPREAD of its 8 neighbours' across the sweep (their light averaged by how much each lets
-/// through, so an opaque neighbour, a floor beside the air above it, neither darkens nor lights it), through the
-/// voxel. 1 before everything and outside the grid. Surfaces read it 2 studs off along their normal
-/// (shaders/mesh.wgsl `light_grid_sun`).
+/// The sun's light per voxel (0..255 linear, X fastest, then Y, then Z): the light entering each voxel from its three
+/// neighbours towards the sun, one along each axis, as each passed it on (its own light times its transmission; 1 outside
+/// the grid), weighted by the sun's components' magnitudes to the power SUN_SHARE_POWER (normalised): from the top layer
+/// down, each layer's rows from the sun's side. Surfaces read it 6 studs along their normal, as the sky's
+/// (shaders/shadow.wgsl `light_grid_sun`).
 ///
-/// Fitted on the engine's (0.747, graphics quality 5, fixtures/quality-levels.luau, the floor's lit share along each
-/// caster's bearing, rms in the sun's share): `voxsun` under a sun 26 degrees up (blocks of 4, 8 and 16 studs, slabs
-/// 8 and 24 up, a 4 x 12 x 4 column: 0.037, the old sweep down the layers with every voxel's light spread over its
-/// neighbours: 0.120) and 70 degrees up (0.046 against 0.035), and `roof`'s 48 x 1 x 48 block 16 studs up under the
-/// 26-degree sun (0.066 against 0.268: 0.33 of the sun at the shadow's darkest, soft over some 45 studs each way,
-/// where the old sweep went black over 25). A low sun's sweep across the layers lets a caster shade its horizontal
-/// neighbours (the 8-stud block's floor 4 studs out: 0.40 of the sun in the engine, unshaded by the old sweep) and
-/// spreads a high caster's shadow over more steps (the 24-stud slab's: 0.82 at its darkest); the open floor takes the
-/// whole sun, as the engine's does (the same under the voxels as under the shadow maps). The light-grid fixture's
-/// "roof" (P11) under a sun 46.7 degrees up shades the floor softly, offset along the sun as its shadow is, a MeshPart
-/// roof not at all.
+/// Fitted on the Roblox client (0.747, graphics quality 5, fixtures/quality-levels.luau `sunslice`, `sunfield`; notes/render.md
+/// "Light grid", "The sun through the grid"): upright quads that fill no voxel through bars, slabs and walls 32 studs long
+/// show the field across the sun's path; under a sun 26 degrees up a caster's shadow leaves it nearly level and sinks a
+/// stud for every four along X, spreading as it goes (the sun's slope is one for two), under suns 60 and 70 degrees up it
+/// falls straight down, sharp, and the light entering a voxel is the one its upstream neighbours let through: a block one
+/// layer tall on a floor leaves the floor 6 studs up open, a block two layers tall shades it. Field shares off the client's
+/// over the quads, rms: ror's renders with the sweep along the sun's largest component, half of each voxel's light spread
+/// over its 8 neighbours and read 2 studs out (P23), 0.0515 (under the 26-degree sun 0.073), with this rule 0.0150
+/// (0.021); a numpy model of it with the weights' power 1 0.037, 2 0.042, with the light leaving each voxel stored instead
+/// of the light entering it 0.051. The `sunfield` floors 0.058 -> 0.017 and the faces turned from the sun 0.226 -> 0.043
+/// of their light without the grid.
 fn propagate_sun(transmission: &[f32], dims: [usize; 3], sun: Vec3) -> Vec<u8> {
 	let [nx, ny, nz] = dims;
 	let mut values = vec![255u8; nx * ny * nz];
-	// the sweep's axis: the sun's largest component, down the layers on a tie
-	let axis = if sun.x.abs() > sun.y.abs() && sun.x.abs() >= sun.z.abs() {
-		0
-	} else if sun.z.abs() > sun.y.abs() && sun.z.abs() > sun.x.abs() {
-		2
-	} else {
-		1
-	};
-	let (across, along) = match axis {
-		0 => (1, 2),
-		1 => (0, 2),
-		_ => (0, 1),
-	};
-	let (n, nu, nv) = (dims[axis], dims[across], dims[along]);
-	let step = sun[axis].abs().max(0.05);
-	let (su, sv) = (sun[across] / step, sun[along] / step);
-	// a slice's voxel (u, v) at k: its index in the transmissions (X fastest, then Z, then Y) and in the values
-	let at = move |k: usize, u: usize, v: usize| {
-		let mut p = [0usize; 3];
-		(p[axis], p[across], p[along]) = (k, u, v);
-		(p[0] + nx * (p[2] + nz * p[1]), p[0] + nx * (p[1] + ny * p[2]))
-	};
-	// from the slice nearest the sun
-	let order: Vec<usize> = if sun[axis] > 0.0 { (0..n).rev().collect() } else { (0..n).collect() };
-	let mut entering = vec![1.0f32; nu * nv];
-	let mut through = vec![1.0f32; nu * nv];
-	let mut spread = vec![1.0f32; nu * nv];
-	let inside = |u: isize, v: isize| u >= 0 && v >= 0 && u < nu as isize && v < nv as isize;
-	let mut previous = None;
-	for &k in &order {
-		if let Some(previous) = previous {
-			through.par_chunks_mut(nu).enumerate().for_each(|(v, row)| {
-				for (u, value) in row.iter_mut().enumerate() {
-					*value = transmission[at(previous, u, v).0];
-				}
-			});
-			let (light, through) = (&entering, &through);
-			// a voxel of the slice: its light and transmission; outside the grid lit and open
-			let voxel = |u: isize, v: isize| if inside(u, v) { (light[u as usize + nu * v as usize], through[u as usize + nu * v as usize]) } else { (1.0, 1.0) };
-			spread.par_chunks_mut(nu).enumerate().for_each(|(v, row)| {
-				let v = v as isize;
-				for (u, value) in row.iter_mut().enumerate() {
-					let u = u as isize;
-					let (mut passed, mut open) = (0.0, 0.0);
-					for dv in -1..=1 {
-						for du in -1..=1 {
-							if du != 0 || dv != 0 {
-								let (light, through) = voxel(u + du, v + dv);
-								passed += light * through;
-								open += through;
-							}
-						}
-					}
-					let (light, through) = voxel(u, v);
-					let around = if open > 1e-6 { passed / open } else { 0.0 };
-					*value = ((1.0 - SUN_SPREAD) * light + SUN_SPREAD * around) * through;
-				}
-			});
-			let spread = &spread;
-			let read = |u: isize, v: isize| if inside(u, v) { spread[u as usize + nu * v as usize] } else { 1.0 };
-			entering.par_chunks_mut(nu).enumerate().for_each(|(v, row)| {
-				for (u, value) in row.iter_mut().enumerate() {
-					let (x, w) = (u as f32 + su, v as f32 + sv);
-					let (x0, w0) = (x.floor(), w.floor());
-					let (fx, fw) = (x - x0, w - w0);
-					let (x0, w0) = (x0 as isize, w0 as isize);
-					let near = read(x0, w0) * (1.0 - fx) + read(x0 + 1, w0) * fx;
-					let far = read(x0, w0 + 1) * (1.0 - fx) + read(x0 + 1, w0 + 1) * fx;
-					*value = near * (1.0 - fw) + far * fw;
-				}
-			});
-		}
-		for v in 0..nv {
-			for u in 0..nu {
-				values[at(k, u, v).1] = (entering[u + nu * v].clamp(0.0, 1.0) * 255.0).round() as u8;
+	let power = tune().sun_power;
+	let weights = sun.abs().powf(power);
+	let total = weights.element_sum();
+	let w = if total > 0.0 { weights / total } else { Vec3::Y };
+	// the neighbour towards the sun along X and Z, as a step through the indices (the layers from the sun's side too)
+	let (step_x, step_z) = (if sun.x > 0.0 { 1isize } else { -1 }, if sun.z > 0.0 { 1isize } else { -1 });
+	let xs: Vec<usize> = if step_x > 0 { (0..nx).rev().collect() } else { (0..nx).collect() };
+	let zs: Vec<usize> = if step_z > 0 { (0..nz).rev().collect() } else { (0..nz).collect() };
+	let ys: Vec<usize> = if sun.y >= 0.0 { (0..ny).rev().collect() } else { (0..ny).collect() };
+	// the light the layer before passed on (its light times its transmission), 1 before the first; this layer's light
+	let mut passed = vec![1.0f32; nx * nz];
+	let mut light = vec![1.0f32; nx * nz];
+	for &y in &ys {
+		let layer = &transmission[nx * nz * y..nx * nz * (y + 1)];
+		for &z in &zs {
+			let from_z = z as isize + step_z;
+			let inside_z = from_z >= 0 && from_z < nz as isize;
+			let mut from_x_light = 1.0f32;
+			let mut from_x_through = 1.0f32;
+			for &x in &xs {
+				let index = x + nx * z;
+				let along_z = if inside_z {
+					let neighbour = x + nx * from_z as usize;
+					light[neighbour] * layer[neighbour]
+				} else {
+					1.0
+				};
+				let here = w.x * from_x_light * from_x_through + w.y * passed[index] + w.z * along_z;
+				light[index] = here;
+				(from_x_light, from_x_through) = (here, layer[index]);
 			}
 		}
-		previous = Some(k);
+		for z in 0..nz {
+			for x in 0..nx {
+				let index = x + nx * z;
+				values[x + nx * (y + ny * z)] = (light[index].clamp(0.0, 1.0) * 255.0).round() as u8;
+				passed[index] = light[index] * layer[index];
+			}
+		}
 	}
 	values
 }
@@ -1080,11 +1071,35 @@ mod tests {
 		assert!(open(&head) > open(&block_roof), "a Head's disc leaves its box's corners open");
 	}
 
-	/// The sun's light through the grid (render::lightgrid propagate_sun): a 48 x 1 x 48 roof 16 studs up, the sun
-	/// 46.7 degrees up towards -X (ClockTime 14.667 at the default latitude). The floor's voxel under the roof's side away
-	/// from the sun is in its shade, under its edge towards the sun lit (the light-grid fixture's "roof" at graphics
-	/// quality 1 in the engine), where the sky's visibility is closed on both. The channel is there whether the scene
-	/// draws the shadow maps or not (past their reach the client shades the sun by it at every level).
+	/// The grid's sun read as a surface reads it (shaders/shadow.wgsl `light_grid_sun`): trilinear between voxel
+	/// centres, 1 outside the grid.
+	fn sun_read(grid: &LightGrid, point: Vec3) -> f32 {
+		let sun = grid.sun.as_ref().expect("a sun channel");
+		let [nx, ny, nz] = grid.dims;
+		let u = (point - grid.origin) / VOXEL - Vec3::splat(0.5);
+		let base = u.floor();
+		let f = u - base;
+		let mut total = 0.0;
+		for corner in 0..8 {
+			let offset = Vec3::new((corner & 1) as f32, ((corner >> 1) & 1) as f32, ((corner >> 2) & 1) as f32);
+			let weight = (0..3).map(|axis| if offset[axis] > 0.5 { f[axis] } else { 1.0 - f[axis] }).product::<f32>();
+			let v = base + offset;
+			let value = if v.min_element() < 0.0 || v.x >= nx as f32 || v.y >= ny as f32 || v.z >= nz as f32 {
+				1.0
+			} else {
+				sun[v.x as usize + nx * (v.y as usize + ny * v.z as usize)] as f32 / 255.0
+			};
+			total += weight * value;
+		}
+		total
+	}
+
+	/// The sun's light through the grid (render::lightgrid propagate_sun): a 48 x 1 x 48 roof 16 studs up, the sun 46.7
+	/// degrees up towards -X (ClockTime 14.667 at the default latitude). The voxels under the roof's middle are in its
+	/// shade, those under its edge towards the sun lighter than under the edge away from it, and past that edge the shade
+	/// goes on (the light-grid fixture's "roof" at graphics quality 1 in the engine: offset along the sun), where the sky's
+	/// visibility is closed under all of it. The channel is there whether the scene draws the shadow maps or not (past
+	/// their reach the client shades the sun by it at every level).
 	#[test]
 	fn the_grid_passes_the_sun_along_its_direction() {
 		let roof = block(Vec3::new(-24.0, 16.0, -24.0), Vec3::new(24.0, 17.0, 24.0));
@@ -1094,48 +1109,71 @@ mod tests {
 		scene.environment.sun_shadow_maps = false;
 		let grid = build(&scene).unwrap();
 		assert_eq!(grid.sun.as_ref(), Some(&with_maps), "the same channel without the maps");
-		let sun = |point: Vec3| {
-			let v = ((point - grid.origin) / VOXEL).floor();
+		// the voxels of the layer under the roof's (8 to 12)
+		let sun = |x: f32| {
+			let v = ((Vec3::new(x, 10.0, 2.0) - grid.origin) / VOXEL).floor();
 			let [nx, ny, _] = grid.dims;
 			grid.sun.as_ref().expect("a sun channel")[v.x as usize + nx * (v.y as usize + ny * v.z as usize)] as f32 / 255.0
 		};
-		assert_eq!(at(&grid, Vec3::new(14.0, 6.0, 2.0)), 0.0, "the sky closed");
-		assert!(sun(Vec3::new(14.0, 6.0, 2.0)) < 0.05, "away from the sun: {}", sun(Vec3::new(14.0, 6.0, 2.0)));
-		// the shade lies away from the sun: lit under the roof's edge towards it, shaded past its other edge
-		for (x, lit) in [(-18.0, true), (30.0, false)] {
-			let (sun, sky) = (sun(Vec3::new(x, 6.0, 2.0)), at(&grid, Vec3::new(x, 6.0, 2.0)));
-			assert!(if lit { sun > 0.5 && sun > sky } else { sun < 0.5 && sun < sky }, "at {x}: the sun {sun}, the sky {sky}");
-		}
-		assert!(sun(Vec3::new(-60.0, 6.0, 2.0)) > 0.99, "past the roof towards the sun");
+		assert_eq!(at(&grid, Vec3::new(14.0, 10.0, 2.0)), 0.0, "the sky closed");
+		assert!(sun(0.0) < 0.05, "under the roof's middle: {}", sun(0.0));
+		assert!(sun(-22.0) > sun(22.0) + 0.4, "the edge towards the sun lighter: {} against {}", sun(-22.0), sun(22.0));
+		assert!(sun(26.0) < 0.5, "past the edge away from the sun, shaded: {}", sun(26.0));
+		assert!(sun(-30.0) > 0.99, "past the edge towards the sun, lit: {}", sun(-30.0));
 	}
 
-	/// A low sun sweeps across the layers (render::lightgrid propagate_sun): the engine's 8-stud block under a sun 26
-	/// degrees up (`voxsun` at graphics quality 5) shades the floor beside it, 0.40 of the sun 4 studs past its far
-	/// side, where a sweep down the layers read the light the block's layers never shade; a 24-stud-high slab's
-	/// shadow is spread out (0.82 of the sun at its darkest in the engine).
+	/// The Roblox client's voxel sun round occupied voxels (0.747, graphics quality 5, fixtures/quality-levels.luau, the sun
+	/// 26 degrees up), read 6 studs along the normal as a surface reads it: a block one layer tall on a floor leaves the
+	/// floor beside it in the sun (`sunfield`: 1.00 from 2 studs past it; P23's sweep across the layers 0.73), a block two
+	/// layers tall shades it (0.34, 0.47, 0.58 at 2, 4 and 6 studs past it); a 4 x 4 bar 16 studs up casts a shadow that
+	/// leaves it nearly level and sinks a stud for every four along X (`sunslice` a1: 0.61 ten studs past the bar at its
+	/// height, the sweep 0.85), and under a sun 60 degrees up towards +Z falls straight down, sharp.
 	#[test]
 	fn a_low_sun_crosses_the_layers() {
-		let floor = block(Vec3::new(-60.0, -1.0, -60.0), Vec3::new(60.0, 0.0, 60.0));
-		let cube = block(Vec3::new(-4.0, 0.0, -4.0), Vec3::new(4.0, 8.0, 4.0));
-		let mut scene = Scene { parts: vec![Arc::new(floor), Arc::new(cube)], ..Default::default() };
-		(scene.environment.clock_time, scene.environment.geographic_latitude) = (16.2, 38.0);
+		let floor = || block(Vec3::new(-60.0, -1.0, -60.0), Vec3::new(60.0, 0.0, 60.0));
+		let low = |parts: Vec<Part>| {
+			let mut scene = Scene { parts: parts.into_iter().map(Arc::new).collect(), ..Default::default() };
+			(scene.environment.clock_time, scene.environment.geographic_latitude) = (16.2, 38.0);
+			scene
+		};
+		let scene = low(vec![floor(), block(Vec3::new(8.0, 0.0, 8.0), Vec3::new(12.0, 4.0, 12.0)), block(Vec3::new(-24.0, 0.0, -24.0), Vec3::new(-16.0, 8.0, -16.0))]);
 		let sun = grid_sun(&scene).unwrap();
 		assert!(sun.x.abs() > sun.y, "the sun is low: {sun}");
 		let grid = build(&scene).unwrap();
-		let at = |grid: &LightGrid, point: Vec3| {
-			let v = ((point - grid.origin) / VOXEL).floor();
-			let [nx, ny, _] = grid.dims;
-			grid.sun.as_ref().unwrap()[v.x as usize + nx * (v.y as usize + ny * v.z as usize)] as f32 / 255.0
-		};
-		// the voxel beside the block's far side from the sun, at its middle's height
-		let beside = at(&grid, Vec3::new(6.0, 6.0, -2.0));
-		assert!(beside < 0.75, "the block's own layers shade their neighbour (a sweep down the layers: 1): {beside}");
-		assert!(at(&grid, Vec3::new(-6.0, 6.0, 2.0)) > 0.95, "towards the sun, open");
-		let slab = block(Vec3::new(-8.0, 24.0, -8.0), Vec3::new(8.0, 25.0, 8.0));
-		let scene = Scene { parts: vec![Arc::new(block(Vec3::new(-60.0, -1.0, -60.0), Vec3::new(60.0, 0.0, 60.0))), Arc::new(slab)], environment: scene.environment.clone(), ..Default::default() };
+		// along the sun's bearing from each block's far side, the floor read 6 studs up
+		let bearing = Vec3::new(-sun.x, 0.0, -sun.z).normalize();
+		let past = |middle: Vec3, half: f32, distance: f32| sun_read(&grid, middle + bearing * (half * (bearing.x.abs() + bearing.z.abs()) + distance) + Vec3::Y * 6.0);
+		for distance in [2.0, 4.0, 8.0] {
+			let beside = past(Vec3::new(10.0, 0.0, 10.0), 2.0, distance);
+			assert!(beside > 0.98, "a block one layer tall, {distance} studs past it: {beside}");
+		}
+		let (two, six) = (past(Vec3::new(-20.0, 0.0, -20.0), 4.0, 2.0), past(Vec3::new(-20.0, 0.0, -20.0), 4.0, 6.0));
+		assert!(two > 0.2 && two < 0.45 && six > two + 0.15 && six < 0.75, "a block two layers tall: {two} 2 studs past, {six} 6");
+		// the bar: x 0 to 4, 16 to 20 up, 32 studs along Z
+		let scene = low(vec![floor(), block(Vec3::new(0.0, 16.0, -16.0), Vec3::new(4.0, 20.0, 16.0))]);
 		let grid = build(&scene).unwrap();
-		let darkest = (0..40).map(|step| at(&grid, Vec3::new(step as f32 * 2.0, 2.0, -2.0 - step as f32 * 0.6))).fold(1.0f32, f32::min);
-		assert!(darkest > 0.3 && darkest < 0.95, "a high slab's shadow spread out: {darkest}");
+		let level = sun_read(&grid, Vec3::new(14.0, 18.0, 0.0));
+		assert!(level > 0.5 && level < 0.7, "ten studs past the bar at its height: {level}");
+		let mut scene = scene;
+		(scene.environment.clock_time, scene.environment.geographic_latitude) = (12.0, 53.5);
+		let grid = build(&scene).unwrap();
+		let (under, beside) = (sun_read(&grid, Vec3::new(2.0, 8.0, 0.0)), sun_read(&grid, Vec3::new(6.0, 8.0, 0.0)));
+		assert!(under < 0.1 && beside > 0.95, "the sun 60 degrees up: under the bar {under}, a stud past its side {beside}");
+	}
+
+	/// An upright sheet fills the voxel its top edge stands in by its whole share for the sun (`sunfield`, `sunslice`: walls
+	/// 8 x 8 and 0.2, 1 and 2 thick on a floor shade the faces turned from the sun behind them alike, 0.19 / 0.29 / 0.41 /
+	/// 0.59 of the light without the grid 1 / 3 / 5 / 7 studs up): 6 studs behind a 0.2-stud sheet 0.31 / 0.53 of the
+	/// sun 5 / 7 studs up, with the sky's two thirds in its top voxel 0.47 / 0.67. The sky's visibility keeps its two
+	/// thirds (an_upright_sheet_fills_part_of_its_voxels).
+	#[test]
+	fn an_upright_sheet_takes_the_sun_whole_where_its_top_stands() {
+		let mut scene = Scene { parts: vec![Arc::new(block(Vec3::new(-60.0, -1.0, -60.0), Vec3::new(60.0, 0.0, 60.0))), Arc::new(block(Vec3::new(1.9, 0.0, -12.0), Vec3::new(2.1, 8.0, 12.0)))], ..Default::default() };
+		(scene.environment.clock_time, scene.environment.geographic_latitude) = (16.2, 38.0);
+		let grid = build(&scene).unwrap();
+		let behind = |height: f32| sun_read(&grid, Vec3::new(8.1, height, 0.0));
+		assert!(behind(5.0) < 0.36 && behind(7.0) < 0.6, "behind the sheet 5 and 7 studs up: {} {}", behind(5.0), behind(7.0));
+		assert!(behind(1.0) < behind(5.0) && behind(5.0) < behind(7.0));
 	}
 
 	#[test]
