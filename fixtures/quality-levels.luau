@@ -935,6 +935,205 @@ return function(Context)
 				Capture("bounce-white-day", DAY, View)
 			end
 		end
+	elseif Station == "sunfield" then
+		-- the light grid's voxel sun round occupied voxels, under the sun alone: on a 1-stud Part floor (whose layer of
+		-- voxels is full) and on a MeshPart quad floor (which fills none), small blocks, balls, thin plates and sheets
+		-- standing on the floor, plates, slabs and blocks floating 8 studs up, and blocks and walls whose faces turned from
+		-- the sun (+X) are read up their height; seen straight down from far (past every level's shadow maps) under the sun
+		-- 26 and 70 degrees up, straight overhead and 45 degrees up along X, and from the side away from the sun
+		local WHITE = Color3.fromRGB(200, 200, 200)
+		local function Cell(Name, Corner, Size, Floor, Shape)
+			-- a box by its minimum corner (on the 4-stud voxels when the corner and size are multiples of 4)
+			local Part = Block(Name, Size, Corner + Size / 2, WHITE)
+			if Shape then
+				Part.Shape = Shape
+			end
+			Sample(Name, Corner + Size / 2, nil)
+			return Part
+		end
+		local function Plain(Name, Middle, Size, Kind)
+			-- a floor as a Part 1 stud thick (its top at y 0) or the install's quad (no voxels)
+			if Kind == "part" then
+				Block(Name, Vector3.new(Size.X, 1, Size.Y), Middle - Vector3.new(0, 0.5, 0), WHITE)
+				return
+			end
+			pcall(function()
+				local Part = AssetService:CreateMeshPartAsync(Content.fromUri(QUAD))
+				Part.Name = Name
+				Part.Anchored = true
+				Part.Material = Enum.Material.SmoothPlastic
+				Part.Color = WHITE
+				Part.Size = Vector3.new(Size.X, Size.Y, 0.001)
+				Part.CFrame = CFrame.new(Middle) * CFrame.Angles(-math.pi / 2, 0, 0) * CFrame.new(-Size.X / 2, -Size.Y / 2, 0)
+				Part.Parent = Root
+			end)
+		end
+		-- two areas 512 studs apart along Z: the Part floor (z 0) and the MeshPart floor (z 512)
+		local Views = {}
+		for _, Area in { { "p", 0, "part" }, { "m", 512, "mesh" } } do
+			local A, Z, Kind = Area[1], Area[2], Area[3]
+			Plain(`{A}-floor`, Vector3.new(80, 0, Z), Vector3.new(480, 320), Kind)
+			local function At(X, Y, Zo)
+				return Vector3.new(X, Y, Z + Zo)
+			end
+			-- on the floor (z -96): blocks 2, 4 (on the voxels and 2 studs off), 8 and 16, a 4-stud ball
+			Cell(`{A}-c2`, At(-140, 0, -100), Vector3.new(2, 2, 2))
+			Cell(`{A}-c4`, At(-80, 0, -100), Vector3.new(4, 4, 4))
+			Cell(`{A}-c4o`, At(-18, 0, -98), Vector3.new(4, 4, 4))
+			Cell(`{A}-c8`, At(40, 0, -100), Vector3.new(8, 8, 8))
+			Cell(`{A}-c16`, At(100, 0, -104), Vector3.new(16, 16, 16))
+			Cell(`{A}-b4`, At(180, 0, -100), Vector3.new(4, 4, 4), Enum.PartType.Ball)
+			-- thin things on the floor (z -32): plates 0.2 thick 4, 8 and 16 across, the shading station's 5 x 0.4 x 5,
+			-- and sheets 8 and 24 long, 8 tall, 0.2 thick, facing away from the sun
+			Cell(`{A}-p4`, At(-140, 0, -36), Vector3.new(4, 0.2, 4))
+			Cell(`{A}-p8`, At(-80, 0, -36), Vector3.new(8, 0.2, 8))
+			Cell(`{A}-p16`, At(-20, 0, -40), Vector3.new(16, 0.2, 16))
+			Block(`{A}-p5`, Vector3.new(5, 0.4, 5), At(44, 0.2, -32), WHITE)
+			Sample(`{A}-p5`, At(44, 0.4, -32))
+			local Ahead = Vector3.new(Sun.X, 0, Sun.Z).Unit
+			for _, Sheet in { { "w8", 8, 110 }, { "w24", 24, 180 } } do
+				local Position = At(Sheet[3], 4, -32)
+				Block(`{A}-{Sheet[1]}`, Vector3.new(Sheet[2], 8, 0.2), CFrame.lookAt(Position, Position - Ahead), WHITE)
+				for _, H in { 1, 3, 5, 7 } do
+					Sample(`{A}-{Sheet[1]}-{H}`, At(Sheet[3], H, -32) - Ahead * 0.1, -Ahead)
+				end
+			end
+			-- floating, bottoms 8 studs up (z 32): plates 0.2 thick 16 and 4 across, a 1-stud slab and a 4-stud one 16
+			-- across, blocks 4 and 8
+			Cell(`{A}-fp16`, At(-140, 8, 24), Vector3.new(16, 0.2, 16))
+			Cell(`{A}-fs16`, At(-80, 8, 24), Vector3.new(16, 1, 16))
+			Cell(`{A}-fb16`, At(-20, 8, 24), Vector3.new(16, 4, 16))
+			Cell(`{A}-fp4`, At(40, 8, 28), Vector3.new(4, 0.2, 4))
+			Cell(`{A}-fc4`, At(100, 8, 28), Vector3.new(4, 4, 4))
+			Cell(`{A}-fc8`, At(160, 8, 24), Vector3.new(8, 8, 8))
+			-- faces turned from the sun (+X, n·l -0.86), in a row along Z at x 260: blocks 4, 8 and 16, a 4-stud block 2
+			-- studs off the voxels, walls 8 x 8 and 0.2, 1 and 2 thick
+			for Index, Spec in { { "k4", 4, 4 }, { "k8", 8, 8 }, { "k16", 16, 16 }, { "k4o", 4, 4, 2 }, { "kw02", 0.2, 8 }, { "kw1", 1, 8 }, { "kw2", 2, 8 } } do
+				local Name, Thick, Size, Off = Spec[1], Spec[2], Spec[3], Spec[4] or 0
+				local Zo = -96 + (Index - 1) * 32 + Off
+				-- the walls' middles in the middle of a voxel's column (x 262), the blocks' far faces at x 264 (+ Off)
+				local X = if Thick < Size then 262 - Thick / 2 else 264 - Thick + Off
+				Block(`{A}-{Name}`, Vector3.new(Thick, Size, Size), At(X + Thick / 2, Size / 2, Zo + Size / 2), WHITE)
+				for H = 1, Size - 1, 2 do
+					Sample(`{A}-{Name}-{H}`, At(X + Thick + 0.05, H, Zo + Size / 2), Vector3.new(1, 0, 0))
+				end
+			end
+			-- straight down from 900 studs (a stud off upright): the three rows, and the faces' row; the faces from the
+			-- side away from the sun, near (70 studs) and far (700, past every level's shadow maps). The client's voxel sun
+			-- is only drawn within some 250 studs of Camera.Focus: each view's focus is its target
+			local Faces = At(262, 6, 0)
+			Views[A] = {
+				rows = { Eye = At(28, 900, -27), Target = At(28, 0, -28), Fov = 13.5, Focus = "target" },
+				row = { Eye = At(276, 900, 9), Target = At(276, 0, 8), Fov = 15, Focus = "target" },
+				side = { Eye = Faces + Vector3.new(70, 4, 0), Target = Faces, Fov = 70, Focus = "target" },
+				far = { Eye = Faces + Vector3.new(700, 40, 0), Target = Faces, Fov = 9, Focus = "target" },
+			}
+		end
+		-- grouped by sun (each view given 6 s: the client's grid follows a focus moved hundreds of studs within a few)
+		local function Settled(Lighting)
+			return With(Lighting, { Settle = 6 })
+		end
+		local SUN = Settled(SUN_ONLY)
+		local HIGH = Settled(With(SUN_ONLY, { ClockTime = 13 }))
+		for _, A in { "p", "m" } do
+			Capture(`sf-{A}-sun`, SUN, Views[A].rows)
+			Capture(`sf-{A}-row-sun`, SUN, Views[A].row)
+			Capture(`sf-{A}-faces`, SUN, Views[A].side)
+			Capture(`sf-{A}-faces-far`, SUN, Views[A].far)
+		end
+		for _, A in { "p", "m" } do
+			Capture(`sf-{A}-faces-nogs`, Settled(With(SUN_ONLY, { GlobalShadows = false })), Views[A].side)
+		end
+		for _, A in { "p", "m" } do
+			Capture(`sf-{A}-high`, HIGH, Views[A].rows)
+			Capture(`sf-{A}-row-high`, HIGH, Views[A].row)
+		end
+		for _, A in { "p", "m" } do
+			Capture(`sf-{A}-vert`, Settled(With(SUN_ONLY, { ClockTime = 12, GeographicLatitude = 23.5 })), Views[A].rows)
+		end
+		for _, A in { "p", "m" } do
+			Capture(`sf-{A}-x45`, Settled(With(SUN_ONLY, { ClockTime = 9, GeographicLatitude = 23.5 })), Views[A].rows)
+		end
+		for _, A in { "p", "m" } do
+			Capture(`sf-{A}-sky`, Settled(SKY_ONLY), Views[A].rows)
+		end
+	elseif Station == "sunslice" then
+		-- the voxel sun's field across the sun's path: bars, slabs and walls 32 studs long along Z on a 1-stud Part floor,
+		-- each cut through its middle by an upright MeshPart quad facing +Z (which fills no voxel), so the quad shows the
+		-- field in X and Y behind the caster; two rows 160 studs apart, the sun 26 degrees up, 70 up and 60 up towards +Z
+		local WHITE = Color3.fromRGB(200, 200, 200)
+		Block("Floor", Vector3.new(600, 1, 320), Vector3.new(220, -0.5, -80), WHITE)
+		local Rows = {
+			{ 0, { { "a1", 0, 16, 4, 4 }, { "a2", 80, 16, 8, 8 }, { "a3", 160, 16, 16, 1 }, { "a4", 240, 0, 4, 4 }, { "a5", 320, 0, 8, 8 }, { "a6", 400, 0, 16, 16 } } },
+			{ -160, { { "b1", 1.9, 0, 0.2, 8 }, { "b2", 81.5, 0, 1, 8 }, { "b3", 161, 0, 2, 8 }, { "b4", 240, 8, 16, 0.2 }, { "b5", 320, 8, 4, 4 }, { "b6", 400, 16, 16, 4 } } },
+		}
+		local Views = {}
+		for _, Row in Rows do
+			local Z = Row[1]
+			for _, Spec in Row[2] do
+				-- name, minimum X, bottom, width along X, height; 32 long along Z through the row's plane
+				local Size = Vector3.new(Spec[4], Spec[5], 32)
+				Block(`sl-{Spec[1]}`, Size, Vector3.new(Spec[2], Spec[3], Z - 16) + Size / 2, WHITE)
+				Sample(`sl-{Spec[1]}`, Vector3.new(Spec[2] + Spec[4] / 2, Spec[3] + Spec[5] / 2, Z), Vector3.new(0, 0, 1))
+			end
+			pcall(function()
+				local Part = AssetService:CreateMeshPartAsync(Content.fromUri(QUAD))
+				Part.Name = `Screen{Z}`
+				Part.Anchored = true
+				Part.Material = Enum.Material.SmoothPlastic
+				Part.Color = WHITE
+				Part.Size = Vector3.new(480, 48, 0.001)
+				Part.CFrame = CFrame.new(-20, 0, Z)
+				Part.Parent = Root
+			end)
+			-- three views of the quad, each over two casters
+			for Index = 0, 2 do
+				local Middle = Vector3.new(60 + 160 * Index, 20, Z)
+				table.insert(Views, { Tag = `sl{Z == 0 and "a" or "b"}{Index + 1}`, View = { Eye = Middle + Vector3.new(0, 0, 110), Target = Middle, Fov = 50, Focus = "target" } })
+			end
+		end
+		local function Settled(Lighting)
+			return With(Lighting, { Settle = 6 })
+		end
+		for _, Arm in { { "sun", SUN_ONLY }, { "high", With(SUN_ONLY, { ClockTime = 13 }) }, { "z60", With(SUN_ONLY, { ClockTime = 12, GeographicLatitude = 53.5 }) } } do
+			for _, View in Views do
+				Capture(`{View.Tag}-{Arm[1]}`, Settled(Arm[2]), View.View)
+			end
+		end
+	elseif Station == "sunregion" then
+		-- where a client draws the light grid round Camera.Focus: 8-stud blocks every 64 studs along X and along Z on a
+		-- floor 1,280 studs across, and blocks on 64-stud platforms 48 to 240 studs up; seen straight down from 1,500 studs
+		-- with the focus moved in steps along each axis, under the sun alone and under OutdoorAmbient alone
+		local WHITE = Color3.fromRGB(200, 200, 200)
+		Block("Floor", Vector3.new(1280, 1, 1280), Vector3.new(0, -0.5, 0), WHITE)
+		for Step = -9, 9 do
+			Block(`rx{Step}`, Vector3.new(8, 8, 8), Vector3.new(64 * Step + 4, 4, 4), WHITE)
+			if Step ~= 0 then
+				Block(`rz{Step}`, Vector3.new(8, 8, 8), Vector3.new(4, 4, 64 * Step + 4), WHITE)
+			end
+		end
+		for Index, Height in { 48, 96, 144, 192, 240 } do
+			local X = -448 + 128 * (Index - 1)
+			Block(`deck{Height}`, Vector3.new(64, 1, 64), Vector3.new(X + 32, Height - 0.5, -320), WHITE)
+			Block(`ry{Height}`, Vector3.new(8, 8, 8), Vector3.new(X + 20, Height + 4, -300), WHITE)
+		end
+		local function Top(Focus)
+			return { Eye = Vector3.new(0, 1500, 60), Target = Vector3.new(0, 0, 0), Fov = 50, FocusAt = Focus }
+		end
+		local Foci = { { "o", Vector3.zero } }
+		for _, D in { 16, 32, 48, 64, 96, 128 } do
+			table.insert(Foci, { `x{D}`, Vector3.new(D, 0, 0) })
+			table.insert(Foci, { `z{D}`, Vector3.new(0, 0, D) })
+		end
+		for _, D in { 32, 64, 96, 128, 160 } do
+			table.insert(Foci, { `y{D}`, Vector3.new(0, D, 0) })
+		end
+		for _, F in Foci do
+			Capture(`rg-sun-{F[1]}`, With(SUN_ONLY, { Settle = 5 }), Top(F[2]))
+		end
+		for _, F in { Foci[1], Foci[2 * 4], Foci[2 * 4 + 1], Foci[#Foci - 1] } do
+			Capture(`rg-sky-{F[1]}`, With(SKY_ONLY, { Settle = 5 }), Top(F[2]))
+		end
 	else
 		error("quality-levels: no station " .. tostring(Station))
 	end
