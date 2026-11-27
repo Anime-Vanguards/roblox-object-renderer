@@ -8,8 +8,8 @@
 //! follows the sun's shadow maps' reach and the voxel sun past it, local lights' per-pixel reach, the shading's
 //! tiers (per pixel round the focus, high quality round the camera), the built-in glow, BloomEffect, ambient
 //! occlusion, anti-aliasing, SunRays and DepthOfField, Glass refraction, the view distance and size cull
-//! (`crate::lod`) and the particles' Rate; the clouds' tiers are kept here, measured, for when they are followed
-//! (its field says so).
+//! (`crate::lod`) and the particles' Rate.
+//! Terrain Clouds draw one look at every level in this build (its generic cloud model).
 //!
 //! Studio's edit quality is not the client's run-time level: `ror cost` and `ror cost --check` keep Studio's
 //! edit table (`crate::lod::Lod::view_distance`, notes/cost.md "Quality").
@@ -65,7 +65,7 @@ pub struct Quality {
 	pub glass_refraction: bool,
 	/// SunRaysEffect and DepthOfFieldEffect (from 16).
 	pub sun_rays_depth_of_field: bool,
-	/// Terrain Clouds' look: 0 at levels 1-7, 1 at 8-10, 2 at 11-13, 3 from 14. Not followed yet.
+	/// Terrain Clouds' look: 0 at levels 1-7, 1 at 8-10, 2 at 11-13, 3 from 14 (render::clouds::uniform).
 	pub clouds: u8,
 	/// A part farther from the camera (to its world box) is not drawn.
 	pub view_distance: f32,

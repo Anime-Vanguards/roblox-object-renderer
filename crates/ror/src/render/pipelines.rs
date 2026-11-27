@@ -123,6 +123,12 @@ pub struct Pipelines {
 	/// mesh's: `vs_decal_bind`)
 	pub decal_bind: Vec<(u32, wgpu::RenderPipeline)>,
 	pub sky: Vec<(u32, wgpu::RenderPipeline)>,
+	/// The sky's module and layout, for Terrain Clouds' passes (`clouds`)
+	sky_module: wgpu::ShaderModule,
+	sky_pipeline_layout: wgpu::PipelineLayout,
+	/// Terrain Clouds' march into their reduced buffer and its blur (sky.wgsl `fs_clouds`,
+	/// `fs_cloud_blur`), made the first time a view draws them
+	clouds: std::sync::OnceLock<[wgpu::RenderPipeline; 2]>,
 	/// Texture residency's feedback (render::residency): a material's sampler and maps' sizes and
 	/// slots, and the buffer the fragments record into
 	pub residency_material_layout: wgpu::BindGroupLayout,
@@ -234,6 +240,13 @@ impl Pipelines {
 				texture_entry(7, wgpu::TextureViewDimension::D3, float),
 				sampler_entry(8, wgpu::SamplerBindingType::Filtering),
 				texture_entry(9, wgpu::TextureViewDimension::D3, float),
+				// their buffer at a reduced size (render::clouds::buffer_size): the march's for the blur,
+				// the blurred one for the sky
+				texture_entry(10, wgpu::TextureViewDimension::D2, float),
+				// the cloud volume's 2D stand-in the lowest looks lay flat and its 2D detail
+				// (render::clouds::load_flat, load_flat_detail)
+				texture_entry(11, wgpu::TextureViewDimension::D2, float),
+				texture_entry(12, wgpu::TextureViewDimension::D2, float),
 			],
 		});
 		let unfiltered = wgpu::TextureSampleType::Float { filterable: false };
@@ -830,6 +843,9 @@ impl Pipelines {
 			decal,
 			decal_bind,
 			sky,
+			sky_module,
+			sky_pipeline_layout,
+			clouds: Default::default(),
 			residency_material_layout,
 			residency_layout,
 			residency_pipeline_layout,
@@ -990,6 +1006,32 @@ impl Pipelines {
 
 	pub fn sky(&self, samples: u32) -> &wgpu::RenderPipeline {
 		&self.sky.iter().find(|(count, _)| *count == samples).unwrap_or(&self.sky[0]).1
+	}
+
+	/// Terrain Clouds' passes (render::clouds::buffer_size): the march into their reduced buffer and its blur,
+	/// each a full-screen triangle into an HDR target, no depth, one sample.
+	pub fn clouds(&self, device: &wgpu::Device) -> &[wgpu::RenderPipeline; 2] {
+		self.clouds.get_or_init(|| {
+			let pipeline = |entry: &str| {
+				device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+					label: Some(entry),
+					layout: Some(&self.sky_pipeline_layout),
+					vertex: wgpu::VertexState { module: &self.sky_module, entry_point: Some("vs_fullscreen"), buffers: &[], compilation_options: Default::default() },
+					primitive: Default::default(),
+					depth_stencil: None,
+					multisample: Default::default(),
+					fragment: Some(wgpu::FragmentState {
+						module: &self.sky_module,
+						entry_point: Some(entry),
+						targets: &[Some(wgpu::ColorTargetState { format: HDR_FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+						compilation_options: Default::default(),
+					}),
+					multiview: None,
+					cache: self.cache.as_ref(),
+				})
+			};
+			[pipeline("fs_clouds"), pipeline("fs_cloud_blur")]
+		})
 	}
 }
 

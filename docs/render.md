@@ -64,7 +64,8 @@ By default every view draws what a Roblox client draws at its highest graphics q
 - ambient occlusion from level 20; no anti-aliasing below level 17 (4 samples from 17, where a client takes 2); `SunRaysEffect` and `DepthOfFieldEffect` from level 16; `BlurEffect` at every level;
 - without `--lod`: each `MeshPart` at its level of detail, as `--lod` draws it, and none of the parts the client's view distance and size cull at that level leave out (490 studs at level 1, 1,600 at 4 to 12, 10,000 at 17). `summary.json`'s `lod` says `"client": true`. With `--lod roblox:N` the cull is Studio's edit quality's instead.
 
-Level 21 with `--quality 21` differs from the default only in the levels of detail and the cull. Not yet followed by level: clouds, and the light a client gives faces turned away from the sun where it draws no shadow maps (`ror::quality::Quality` holds the client's numbers for the clouds).
+Level 21 with `--quality 21` differs from the default only in the levels of detail and the cull. Not yet followed by level: the light a client gives faces turned away from the sun where it draws no shadow maps.
+This build's Terrain Clouds draw one look at every level.
 
 ## Lighting, materials, and map backdrops
 

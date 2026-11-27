@@ -47,7 +47,15 @@ struct SkyParams {
 	cloud_shape_params: vec4<f32>,
 	cloud_light: vec4<f32>,
 	cloud_sky: vec4<f32>,
+	// x the most of the clouds' exposed radiance laid over the sky, y their look by the graphics quality
+	// (crate::quality::Quality::clouds), z and w what an Atmosphere leaves of them: exp(-z sin(e)^-w)
 	cloud_spare: vec4<f32>,
+	// the flat layer of the lowest looks (render::clouds::Flat): x the stand-in's threshold, y its
+	// opacity's steepness times Density, z the angle a texel of the clouds' buffer spans, w 1 when drawn;
+	// the sun's light on it (Flat::sun) A, B, C and the detail's amplitude; R, Q, K
+	cloud_flat: vec4<f32>,
+	cloud_flat_sun: vec4<f32>,
+	cloud_flat_rim: vec4<f32>,
 	// the stars (render::star_uniform): x how many, y their light as a share of midnight's, z a star's
 	// side in the target's pixels
 	stars: vec4<f32>,
@@ -59,7 +67,45 @@ struct SkyParams {
 @group(0) @binding(7) var cloud_shape: texture_3d<f32>;
 @group(0) @binding(8) var cloud_sampler: sampler;
 @group(0) @binding(9) var cloud_detail: texture_3d<f32>;
+// Terrain Clouds' buffer (render::clouds::buffer_size): what `clouds` gives along each of its pixels'
+// rays, at a reduced size; the march's for the blur, the blurred one for the sky
+@group(0) @binding(10) var cloud_buffer: texture_2d<f32>;
+// the cloud volume's 2D stand-in the lowest looks lay flat (render::clouds::load_flat) and the 2D
+// detail it takes (render::clouds::load_flat_detail)
+@group(0) @binding(11) var cloud_flat_texture: texture_2d<f32>;
+@group(0) @binding(12) var cloud_flat_detail: texture_2d<f32>;
 
+
+// Terrain Clouds' march into their buffer: the clouds along each of its pixels' rays
+@fragment
+fn fs_clouds(input: FullscreenOutput) -> @location(0) vec4<f32> {
+	let point = sky.rays * vec4<f32>(input.ndc, 0.5, 1.0);
+	return clouds(normalize(point.xyz / point.w));
+}
+
+// The march's buffer through a 3 x 3 tent
+@fragment
+fn fs_cloud_blur(input: FullscreenOutput) -> @location(0) vec4<f32> {
+	let last = vec2<i32>(textureDimensions(cloud_buffer)) - 1;
+	let at = vec2<i32>(input.clip.xy);
+	var sum = vec4<f32>(0.0);
+	for (var dy = -1; dy <= 1; dy++) {
+		for (var dx = -1; dx <= 1; dx++) {
+			let weight = f32((2 - abs(dx)) * (2 - abs(dy)));
+			sum += weight * textureLoad(cloud_buffer, clamp(at + vec2<i32>(dx, dy), vec2<i32>(0), last), 0);
+		}
+	}
+	return sum / 16.0;
+}
+
+// The blurred buffer at a pixel of the view through a second 3 x 3 tent of its texels: four bilinear
+// taps half a texel off each way
+fn buffered_clouds(ndc: vec2<f32>) -> vec4<f32> {
+	let half = 0.5 / vec2<f32>(textureDimensions(cloud_buffer));
+	let uv = ndc * vec2<f32>(0.5, -0.5) + 0.5;
+	return 0.25 * (textureSampleLevel(cloud_buffer, sky_sampler, uv - half, 0.0) + textureSampleLevel(cloud_buffer, sky_sampler, uv + half, 0.0)
+		+ textureSampleLevel(cloud_buffer, sky_sampler, uv + vec2<f32>(half.x, -half.y), 0.0) + textureSampleLevel(cloud_buffer, sky_sampler, uv + vec2<f32>(-half.x, half.y), 0.0));
+}
 
 // A celestial body's texture along `direction`: a square of the body's angular size facing the
 // viewer, upright and mirrored left to right (sky-elements: a white square sun texture covers 10.5
@@ -397,7 +443,10 @@ fn fs_sky(input: FullscreenOutput) -> @location(0) vec4<f32> {
 	let direction = normalize(point.xyz / point.w);
 	let ddx = dpdx(direction);
 	let ddy = dpdy(direction);
-	let cloud = clouds(direction);
+	var cloud = vec4<f32>(0.0);
+	if (sky.clouds.x > 0.5) {
+		cloud = buffered_clouds(input.ndc);
+	}
 	var color: vec3<f32>;
 	if (sky.images.x > 0.5) {
 		color = skybox(direction, ddx, ddy);
@@ -412,5 +461,11 @@ fn fs_sky(input: FullscreenOutput) -> @location(0) vec4<f32> {
 	var shown = sqrt(max(color * sky.params.x, vec3<f32>(0.0)));
 	shown += body(sun_texture, sky.sun, direction) * sky.bodies.x;
 	shown += body(moon_texture, sky.moon, direction) * sky.bodies.y;
+	// an Atmosphere fades the clouds by their elevation, the lowest looks' flat layer to 0.3 at most
+	// (render::clouds::atmosphere_fade; notes/render.md "Clouds")
+	if (sky.clouds.x > 0.5 && sky.cloud_spare.z > 0.0) {
+		let fade = exp(-sky.cloud_spare.z * pow(max(direction.y, 0.0175), -sky.cloud_spare.w));
+		cloud *= select(fade, 0.3 + 0.7 * fade, sky.cloud_flat.w > 0.5);
+	}
 	return vec4<f32>(over_clouds(shown, cloud), 1.0);
 }

@@ -425,7 +425,7 @@ struct SkyUniform {
 	/// The camera's rays ([`Camera::ray_unprojection`])
 	rays: [[f32; 4]; 4],
 	/// Terrain Clouds ([`clouds::uniform`])
-	clouds: [[f32; 4]; 6],
+	clouds: [[f32; 4]; 9],
 	/// The stars ([`star_uniform`])
 	stars: [f32; 4],
 }
@@ -1441,6 +1441,9 @@ pub struct RendererInner {
 	/// Studio's cloud volume, loaded the first time a view draws Terrain Clouds ([`clouds`]), or why it
 	/// could not be
 	clouds: std::sync::OnceLock<Result<clouds::Volumes, String>>,
+	/// The cloud volume's 2D stand-in the lowest looks lay flat ([`clouds::load_flat`]), loaded the first
+	/// time a view draws them, or why it could not be
+	clouds_flat: std::sync::OnceLock<Result<(wgpu::TextureView, wgpu::TextureView), String>>,
 	/// What kept textures' levels go up through (texture_files)
 	staging: texture_files::Staging,
 	/// The bytes of material maps a render's views must be able to save for their levels to be read
@@ -2199,6 +2202,7 @@ impl Renderer {
 				layers: std::sync::OnceLock::new(),
 				voxel_field: std::sync::OnceLock::new(),
 				clouds: std::sync::OnceLock::new(),
+				clouds_flat: std::sync::OnceLock::new(),
 				staging: texture_files::Staging::new(),
 				recent_keys: Mutex::default(),
 				residency_from: std::sync::atomic::AtomicU64::new(residency::FEEDBACK_FROM),
@@ -5156,32 +5160,100 @@ impl Renderer {
 			},
 			None => None,
 		};
+		// the look by the view's graphics quality (crate::quality::Quality::clouds): the lowest two lay
+		// the volume's 2D stand-in flat (render::clouds::Flat)
+		let (buffer_width, buffer_height) = clouds::buffer_size(render_width, render_height, supersample);
+		let flat = match volume.filter(|_| clouds::draws_flat(quality.clouds)) {
+			Some(_) => match self.clouds_flat.get_or_init(|| Ok((clouds::load_flat(&self.gpu, &self.assets)?, clouds::load_flat_detail(&self.gpu, &self.assets)?))) {
+				Ok(views) => Some(views),
+				Err(error) => {
+					stats.missing.push(format!("Terrain Clouds: {error}"));
+					None
+				}
+			},
+			None => None,
+		};
 		if volume.is_some() {
-			sky_uniform.clouds = clouds::uniform(environment.clouds.as_ref());
+			let pixel = 2.0 * (camera.fov.to_radians() * 0.5).tan() / buffer_height as f32;
+			// an Atmosphere fades them by its Density whatever its Haze, over a skybox drawn from its images
+			let atmosphere = environment.atmosphere.as_ref().filter(|_| prepared.environment.images.is_some());
+			let look = if flat.is_some() || !clouds::draws_flat(quality.clouds) { quality.clouds } else { 3 };
+			sky_uniform.clouds = clouds::sky_uniform(environment.clouds.as_ref(), look, pixel, atmosphere);
 		}
+		let drawn_clouds = volume.is_some();
+		let (flat, flat_detail) = flat.map(|(stand_in, detail)| (stand_in, detail)).unwrap_or((&self.defaults.black.view, &self.defaults.black.view));
 		let (volume, detail) = volume.map(|volumes| (&volumes.shape, &volumes.detail)).unwrap_or((&self.defaults.no_clouds, &self.defaults.no_clouds));
 		let sky_buffer = lease.buffer("sky params", wgpu::BufferUsages::UNIFORM, bytemuck::bytes_of(&sky_uniform));
 		let body_view = |texture: &Option<Arc<GpuTexture>>| texture.as_ref().map(|texture| texture.view()).unwrap_or_else(|| self.defaults.black.view.clone());
 		let (sun_view, moon_view) = (body_view(&bodies.sun_texture), body_view(&bodies.moon_texture));
-		let sky_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-			label: Some("sky"),
-			layout: &self.pipelines.sky_layout,
-			entries: &[
-				wgpu::BindGroupEntry { binding: 0, resource: frame_buffer.as_entire_binding() },
-				wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&prepared.environment.sky) },
-				wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.defaults.linear_sampler) },
-				wgpu::BindGroupEntry { binding: 3, resource: sky_buffer.as_entire_binding() },
-				wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&sun_view) },
-				wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&moon_view) },
-				wgpu::BindGroupEntry {
-					binding: 6,
-					resource: wgpu::BindingResource::TextureView(prepared.environment.images.as_ref().map(|images| &images.view).unwrap_or(&self.defaults.no_sky_images)),
-				},
-				wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(volume) },
-				wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::Sampler(&self.defaults.cloud_sampler) },
-				wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(detail) },
-			],
-		});
+		// the sky's bind group with `cloud_buffer` (binding 10) the clouds' buffer it reads
+		let sky_group_with = |cloud_buffer: &wgpu::TextureView| {
+			device.create_bind_group(&wgpu::BindGroupDescriptor {
+				label: Some("sky"),
+				layout: &self.pipelines.sky_layout,
+				entries: &[
+					wgpu::BindGroupEntry { binding: 0, resource: frame_buffer.as_entire_binding() },
+					wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&prepared.environment.sky) },
+					wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.defaults.linear_sampler) },
+					wgpu::BindGroupEntry { binding: 3, resource: sky_buffer.as_entire_binding() },
+					wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&sun_view) },
+					wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&moon_view) },
+					wgpu::BindGroupEntry {
+						binding: 6,
+						resource: wgpu::BindingResource::TextureView(prepared.environment.images.as_ref().map(|images| &images.view).unwrap_or(&self.defaults.no_sky_images)),
+					},
+					wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(volume) },
+					wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::Sampler(&self.defaults.cloud_sampler) },
+					wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(detail) },
+					wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(cloud_buffer) },
+					wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(flat) },
+					wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(flat_detail) },
+				],
+			})
+		};
+		// Terrain Clouds: marched into a buffer at a reduced size, blurred there, and read by the sky pass
+		// through a second blur (render::clouds::buffer_size, notes/render.md "Clouds")
+		let cloud_view = if drawn_clouds {
+			let (width, height) = (buffer_width, buffer_height);
+			let buffer = |label: &str| {
+				lease.scratch_view(&wgpu::TextureDescriptor {
+					label: Some(label),
+					size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+					mip_level_count: 1,
+					sample_count: 1,
+					dimension: wgpu::TextureDimension::D2,
+					format: HDR_FORMAT,
+					usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+					view_formats: &[],
+				})
+			};
+			let (marched, blurred) = (buffer("clouds"), buffer("clouds blurred"));
+			let [march, blur] = self.pipelines.clouds(device);
+			for (pipeline, input, output, name) in [(march, &self.defaults.black.view, &marched, "clouds"), (blur, &marched, &blurred, "clouds blur")] {
+				let group = sky_group_with(input);
+				let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+					label: Some(name),
+					color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+						view: output,
+						depth_slice: None,
+						resolve_target: None,
+						ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+					})],
+					depth_stencil_attachment: None,
+					timestamp_writes: None,
+					occlusion_query_set: None,
+				});
+				let time = profile.start(&mut pass, name);
+				pass.set_pipeline(pipeline);
+				pass.set_bind_group(0, &group, &[]);
+				pass.draw(0..3, 0..1);
+				profile.end(&mut pass, time);
+			}
+			blurred
+		} else {
+			self.defaults.black.view.clone()
+		};
+		let sky_group = sky_group_with(&cloud_view);
 
 		// the occlusion first, its targets then the main pass's (same kinds: ao::AoTargets::release), the
 		// frame's memory going round instead of doubling (a 1080p view's AO took 4-sample colour and depth
