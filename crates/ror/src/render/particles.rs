@@ -840,7 +840,11 @@ impl super::Renderer {
 								None => self.load_whole(&key, TextureUse::Color),
 							};
 							match loaded {
-								Ok(texture) => Some(texture),
+								Ok(texture) => {
+									// an upload drawn for a transcode not to be had now: drawn, and reported
+									missing.extend(texture.stand_in.as_deref().map(|why| format!("{}: {why}", emitter.path)));
+									Some(texture)
+								}
 								Err(error) => {
 									missing.push(format!("{}: {error:#} (its particles are not drawn)", emitter.path));
 									None

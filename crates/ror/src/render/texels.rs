@@ -210,19 +210,21 @@ pub fn normal_mips(image: &mut ror_image::Image) {
 impl super::Renderer {
 	/// The image a texture key (a transcode layer's, else an image's URI) draws, before
 	/// [`uploadable`]: an image asset's transcode, else (none, or not an asset) its upload with ror's
-	/// own mips.
-	pub(super) fn texture_image(&self, uri: &str, usage: TextureUse) -> Result<ror_image::Image> {
+	/// own mips. With the upload drawn in place of a transcode that should be there (Roblox still
+	/// making it, none cached offline, not fetched now), why: a stand-in, reported and not kept.
+	pub(super) fn texture_image(&self, uri: &str, usage: TextureUse) -> Result<(ror_image::Image, Option<String>)> {
 		match super::transcode::parse_layer_key(uri) {
 			Some((layer, asset)) => match self.transcode_image(asset, layer) {
-				Ok(image) => Ok(image),
-				// an image asset without a transcode (or none yet) draws its upload; TexturePack layers
-				// are only keyed once they loaded (Renderer::pack_layers)
-				Err(_) if layer == ror_assets::Transcode::Image => self.source_image(asset, usage, false),
+				Ok(image) => Ok((image, None)),
+				// an image asset without a transcode draws its upload, as does one whose transcode is
+				// not to be had now; TexturePack layers are only keyed once they loaded
+				// (Renderer::pack_layers)
+				Err(error) if layer == ror_assets::Transcode::Image => Ok((self.source_image(asset, usage, false)?, super::transcode::stand_in_reason(asset, &error))),
 				Err(error) => Err(error),
 			},
 			// an asset drawn by its own URI, not as an image transcode, stands in for a TexturePack's
 			// layer (a MaterialVariant's map no pack lists: Studio makes a pack of it, render::materials)
-			None => self.source_image(uri, usage, matches!(ror_assets::ContentId::parse(uri), Ok(ror_assets::ContentId::Asset { .. }))),
+			None => Ok((self.source_image(uri, usage, matches!(ror_assets::ContentId::parse(uri), Ok(ror_assets::ContentId::Asset { .. })))?, None)),
 		}
 	}
 

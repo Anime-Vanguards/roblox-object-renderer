@@ -209,6 +209,10 @@ pub struct GpuTexture {
 	pub id: u32,
 	/// Local-file stamp provenance for this texture.
 	pub proof: StampProof,
+	/// An image asset's upload drawn in place of its transcode for now (Roblox still making it, none
+	/// cached offline, not fetched): why, as a render reports it. Kept as a failure is, for
+	/// [`FAILURE_TTL`], and never written to disk.
+	pub stand_in: Option<Arc<str>>,
 }
 
 /// The levels of a texture the GPU holds: its level `base` down to its coarsest, as a texture of
@@ -311,13 +315,13 @@ impl GpuTexture {
 
 	/// A texture the GPU holds whole: `[has_alpha, dxt5nm, normal_rg]`, its levels' bytes.
 	pub fn whole(texture: wgpu::Texture, view: wgpu::TextureView, width: u32, height: u32, [has_alpha, dxt5nm, normal_rg]: [bool; 3], bytes: u64) -> Self {
-		Self { width, height, has_alpha, dxt5nm, normal_rg, full_bytes: bytes, held: parking_lot::RwLock::new(Some(Held { texture, view, base: 0, bytes })), source: None, id: 0, proof: StampProof::Remote }
+		Self { width, height, has_alpha, dxt5nm, normal_rg, full_bytes: bytes, held: parking_lot::RwLock::new(Some(Held { texture, view, base: 0, bytes })), source: None, id: 0, proof: StampProof::Remote, stand_in: None }
 	}
 
 	/// A texture whose levels are read from `source` once asked for, with its slot in the residency
 	/// feedback.
 	pub(super) fn on_disk(source: super::texture_files::Source, width: u32, height: u32, [has_alpha, dxt5nm, normal_rg]: [bool; 3], full_bytes: u64) -> Self {
-		Self { width, height, has_alpha, dxt5nm, normal_rg, full_bytes, held: parking_lot::RwLock::new(None), source: Some(source), id: super::residency::take_id(), proof: StampProof::Remote }
+		Self { width, height, has_alpha, dxt5nm, normal_rg, full_bytes, held: parking_lot::RwLock::new(None), source: Some(source), id: super::residency::take_id(), proof: StampProof::Remote, stand_in: None }
 	}
 
 	/// What the GPU holds of it now.
@@ -402,6 +406,11 @@ pub fn texture_format(format: ror_image::PixelFormat) -> wgpu::TextureFormat {
 /// Something a [`Cache`] can account for.
 pub trait Weighed {
 	fn bytes(&self) -> u64;
+	/// A stand-in for what should have loaded ([`GpuTexture::stand_in`]): kept as a failure is, for
+	/// [`FAILURE_TTL`], then loaded again.
+	fn stand_in(&self) -> bool {
+		false
+	}
 }
 
 impl Weighed for GpuMesh {
@@ -414,6 +423,10 @@ impl Weighed for GpuTexture {
 	fn bytes(&self) -> u64 {
 		// one on disk the GPU holds nothing of yet still holds its file, a little
 		GpuTexture::bytes(self).max(if self.source.is_some() { 4096 } else { 0 })
+	}
+
+	fn stand_in(&self) -> bool {
+		self.stand_in.is_some()
 	}
 }
 
@@ -459,6 +472,17 @@ struct Entry<V> {
 	cell: Arc<OnceLock<CellState<V>>>,
 	last_used: u64,
 	created: std::time::Instant,
+}
+
+impl<V: Weighed> Entry<V> {
+	/// A stand-in ([`Weighed::stand_in`]): retried after [`FAILURE_TTL`], as a failure is.
+	fn holds_stand_in(&self) -> bool {
+		matches!(self.cell.get(), Some(CellState::Cached(value)) if value.stand_in())
+	}
+
+	fn stale_stand_in(&self) -> bool {
+		self.holds_stand_in() && self.created.elapsed() > FAILURE_TTL
+	}
 }
 
 /// How long a failed load is remembered before the next request retries it.
@@ -517,7 +541,7 @@ impl<K: Eq + Hash + Clone, V: Weighed> Cache<K, V> {
 		let now = std::time::Instant::now();
 		let mut first = {
 			let entries = self.entries.lock();
-			entries.values().filter(|entry| matches!(entry.cell.get(), Some(CellState::CachedErr(_)))).map(|entry| entry.created + FAILURE_TTL).filter(|retried| *retried > now).min()
+			entries.values().filter(|entry| matches!(entry.cell.get(), Some(CellState::CachedErr(_))) || entry.holds_stand_in()).map(|entry| entry.created + FAILURE_TTL).filter(|retried| *retried > now).min()
 		};
 		if offline_view {
 			let offline = self.offline.lock();
@@ -579,8 +603,9 @@ impl<K: Eq + Hash + Clone, V: Weighed> Cache<K, V> {
 				{
 					let mut entries = self.entries.lock();
 					if let Some(entry) = entries.get_mut(key) {
+						let stale = entry.stale_stand_in();
 						match entry.cell.get() {
-							Some(CellState::Cached(value)) => {
+							Some(CellState::Cached(value)) if !stale => {
 								entry.last_used = tick;
 								self.hits.fetch_add(1, Ordering::Relaxed);
 								return Ok(value.clone());
@@ -710,7 +735,7 @@ impl<K: Eq + Hash + Clone, V: Weighed> Cache<K, V> {
 				let mut entries = self.entries.lock();
 				// a hit neither clones the key nor allocates while the lock is held
 				match entries.get_mut(key) {
-					Some(entry) if !matches!(entry.cell.get(), Some(CellState::Uncached | CellState::UncachedErr)) && !(matches!(entry.cell.get(), Some(CellState::CachedErr(_))) && entry.created.elapsed() > FAILURE_TTL) => {
+					Some(entry) if !matches!(entry.cell.get(), Some(CellState::Uncached | CellState::UncachedErr)) && !(matches!(entry.cell.get(), Some(CellState::CachedErr(_))) && entry.created.elapsed() > FAILURE_TTL) && !entry.stale_stand_in() => {
 						entry.last_used = tick;
 						entry.cell.clone()
 					}
@@ -804,6 +829,9 @@ impl<K: Eq + Hash + Clone, V: Weighed> Cache<K, V> {
 		let tick = self.tick.fetch_add(1, Ordering::Relaxed);
 		let mut entries = self.entries.lock();
 		let entry = entries.get_mut(key)?;
+		if entry.stale_stand_in() {
+			return None;
+		}
 		let CellState::Cached(value) = entry.cell.get()? else {
 			return None;
 		};

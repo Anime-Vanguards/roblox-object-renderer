@@ -60,6 +60,19 @@ pub(super) fn layer_key(layer: Transcode, pack: &str) -> String {
 	format!("{LAYER_PREFIX}{}{phone}:{pack}", layer_name(layer))
 }
 
+/// Why `asset`'s upload is drawn in place of its image transcode, which failed with `error`, as a
+/// render reports it in `missing`; `None` when the asset has no transcode (its upload is what Roblox
+/// draws).
+pub(super) fn stand_in_reason(asset: &str, error: &anyhow::Error) -> Option<String> {
+	let why = match error.downcast_ref::<ror_assets::AssetError>() {
+		Some(ror_assets::AssetError::NoTranscode(_)) => return None,
+		Some(ror_assets::AssetError::Http { status: 406, .. }) => "Roblox is still making its texture transcode (HTTP 406)".to_string(),
+		Some(ror_assets::AssetError::Offline { .. }) => "its texture transcode is not cached (offline)".to_string(),
+		_ => format!("its texture transcode did not load ({error:#})"),
+	};
+	Some(format!("{asset}: {why}; drew the uploaded image instead"))
+}
+
 /// The texture key of an image asset drawn as Studio draws it: its `Image` transcode (the upload
 /// when it has none, `Renderer::load_texture`); other content as is. For SurfaceAppearance maps
 /// without a TexturePack, MeshPart / SpecialMesh textures, decals, beams and particles: after their
@@ -166,7 +179,8 @@ impl Renderer {
 	/// Errors when the asset has none (not an asset id, not an image, still being made).
 	pub(super) fn transcode_image(&self, uri: &str, transcode: Transcode) -> Result<ror_image::Image> {
 		let decode = |pack: u32| -> Result<ror_image::Image> {
-			let fetched = self.assets.fetch_transcode(uri, transcode, pack).map_err(|error| anyhow!("{error}"))?;
+			// the asset error kept as it is: whether the upload stands in for it (stand_in_reason)
+			let fetched = self.assets.fetch_transcode(uri, transcode, pack).map_err(anyhow::Error::new)?;
 			ror_image::decode(&fetched.bytes).map_err(|error| anyhow!("{uri}: transcode pack {pack}: {error}"))
 		};
 		let first = decode(0)?;
@@ -207,6 +221,19 @@ impl Renderer {
 		loaded.then(|| MaterialKey { color: Some(color), normal: Some(normal), metalness: Some(mr.clone()), roughness: Some(mr), emissive: None, clamped: false })
 	}
 
+	/// Why a SurfaceAppearance TexturePack's layers did not load ([`Renderer::pack_layers`] none: still
+	/// being made, not cached offline, refused), as a render reports it; its maps are drawn instead.
+	/// None for the built-in materials' kind of pack, and when they load.
+	pub(super) fn pack_layers_missing(&self, pack: &str) -> Option<String> {
+		if self.texture_pack(pack).is_ok_and(|xml| xml.usage != 0) {
+			return None;
+		}
+		let error = [(Transcode::PackColor, TextureUse::Color), (Transcode::PackNormal, TextureUse::Normal), (Transcode::PackMetalnessRoughness, TextureUse::Scalar)]
+			.into_iter()
+			.find_map(|(layer, usage)| self.load_texture(&layer_key(layer, pack), usage).err())?;
+		Some(format!("{pack}: its TexturePack's layers did not load ({error:#}); drew its maps instead"))
+	}
+
 	/// A material's pack (a built-in material's: `<usage>` 1 on the pre-2022 classic packs, 3 on the
 	/// others; a MaterialVariant's TexturePack) as material textures from its transcoded layers:
 	/// colour (gamma 2, with the colour map's alpha), normal (DXT5nm) and the third layer, metalness in
@@ -234,6 +261,18 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn only_a_transcode_to_be_had_later_makes_a_stand_in() {
+		let uri = "rbxassetid://1";
+		let error = |error: ror_assets::AssetError| anyhow::Error::new(error);
+		// no transcode at all: the upload is what Roblox draws
+		assert_eq!(stand_in_reason(uri, &error(ror_assets::AssetError::NoTranscode(uri.into()))), None);
+		let being_made = stand_in_reason(uri, &error(ror_assets::AssetError::Http { uri: uri.into(), status: 406, reason: None })).unwrap();
+		assert_eq!(being_made, "rbxassetid://1: Roblox is still making its texture transcode (HTTP 406); drew the uploaded image instead");
+		assert!(stand_in_reason(uri, &error(ror_assets::AssetError::Offline { uri: uri.into() })).unwrap().contains("not cached (offline)"));
+		assert!(stand_in_reason(uri, &error(ror_assets::AssetError::Network { uri: uri.into(), detail: "timed out".into() })).unwrap().contains("timed out"));
+	}
 
 	#[test]
 	fn layer_keys_round_trip() {

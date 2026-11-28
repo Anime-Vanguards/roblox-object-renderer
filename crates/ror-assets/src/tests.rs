@@ -957,6 +957,51 @@ fn warm_takes_an_images_upload_without_a_transcode() {
 }
 
 #[test]
+fn warm_waits_for_a_transcode_being_made() {
+	// image 11's transcode is being made for the first two requests naming it, then there; image 12's
+	// is never made: remembered as a fetch would remember it, and its upload taken instead
+	let cdn = MockServer::start(|r| match r.path.as_str() {
+		"/cdn/11/ktx2" => Reply::bytes(KTX2),
+		"/cdn/12" => Reply::bytes(PNG),
+		_ => Reply::status(404),
+	});
+	let cdn_origin = cdn.origin();
+	let asked = Arc::new(AtomicUsize::new(0));
+	let counter = asked.clone();
+	let ad = MockServer::start(move |r| {
+		let requests: Vec<serde_json::Value> = serde_json::from_slice(&r.body).unwrap_or_default();
+		let replies: Vec<serde_json::Value> = requests
+			.iter()
+			.map(|request| {
+				let request_id = request["requestId"].clone();
+				let being_made = serde_json::json!({ "requestId": request_id, "errors": [{ "code": 406, "message": "Asset content representation is being generated", "customErrorCode": 21 }] });
+				match (request["assetId"].as_u64(), request["contentRepresentationPriorityList"].is_string()) {
+					(Some(11), true) if counter.fetch_add(1, Ordering::SeqCst) < 2 => being_made,
+					(Some(11), true) => serde_json::json!({ "requestId": request_id, "location": format!("{cdn_origin}/cdn/11/ktx2"), "contentRepresentationSpecifier": { "format": "ktx2" } }),
+					(Some(12), true) => being_made,
+					(Some(12), false) => serde_json::json!({ "requestId": request_id, "location": format!("{cdn_origin}/cdn/12") }),
+					_ => serde_json::json!({ "requestId": request_id, "errors": [{ "code": 404, "message": "no" }] }),
+				}
+			})
+			.collect();
+		Reply::json(&serde_json::to_string(&replies).unwrap())
+	});
+	let a = assets(AssetConfig::new(temp_state("warm-being-made")), endpoints(&ad, &cdn), true);
+	let downloads = [11, 12].map(|id| crate::Download::Transcode(format!("rbxassetid://{id}"), Transcode::Image));
+	let report = a.warm(&downloads, &|_| 0);
+	assert_eq!(report.downloaded, 2, "11's transcode once made, 12's upload");
+	assert_eq!(asked.load(Ordering::SeqCst), 3, "11 asked for until made");
+	assert_eq!(a.fetch_transcode("rbxassetid://11", Transcode::Image, 0).unwrap().source, Source::DiskCache);
+	assert_eq!(a.fetch("rbxassetid://12").unwrap().source, Source::DiskCache);
+	// both asked for again together after each wait (four in tests), then 12's upload
+	assert_eq!(ad.requests().len(), 1 + crate::TRANSCODE_WAITS_MS.len() + 1);
+	// 12's is remembered: a fetch answers 406 without asking
+	let before = ad.requests().len();
+	assert!(matches!(a.fetch_transcode("rbxassetid://12", Transcode::Image, 0), Err(AssetError::Http { status: 406, .. })));
+	assert_eq!(ad.requests().len(), before);
+}
+
+#[test]
 fn phone_transcodes_are_asked_for_and_cached_apart() {
 	let cdn = MockServer::start(|r| match r.path.as_str() {
 		"/desktop" => Reply::bytes(KTX2),

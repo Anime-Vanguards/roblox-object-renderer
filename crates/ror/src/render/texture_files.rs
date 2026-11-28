@@ -509,14 +509,10 @@ impl super::Renderer {
 				return Ok(LoadOutcome { value: texture, keep: true, offline_fallback: false });
 			}
 		}
-		let (image, fallback) = match super::transcode::parse_layer_key(uri) {
-			Some((ror_assets::Transcode::Image, asset)) if self.assets.offline() => match self.transcode_image(asset, ror_assets::Transcode::Image) {
-				Ok(image) => (image, false),
-				Err(_) => (self.texture_image(asset, usage).map_err(LoadError::Cached)?, true),
-			},
-			_ => (self.texture_image(uri, usage).map_err(LoadError::Cached)?, false),
-		};
-		if !fallback
+		// an upload standing in for a transcode is drawn but never kept on disk: the transcode is drawn
+		// once it is there
+		let (image, stand_in) = self.texture_image(uri, usage).map_err(LoadError::Cached)?;
+		if stand_in.is_none()
 			&& let Some(name) = &kept
 		{
 			let own = dir.join(name);
@@ -528,8 +524,10 @@ impl super::Renderer {
 			}
 		}
 		self.gpu_room(image.levels.iter().map(|level| level.len() as u64).sum()).map_err(LoadError::Cached)?;
-		let texture = GpuTexture::upload(&self.gpu, uri, &image, usage).map_err(LoadError::Cached)?;
-		Ok(LoadOutcome { value: texture, keep: true, offline_fallback: fallback && self.assets.is_offline_view() })
+		let mut texture = GpuTexture::upload(&self.gpu, uri, &image, usage).map_err(LoadError::Cached)?;
+		let offline_fallback = stand_in.is_some() && self.assets.is_offline_view();
+		texture.stand_in = stand_in.map(std::sync::Arc::from);
+		Ok(LoadOutcome { value: texture, keep: true, offline_fallback })
 	}
 }
 

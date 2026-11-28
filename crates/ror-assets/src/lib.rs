@@ -636,7 +636,7 @@ impl Assets {
 	/// `pack_N` keys (`ror_image::ktx2_pack_table`); `ror_image::join_packs` joins them. Each pack is
 	/// cached under its own key, apart from the uploaded image. Errors with
 	/// [`AssetError::NoTranscode`] for content that is not an asset id; a transcode that is still
-	/// being made (assetdelivery's 406) is waited for a few seconds, then reported as HTTP 406. The
+	/// being made (assetdelivery's 406) is waited for (30 s in all), then reported as HTTP 406. The
 	/// transcode is the one made for [`AssetConfig::transcode_target`].
 	pub fn fetch_transcode(&self, uri: &str, transcode: Transcode, pack: u32) -> Result<Arc<Fetched>, AssetError> {
 		let id = ContentId::parse(uri)?;
@@ -649,7 +649,7 @@ impl Assets {
 		let key = transcode.cache_key(&id.canonical(), pack, self.inner.config.transcode_target);
 		self.fetch_keyed(&key, uri, None, || {
 			self.load_disk_or_network(&key, uri, || {
-				// one still being made when last asked is asked once more, not waited for again
+				// one still being made when last asked (and waited for then) is asked once more, not waited for again
 				let waits: &[u64] = if self.inner.disk.last_refusal(&key).is_some_and(|last| last.status == 406) { &[] } else { &TRANSCODE_WAITS_MS };
 				self.download_transcode(asset, version, transcode, pack, uri, waits)
 			})
@@ -866,8 +866,8 @@ impl Assets {
 
 	/// assetdelivery `GET /v1/assetId/{id}[/version/{v}]` naming the transcode's pack in
 	/// `contentRepresentationPriorityList`, without falling back to the uploaded image (the routes of
-	/// [`Assets::find_location`], the same query on each; while the transcode is being made, retried after
-	/// 0.5, 1, 2 and 4 s), then the CDN location without a credential. Returns (KTX2 bytes, CDN host).
+	/// [`Assets::find_location`], the same query on each; while the transcode is being made, asked again
+	/// after each of `waits`), then the CDN location without a credential. Returns (KTX2 bytes, CDN host).
 	fn download_transcode(&self, id: u64, version: Option<u64>, transcode: Transcode, pack: u32, uri: &str, waits: &[u64]) -> Result<(Vec<u8>, String), AssetError> {
 		let location = self.find_location(id, version, Some(&transcode_query(transcode, pack, self.inner.config.transcode_target)), uri, waits)?;
 		let reply = self.get(&location, None, "*/*", uri)?;
@@ -1106,11 +1106,15 @@ enum Located {
 	Generating,
 }
 
-/// Waits between requests for a transcode that is being made.
+/// Waits between requests for a transcode that is being made: 30 s in all, asked again after 0.5 s
+/// and then less and less often. Of 148 transcodes of real textures assetdelivery made after a first
+/// request, 94 % were there within 30 s (median 9.8 s; the 7.5 s waited before caught 36 %;
+/// notes/assets.md "Transcodes being made"). A Roblox client asks two or three times within a second,
+/// then draws nothing until it asks again minutes later.
 #[cfg(not(test))]
-const TRANSCODE_WAITS_MS: [u64; 4] = [500, 1000, 2000, 4000];
+pub(crate) const TRANSCODE_WAITS_MS: [u64; 14] = [500, 500, 1000, 1000, 1000, 2000, 2000, 2000, 3000, 3000, 3000, 3000, 4000, 4000];
 #[cfg(test)]
-const TRANSCODE_WAITS_MS: [u64; 4] = [10, 10, 10, 10];
+pub(crate) const TRANSCODE_WAITS_MS: [u64; 4] = [10, 10, 10, 10];
 
 #[derive(Deserialize)]
 struct AssetLocation {

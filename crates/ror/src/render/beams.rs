@@ -170,7 +170,11 @@ impl super::Renderer {
 							}
 						}) {
 							None => None,
-							Some(Ok(texture)) => Some(texture),
+							Some(Ok(texture)) => {
+								// an upload drawn for a transcode not to be had now: drawn, and reported
+								missing.extend(texture.stand_in.as_deref().map(|why| format!("{}: {why}", beam.path)));
+								Some(texture)
+							}
 							Some(Err(error)) => {
 								missing.push(format!("{}: {error:#} (not drawn)", beam.path));
 								return None;

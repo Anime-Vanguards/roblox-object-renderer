@@ -3102,7 +3102,11 @@ impl Renderer {
 		let mut load = |uri: &Option<String>, usage: TextureUse| -> Option<Arc<GpuTexture>> {
 			let uri = uri.as_ref()?;
 			match self.load_texture(uri, usage) {
-				Ok(texture) => Some(texture),
+				Ok(texture) => {
+					// an upload drawn for a transcode not to be had now: drawn, and reported
+					missing.extend(texture.stand_in.as_deref().map(str::to_string));
+					Some(texture)
+				}
 				Err(error) => {
 					missing.push(format!("{error:#}"));
 					None
@@ -3127,10 +3131,11 @@ impl Renderer {
 			entries: &[wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(sampler) }, wgpu::BindGroupEntry { binding: 6, resource: info.as_entire_binding() }],
 		});
 		// only fully loaded materials whose local textures match `kept`'s stamps are kept; one with a
-		// failed or moving texture asks the texture cache again next time
+		// failed or moving texture, or an upload standing in for a transcode, asks the texture cache
+		// again next time
 		let uris = [&key.color, &key.normal, &key.metalness, &key.roughness, &key.emissive];
 		let kept_uris = [&kept.color, &kept.normal, &kept.metalness, &kept.roughness, &kept.emissive];
-		let complete = uris.iter().zip(&maps).all(|(uri, texture)| uri.is_none() || texture.is_some());
+		let complete = uris.iter().zip(&maps).all(|(uri, texture)| uri.is_none() || texture.as_ref().is_some_and(|texture| texture.stand_in.is_none()));
 		let stable = uris.iter().zip(kept_uris).zip(&maps).all(|((raw, kept_uri), texture)| match (raw, kept_uri, texture) {
 			(Some(raw), Some(ku), Some(tex)) => match &tex.proof {
 				resources::StampProof::Remote => !names_local_file(raw),
@@ -6561,6 +6566,13 @@ impl Renderer {
 			// time (forcefield-time); between sweeps, the state drawn here, it looks untextured
 			return material;
 		}
+		// a SurfaceAppearance pack whose layers did not load (being made, not cached offline, refused):
+		// its maps are drawn instead (below), and why is reported
+		if let Some(pack) = part.surface_appearance.as_ref().and_then(|appearance| appearance.texture_pack.as_ref()).filter(|_| transcode::enabled())
+			&& let Some(why) = self.pack_layers_missing(pack)
+		{
+			missing.push(why);
+		}
 		let composite_key = part.composite.as_ref().map(composite::key).filter(|key| self.composite_loads(key, &part.path, missing));
 		let mut pack_proofs: Vec<(String, resources::StampProof)> = Vec::new();
 		let mut pack_or = |pack: Option<&String>, maps: [Option<String>; 5]| -> [Option<String>; 5] {
@@ -8532,8 +8544,8 @@ mod camera_reuse_tests {
 		let _ = std::fs::remove_dir_all(&state);
 	}
 
-	/// A silent offline fallback (`SurfaceAppearance.TexturePack` uncached while `ColorMap` is local,
-	/// leaving `stats.missing` empty) must neither publish shared `PreparedPart`s nor cache a
+	/// An offline fallback (`SurfaceAppearance.TexturePack` uncached while `ColorMap` is local: its maps
+	/// drawn, and reported in `stats.missing`) must neither publish shared `PreparedPart`s nor cache a
 	/// non-`offline_only` `PreparedGeometry`, while still letting repeat offline views reuse it.
 	#[test]
 	fn silent_offline_pack_fallback_does_not_poison_online_preparations() {
@@ -8565,7 +8577,7 @@ mod camera_reuse_tests {
 		});
 		let request = view([8.0, 6.0, -10.0]);
 		let (_, first) = offline.render(&scene, std::slice::from_ref(&request)).unwrap();
-		assert!(first.missing.iter().all(|m| !m.contains("9090909")), "pack fallback is silent: {:?}", first.missing);
+		assert!(first.missing.iter().any(|m| m.contains("rbxassetid://9090909: its TexturePack's layers did not load") && m.contains("drew its maps instead")), "pack fallback reported: {:?}", first.missing);
 		let key = super::scene_key(&scene).unwrap();
 		assert!(online.preparations.get(&key, online.dropped_failures(false), false).is_none(), "silent offline pack fallback poisoned online Preparations");
 		assert_eq!(online.preparations.part_stats().0, 0, "silent offline pack fallback published shared PreparedParts");
@@ -8575,9 +8587,9 @@ mod camera_reuse_tests {
 		let _ = std::fs::remove_dir_all(&state);
 	}
 
-	/// A clip frame prepared on an offline view that hit a silent fallback (uncached `TexturePack`
-	/// with a local `ColorMap`, leaving `stats.missing` empty) must NOT mark its parts reusable in
-	/// `ClipKept`, so subsequent frames re-prepare instead of carrying the silent fallback forward.
+	/// A clip frame prepared on an offline view that hit a fallback (uncached `TexturePack` with a local
+	/// `ColorMap`, its maps drawn and reported) must NOT mark its parts reusable in `ClipKept`, so
+	/// subsequent frames re-prepare instead of carrying the fallback forward.
 	#[test]
 	fn silent_offline_pack_fallback_is_not_reusable_across_clip_frames() {
 		let state = std::env::temp_dir().join(format!("ror-silent-pack-clip-reusable-{}", std::process::id()));
@@ -8616,7 +8628,7 @@ mod camera_reuse_tests {
 		let sky0 = offline.prepare_environment(&scene0);
 		let (mut views0, mut stats0) = offline.submit_frame(&scene0, std::slice::from_ref(&request), sky0, None, Default::default(), None, Some((&kept, false))).unwrap();
 		views0.pop().unwrap().finish(&mut stats0).unwrap();
-		assert!(stats0.missing.iter().all(|m| !m.contains("9090910")), "pack fallback is silent: {:?}", stats0.missing);
+		assert!(stats0.missing.iter().any(|m| m.contains("rbxassetid://9090910: its TexturePack's layers did not load")), "pack fallback reported: {:?}", stats0.missing);
 		let key0 = super::scene_key(&scene0).unwrap();
 		let flags = vec![0u8; scene0.parts.len()];
 		assert!(
@@ -8675,7 +8687,63 @@ mod camera_reuse_tests {
 		let store_tex_dir = store.join("textures").join(env!("ROR_TEXTURE_CODE"));
 		let store_tex_count = std::fs::read_dir(&store_tex_dir).map(|entries| entries.flatten().filter(|e| e.path().extension().is_some_and(|ext| ext == "tex")).count()).unwrap_or(0);
 		assert_eq!(store_tex_count, 0, "offline transcode fallback must not publish a .tex file to the shared store");
+		assert!(fallback_tex.stand_in.as_deref().is_some_and(|why| why.contains("not cached (offline)")), "{:?}", fallback_tex.stand_in);
 		drop((fallback_tex, offline, online));
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	/// An image whose transcode Roblox is still making (406, remembered from an earlier ask) draws its
+	/// upload in its place: reported in `missing` by the material drawing it, never kept in a texture
+	/// file, and remembered by the texture cache as a failure is (then asked for again), so the
+	/// transcode is drawn once it is there.
+	#[test]
+	fn a_transcode_being_made_draws_the_upload_and_reports_it() {
+		let state = std::env::temp_dir().join(format!("ror-transcode-being-made-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&state);
+		std::fs::create_dir_all(&state).unwrap();
+		let store = state.join("store");
+		let config = ror_assets::AssetConfig { store: Some(store.clone()), studio_content: Some(state.join("no-studio")), ..ror_assets::AssetConfig::new(&state) };
+		let renderer = Renderer::new(crate::render::test_gpu(), ror_assets::Assets::new(config)).expect("a renderer");
+		let raw_uri = "rbxassetid://7171717";
+		// ror-assets' disk cache: `assets/<2 hex>/<FNV-1a-128 of the key>.{bin,json,refused}`
+		let entry = |key: &str, extension: &str| {
+			let mut hash = 0x6c62272e07bb014262b821756295c58du128;
+			for byte in key.as_bytes() {
+				hash ^= *byte as u128;
+				hash = hash.wrapping_mul(0x0000000001000000000000000000013b);
+			}
+			let hex = format!("{hash:032x}");
+			let dir = state.join("assets").join(&hex[..2]);
+			std::fs::create_dir_all(&dir).unwrap();
+			dir.join(format!("{hex}.{extension}"))
+		};
+		let png = state.join("upload.png");
+		crate::output::write_png(&png, 4, 4, &[200, 60, 30, 255].repeat(16), true).unwrap();
+		let png_bytes = std::fs::read(&png).unwrap();
+		std::fs::write(entry(raw_uri, "bin"), &png_bytes).unwrap();
+		std::fs::write(entry(raw_uri, "json"), serde_json::json!({"uri": raw_uri, "fetched_at": 1, "source_host": "test", "size": png_bytes.len(), "kind": "png"}).to_string()).unwrap();
+		let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+		let pack0 = format!("{raw_uri}#ktx2/7rdo/{}", ror_assets::Transcode::Image.fidelity(0));
+		std::fs::write(entry(&pack0, "refused"), serde_json::json!({"status": 406, "until": now + 600, "since": now}).to_string()).unwrap();
+
+		let key = super::transcode::image_key(raw_uri);
+		let texture = renderer.load_texture(&key, TextureUse::Color).expect("the upload in its place");
+		assert_eq!((texture.width, texture.height), (4, 4));
+		let why = texture.stand_in.as_deref().unwrap_or_default().to_string();
+		assert!(why.starts_with(raw_uri) && why.contains("still making") && why.contains("drew the uploaded image"), "{why}");
+		let tex_files = |dir: std::path::PathBuf| std::fs::read_dir(dir.join("textures").join(env!("ROR_TEXTURE_CODE"))).map(|entries| entries.flatten().filter(|e| e.path().extension().is_some_and(|ext| ext == "tex")).count()).unwrap_or(0);
+		assert_eq!((tex_files(state.clone()), tex_files(store.clone())), (0, 0), "a stand-in is never kept in a texture file");
+		assert!(renderer.textures.failures().0.is_some(), "remembered as a failure is: retried after FAILURE_TTL");
+		// the material drawing it reports it, and is not kept: the next one reports it again
+		let material = MaterialKey { color: Some(key.clone()), ..MaterialKey::default() };
+		let mut missing = Vec::new();
+		let first = renderer.material_bind_group(&material, &mut missing);
+		assert_eq!(missing, vec![why.clone()]);
+		let mut again = Vec::new();
+		let second = renderer.material_bind_group(&material, &mut again);
+		assert_eq!(again, vec![why]);
+		assert!(!Arc::ptr_eq(&first, &second));
+		drop((first, second, texture, renderer));
 		let _ = std::fs::remove_dir_all(&state);
 	}
 

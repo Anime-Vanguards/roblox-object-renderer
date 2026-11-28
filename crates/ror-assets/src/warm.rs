@@ -24,13 +24,10 @@ use crate::cache::Meta;
 use crate::http::Credential;
 use crate::transcode::{self, MAX_PACKS, Transcode};
 use crate::uri::ContentId;
-use crate::{ApiError, AssetError, Assets, Located, RefusalReason, RepresentationSpecifier, gunzip_if_needed, sniff_kind, transcode_query};
+use crate::{ApiError, AssetError, Assets, Located, RefusalReason, RepresentationSpecifier, TRANSCODE_WAITS_MS, gunzip_if_needed, sniff_kind, transcode_query};
 
 /// Items per batch request (assetdelivery answers 100 in one).
 pub const BATCH: usize = 100;
-/// Rounds: the files and the transcodes' first packs; the packs those list (and the uploads of
-/// images without a transcode); whatever a third round still finds.
-const ROUNDS: usize = 3;
 
 /// Something [`Assets::warm`] downloads.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -90,17 +87,18 @@ enum Place {
 	NoTranscode,
 	/// Refused (an HTTP status or assetdelivery error code), and why.
 	Refused(u16, Option<RefusalReason>),
-	/// A transcode assetdelivery is still making (406): a fetch would wait seconds for it, then draw
-	/// the upload; remembered as it would be, the upload comes now.
+	/// A transcode assetdelivery is still making (406): asked again while the wait for it lasts.
 	Generating,
 	/// Not known: the request failed, the reply was odd.
 	Unknown,
 }
 
-/// What became of an item: downloaded (with the packs a pack 0 lists), without a transcode, failed.
+/// What became of an item: downloaded (with the packs a pack 0 lists), without a transcode, still
+/// being made, failed.
 enum Outcome {
 	Downloaded { packs: u32 },
 	NoTranscode,
+	Generating,
 	Failed,
 }
 
@@ -143,8 +141,11 @@ impl Assets {
 	/// their locations from assetdelivery's batch endpoint, the files from the CDN side by side (up
 	/// to [`crate::AssetConfig::max_concurrent_downloads`]). A transcode's pack 0 comes first; `packs`
 	/// tells from its bytes how many packs the transcode has (`ror_image::ktx2_pack_table`), and
-	/// the others follow. Nothing here fails: what could not be fetched is left to a later fetch,
-	/// which tries again and reports it. Offline, it does nothing.
+	/// the others follow. Transcodes assetdelivery is still making are asked for again, all of them in
+	/// one batch, while a fetch would wait for one (30 s in all): those not made by then are remembered
+	/// as a fetch remembers them, and an image's upload is fetched instead. Nothing here fails: what
+	/// could not be fetched is left to a later fetch, which tries again and reports it. Offline, it
+	/// does nothing.
 	pub fn warm(&self, downloads: &[Download], packs: &(dyn Fn(&[u8]) -> u32 + Sync)) -> WarmReport {
 		let mut report = WarmReport::default();
 		if self.offline {
@@ -181,9 +182,33 @@ impl Assets {
 				}
 			}
 		}
-		for _ in 0..ROUNDS {
+		// transcodes being made, asked for again together after each wait a fetch would make
+		let mut pending: Vec<Item> = Vec::new();
+		let mut waits = TRANSCODE_WAITS_MS.iter();
+		loop {
 			if round.is_empty() {
-				break;
+				if pending.is_empty() {
+					break;
+				}
+				match waits.next() {
+					Some(&ms) => {
+						std::thread::sleep(std::time::Duration::from_millis(ms));
+						round = std::mem::take(&mut pending);
+					}
+					None => {
+						// not made in time: remembered as a fetch remembers it, and an image drawn from its upload
+						for item in std::mem::take(&mut pending) {
+							self.remember_refusal(&item.key, 406, None, now());
+							if item.kind == Kind::Pack(Transcode::Image, 0) {
+								let upload = Item { key: item.canonical.clone(), kind: Kind::Plain, ..item };
+								self.consider(upload, &mut seen, &mut round, &mut report);
+							}
+						}
+						if round.is_empty() {
+							break;
+						}
+					}
+				}
 			}
 			let outcomes = self.fetch_items(&round, packs, &mut report);
 			let mut next = Vec::new();
@@ -200,6 +225,7 @@ impl Assets {
 						let upload = Item { key: item.canonical.clone(), kind: Kind::Plain, ..item.clone() };
 						self.consider(upload, &mut seen, &mut next, &mut report);
 					}
+					(_, Outcome::Generating) => pending.push(item.clone()),
 					_ => {}
 				}
 			}
@@ -400,10 +426,7 @@ impl Assets {
 		let location = match place {
 			Place::Url(location) => location,
 			Place::NoTranscode => return Outcome::NoTranscode,
-			Place::Generating => {
-				self.remember_refusal(&item.key, 406, None, now());
-				return Outcome::NoTranscode;
-			}
+			Place::Generating => return Outcome::Generating,
 			Place::Refused(status, reason) => {
 				// remembered only when final: an authorisation refusal once a credential was tried
 				if !matches!(status, 401 | 403 | 409) || self.tried_credentials() {
