@@ -705,6 +705,8 @@ fn extract_part(document: &Document, referent: Ref, instance: &Instance, skeleto
 	// replace what it draws (scene::collision)
 	let shape = (!matches!(geometry, Geometry::MeshPart { .. } | Geometry::Union { .. })).then(|| geometry.clone());
 	let collision = Some(Arc::new(super::collision::of(instance, shape)));
+	// a MeshPart showing an EditableMesh casts no shadow in a client (scene::is_editable_mesh_uri)
+	let editable_mesh = matches!(&geometry, Geometry::MeshPart { mesh, .. } if super::is_editable_mesh_uri(mesh));
 
 	let mut part = Part {
 		path: path.clone(),
@@ -718,7 +720,7 @@ fn extract_part(document: &Document, referent: Ref, instance: &Instance, skeleto
 		material_variant: ["MaterialVariantSerialized", "MaterialVariant"].iter().find_map(|name| props::string(instance, name).filter(|value| !value.is_empty())).unwrap_or_default(),
 		transparency: props::f32(instance, "Transparency", 0.0),
 		reflectance: props::f32(instance, "Reflectance", 0.0),
-		cast_shadow: props::bool(instance, "CastShadow", true),
+		cast_shadow: props::bool(instance, "CastShadow", true) && !editable_mesh,
 		shadow_only: props::attribute_flag(instance, super::SHADOW_ONLY),
 		double_sided: props::bool(instance, "DoubleSided", false),
 		texture: None,
@@ -1363,6 +1365,27 @@ mod tests {
 		assert!(matches!(&part("Torso").geometry, Geometry::MeshPart { mesh, .. } if mesh == "rbxassetid://48112070"));
 		assert!(matches!(&part("Left Arm").geometry, Geometry::MeshPart { mesh, .. } if mesh.ends_with("leftarm.mesh")));
 		assert!(scene.parts.iter().all(|part| part.composite.is_none()));
+	}
+
+	/// A MeshPart showing an EditableMesh (the engine emulator's snapshot of it) casts no shadow, as in a client;
+	/// one showing a mesh file, or a file the emulator did not write, keeps its CastShadow
+	#[test]
+	fn editable_mesh_parts_cast_no_shadow() {
+		use crate::scene::build::PartSpec;
+		use rbx_dom_weak::types::ContentId;
+
+		let cast = |mesh: &str, cast_shadow: bool| {
+			let mut model = ModelBuilder::new("Meshes");
+			let part = model.part(&PartSpec { class: "MeshPart", name: "Quad".into(), cast_shadow, ..Default::default() });
+			model.set(part, "MeshId", ContentId::from(mesh));
+			let scene = super::extract(&model.into_document());
+			scene.parts[0].cast_shadow
+		};
+		assert!(!cast("file:///C:/state/editable-meshes/0123456789abcdef-148.mesh", true));
+		assert!(!cast(r"file://C:\state\editable-meshes\0123456789abcdef-148.mesh", true));
+		assert!(cast("file:///C:/content/meshes/quad.mesh", true));
+		assert!(cast("rbxassetid://123", true));
+		assert!(!cast("rbxassetid://123", false));
 	}
 }
 

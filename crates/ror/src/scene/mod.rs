@@ -47,6 +47,15 @@ pub fn casts_shadow(transparency: f32) -> bool {
 	transparency < SHADOW_CUT_TRANSPARENCY
 }
 
+/// Whether a MeshPart's mesh is an `EditableMesh` as the engine emulator records it (a `file://` FileMesh
+/// snapshot under its state dir's `editable-meshes`, rewritten whenever the mesh changes). A Roblox client
+/// casts no shadow from such a part, the sun's or local lights', opaque or not, whatever its CastShadow
+/// (fixtures/texture-alpha.luau and fixtures/leaf-shadows.luau in a 0.747 client: a quad, a closed box and a
+/// textured quad, and a part given the mesh with ApplyMesh); a file mesh's part casts.
+pub fn is_editable_mesh_uri(uri: &str) -> bool {
+	uri.starts_with("file://") && (uri.contains("/editable-meshes/") || uri.contains("\\editable-meshes\\"))
+}
+
 /// The attribute that makes a part shadow-only, set to the boolean `true` ([`Part::shadow_only`]):
 /// a hint to this renderer alone, which the Roblox engine does not know.
 pub const SHADOW_ONLY: &str = "RorShadowOnly";
@@ -255,6 +264,7 @@ pub struct Part {
 	pub material_variant: String,
 	pub transparency: f32,
 	pub reflectance: f32,
+	/// CastShadow, false for a MeshPart showing an EditableMesh ([`is_editable_mesh_uri`]).
 	pub cast_shadow: bool,
 	/// The [`SHADOW_ONLY`] attribute: nothing of the part is drawn, and with CastShadow it casts an
 	/// opaque part's shadows at any Transparency.
