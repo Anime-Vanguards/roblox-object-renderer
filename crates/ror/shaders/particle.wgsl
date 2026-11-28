@@ -90,10 +90,21 @@ struct ParticleLight {
 // King's particles 2.25 -> 2.19 ms a view)
 override CROSS_FADE: bool = true;
 
-// The particle's texel at this pixel (the flipbook's two frames cross-faded)
+// The particle's texel at this pixel (the flipbook's two frames cross-faded). A client weighs each frame's
+// colour by its alpha as it fades between them, so the colour under a transparent frame's texels counts
+// for nothing (fixtures/playback-timing.luau "crossfade", a 0.747 client: a white frame fading into a
+// transparent one reads 223 / 204 / 174 / 130 at blends 0, 1/6, 1/3 and 1/2 whether black or white lies
+// under the transparent one, Normal and additive alike; mixed straight, the black one read 179 / 112 / 46).
+// A legacy effect's texture holds its colour premultiplied already.
 fn particle_texel(input: ParticleOutput) -> vec4<f32> {
 	if (CROSS_FADE) {
-		return mix(textureSample(particle_texture, particle_sampler, input.uv.xy), textureSample(particle_texture, particle_sampler, input.uv.zw), input.params.w);
+		let shown = textureSample(particle_texture, particle_sampler, input.uv.xy);
+		let next = textureSample(particle_texture, particle_sampler, input.uv.zw);
+		let blend = input.params.w;
+		let alpha = mix(shown.a, next.a, blend);
+		let weighted = mix(shown.rgb * shown.a, next.rgb * next.a, blend) / max(alpha, 1e-6);
+		let colour = select(mix(shown.rgb, next.rgb, blend), weighted, alpha > 1e-6 && input.extra.y <= 0.5);
+		return vec4<f32>(colour, alpha);
 	}
 	return textureSample(particle_texture, particle_sampler, input.uv.xy);
 }

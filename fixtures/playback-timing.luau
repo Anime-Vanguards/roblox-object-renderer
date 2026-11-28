@@ -43,6 +43,10 @@
 --   freezes them (TimeScale 0), and advances a half's particles' places in their emitters first (Emit
 --   then Clear); `random-mover`'s attachment moved cell to cell lays one emitter's particles 0-63 over
 --   the left half.
+-- "crossfade" (x 12000, seen from -Z at 30 studs): cross-faded 2 x 2 OneShot sheets living 0.3 s whose frames 0 and
+--   2 are opaque white and 1 and 3 transparent, black beneath in `Context.CrossBlackTexture` and white in
+--   `Context.CrossWhiteTexture`: `black-n`, `white-n` (LightEmission 0) and `black-a`, `white-a` (1), Size 1.5, 5 studs
+--   apart; a job emits one particle each and freezes them 0-3 frames old (blends 0, 1/6, 1/3 and 1/2).
 -- "parentout2" (x 10000, seen from -Z at 70 studs, the legacy effects at 90): `t-ref`, `t-out`, `t-holder` and
 --   `t-off`, white Trails (Lifetime 10) on 0.2-stud parts 2.5 studs apart from y 20 down, each part in a Model
 --   `<name>-holder`, which a job moves along -X at 10 studs a second and parents out and back (the Trail, or the
@@ -301,6 +305,24 @@ return function(Context)
 			Emitter(Anchor(Model, `random-{Index}-anchor`, Center + Vector3.new((7.5 - Column) * 2, (3.5 - Row) * 2, 0)), `random-{Index}`, Sheet)
 		end
 		Emitter(Anchor(Model, "random-mover-anchor", Center + Vector3.new(0, -12, 0)), "random-mover", Sheet)
+	end
+
+	-- crossfade: a frame fading into a transparent one, black or white beneath
+	do
+		local Center = Vector3.new(12000, 0, 0)
+		local Model = Group("crossfade", Center, { eye = { 12000, 0, -30 }, target = { 12000, 0, 0 }, fov = 40 })
+		Block(Model, "Backdrop", CFrame.new(Center + Vector3.new(0, 0, 30)), Vector3.new(200, 120, 1), Color3.new(0, 0, 0), Enum.Material.Neon)
+		for Index, Case in { { "black-n", "CrossBlackTexture", 0 }, { "white-n", "CrossWhiteTexture", 0 }, { "black-a", "CrossBlackTexture", 1 }, { "white-a", "CrossWhiteTexture", 1 } } do
+			Emitter(Anchor(Model, `{Case[1]}-anchor`, Center + Vector3.new((1.5 - (Index - 1)) * 5, 0, 0)), Case[1], {
+				Size = Constant(1.5),
+				Lifetime = NumberRange.new(0.3, 0.3),
+				Texture = Context[Case[2]] or SQUARE,
+				LightEmission = Case[3],
+				FlipbookLayout = Enum.ParticleFlipbookLayout.Grid2x2,
+				FlipbookMode = Enum.ParticleFlipbookMode.OneShot,
+				FlipbookBlendFrames = true,
+			})
+		end
 	end
 
 	-- parentout2: trails, beams and legacy effects a job parents out of the world and back

@@ -1562,6 +1562,76 @@ mod tests {
 		let _ = std::fs::remove_dir_all(&state);
 	}
 
+	/// A cross-fade weighs each frame's colour by its alpha: a white frame half faded into a transparent one
+	/// reads the same whether black or white lies under the transparent texels (a Roblox client's 2 x 2 sheets,
+	/// fixtures/playback-timing.luau "crossfade": 130 of 255 at blend 1/2 both; mixed straight, ror drew the
+	/// black one 46)
+	#[test]
+	fn cross_fades_weigh_each_frame_by_its_alpha() {
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use glam::Affine3A;
+		use rbx_dom_weak::InstanceBuilder;
+		use rbx_dom_weak::types::{ContentId, Enum, NumberRange, NumberSequence, NumberSequenceKeypoint};
+		let state = std::env::temp_dir().join(format!("ror-particle-crossfade-test-{}", std::process::id()));
+		std::fs::create_dir_all(&state).unwrap();
+		let gpu = crate::render::test_gpu();
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = super::super::Renderer::new(gpu, assets).expect("a renderer");
+		let constant = |value: f32| NumberSequence { keypoints: vec![NumberSequenceKeypoint::new(0.0, value, 0.0), NumberSequenceKeypoint::new(1.0, value, 0.0)] };
+		let (width, height, fov, distance) = (240u32, 120u32, 40.0f32, 30.0f32);
+		let cases: [(u8, Vec3); 2] = [(0, Vec3::new(5.0, 0.0, 0.0)), (255, Vec3::new(-5.0, 0.0, 0.0))];
+		let mut model = ModelBuilder::new("Fade");
+		model.part(&PartSpec { name: "Wall".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, 0.0, 30.0)), size: Vec3::new(200.0, 100.0, 1.0), color: [0, 0, 0], cast_shadow: false, ..Default::default() });
+		for (index, &(under, at)) in cases.iter().enumerate() {
+			// a 2 x 2 sheet: the left frames opaque white, the right ones transparent with `under` beneath
+			let rgba: Vec<u8> = (0..64 * 64).flat_map(|texel| if texel % 64 < 32 { [255; 4] } else { [under, under, under, 0] }).collect();
+			let path = state.join(format!("sheet-{index}.png"));
+			crate::output::write_png(&path, 64, 64, &rgba, false).unwrap();
+			let uri = format!("file:///{}", path.display().to_string().replace('\\', "/"));
+			let holder = model.part(&PartSpec { name: "Holder".into(), cframe: Affine3A::from_translation(at), size: Vec3::splat(0.2), transparency: 1.0, cast_shadow: false, ..Default::default() });
+			model.child(
+				holder,
+				InstanceBuilder::new("ParticleEmitter")
+					.with_property("Texture", ContentId::from(uri))
+					.with_property("Size", constant(1.5))
+					.with_property("Lifetime", NumberRange::new(0.3, 0.3))
+					.with_property("Speed", NumberRange::new(0.0, 0.0))
+					.with_property("Rate", 0.0f32)
+					.with_property("LightEmission", 0.0f32)
+					.with_property("LightInfluence", 0.0f32)
+					.with_property("Brightness", 1.0f32)
+					// Grid2x2, OneShot, cross-faded
+					.with_property("FlipbookLayout", Enum::from_u32(1))
+					.with_property("FlipbookMode", Enum::from_u32(1))
+					.with_property("FlipbookBlendFrames", true),
+			);
+		}
+		let mut scene = crate::scene::extract::extract(&model.into_document());
+		// 0.05 s old: 3 · 0.05 / 0.3, half way from the first frame to the transparent second
+		for emitter in scene.particles.iter_mut() {
+			emitter.bursts = vec![(0.05, 1)];
+		}
+		scene.environment = crate::scene::Environment { brightness: 0.0, ambient: Vec3::ZERO, outdoor_ambient: Vec3::ZERO, environment_diffuse_scale: 0.0, environment_specular_scale: 0.0, global_shadows: false, ..Default::default() };
+		let spec = super::super::CameraSpec::LookAt { eye: [0.0, 0.0, -distance], target: [0.0; 3], fov };
+		let project = spec.place(None, width, height).view_projection(width as f32 / height as f32);
+		let view = super::super::ViewRequest { width, height, camera: spec, background: super::super::Background::Sky, ..Default::default() };
+		let (images, _) = renderer.render(&scene, &[view]).unwrap();
+		let mut reads = Vec::new();
+		for &(_, at) in &cases {
+			let clip = project * at.extend(1.0);
+			let (x, y) = (((clip.x / clip.w * 0.5 + 0.5) * width as f32) as usize, ((0.5 - clip.y / clip.w * 0.5) * height as f32) as usize);
+			let mut sum = 0.0;
+			for dy in 0..5 {
+				for dx in 0..5 {
+					sum += images[0].rgba[((y + dy - 2) * width as usize + x + dx - 2) * 4] as f32;
+				}
+			}
+			reads.push(sum / 25.0);
+		}
+		assert!(reads.iter().all(|read| (read - 130.0).abs() <= 3.0) && (reads[0] - reads[1]).abs() <= 1.0, "black beneath {}, white beneath {}: the client shows 130 for both", reads[0], reads[1]);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
 	/// WindAffectsDrag: Drag pulls the velocity towards Workspace.GlobalWind, the velocity relative to it
 	/// decaying as the speed does (a Roblox client's particles at rest under GlobalWind 20 studs a second
 	/// along X, measured at 0.969 and 1.985 s; fixtures/particle-probes.luau "wind")
