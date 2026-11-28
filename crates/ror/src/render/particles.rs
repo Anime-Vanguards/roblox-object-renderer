@@ -1424,6 +1424,74 @@ mod tests {
 		let _ = std::fs::remove_dir_all(&state);
 	}
 
+	/// An image file's coarser levels keep what a Roblox client's keep: its texels averaged on the stored
+	/// values, the colour under transparent ones as it is. 256-texel images of alternate columns at 4
+	/// texels a pixel, white beside black under alpha 0 and white beside opaque black, read 51 and 130 in a
+	/// client (0.747, fixtures/texture-mips.luau "chain", two sessions; ror's levels in linear light by a
+	/// tent read 91 and 188)
+	#[test]
+	fn minified_image_files_keep_the_clients_levels() {
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use glam::Affine3A;
+		use rbx_dom_weak::InstanceBuilder;
+		use rbx_dom_weak::types::{ContentId, NumberRange, NumberSequence, NumberSequenceKeypoint};
+		let state = std::env::temp_dir().join(format!("ror-particle-mips-test-{}", std::process::id()));
+		std::fs::create_dir_all(&state).unwrap();
+		let gpu = crate::render::test_gpu();
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = super::super::Renderer::new(gpu, assets).expect("a renderer");
+		let constant = |value: f32| NumberSequence { keypoints: vec![NumberSequenceKeypoint::new(0.0, value, 0.0), NumberSequenceKeypoint::new(1.0, value, 0.0)] };
+		// 256-texel images whose even columns are opaque white and odd ones `odd`; where each is drawn, and
+		// the client's level there
+		let cases: [([u8; 4], Vec3, f32); 2] = [([0, 0, 0, 0], Vec3::new(15.0, 0.0, 0.0), 51.0), ([0, 0, 0, 255], Vec3::new(-15.0, 0.0, 0.0), 130.0)];
+		let (width, height, fov, distance) = (240u32, 120u32, 40.0f32, 60.0f32);
+		// 64 px across at 4 texels a pixel: the quad spans twice Size
+		let size = 64.0 * (fov.to_radians() * 0.5).tan() * distance / (height as f32 * 0.5) / 2.0;
+		let mut model = ModelBuilder::new("Mips");
+		model.part(&PartSpec { name: "Wall".into(), cframe: Affine3A::from_translation(Vec3::new(0.0, 0.0, 30.0)), size: Vec3::new(200.0, 100.0, 1.0), color: [0, 0, 0], cast_shadow: false, ..Default::default() });
+		for (index, &(odd, at, _)) in cases.iter().enumerate() {
+			let rgba: Vec<u8> = (0..256 * 256).flat_map(|texel| if texel % 2 == 0 { [255; 4] } else { odd }).collect();
+			let path = state.join(format!("columns-{index}.png"));
+			crate::output::write_png(&path, 256, 256, &rgba, false).unwrap();
+			let uri = format!("file:///{}", path.display().to_string().replace('\\', "/"));
+			let holder = model.part(&PartSpec { name: "Holder".into(), cframe: Affine3A::from_translation(at), size: Vec3::splat(0.2), transparency: 1.0, cast_shadow: false, ..Default::default() });
+			model.child(
+				holder,
+				InstanceBuilder::new("ParticleEmitter")
+					.with_property("Texture", ContentId::from(uri))
+					.with_property("Size", constant(size))
+					.with_property("Lifetime", NumberRange::new(10.0, 10.0))
+					.with_property("Speed", NumberRange::new(0.0, 0.0))
+					.with_property("Rate", 0.0f32)
+					.with_property("LightEmission", 0.0f32)
+					.with_property("LightInfluence", 0.0f32)
+					.with_property("Brightness", 1.0f32),
+			);
+		}
+		let mut scene = crate::scene::extract::extract(&model.into_document());
+		for emitter in scene.particles.iter_mut() {
+			emitter.bursts = vec![(0.0, 1)];
+		}
+		scene.environment = crate::scene::Environment { brightness: 0.0, ambient: Vec3::ZERO, outdoor_ambient: Vec3::ZERO, environment_diffuse_scale: 0.0, environment_specular_scale: 0.0, global_shadows: false, ..Default::default() };
+		let spec = super::super::CameraSpec::LookAt { eye: [0.0, 0.0, -distance], target: [0.0; 3], fov };
+		let project = spec.place(None, width, height).view_projection(width as f32 / height as f32);
+		let view = super::super::ViewRequest { width, height, camera: spec, background: super::super::Background::Sky, ..Default::default() };
+		let (images, _) = renderer.render(&scene, &[view]).unwrap();
+		for &(odd, at, level) in &cases {
+			let clip = project * at.extend(1.0);
+			let (x, y) = (((clip.x / clip.w * 0.5 + 0.5) * width as f32) as usize, ((0.5 - clip.y / clip.w * 0.5) * height as f32) as usize);
+			let mut sum = 0.0;
+			for dy in 0..9 {
+				for dx in 0..9 {
+					sum += images[0].rgba[((y + dy - 4) * width as usize + x + dx - 4) * 4] as f32;
+				}
+			}
+			let read = sum / 81.0;
+			assert!((read - level).abs() <= 2.0, "white beside {odd:?}: {read} where the client shows {level}");
+		}
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
 	/// WindAffectsDrag: Drag pulls the velocity towards Workspace.GlobalWind, the velocity relative to it
 	/// decaying as the speed does (a Roblox client's particles at rest under GlobalWind 20 studs a second
 	/// along X, measured at 0.969 and 1.985 s; fixtures/particle-probes.luau "wind")

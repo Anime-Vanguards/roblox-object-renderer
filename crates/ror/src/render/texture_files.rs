@@ -384,7 +384,7 @@ fn decode_local(uri: &str, bytes: &[u8], usage: TextureUse, supports_bc: bool) -
 	let mut image = ror_image::decode(bytes).map_err(|error| anyhow::anyhow!("{uri}: {error}"))?;
 	if image.format == ror_image::PixelFormat::Rgba8 && image.levels.len() <= 1 {
 		match usage {
-			TextureUse::Color => ror_image::generate_mips_with(&mut image, ror_image::MipFilter::Triangle, true),
+			TextureUse::Color => ror_image::generate_mips_client(&mut image),
 			TextureUse::Normal => super::texels::normal_mips(&mut image),
 			TextureUse::Data | TextureUse::Scalar => ror_image::generate_mips(&mut image),
 		}

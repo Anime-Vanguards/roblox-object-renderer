@@ -98,6 +98,79 @@ fn chain_for_layer(base: &[u8], dims: [usize; 3], count: usize, filter: MipFilte
 	}
 }
 
+/// The chain a Roblox client builds for an image file it loads (`crate::generate_mips_client`), on the
+/// stored values, each level from the one before: both sides even (or 1 x 1), texel pairs averaged rounding
+/// half up, across first; otherwise each axis by [`client_halve`], down first, an even one's pairs rounding
+/// down. Volumes and other formats take the box filter.
+pub(crate) fn generate_client(image: &mut Image) {
+	if image.format != PixelFormat::Rgba8 || image.levels.is_empty() || image.depth > 1 {
+		generate(image, MipFilter::Box, Space::Stored);
+		return;
+	}
+	let (width, height, layers) = (image.width as usize, image.height as usize, image.layers.max(1) as usize);
+	let layer_bytes = width * height * 4;
+	if image.levels[0].len() != layer_bytes * layers {
+		return;
+	}
+	let count = layout::full_chain_len(image.width, image.height, 1) as usize;
+	image.levels.truncate(1);
+	let mut chain: Vec<Vec<u8>> = vec![Vec::new(); count - 1];
+	for layer in 0..layers {
+		let mut level = image.levels[0][layer * layer_bytes..(layer + 1) * layer_bytes].to_vec();
+		let (mut w, mut h) = (width, height);
+		for dst in chain.iter_mut() {
+			let (next, next_w, next_h) = if w % 2 == 0 && h % 2 == 0 {
+				let (across, aw, ah) = client_halve(&level, w, h, true, 1);
+				client_halve(&across, aw, ah, false, 1)
+			} else {
+				let (down, dw, dh) = client_halve(&level, w, h, false, 0);
+				client_halve(&down, dw, dh, true, 0)
+			};
+			dst.extend_from_slice(&next);
+			(level, w, h) = (next, next_w, next_h);
+		}
+	}
+	image.levels.extend(chain);
+}
+
+/// One axis of `level` (w x h RGBA8) halved as a Roblox client halves it: an even side's pairs averaged
+/// (`round_up` 1: half up, 0: down); an odd side n by a 2-tap filter into m = n / 2, output texel k reading
+/// (k + 1/2) s - 1/2 of the source with s = n / m in 16.16 fixed point (truncated), the next texel's weight
+/// the place's fraction in 8 bits (floored), the blend floored. A side of 1 stays.
+fn client_halve(level: &[u8], w: usize, h: usize, across: bool, round_up: u16) -> (Vec<u8>, usize, usize) {
+	let n = if across { w } else { h };
+	if n <= 1 {
+		return (level.to_vec(), w, h);
+	}
+	let m = n / 2;
+	let (nw, nh) = if across { (m, h) } else { (w, m) };
+	let taps: Vec<(usize, usize, u32)> = (0..m)
+		.map(|k| {
+			if n == 2 * m {
+				return (2 * k, 2 * k + 1, 0);
+			}
+			let step = ((n as u64) << 16) / m as u64;
+			let place = k as u64 * step + step / 2 - (1 << 15);
+			let first = (place >> 16) as usize;
+			(first, (first + 1).min(n - 1), ((place & 0xFFFF) >> 8) as u32)
+		})
+		.collect();
+	let mut out = vec![0u8; nw * nh * 4];
+	let lines = if across { h } else { w };
+	for line in 0..lines {
+		for (k, &(a, b, weight)) in taps.iter().enumerate() {
+			let at = |i: usize| (if across { line * w + i } else { i * w + line }) * 4;
+			let (a, b) = (at(a), at(b));
+			let o = (if across { line * nw + k } else { k * nw + line }) * 4;
+			for c in 0..4 {
+				let (x, y) = (level[a + c], level[b + c]);
+				out[o + c] = if n == 2 * m { ((x as u16 + y as u16 + round_up) >> 1) as u8 } else { ((x as u32 * (256 - weight) + y as u32 * weight) >> 8) as u8 };
+			}
+		}
+	}
+	(out, nw, nh)
+}
+
 /// Stored code → value in [0, 1], as `v as f32 * (1.0 / 255.0)` gives it.
 fn unit_table() -> &'static [f32; 256] {
 	static TABLE: OnceLock<[f32; 256]> = OnceLock::new();
@@ -486,6 +559,47 @@ mod tests {
 		crate::generate_mips(&mut image);
 		assert_eq!(image.levels.len(), 2);
 		assert_eq!(image.levels[1], [128, 128, 128, 128]);
+	}
+
+	/// A Roblox client's chain for an image file: pairs rounded half up across, then down, on the stored
+	/// values with the colour under alpha 0 averaged in; odd sides by the 2-tap filter, down first.
+	#[test]
+	fn client_chain_rounds_pairs_and_takes_two_taps_on_odd_sides() {
+		// 2 x 2 of 0, 1 / 0, 0: across (0 + 1 + 1) >> 1 = 1 and 0, then down (1 + 0 + 1) >> 1 = 1, where the
+		// 2 x 2 average (1 + 2) >> 2 is 0
+		let texel = |v: u8| [v, v, v, 255];
+		let mut image = rgba_image(2, 2, [texel(0), texel(1), texel(0), texel(0)].concat());
+		crate::generate_mips_client(&mut image);
+		assert_eq!(image.levels[1], [1, 1, 1, 255]);
+		let mut boxed = rgba_image(2, 2, [texel(0), texel(1), texel(0), texel(0)].concat());
+		crate::generate_mips(&mut boxed);
+		assert_eq!(boxed.levels[1], [0, 0, 0, 255]);
+
+		// white beside black under alpha 0: the colour averages in, 128 and alpha 128
+		let mut image = rgba_image(2, 1, [[255, 255, 255, 255], [0, 0, 0, 0]].concat());
+		crate::generate_mips_client(&mut image);
+		// a 2 x 1 level takes the odd path: the pair rounds down
+		assert_eq!(image.levels[1], [127, 127, 127, 127]);
+
+		// 5 x 1 of 0, 255, 0, 255, 0: s = 2.5, texel 0 reads 0.75 (192 / 256 of texel 1), texel 1 reads 3.25
+		// (64 / 256 of texel 4); the area weights give 102
+		let row: Vec<u8> = [0u8, 255, 0, 255, 0].iter().flat_map(|&v| texel(v)).collect();
+		let mut image = rgba_image(5, 1, row);
+		crate::generate_mips_client(&mut image);
+		assert_eq!(image.levels[1], [texel(191), texel(191)].concat());
+		assert_eq!(image.levels.len(), 3);
+
+		// 1 x 3 is halved down: the middle texel; then the chain ends at 1 x 1 whatever the sides
+		let mut image = rgba_image(1, 3, [texel(10), texel(20), texel(30)].concat());
+		crate::generate_mips_client(&mut image);
+		assert_eq!(image.levels[1], texel(20));
+		for (width, height) in [(255u32, 255u32), (473, 287), (7, 1), (64, 4)] {
+			let mut image = rgba_image(width, height, vec![200; (width * height * 4) as usize]);
+			crate::generate_mips_client(&mut image);
+			assert_eq!(image.levels.len() as u32, layout::full_chain_len(width, height, 1), "{width} x {height}");
+			assert!(image.levels.iter().all(|l| l.iter().all(|&v| v == 200)), "{width} x {height}");
+			assert_eq!(image.levels.last().unwrap().len(), 4);
+		}
 	}
 
 	#[test]

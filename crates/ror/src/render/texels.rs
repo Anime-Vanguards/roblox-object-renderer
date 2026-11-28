@@ -217,23 +217,29 @@ impl super::Renderer {
 				Ok(image) => Ok(image),
 				// an image asset without a transcode (or none yet) draws its upload; TexturePack layers
 				// are only keyed once they loaded (Renderer::pack_layers)
-				Err(_) if layer == ror_assets::Transcode::Image => self.source_image(asset, usage),
+				Err(_) if layer == ror_assets::Transcode::Image => self.source_image(asset, usage, false),
 				Err(error) => Err(error),
 			},
-			None => self.source_image(uri, usage),
+			// an asset drawn by its own URI, not as an image transcode, stands in for a TexturePack's
+			// layer (a MaterialVariant's map no pack lists: Studio makes a pack of it, render::materials)
+			None => self.source_image(uri, usage, matches!(ror_assets::ContentId::parse(uri), Ok(ror_assets::ContentId::Asset { .. }))),
 		}
 	}
 
-	/// The uploaded image (PNG, JPEG, DDS, ...) with ror's own mips.
-	fn source_image(&self, uri: &str, usage: TextureUse) -> Result<ror_image::Image> {
+	/// The uploaded image (PNG, JPEG, DDS, ...) with ror's own mips: colour as a Roblox client builds an
+	/// image file's mips, on the stored values with the colour under transparent texels averaged in (an
+	/// image transcode's are box-filtered on them too; notes/image.md "Mips a Roblox client builds"),
+	/// or, standing in for a TexturePack's colour layer (`pack_layer`), in linear light with a tent as
+	/// Roblox's transcoder builds those (organic-sun's Slate and Sandstone maps from their PNGs: 76 / 79 %
+	/// of pixels within 2 of Studio's this way, 64 / 68 % with the image file's chain); data mips with a
+	/// box, normal maps' as averaged and renormalised normals (normal_mips).
+	fn source_image(&self, uri: &str, usage: TextureUse, pack_layer: bool) -> Result<ror_image::Image> {
 		let fetched = self.assets.fetch(uri).map_err(|error| anyhow::anyhow!("{error}"))?;
 		let mut image = ror_image::decode(&fetched.bytes).map_err(|error| anyhow::anyhow!("{uri}: {error}"))?;
 		if image.format == ror_image::PixelFormat::Rgba8 && image.levels.len() <= 1 {
-			// Roblox builds colour mips in linear light with a tent filter, data mips with a box
-			// (notes/image.md "Mips"), normal maps' as averaged and renormalised normals
-			// (normal_mips)
 			match usage {
-				TextureUse::Color => ror_image::generate_mips_with(&mut image, ror_image::MipFilter::Triangle, true),
+				TextureUse::Color if pack_layer => ror_image::generate_mips_with(&mut image, ror_image::MipFilter::Triangle, true),
+				TextureUse::Color => ror_image::generate_mips_client(&mut image),
 				TextureUse::Normal => normal_mips(&mut image),
 				TextureUse::Data | TextureUse::Scalar => ror_image::generate_mips(&mut image),
 			}

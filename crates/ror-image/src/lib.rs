@@ -318,6 +318,19 @@ pub fn generate_mips_srgb(image: &mut Image) {
 	mips::generate(image, MipFilter::Box, mips::Space::Linear);
 }
 
+/// Replaces the mip chain of an RGBA8 image with the one a Roblox client builds for an image file it
+/// loads itself (a local content file; an upload has the transcoder's mips): on the stored values, every
+/// channel alike (the colour under transparent texels averaged in as it is), each level from the one
+/// before. A level whose sides are both even averages texel pairs rounding half up, across, then down; one
+/// with an odd side takes a 2-tap filter down, then across, output texel k of an odd side n reading
+/// (k + 1/2) s - 1/2 with s = n / (n / 2) in 16.16 fixed point, an 8-bit floored weight and a floored blend
+/// (an even side there averages pairs rounding down). Read texel by texel from a Roblox client (0.747) drawing
+/// 256- and 255-texel images as particles at each level's own size (`fixtures/texture-mips.luau`). Volumes
+/// take [`generate_mips`].
+pub fn generate_mips_client(image: &mut Image) {
+	mips::generate_client(image);
+}
+
 /// Mip chain with a chosen kernel, in linear light (`linear_light`: RGB decoded from sRGB) or on
 /// the stored values.
 ///
