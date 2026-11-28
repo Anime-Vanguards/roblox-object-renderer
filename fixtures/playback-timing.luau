@@ -35,6 +35,14 @@
 -- "alive" (x 8000, seen from -Z): Rate 60 emitters of 0.15-stud squares leaving up at 30 studs a second,
 --   Lifetimes 0.05, 0.1, 0.0667, 0.04, 0.075 and 0.125 s (3, 6, 4, 2.4, 4.5 and 7.5 frames at 60 a second),
 --   `alive-<n>`, running.
+-- "random" (x 9000, seen from -Z at 40 studs): a 16 x 8 grid, 2 studs apart, of unblended Random flipbooks of
+--   `Context.SheetTexture` (Size 0.6, Rate 0, never moving), `random-<n>` row by row from the top left
+--   (seen from -Z, +X to the left), and `random-mover` 12 studs under the middle. A job sets each half's
+--   FlipbookFramerate, layout (`Context.Sheet2Texture`, `Context.Sheet8Texture` for 2 x 2 and 8 x 8) and
+--   Lifetime, has each cell of a half emit one particle so that the cells hold ages 0-63 frames when it
+--   freezes them (TimeScale 0), and advances a half's particles' places in their emitters first (Emit
+--   then Clear); `random-mover`'s attachment moved cell to cell lays one emitter's particles 0-63 over
+--   the left half.
 -- "parentout" (x 7000, seen from -Z): Rate 10 emitters of 0.3-stud squares leaving up at 30 studs a second,
 --   switched off in the file: `po-ref` (a job switches it on), `po-out-back` (switched on, then parented
 --   out of the world and back), `po-emit-out` (Rate 0: emitted while out of the world), `po-model` (its
@@ -264,6 +272,27 @@ return function(Context)
 			local E = Emitter(Anchor(Model, `alive-{Index}-anchor`, Center + Vector3.new((Index - 2) * 2, 0, 0)), `alive-{Index}`, { Size = Constant(0.15), Speed = NumberRange.new(30, 30), Lifetime = NumberRange.new(Life, Life) })
 			E.Rate = 60
 		end
+	end
+
+	-- random: unblended Random sheets a job freezes at whole frames of age, by framerate and particle
+	do
+		local Center = Vector3.new(9000, 0, 0)
+		local Model = Group("random", Center, { eye = { 9000, 0, -40 }, target = { 9000, 0, 0 }, fov = 40 })
+		Block(Model, "Backdrop", CFrame.new(Center + Vector3.new(0, 0, 30)), Vector3.new(200, 120, 1), Color3.new(0, 0, 0), Enum.Material.Neon)
+		local Sheet = {
+			Size = Constant(0.6),
+			Lifetime = NumberRange.new(5, 5),
+			Texture = Context.SheetTexture or SQUARE,
+			FlipbookLayout = Enum.ParticleFlipbookLayout.Grid4x4,
+			FlipbookMode = Enum.ParticleFlipbookMode.Random,
+			FlipbookFramerate = NumberRange.new(60, 60),
+			FlipbookBlendFrames = false,
+		}
+		for Index = 1, 128 do
+			local Column, Row = (Index - 1) % 16, (Index - 1) // 16
+			Emitter(Anchor(Model, `random-{Index}-anchor`, Center + Vector3.new((7.5 - Column) * 2, (3.5 - Row) * 2, 0)), `random-{Index}`, Sheet)
+		end
+		Emitter(Anchor(Model, "random-mover-anchor", Center + Vector3.new(0, -12, 0)), "random-mover", Sheet)
 	end
 
 	-- parentout: emitters a job parents out of the world and back

@@ -316,6 +316,9 @@ pub struct Birth {
 	pub cframe: Affine3A,
 	pub velocity: Vec3,
 	pub stream: u64,
+	/// Its place among the emitter's spawns, from 0: Emit's and Rate's alike in time order, a frame's
+	/// bursts before its Rate spawns (a Random flipbook's frames follow it: render::particles::flipbook).
+	pub index: u64,
 	/// The emitting part's size then (its shape's volume; a tweened Size changes it).
 	pub size: Vec3,
 	/// A LockedToPart particle's frame now when not the emitter's: where the emitter was as physics
@@ -1752,6 +1755,8 @@ struct RateBirth {
 /// only across newly-reached grid frames `index..frames.len()`.
 #[derive(Clone)]
 struct RateScan {
+	/// The Rate spawns before each burst (in the timeline's emits' order) the scan has passed.
+	burst_rates: Vec<u64>,
 	time: f32,
 	rate: f32,
 	longest: f32,
@@ -3300,6 +3305,15 @@ impl Resolved<'_> {
 			let spawn_now = timeline.spawn_time(start, time);
 			let cleared = timeline.last_clear(time).unwrap_or(f32::NEG_INFINITY);
 			let mut births = Vec::new();
+			// each particle's place among the emitter's spawns: the burst particles before a burst, and (once
+			// Rate's scan has passed it) the Rate spawns before it
+			let per_burst = emitter.emit_count.unwrap_or(1) as u64;
+			let mut bursts_before = Vec::with_capacity(timeline.emits.len() + 1);
+			bursts_before.push(0u64);
+			for emitted in &timeline.emits {
+				bursts_before.push(bursts_before[bursts_before.len() - 1] + emitted.count as u64 * per_burst);
+			}
+			let mut burst_births: Vec<(usize, usize)> = Vec::new();
 			for (burst, emitted) in timeline.emits.iter().enumerate() {
 				let (at, count) = (emitted.at, emitted.count);
 				if at > time + 1e-6 || at < cleared {
@@ -3313,7 +3327,8 @@ impl Resolved<'_> {
 				let cframe = frame_at(at);
 				let (velocity, size) = (velocity_at(at), size_at(at));
 				for index in 0..count * emitter.emit_count.unwrap_or(1) {
-					births.push(Birth { age, lived, cframe, velocity, stream: (1 << 40) + ((burst as u64) << 20) + index as u64, size, follow: follow_of(at) });
+					burst_births.push((births.len(), burst));
+					births.push(Birth { age, lived, cframe, velocity, stream: (1 << 40) + ((burst as u64) << 20) + index as u64, index: bursts_before[burst] + index as u64, size, follow: follow_of(at) });
 				}
 			}
 			// Rate: Studio's per-frame accumulator, in step across emitters (particle-emission rate,
@@ -3352,10 +3367,12 @@ impl Resolved<'_> {
 				} else {
 					None
 				};
-				let (mut accumulated, mut deferred, mut on, mut previous, mut stream, mut live, mut index) = match resume {
-					Some(scan) => (scan.accumulated, scan.deferred, scan.on, scan.previous, scan.stream, scan.live, scan.index),
-					None => (0.0f64, 0.0f64, false, None, 0u64, std::collections::VecDeque::new(), 0usize),
+				let (mut accumulated, mut deferred, mut on, mut previous, mut stream, mut live, mut index, mut burst_rates) = match resume {
+					Some(scan) => (scan.accumulated, scan.deferred, scan.on, scan.previous, scan.stream, scan.live, scan.index, scan.burst_rates),
+					None => (0.0f64, 0.0f64, false, None, 0u64, std::collections::VecDeque::new(), 0usize, Vec::new()),
 				};
+				// the bursts at or before a frame come before its Rate spawns
+				let through = |frame: f32| bursts_before[timeline.emits.partition_point(|emitted| emitted.at <= frame + 1e-6)];
 				let rate = f64::from(emitter.rate);
 				while live.front().is_some_and(|birth| birth.frame < cleared || (now - birth.pt).max(0.0) > longest) {
 					live.pop_front();
@@ -3366,6 +3383,9 @@ impl Resolved<'_> {
 				let frame_count = self.frames.len();
 				while index < frame_count {
 					let frame = self.frames[index];
+					while burst_rates.len() < timeline.emits.len() && timeline.emits[burst_rates.len()].at <= frame + 1e-6 {
+						burst_rates.push(stream);
+					}
 					let enabled = timeline.enabled_at(frame);
 					// Contiguous disabled span: neither `on` nor `enabled` produces births or mutates
 					// accumulator state; jump straight to the next enable event while keeping the exact
@@ -3418,6 +3438,7 @@ impl Resolved<'_> {
 											cframe: frame_at(frame),
 											velocity: velocity_at(frame),
 											stream,
+											index: stream - 1 + through(frame),
 											size: size_at(frame),
 											follow: follow_of(frame),
 										});
@@ -3456,11 +3477,16 @@ impl Resolved<'_> {
 							cframe: frame_at(birth.frame),
 							velocity: velocity_at(birth.frame),
 							stream: birth.stream,
+							index: birth.stream - 1 + through(birth.frame),
 							size: size_at(birth.frame),
 							follow: follow_of(birth.frame),
 						});
 					}
-					self.scans.lock().insert(scan_key, RateScan { time, rate: emitter.rate, longest, index: frame_count, accumulated, deferred, on, previous, stream, live, capped });
+					self.scans.lock().insert(scan_key, RateScan { burst_rates: burst_rates.clone(), time, rate: emitter.rate, longest, index: frame_count, accumulated, deferred, on, previous, stream, live, capped });
+				}
+				// a burst the scan has not reached comes after every Rate spawn so far
+				for (at_birth, burst) in burst_births.drain(..) {
+					births[at_birth].index += burst_rates.get(burst).copied().unwrap_or(stream);
 				}
 				if substeps > 0 {
 					particle_substeps.fetch_add(substeps, std::sync::atomic::Ordering::Relaxed);

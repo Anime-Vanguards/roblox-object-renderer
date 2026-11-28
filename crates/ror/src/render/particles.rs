@@ -37,13 +37,34 @@ const MAX_PARTICLES: usize = 4096;
 /// at 1.8e-5 to 2.8e-5 studs a second that the client never draws, and ror drew them.
 const SLOWEST_ORIENTED: f32 = 1e-4;
 
-/// Random flipbooks step at floor(age · FlipbookFramerate + this) (particle-flipbook-clock half: a
-/// Loop grid beside the Random one pins the age at 0.4902-0.4906 s, where every Random cell fits a
-/// phase of 0.42-0.45 and none fits floor + 1 or rounding: framerates 46-52 would step at 0.5. With
-/// ror's own ages, the 256 Random cells of particle-flipbook-clock and particle-random-frames show
-/// Studio's frame at 230 / 239 / 250 / 250 / 249 / 246 / 236 of 256 for phases 0.28 / 0.32 / 0.36 /
-/// 0.38 / 0.40 / 0.43 / 0.5, 200 for floor + 1).
-const RANDOM_PHASE: f32 = 0.38;
+/// A Random flipbook's phase for each of an emitter's first 128 particles, in 120ths of a step (its
+/// particle `index`: [`flipbook`]): a Roblox client steps particle `index` at floor(age · FlipbookFramerate
+/// + phase), the phase the same for that index in every emitter and session (0.747 on the sim's exact
+/// 60-frames-a-second clock, `fixtures/playback-timing.luau` "random": 64 emitters at once per index,
+/// framerate 1, each index in two sessions alike to the 60th of a step; a held-out session of fresh
+/// emitters and other indices alike). No generator of them was found (xorshift and sine hashes,
+/// mt19937, minstd, PCG streams): the middles of the measured 60ths are kept, and 0 where a particle
+/// stepped as if its phase were none (indices 9, 11 and 118: a step at a whole frame shows the step
+/// before, as an unblended Loop's does). Past them the phase is the particle's own random draw.
+const RANDOM_PHASES: [u8; 128] = [
+	51, 97, 35, 13, 71, 117, 53, 17, 75, 0, 57, 0, 57, 115, 51, 3, //
+	61, 119, 55, 23, 79, 17, 75, 27, 83, 21, 79, 79, 9, 73, 3, 81, //
+	13, 77, 7, 101, 33, 95, 27, 105, 37, 99, 31, 53, 113, 47, 107, 87, //
+	27, 81, 21, 1, 61, 117, 55, 37, 95, 31, 89, 9, 67, 3, 61, 43, //
+	101, 39, 95, 79, 15, 73, 9, 113, 49, 107, 43, 23, 79, 21, 79, 57, //
+	115, 55, 113, 91, 29, 89, 27, 5, 63, 3, 61, 101, 33, 99, 31, 15, //
+	67, 13, 65, 49, 101, 47, 99, 83, 15, 81, 13, 9, 69, 113, 51, 21, //
+	79, 3, 63, 79, 17, 61, 0, 89, 29, 73, 11, 85, 23, 69, 5, 97, //
+];
+
+/// Marsaglia's xorshift32 (shifts 13, 17, 5): a Random flipbook's frame is this of its particle's key
+/// ([`flipbook`]) modulo the frame count.
+fn xorshift32(mut x: u32) -> u32 {
+	x ^= x << 13;
+	x ^= x >> 17;
+	x ^= x << 5;
+	x
+}
 
 /// Seconds within which a particle's age counts as reaching its Lifetime ([`particle`]): f32 frame times
 /// land a few microseconds either side of a whole frame, and a client's 0.0667 s Lifetime ends at 4 frames
@@ -360,8 +381,9 @@ fn motion(start: Vec3, velocity: Vec3, acceleration: Vec3, drag: f32, wind: Vec3
 	(position, wind + terminal + (velocity - wind - terminal) * decay)
 }
 
-/// The flipbook frame at `age` (of `lifetime`), the next one and the blend towards it.
-fn flipbook(emitter: &ParticleEmitter, age: f32, lifetime: f32, rng: &mut Rng) -> (u32, u32, f32) {
+/// The flipbook frame at `age` (of `lifetime`) of an emitter's particle `index` (its place among the
+/// emitter's spawns, from 0: a Random sheet's frames follow it), the next one and the blend towards it.
+fn flipbook(emitter: &ParticleEmitter, age: f32, lifetime: f32, index: u64, rng: &mut Rng) -> (u32, u32, f32) {
 	let (columns, rows) = emitter.flipbook_grid();
 	let count = (columns * rows).max(1);
 	let framerate = rng.range(emitter.flipbook_framerate).max(0.0);
@@ -405,17 +427,29 @@ fn flipbook(emitter: &ParticleEmitter, age: f32, lifetime: f32, rng: &mut Rng) -
 			let next = if step + 1 < count { step + 1 } else { period - (step + 1) % period };
 			(frame, next.min(count - 1), position.fract())
 		}
-		// Random: not random. Step n = floor(age · framerate + RANDOM_PHASE) shows frame (n mod count)
-		// xor (n / count mod count), the same for every particle of that age, from a random step with
-		// FlipbookStartRandom (particle-random-frames: 4 x 4 swirl particles at framerates 1 to 64
-		// frozen near 1 s show frames 1-15, then 16-31 with the last bit flipped, 32-47 xor 2, 48-63
-		// xor 3, all 64 of two captures; particle-flipbook-random random: 64 emitters alike)
+		// Random: not random. A client keys particle `index`'s step n = floor(age · framerate + phase)
+		// as (index << 16) + n and shows xorshift32(key) mod count (fixtures/playback-timing.luau
+		// "random", 0.747 on the sim's exact clock: 4 x 4, 2 x 2 and 8 x 8 sheets at framerates 1 to 120
+		// frozen 0-63 frames old, 64 emitters a capture, indices 0-127, 1000-1003; two sessions alike cell
+		// for cell, 0 of 1,546 apart; a held-out session of fresh emitters fits as well). Masked to four
+		// bits that is (n mod 16) xor (n / 16 mod 16) xor (index / 2 mod 16): an emitter's first particle
+		// runs 0, 1, 2, 3... as Studio's swirl frames near 1 s did (particle-random-frames), its later
+		// ones another order (the twelfth 0, 1, 3, 2, 6, 7, 5, 4, 12, 12, 15, 15 at 0-11 frames). The
+		// phase is the same for an index in every emitter ([`RANDOM_PHASES`]); with
+		// FlipbookStartRandom from a random step (its form not measured)
 		3 => {
-			let position = age * framerate + RANDOM_PHASE;
-			let step = position.floor() as u64 + start as u64;
-			let count = count as u64;
-			let pick = |n: u64| ((n % count) ^ (n / count % count)) as u32 % count as u32;
-			(pick(step), pick(step + 1), position.fract())
+			let phase = match RANDOM_PHASES.get(index as usize) {
+				Some(&sixtieths) => sixtieths as f32 / 120.0,
+				None => rng.unit(),
+			};
+			let position = age * framerate + phase;
+			// a step reached exactly shows the one before, as a Loop's frame does (phase 0: indices 9 and
+			// 11 at 60 frames a second step a frame late), but none before the first (index 118 at age 0)
+			let reached = if emitter.flipbook_blend_frames { position } else { (position - FRAME_REACHED).max(0.0) };
+			let step = (reached.floor() as i64).wrapping_add(start as i64);
+			let key = ((index as u32) << 16).wrapping_add(step as u32);
+			let pick = |key: u32| xorshift32(key) % count;
+			(pick(key), pick(key.wrapping_add(1)), position.fract())
 		}
 		// Loop; unblended, a frame reached exactly shows the one before (fixtures/playback-timing.luau
 		// "edges", a 0.747 client on its exact 60-frames-a-second clock, two sessions: 4 x 4 sheets at 30,
@@ -445,7 +479,7 @@ fn flipbook(emitter: &ParticleEmitter, age: f32, lifetime: f32, rng: &mut Rng) -
 /// freezing frame's step counts for dying, not ageing, and a spawning clock exactly at the Lifetime keeps
 /// the particle: sheets of 3 and 6 frames' Lifetime frozen 3 and 6 frames after their emission still
 /// draw, 2 and 5 frames old ("edges"; ror dropped the 3-frame one, its lived time a hair over 0.05 s).
-fn particle(emitter: &ParticleEmitter, frame: &glam::Affine3A, size: Vec3, inherited: Vec3, age: f32, lived: f32, rng: &mut Rng) -> Option<Particle> {
+fn particle(emitter: &ParticleEmitter, frame: &glam::Affine3A, size: Vec3, inherited: Vec3, age: f32, lived: f32, index: u64, rng: &mut Rng) -> Option<Particle> {
 	let lifetime = rng.range(emitter.lifetime);
 	if lifetime <= 0.0 || age >= lifetime - AGE_EDGE || lived > lifetime + LIFE_EDGE {
 		return None;
@@ -492,7 +526,7 @@ fn particle(emitter: &ParticleEmitter, frame: &glam::Affine3A, size: Vec3, inher
 	let transparency_offsets = offsets(&emitter.transparency, 0.0, 1.0);
 	let squash_offsets = offsets(&emitter.squash, f32::NEG_INFINITY, f32::INFINITY);
 	let life = (age / lifetime).clamp(0.0, 1.0);
-	let frames = flipbook(emitter, age, lifetime, rng);
+	let frames = flipbook(emitter, age, lifetime, index, rng);
 	// sequences sampled at 32 points (k / 31) and interpolated, as for beams (particle-age: a Size
 	// peak at half life shows 2.95 of 3 studs, 2.94 predicted)
 	let sampled = |at: &dyn Fn(f32) -> f32| {
@@ -560,7 +594,7 @@ pub fn simulate(emitter: &ParticleEmitter) -> Vec<Particle> {
 			let mut rng = Rng::new(emitter.seed, birth.stream);
 			// a part moved by its CFrame lends its particles no velocity, whatever VelocityInheritance
 			// (particle-moving inherit: the same still line as without it)
-			let Some(mut particle) = particle(emitter, &birth.cframe, birth.size, Vec3::ZERO, birth.age, birth.lived, &mut rng) else {
+			let Some(mut particle) = particle(emitter, &birth.cframe, birth.size, Vec3::ZERO, birth.age, birth.lived, birth.index, &mut rng) else {
 				continue;
 			};
 			// a burst's streams start at 2^40 (scene::playback), Rate's count up from 1
@@ -580,11 +614,20 @@ pub fn simulate(emitter: &ParticleEmitter) -> Vec<Particle> {
 		particles.sort_by(|a, b| b.age.total_cmp(&a.age));
 		return particles;
 	}
+	// each burst's particles' places among the emitter's spawns, the oldest burst's first
+	let mut oldest_first: Vec<usize> = (0..emitter.bursts.len()).collect();
+	oldest_first.sort_by(|&a, &b| emitter.bursts[b].0.total_cmp(&emitter.bursts[a].0));
+	let mut first_index = vec![0u64; emitter.bursts.len()];
+	let mut spawned = 0u64;
+	for burst in oldest_first {
+		first_index[burst] = spawned;
+		spawned += emitter.bursts[burst].1 as u64;
+	}
 	for (burst, &(age, count)) in emitter.bursts.iter().enumerate() {
 		for index in 0..count {
 			let stream = (1 << 40) + ((burst as u64) << 20) + index as u64;
 			let mut rng = Rng::new(emitter.seed, stream);
-			if let Some(particle) = particle(emitter, &emitter.cframe, emitter.size, Vec3::ZERO, age, age, &mut rng) {
+			if let Some(particle) = particle(emitter, &emitter.cframe, emitter.size, Vec3::ZERO, age, age, first_index[burst] + index as u64, &mut rng) {
 				particles.push(Particle { stream, ..particle });
 			}
 		}
@@ -599,7 +642,8 @@ pub fn simulate(emitter: &ParticleEmitter) -> Vec<Particle> {
 				break;
 			}
 			let mut rng = Rng::new(emitter.seed, index + 1);
-			if let Some(particle) = particle(emitter, &emitter.cframe, emitter.size, Vec3::ZERO, age, age, &mut rng) {
+			// (a steady emitter's history is not known: its particles counted from the youngest)
+			if let Some(particle) = particle(emitter, &emitter.cframe, emitter.size, Vec3::ZERO, age, age, index, &mut rng) {
 				particles.push(Particle { rate: true, stream: index + 1, ..particle });
 			}
 			index += 1;
@@ -1568,12 +1612,12 @@ mod tests {
 		// OneShot: the 16 frames of a 4 x 4 sheet over the lifetime
 		let emitter = ParticleEmitter { flipbook_layout: 2, flipbook_mode: 1, flipbook_blend_frames: false, ..emitter() };
 		let mut rng = Rng::new(1, 1);
-		assert_eq!(flipbook(&emitter, 0.0, 16.0, &mut rng).0, 0);
-		assert_eq!(flipbook(&emitter, 5.5, 16.0, &mut rng).0, 5);
-		assert_eq!(flipbook(&emitter, 16.0, 16.0, &mut rng).0, 15);
+		assert_eq!(flipbook(&emitter, 0.0, 16.0, 0, &mut rng).0, 0);
+		assert_eq!(flipbook(&emitter, 5.5, 16.0, 0, &mut rng).0, 5);
+		assert_eq!(flipbook(&emitter, 16.0, 16.0, 0, &mut rng).0, 15);
 		// Loop at 2 frames a second wraps after 8 seconds
 		let looping = ParticleEmitter { flipbook_mode: 0, flipbook_framerate: (2.0, 2.0), ..emitter };
-		assert_eq!(flipbook(&looping, 8.75, 100.0, &mut rng).0, 1);
+		assert_eq!(flipbook(&looping, 8.75, 100.0, 0, &mut rng).0, 1);
 	}
 
 	/// Unblended, Loop and PingPong sheets show the frame before at a whole frame, as OneShot ones do: a
@@ -1586,12 +1630,12 @@ mod tests {
 		// (mode, framerate, frames of age, the client's frame); Loop 0, PingPong 2
 		let cases = [(0, 30.0, 1, 0), (0, 30.0, 2, 0), (0, 30.0, 3, 1), (0, 30.0, 4, 1), (0, 40.0, 2, 1), (0, 40.0, 3, 1), (0, 40.0, 9, 5), (0, 40.0, 11, 7), (0, 60.0, 1, 0), (0, 60.0, 8, 7), (0, 120.0, 8, 15), (0, 120.0, 9, 1), (2, 30.0, 4, 1), (2, 60.0, 11, 10), (2, 120.0, 8, 15), (2, 120.0, 9, 13), (2, 120.0, 11, 9)];
 		for (mode, framerate, frames, client) in cases {
-			let (frame, _, blend) = flipbook(&sheet(mode, framerate), frames as f32 / 60.0, 5.0, &mut rng);
+			let (frame, _, blend) = flipbook(&sheet(mode, framerate), frames as f32 / 60.0, 5.0, 0, &mut rng);
 			assert_eq!((frame, blend), (client, 0.0), "mode {mode} at {framerate} frames a second, {frames} frames old");
 		}
 		// cross-faded, a whole frame shows itself
 		let blended = ParticleEmitter { flipbook_blend_frames: true, ..sheet(0, 60.0) };
-		assert_eq!(flipbook(&blended, 8.0 / 60.0, 5.0, &mut rng).0, 8);
+		assert_eq!(flipbook(&blended, 8.0 / 60.0, 5.0, 0, &mut rng).0, 8);
 	}
 
 	/// Cross-faded, a OneShot sheet runs to its last frame at the end of the life: 15 · age / Lifetime on
@@ -1605,23 +1649,23 @@ mod tests {
 		for (layout, count) in [(1u32, 4.0f32), (2, 16.0), (3, 64.0)] {
 			let blended = ParticleEmitter { flipbook_layout: layout, flipbook_mode: 1, flipbook_blend_frames: true, ..emitter() };
 			for life in [0.1f32, 0.3, 0.55, 0.9] {
-				let (frame, next, blend) = flipbook(&blended, life * 0.15, 0.15, &mut rng);
+				let (frame, next, blend) = flipbook(&blended, life * 0.15, 0.15, 0, &mut rng);
 				let position = (count - 1.0) * life;
 				assert_eq!(frame, position.floor() as u32, "{count} frames at {life}");
 				assert_eq!(next, frame + 1);
 				assert!((blend - position.fract()).abs() < 1e-4, "{count} frames at {life}: blend {blend}");
 			}
 			// the last frame whole at the end of the life
-			let (frame, _, blend) = flipbook(&blended, 0.15, 0.15, &mut rng);
+			let (frame, _, blend) = flipbook(&blended, 0.15, 0.15, 0, &mut rng);
 			assert_eq!((frame, blend), (count as u32 - 1, 0.0));
 		}
 		// unblended, each frame keeps a sixteenth of the life, the one before at a whole frame (an age of 3
 		// frames at Lifetime 0.1 s, as the client was frozen at)
 		let unblended = ParticleEmitter { flipbook_layout: 2, flipbook_mode: 1, flipbook_blend_frames: false, ..emitter() };
-		assert_eq!(flipbook(&unblended, 0.55 * 0.15, 0.15, &mut rng), (8, 9, 0.0));
-		assert_eq!(flipbook(&unblended, 3.0 / 60.0, 0.1, &mut rng), (7, 8, 0.0));
-		assert_eq!(flipbook(&unblended, 2.0 / 60.0, 0.1, &mut rng), (5, 6, 0.0));
-		assert_eq!(flipbook(&unblended, 0.0, 0.1, &mut rng), (0, 1, 0.0));
+		assert_eq!(flipbook(&unblended, 0.55 * 0.15, 0.15, 0, &mut rng), (8, 9, 0.0));
+		assert_eq!(flipbook(&unblended, 3.0 / 60.0, 0.1, 0, &mut rng), (7, 8, 0.0));
+		assert_eq!(flipbook(&unblended, 2.0 / 60.0, 0.1, 0, &mut rng), (5, 6, 0.0));
+		assert_eq!(flipbook(&unblended, 0.0, 0.1, 0, &mut rng), (0, 1, 0.0));
 		// from a random first frame s, s + (15 - s) · age / Lifetime
 		let random = ParticleEmitter { flipbook_layout: 2, flipbook_mode: 1, flipbook_blend_frames: true, flipbook_start_random: true, ..emitter() };
 		for stream in 0..16 {
@@ -1630,10 +1674,49 @@ mod tests {
 				rng.range(random.flipbook_framerate);
 				(rng.unit() * 16.0).floor()
 			};
-			let (frame, _, blend) = flipbook(&random, 0.5 * 0.15, 0.15, &mut Rng::new(7, stream));
+			let (frame, _, blend) = flipbook(&random, 0.5 * 0.15, 0.15, 0, &mut Rng::new(7, stream));
 			let position = start + (15.0 - start) * 0.5;
 			assert_eq!(frame, position.floor() as u32);
 			assert!((blend - position.fract()).abs() < 1e-4);
+		}
+	}
+
+	/// A Random sheet's frames by particle: xorshift32((index << 16) + step) mod count, the step at the
+	/// index's measured phase (a Roblox client's sheets frozen 0-63 frames old on its 60-frames-a-second
+	/// clock, fixtures/playback-timing.luau "random": each row one capture half, 64 emitters' particles of
+	/// that index; two sessions alike)
+	#[test]
+	fn random_sheets_follow_each_particles_place_in_its_emitter() {
+		// (index, layout: 1 = 2 x 2, 2 = 4 x 4, 3 = 8 x 8, framerate, the client's frames at 0, 1, 2... frames old)
+		let phase_zero: Vec<u32> = [vec![11; 61], vec![10; 3]].concat();
+		let cases: [(u64, u32, f32, &[u32]); 15] = [
+			(118, 2, 1.0, &phase_zero),
+			(0, 2, 60.0, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14, 2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13, 3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12]),
+			(0, 2, 30.0, &[0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15, 1, 1, 0, 0, 3, 3, 2, 2]),
+			(11, 2, 60.0, &[5, 5, 4, 7, 6, 1, 0, 3, 2, 13, 12, 15, 14, 9, 8, 11, 10, 4, 5, 6, 7, 0, 1, 2, 3, 12, 13, 14, 15, 8, 9, 10, 11, 7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 6, 7, 4, 5, 2, 3, 0, 1, 14, 15, 12, 13, 10, 11, 8]),
+			(12, 2, 30.0, &[6, 6, 7, 7, 4, 4, 5, 5, 2, 2, 3, 3, 0, 0, 1, 1, 14, 14, 15, 15, 12, 12, 13, 13, 10, 10, 11, 11, 8, 8, 9, 9, 7, 7, 6, 6]),
+			(7, 3, 60.0, &[35, 2, 33, 0, 39, 6, 37, 4, 43, 10, 41, 8, 47, 14, 45, 12, 18, 51, 16, 49, 22, 55, 20, 53, 26, 59, 24, 57, 30, 63, 28, 61, 1, 32, 3, 34, 5, 36, 7, 38, 9, 40, 11, 42, 13, 44, 15, 46, 48, 17, 50, 19, 52, 21, 54, 23, 56, 25, 58, 27, 60, 29, 62, 31]),
+			(7, 1, 60.0, &[3, 2, 1, 0, 3, 2, 1, 0, 3, 2, 1, 0, 3, 2, 1, 0, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 1, 0, 3, 2]),
+			(2, 2, 120.0, &[1, 3, 5, 7, 9, 11, 13, 15, 0, 2, 4, 6, 8, 10, 12, 14, 3, 1, 7, 5, 11, 9, 15, 13, 2, 0, 6, 4, 10, 8, 14, 12]),
+			(2, 2, 7.5, &[1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 5, 5, 5, 5, 5, 5, 5, 5, 4, 4]),
+			(30, 3, 30.0, &[47, 47, 14, 14, 45, 45, 12, 12, 43, 43, 10, 10, 41, 41, 8, 8, 39, 39, 6, 6, 37, 37, 4, 4, 35, 35, 2, 2, 33, 33, 0, 0, 30, 30, 63, 63]),
+			(31, 1, 12.0, &[3, 3, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 1, 1, 1]),
+			(56, 2, 7.5, &[12, 12, 13, 13, 13, 13, 13, 13, 13, 13, 14, 14, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15, 8, 8, 8, 8]),
+			(57, 2, 60.0, &[12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3, 13, 12, 15, 14, 9, 8, 11, 10, 5, 4, 7, 6, 1, 0, 3, 2]),
+			(103, 2, 90.0, &[3, 1, 0, 6, 5, 11, 10, 8, 15, 13, 12, 3, 0, 6, 7, 5, 10, 8, 9, 15, 12, 1, 0, 2, 5, 7, 6, 8, 11, 13, 12, 14]),
+			(102, 3, 20.0, &[19, 50, 50, 50, 17, 17, 17, 48, 48, 48, 23, 23, 23, 54, 54, 54, 21, 21, 21, 52, 52, 52, 27, 27, 27, 58, 58, 58]),
+		];
+		for (index, layout, framerate, client) in cases {
+			let sheet = ParticleEmitter { flipbook_layout: layout, flipbook_mode: 3, flipbook_blend_frames: false, flipbook_framerate: (framerate, framerate), lifetime: (5.0, 5.0), ..emitter() };
+			let drawn: Vec<u32> = (0..client.len()).map(|frames| flipbook(&sheet, frames as f32 / 60.0, 5.0, index, &mut Rng::new(1, 1)).0).collect();
+			assert_eq!(drawn, client, "particle {index} of a {layout} sheet at {framerate} frames a second");
+		}
+		// an emitter's twelfth particle twelve frames old, and so on (P25's coded sheets: one emitter caught
+		// at 0-11 frames, a particle each): 0, 1, 3, 2, 6, 7, 5, 4, 12, 12, 15, 15 at 60, 0, 1, 0, 0, 0, 1, 0... at 30
+		for (framerate, client) in [(60.0, [0, 1, 3, 2, 6, 7, 5, 4, 12, 12, 15, 15]), (30.0, [0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0])] {
+			let sheet = ParticleEmitter { flipbook_layout: 2, flipbook_mode: 3, flipbook_blend_frames: false, flipbook_framerate: (framerate, framerate), lifetime: (5.0, 5.0), ..emitter() };
+			let drawn: Vec<u32> = (0..12u64).map(|k| flipbook(&sheet, k as f32 / 60.0, 5.0, k, &mut Rng::new(1, 1)).0).collect();
+			assert_eq!(drawn, client, "{framerate} frames a second");
 		}
 	}
 
@@ -1644,7 +1727,7 @@ mod tests {
 		let angle = |emitter: &ParticleEmitter, age: f32, seed: u64| {
 			let mut rng = Rng::new(seed, 1);
 			let age = age.min(emitter.lifetime.0 - 2.0 * AGE_EDGE);
-			particle(emitter, &glam::Affine3A::IDENTITY, Vec3::ZERO, Vec3::ZERO, age, age, &mut rng).expect("alive").rotation
+			particle(emitter, &glam::Affine3A::IDENTITY, Vec3::ZERO, Vec3::ZERO, age, age, 0, &mut rng).expect("alive").rotation
 		};
 		let fixed = |rotation: f32, rot_speed: f32, lifetime: f32| ParticleEmitter { rotation: (rotation, rotation), rot_speed: (rot_speed, rot_speed), lifetime: (lifetime, lifetime), ..emitter() };
 		let near = |drawn: f32, measured: f32| ((drawn - measured + 180.0).rem_euclid(360.0) - 180.0).abs() < 2.5;
