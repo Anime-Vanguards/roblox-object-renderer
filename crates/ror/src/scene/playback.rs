@@ -541,6 +541,13 @@ fn world_spans(document: &Document, parents: &[(Ref, Vec<(f32, Ref)>)], start: f
 	out
 }
 
+/// Whether a client runs nothing of an instance of `class` out of the world, and starts it afresh back in
+/// ([`Timeline::in_world`]): emitters, trails, beams and the legacy Fire, Smoke and Sparkles (ForceField and
+/// Explosion not measured).
+fn world_runs(class: &str) -> bool {
+	matches!(class, "ParticleEmitter" | "Trail" | "Beam" | "Fire" | "Smoke" | "Sparkles")
+}
+
 fn descendants(document: &Document, referent: Ref) -> Vec<Ref> {
 	let mut list = Vec::new();
 	let mut stack = vec![referent];
@@ -1455,8 +1462,14 @@ impl Timeline {
 	/// clock: a Rate 10 emitter switched on, parented out after 9 frames and in after 21 showed only the
 	/// particle of its seventh frame back, as its switched-on twin's first; one under a Model parented out
 	/// and back alike; three emitted 3 frames after it was parented out, back in 3 frames later, left in
-	/// that frame). Studio recordings hide what is not there with Enabled, so this decides hand-written
-	/// playbacks.
+	/// that frame). Trails, Beams and the legacy Fire, Smoke and Sparkles alike (`fixtures/playback-timing.luau`
+	/// "parentout2", the same client and clock, three sessions; [`world_runs`]): a Trail taken out, or its
+	/// part's Model, keeps nothing of what it left and starts afresh where it is back (one switched off and on
+	/// keeps both pieces); a Beam's TextureSpeed scroll starts again at 0 back in, as a beam switched on does
+	/// (0.387 of its length behind its twin's, which had scrolled for 334 frames: 0.398 by that); a Fire, a
+	/// Smoke and a Sparkles parented out and back hold what their twins switched on that frame hold (light
+	/// 471 / 97 / 261 against 453 / 96 / 254; on throughout 544 / 1,394 / 572). Studio recordings hide what
+	/// is not there with Enabled, so this decides hand-written playbacks.
 	fn in_world(mut self, spans: &[(f32, bool)]) -> Self {
 		let world_at = |t: f32| {
 			let index = spans.partition_point(|(time, _)| *time <= t + 1e-6);
@@ -2588,8 +2601,9 @@ impl Playback {
 		for (_, events) in &mut parents {
 			events.sort_by(|a, b| a.0.total_cmp(&b.0));
 		}
-		// what a Roblox client runs of an emitter the playback takes out of the world and back ([`Timeline::in_world`])
-		for (referent, spans) in world_spans(document, &parents, start, timelines.keys().copied().filter(|&referent| document.dom.get_by_ref(referent).is_some_and(|instance| instance.class == "ParticleEmitter"))) {
+		// what a Roblox client runs of an emitter, a trail, a beam or a legacy effect the playback takes out of
+		// the world and back ([`Timeline::in_world`])
+		for (referent, spans) in world_spans(document, &parents, start, timelines.keys().copied().filter(|&referent| document.dom.get_by_ref(referent).is_some_and(|instance| world_runs(instance.class.as_str())))) {
 			if let Some(timeline) = timelines.get_mut(&referent) {
 				*timeline = std::mem::take(timeline).in_world(&spans).sorted(start);
 			}
@@ -5134,6 +5148,65 @@ mod tests {
 			drawn.sort_unstable();
 			assert_eq!(drawn, ages, "{name}");
 		}
+	}
+
+	/// Trails, Beams and legacy effects parented out of the world and back run as emitters do (a Roblox client on its
+	/// exact 60-frames-a-second clock, fixtures/playback-timing.luau "parentout2"): parts moving along -X at 10
+	/// studs a second from frame 0 to 90, drawn at frame 100; the Trail parented out from frame 30 to 60 keeps only
+	/// what it left from 60 (its twin all of it), the Beam scrolls from 0 again at 60, and the Fire out from 20 to 50
+	/// holds only what it spawned since 50.
+	#[test]
+	fn trails_beams_and_legacy_effects_out_of_the_world_run_nothing() {
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use rbx_dom_weak::InstanceBuilder;
+		use rbx_dom_weak::types::Variant;
+		let mut model = ModelBuilder::new("Fx");
+		for (name, y) in [("Ref", 0.0f32), ("Out", 5.0)] {
+			let part = model.part(&PartSpec { name: format!("{name}Part"), cframe: Affine3A::from_translation(Vec3::new(0.0, y, 0.0)), ..PartSpec::default() });
+			let a0 = model.child(part, InstanceBuilder::new("Attachment").with_name("A0").with_property("CFrame", crate::scene::build::cframe(Affine3A::from_translation(Vec3::new(0.0, 0.5, 0.0)))));
+			let a1 = model.child(part, InstanceBuilder::new("Attachment").with_name("A1").with_property("CFrame", crate::scene::build::cframe(Affine3A::from_translation(Vec3::new(0.0, -0.5, 0.0)))));
+			model.child(part, InstanceBuilder::new("Trail").with_name(format!("{name}Trail")).with_property("Attachment0", Variant::Ref(a0)).with_property("Attachment1", Variant::Ref(a1)).with_property("Lifetime", 10.0f32).with_property("Enabled", true));
+			model.child(part, InstanceBuilder::new("Beam").with_name(format!("{name}Beam")).with_property("Attachment0", Variant::Ref(a0)).with_property("Attachment1", Variant::Ref(a1)).with_property("TextureSpeed", 0.25f32).with_property("Enabled", true));
+			model.child(part, InstanceBuilder::new("Fire").with_name(format!("{name}Fire")).with_property("Enabled", true));
+		}
+		let mut document = model.into_document();
+		let frame = |index: u32| index as f32 / 60.0;
+		let act = |at: u32, target: &str, parent: &str| Action { at: frame(at), target: target.into(), parent: Some(parent.into()), ..Default::default() };
+		let motion = ["Fx.RefPart", "Fx.OutPart"]
+			.iter()
+			.zip([0.0f32, 5.0])
+			.map(|(target, y)| Motion { target: (*target).into(), keys: vec![MotionKey { at: 0.0, cframe: vec![0.0, y, 0.0], ..Default::default() }, MotionKey { at: frame(90), cframe: vec![-15.0, y, 0.0], ..Default::default() }], ..Default::default() })
+			.collect();
+		let actions = vec![
+			act(30, "Fx.OutPart.OutTrail", ""),
+			act(60, "Fx.OutPart.OutTrail", "Fx.OutPart"),
+			act(30, "Fx.OutPart.OutBeam", ""),
+			act(60, "Fx.OutPart.OutBeam", "Fx.OutPart"),
+			act(20, "Fx.OutPart.OutFire", ""),
+			act(50, "Fx.OutPart.OutFire", "Fx.OutPart"),
+		];
+		let playback = Playback { time: frame(100), actions, motion, ..Default::default() };
+		let resolved = playback.resolve(&document).unwrap();
+		let undo = resolved.apply_state(&mut document).unwrap();
+		let mut scene = crate::scene::extract::extract(&document);
+		resolved.apply_history(&document, &mut scene);
+		undo.restore(&mut document);
+		// the trails' extent along X: its twin's from 0 to -15, the one taken out from -10 (frame 60) on
+		let extent = |name: &str| {
+			let trail = scene.trails.iter().find(|trail| trail.path.ends_with(name)).unwrap();
+			trail.points.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), point| (low.min(point.position0.x), high.max(point.position0.x)))
+		};
+		let (low, high) = extent("RefTrail");
+		assert!((low + 15.0).abs() < 0.1 && high.abs() < 0.1, "twin: {low}..{high}");
+		let (low, high) = extent("OutTrail");
+		assert!((low + 15.0).abs() < 0.1 && (high + 10.0).abs() < 0.2, "taken out: {low}..{high}");
+		// the beams' scroll: 0.25 · 100 / 60 and 0.25 · 40 / 60
+		let offset = |name: &str| scene.beams.iter().find(|beam| beam.path.ends_with(name)).unwrap().texture_offset;
+		assert!((offset("RefBeam") - 0.4167).abs() < 0.01 && (offset("OutBeam") - 0.1667).abs() < 0.01, "{} {}", offset("RefBeam"), offset("OutBeam"));
+		// the Fire's oldest particle: its twin's from frame 0, the one taken out's from 50
+		let oldest = |name: &str| scene.particles.iter().filter(|emitter| emitter.path.contains(name)).flat_map(|emitter| emitter.births.iter().flatten()).map(|birth| birth.age).fold(0.0f32, f32::max);
+		assert!(oldest("RefFire") > frame(60), "twin: {}", oldest("RefFire"));
+		assert!(oldest("OutFire") <= frame(50) + 1e-3 && oldest("OutFire") > 0.0, "taken out: {}", oldest("OutFire"));
 	}
 
 	/// A particle is drawn while its age is under its Lifetime, an age reaching it gone; frozen, a spawning

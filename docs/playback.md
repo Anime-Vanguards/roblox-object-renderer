@@ -43,7 +43,7 @@ ror video Effect.rbxm \
 - Places use their own `Lighting`. Models copy `--lighting-from` if supplied, or create a default `Lighting` environment whenever a playback references `Lighting`.
 - Post effects, `Sky`, and `Atmosphere` instances carried inside an effect model take effect as soon as they are parented into `Lighting` (a `Sky` or `Atmosphere` with `Enabled = false` remains inactive).
 - A `parent` action targeting `Lighting` with a `class` filter moves the scene's original instances of that class out (`""`) or back (`"Lighting"`). `ree` recordings emit this when a cutscene temporarily swaps out a map's lighting.
-- A `ParticleEmitter` parented out of the world (`""`), itself or through an ancestor, runs nothing until it is back: its particles are cleared and it emits nothing; back in the world it starts as if switched on in that frame, and an `emit` made while it was out leaves then.
+- A `ParticleEmitter` parented out of the world (`""`), itself or through an ancestor, runs nothing until it is back: its particles are cleared and it emits nothing; back in the world it starts as if switched on in that frame, and an `emit` made while it was out leaves then. A `Trail`, a `Beam`, a `Fire`, a `Smoke` and a `Sparkles` alike: a trail starts again from where it is back, a beam's texture scroll from 0.
 - Terrain clouds are targeted at `Workspace.Terrain.Clouds.<Property>` (`Color`, `Cover`, `Density`, `Enabled`). They initialize from `--lighting-from`, then the input file, else a disabled `Clouds` instance that a playback can enable. Video clips re-read clouds every frame.
 
 ## The playback JSON

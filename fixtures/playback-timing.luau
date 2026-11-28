@@ -43,6 +43,14 @@
 --   freezes them (TimeScale 0), and advances a half's particles' places in their emitters first (Emit
 --   then Clear); `random-mover`'s attachment moved cell to cell lays one emitter's particles 0-63 over
 --   the left half.
+-- "parentout2" (x 10000, seen from -Z at 70 studs, the legacy effects at 90): `t-ref`, `t-out`, `t-holder` and
+--   `t-off`, white Trails (Lifetime 10) on 0.2-stud parts 2.5 studs apart from y 20 down, each part in a Model
+--   `<name>-holder`, which a job moves along -X at 10 studs a second and parents out and back (the Trail, or the
+--   Model) or switches off and on; `b-ref` and `b-out`, Beams with `Context.StripeTexture` (a band across the
+--   texture's top rows) at TextureSpeed 0.25 between attachments 12 studs apart at y 8 and 6; `Fire-<case>`,
+--   `Smoke-<case>` and `Sparkles-<case>` for cases ref, out and late, 9 studs apart along y -20, switched off in
+--   the file (a job switches them on, parents `out` out and back, switches `late` on when `out` is back, and
+--   freezes them with TimeScale 0).
 -- "parentout" (x 7000, seen from -Z): Rate 10 emitters of 0.3-stud squares leaving up at 30 studs a second,
 --   switched off in the file: `po-ref` (a job switches it on), `po-out-back` (switched on, then parented
 --   out of the world and back), `po-emit-out` (Rate 0: emitted while out of the world), `po-model` (its
@@ -293,6 +301,73 @@ return function(Context)
 			Emitter(Anchor(Model, `random-{Index}-anchor`, Center + Vector3.new((7.5 - Column) * 2, (3.5 - Row) * 2, 0)), `random-{Index}`, Sheet)
 		end
 		Emitter(Anchor(Model, "random-mover-anchor", Center + Vector3.new(0, -12, 0)), "random-mover", Sheet)
+	end
+
+	-- parentout2: trails, beams and legacy effects a job parents out of the world and back
+	do
+		local Center = Vector3.new(10000, 0, 0)
+		local Model = Group("parentout2", Center, { eye = { 10000, 0, -70 }, target = { 10000, 0, 0 }, fov = 40 })
+		Block(Model, "Backdrop", CFrame.new(Center + Vector3.new(0, 0, 30)), Vector3.new(300, 200, 1), Color3.new(0, 0, 0), Enum.Material.Neon)
+		local function Ends(Part: BasePart, Offset: Vector3)
+			local A0 = Instance.new("Attachment")
+			A0.Name = "A0"
+			A0.Position = Offset
+			A0.Parent = Part
+			local A1 = Instance.new("Attachment")
+			A1.Name = "A1"
+			A1.Position = -Offset
+			A1.Parent = Part
+			return A0, A1
+		end
+		for Index, Name in { "t-ref", "t-out", "t-holder", "t-off" } do
+			local Holder = Instance.new("Model")
+			Holder.Name = `{Name}-holder`
+			Holder.Parent = Model
+			local Part = Block(Holder, `{Name}-part`, CFrame.new(Center + Vector3.new(16, 20 - (Index - 1) * 2.5, 0)), Vector3.new(0.2, 0.2, 0.2), nil, nil, 1)
+			local A0, A1 = Ends(Part, Vector3.new(0, 0.5, 0))
+			local T = Instance.new("Trail")
+			T.Name = Name
+			T.Attachment0, T.Attachment1 = A0, A1
+			T.Lifetime = 10
+			T.LightEmission, T.LightInfluence, T.Brightness = 0, 0, 1
+			T.FaceCamera = true
+			T.Enabled = false
+			T.Parent = Part
+		end
+		for Index, Name in { "b-ref", "b-out" } do
+			local Part = Block(Model, `{Name}-part`, CFrame.new(Center + Vector3.new(-2, 8 - (Index - 1) * 2, 0)), Vector3.new(0.2, 0.2, 0.2), nil, nil, 1)
+			local A0, A1 = Ends(Part, Vector3.new(6, 0, 0))
+			local B = Instance.new("Beam")
+			B.Name = Name
+			B.Attachment0, B.Attachment1 = A0, A1
+			B.Texture = Context.StripeTexture or SQUARE
+			B.TextureMode = Enum.TextureMode.Stretch
+			B.TextureLength = 1
+			B.TextureSpeed = 0.25
+			B.Width0, B.Width1 = 1, 1
+			B.FaceCamera = true
+			B.LightEmission, B.LightInfluence, B.Brightness = 0, 0, 1
+			B.Segments = 1
+			B.Parent = Part
+		end
+		for Row, Class in { "Fire", "Smoke", "Sparkles" } do
+			for Column, Case in { "ref", "out", "late" } do
+				local Part = Block(Model, `{Class}-{Case}-part`, CFrame.new(Center + Vector3.new(36 - ((Row - 1) * 3 + Column - 1) * 9, -20, 0)), Vector3.new(1, 1, 1), nil, nil, 1)
+				local Effect = Instance.new(Class) :: any
+				Effect.Name = `{Class}-{Case}`
+				if Class == "Fire" then
+					Effect.Size = 2
+					Effect.Heat = 9
+				elseif Class == "Smoke" then
+					Effect.RiseVelocity = 4
+					Effect.Size = 0.5
+					Effect.Opacity = 0.5
+					Effect.Color = Color3.new(1, 1, 1)
+				end
+				Effect.Enabled = false
+				Effect.Parent = Part
+			end
+		end
 	end
 
 	-- parentout: emitters a job parents out of the world and back
