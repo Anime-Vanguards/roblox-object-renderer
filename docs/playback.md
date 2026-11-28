@@ -113,7 +113,7 @@ ror video Effect.rbxm \
 
 Properties are strictly type-checked: passing an incompatible value fails the render with an error listing accepted forms. Legacy content string properties and newer `Content` properties alias to the same underlying value (`Image`/`ImageContent`, `Texture`/`TextureContent`, `MeshId`/`MeshContent`, etc.).
 
-Recordings produced by `ree` from `.luau` scripts use this exact JSON format (plus recorded frame timestamps); see [scripts.md](scripts.md).
+Recordings produced by `ree` from `.luau` scripts use this exact JSON format (plus recorded frame timestamps); see [scripts.md](scripts.md). A client's recording also keeps its local player: its `scene.rbxm` has a root `~Players` (a `Players`) holding the `Player`, whose `Character` names the local character, and its playback sets `Character` on `~Players.<name>` when that changes; `ror` draws name tags for that character ([render.md](render.md), names over heads).
 
 ## Emit modes
 

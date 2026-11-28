@@ -494,9 +494,9 @@ pub(super) struct GuiDraw {
 	pub screen: Option<i32>,
 	/// Its framed ViewportFrames as this view draws them, in the order the GUI draws them.
 	framed: Vec<FramedDraw>,
-	/// A name tag's content this view draws (scene::guis::NameTag::content: its text size, its bar);
+	/// A name tag's content this view draws (scene::guis::NameTag::content: its text size, what of it);
 	/// `None`: the GUI's own.
-	tag: Option<(usize, bool)>,
+	tag: Option<(usize, crate::scene::guis::TagPart)>,
 }
 
 /// A framed ViewportFrame of a GUI draw (scene::guis::Framed): its world drawn by its own camera at
@@ -783,6 +783,7 @@ pub(super) fn plan_with_skips(scene: &Scene, camera: &Camera, request: &ViewRequ
 			}
 
 			GuiKind::NameTag(tag) => {
+				use crate::scene::guis::{NameTag, TagPart};
 				// drawn over the finished image as AlwaysOnTop GUIs are, in the image's pixels, sized as a
 				// billboard's pixels are (the view's GUI scale)
 				let anchor = tag.head + Vec3::Y * crate::scene::guis::NAME_RISE;
@@ -792,21 +793,46 @@ pub(super) fn plan_with_skips(scene: &Scene, camera: &Camera, request: &ViewRequ
 					skipped.push(crate::scene::guis::SkippedGui { path: gui.path.clone(), reason: "behind near plane".into() });
 					continue;
 				}
-				// (the client measures from its local character; ror has none and takes the camera)
+				// its text size by the camera's distance (fixtures/name-tags.luau "viewer": 24 px at 10 studs from
+				// the camera with the local character 59 off, 12 px at 60 with it 11 off)
 				let distance = camera.eye.distance(tag.head);
-				let opacity = crate::scene::guis::NameTag::fade(distance, tag.name_distance);
-				if opacity <= 0.0 {
+				// (opacity of the name, of the bar alone; whether a part on the camera's line hides the tag)
+				let (name, bar, occludes) = match tag.viewer.as_deref() {
+					// no local player known: the camera stands in for one, a default Humanoid's distances and
+					// NameOcclusion, the bar with the name
+					None => {
+						let name = NameTag::fade(distance, tag.name_distance);
+						let bar = if tag.health.is_some() && NameTag::fade(distance, tag.health_distance) > 0.0 { name } else { 0.0 };
+						(name, bar, true)
+					}
+					// the client's local character: its own name never shows; the others' distances from its Head
+					// (from the camera without one), a Viewer's limits its Humanoid's, the bar fading by its own
+					// limit and shown past the name's (fixtures/name-tags.luau "viewer")
+					Some(viewer) => {
+						if tag.model == viewer.model {
+							skipped.push(crate::scene::guis::SkippedGui { path: gui.path.clone(), reason: "the local character's own".into() });
+							continue;
+						}
+						let from = viewer.head.unwrap_or(camera.eye).distance(tag.head);
+						let (name_limit, health_limit) = if tag.subject { (tag.name_distance, tag.health_distance) } else { (viewer.name_distance, viewer.health_distance) };
+						let bar = if tag.health.is_some() { NameTag::viewer_fade(from, health_limit) } else { 0.0 };
+						(NameTag::viewer_fade(from, name_limit), bar, viewer.occludes)
+					}
+				};
+				if name <= 0.0 && bar <= 0.0 {
 					skipped.push(crate::scene::guis::SkippedGui { path: gui.path.clone(), reason: "beyond NameDisplayDistance".into() });
 					continue;
 				}
-				if tag.hidden(camera.eye) {
+				if occludes && tag.hidden(camera.eye) {
 					skipped.push(crate::scene::guis::SkippedGui { path: gui.path.clone(), reason: "hidden behind a part".into() });
 					continue;
 				}
-				let size = crate::scene::guis::NameTag::size(distance);
-				let bar = tag.health.is_some() && crate::scene::guis::NameTag::fade(distance, tag.health_distance) > 0.0;
-				let Some((_, base_hash)) = tag.content(size, bar) else {
-					continue;
+				let size = NameTag::size(distance);
+				// one image while the bar shows as the name does; the name and the bar alone apart otherwise
+				let parts: Vec<(TagPart, f32)> = if bar > 0.0 && (name - bar).abs() < 1e-6 {
+					vec![(TagPart::NameAndBar, name)]
+				} else {
+					[(TagPart::Name, name), (TagPart::Bar, bar)].into_iter().filter(|&(_, opacity)| opacity > 0.0).collect()
 				};
 				let gui_scale = (request.gui_scale.filter(|scale| *scale > 0.0).unwrap_or(height as f32 / REFERENCE_HEIGHT) * 1024.0).floor().max(1.0) / 1024.0;
 				let (image_width, image_height) = (width as f32, height as f32);
@@ -815,25 +841,30 @@ pub(super) fn plan_with_skips(scene: &Scene, camera: &Camera, request: &ViewRequ
 				// the name's baseline and the bar's top keep their rows as the point moves within a pixel)
 				let x = (relative.dot(right) / depth * focal + image_width * 0.5).round();
 				let y = (-relative.dot(up) / depth * focal + image_height * 0.5).round();
-				let key = GuiKey::new(*base_hash, tag.canvases[size], gui_scale, true);
-				let [canvas_width, canvas_height] = key.canvas().map(|side| side * key.scale());
-				let (left, top) = ((x - canvas_width * 0.5).round(), (y - canvas_height * 0.5).round());
 				let corner = |px: f32, py: f32| camera.eye - back * depth + right * ((px - image_width * 0.5) * depth / focal) + up * ((image_height * 0.5 - py) * depth / focal);
-				draws.push(GuiDraw {
-					gui: index,
-					key,
-					local_snaps: Arc::from([]),
-					corners: [corner(left, top), corner(left + canvas_width, top), corner(left, top + canvas_height), corner(left + canvas_width, top + canvas_height)],
-					normal: back,
-					// (z: its transparency, the fade)
-					params: [0.0, 1.0, 1.0 - opacity, 0.0],
-					center: anchor,
-					z_offset: 0.0,
-					overlay: true,
-					screen: None,
-					framed: Vec::new(),
-					tag: Some((size, bar)),
-				});
+				for (part, opacity) in parts {
+					let Some((_, base_hash)) = tag.content(size, part) else {
+						continue;
+					};
+					let key = GuiKey::new(*base_hash, tag.canvases[size], gui_scale, true);
+					let [canvas_width, canvas_height] = key.canvas().map(|side| side * key.scale());
+					let (left, top) = ((x - canvas_width * 0.5).round(), (y - canvas_height * 0.5).round());
+					draws.push(GuiDraw {
+						gui: index,
+						key,
+						local_snaps: Arc::from([]),
+						corners: [corner(left, top), corner(left + canvas_width, top), corner(left, top + canvas_height), corner(left + canvas_width, top + canvas_height)],
+						normal: back,
+						// (z: its transparency, the fade)
+						params: [0.0, 1.0, 1.0 - opacity, 0.0],
+						center: anchor,
+						z_offset: 0.0,
+						overlay: true,
+						screen: None,
+						framed: Vec::new(),
+						tag: Some((size, part)),
+					});
+				}
 			}
 		}
 	}
@@ -910,7 +941,7 @@ fn wanted<'a>(scene: &'a Scene, draws: &[&'a GuiDraw]) -> Members<'a> {
 			continue;
 		};
 		let content = match (&gui.kind, draw.tag) {
-			(GuiKind::NameTag(tag), Some((size, bar))) => tag.content(size, bar).map_or(&gui.content, |(content, _)| content),
+			(GuiKind::NameTag(tag), Some((size, part))) => tag.content(size, part).map_or(&gui.content, |(content, _)| content),
 			_ => &gui.content,
 		};
 		wanted.push((draw.key, gui, content, &draw.local_snaps));
@@ -2304,7 +2335,7 @@ mod tests {
 		let GuiKind::NameTag(tag) = &gui.kind else {
 			panic!("a name tag");
 		};
-		assert_eq!((tag.health, tag.contents.len()), (Some(0.5), 6), "half health: a bar at each of three sizes");
+		assert_eq!((tag.health, tag.contents.len()), (Some(0.5), 9), "half health: at each of three sizes the name, with its bar, the bar alone");
 		let plan_at = |scene: &Scene, distance: f32| {
 			let request = ViewRequest { width: 400, height: 300, camera: CameraSpec::LookAt { eye: [0.0, 0.0, distance], target: [0.0; 3], fov: 70.0 }, gui_scale: Some(1.0), ..Default::default() };
 			let camera = request.camera.place(None, request.width, request.height);
@@ -2315,7 +2346,7 @@ mod tests {
 			let [draw] = draws.as_slice() else {
 				panic!("at {distance}: {skipped:?}");
 			};
-			assert!(draw.overlay && draw.screen.is_none() && draw.tag == Some((size, true)), "at {distance}: {:?}", draw.tag);
+			assert!(draw.overlay && draw.screen.is_none() && draw.tag == Some((size, crate::scene::guis::TagPart::NameAndBar)), "at {distance}: {:?}", draw.tag);
 			assert!((1.0 - draw.params[2] - opacity).abs() < 0.01, "at {distance}: opacity {}", 1.0 - draw.params[2]);
 			// the canvas's centre on the point 1.5 studs over the head, on a whole pixel
 			assert_eq!(draw.key.canvas(), tag.canvases[size]);
@@ -2324,6 +2355,120 @@ mod tests {
 		assert!(draws.is_empty() && skipped.iter().any(|entry| entry.reason == "beyond NameDisplayDistance"), "{skipped:?}");
 		let (draws, skipped) = plan_at(&scene(true), 10.0);
 		assert!(draws.is_empty() && skipped.iter().any(|entry| entry.reason == "hidden behind a part"), "{skipped:?}");
+	}
+
+
+	/// With the local player a client recording names (`~Players`), name tags are drawn for its character:
+	/// distances from its Head, a Viewer's limits and NameOcclusion its Humanoid's, its own name never, the bar
+	/// fading by its own limit and shown past the name's; with no character, from the camera; a playback's
+	/// Character sets move the viewer (fixtures/name-tags.luau "viewer" in a Roblox client).
+	#[test]
+	fn name_tags_are_drawn_for_the_recordings_local_player() {
+		use crate::render::camera::CameraSpec;
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use crate::scene::guis::{SkippedGui, TagPart};
+		use rbx_dom_weak::InstanceBuilder;
+		use rbx_dom_weak::types::{Enum, Variant};
+
+		// a rig whose head's centre is at `at` (a Humanoid with `humanoid`'s properties) in the scene's model
+		let rig = |model: &mut ModelBuilder, name: &str, at: glam::Vec3, humanoid: InstanceBuilder| {
+			let rig = model.child(model.model, InstanceBuilder::new("Model").with_name(name));
+			for (part, offset, size) in [("Head", glam::Vec3::ZERO, glam::Vec3::new(2.0, 1.0, 1.0)), ("Torso", glam::Vec3::new(0.0, -1.5, 0.0), glam::Vec3::new(2.0, 2.0, 1.0))] {
+				let part = model.part(&PartSpec { name: part.into(), cframe: glam::Affine3A::from_translation(at + offset), size, ..Default::default() });
+				model.dom.transfer_within(part, rig);
+			}
+			model.child(rig, humanoid);
+			rig
+		};
+		// the rig `Seen` at the origin and the local player's character `Me` with its Humanoid's properties,
+		// its Head at `me`, a board between the camera (on +Z) and Seen's head when `blocked`; `local`: the
+		// document names the local player (its Character Me, or none)
+		let scene = |me: glam::Vec3, mine: InstanceBuilder, seen: InstanceBuilder, blocked: bool, local: Option<bool>| {
+			let mut model = ModelBuilder::new("Scene");
+			rig(&mut model, "Seen", glam::Vec3::ZERO, seen);
+			let character = rig(&mut model, "Me", me, mine);
+			if blocked {
+				model.part(&PartSpec { name: "Board".into(), cframe: glam::Affine3A::from_translation(glam::Vec3::new(0.0, 0.0, 5.0)), size: glam::Vec3::new(4.0, 4.0, 0.2), ..Default::default() });
+			}
+			if let Some(with_character) = local {
+				let root = model.dom.root_ref();
+				let players = model.dom.insert(root, InstanceBuilder::new("Players").with_name("~Players"));
+				let character = if with_character { character } else { rbx_dom_weak::types::Ref::none() };
+				model.dom.insert(players, InstanceBuilder::new("Player").with_name("Player").with_property("Character", Variant::Ref(character)));
+			}
+			let mut document = model.into_document();
+			document.play = true;
+			document
+		};
+		let humanoid = || InstanceBuilder::new("Humanoid");
+		let hurt = || InstanceBuilder::new("Humanoid").with_property("HealthDisplayType", Enum::from_u32(1));
+		// the draws of Seen's tag (name and bar parts with their opacities) with the camera `distance` out on +Z
+		let plan_seen = |document: &crate::scene::load::Document, distance: f32| -> (Vec<(TagPart, f32)>, Vec<SkippedGui>) {
+			let scene = crate::scene::extract::extract(document);
+			let request = ViewRequest { width: 400, height: 300, camera: CameraSpec::LookAt { eye: [0.0, 0.0, distance], target: [0.0; 3], fov: 70.0 }, gui_scale: Some(1.0), ..Default::default() };
+			let camera = request.camera.place(None, request.width, request.height);
+			let (draws, skipped) = plan_with_skips(&scene, &camera, &request);
+			let seen = scene.guis.iter().position(|gui| gui.path.ends_with("Seen.Humanoid")).expect("Seen's tag");
+			let parts = draws.iter().filter(|draw| draw.gui == seen).map(|draw| (draw.tag.expect("a tag").1, 1.0 - draw.params[2])).collect();
+			(parts, skipped.into_iter().filter(|skip| skip.path.ends_with("Seen.Humanoid")).collect())
+		};
+		let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+		// the camera 15 studs out, the local character's Head 95 studs off: (100 - 95) / 10 = 0.5 (from the
+		// camera the old law would draw it whole)
+		let (parts, _) = plan_seen(&scene(glam::Vec3::new(0.0, 0.0, 95.0), humanoid(), humanoid(), false, Some(true)), 15.0);
+		assert!(matches!(parts.as_slice(), [(TagPart::Name, opacity)] if near(*opacity, 0.5)), "{parts:?}");
+		// its own name never shows, whatever the distance
+		let document = scene(glam::Vec3::new(0.0, 0.0, -6.0), humanoid(), humanoid(), false, Some(true));
+		let tags = crate::scene::extract::extract(&document);
+		let request = ViewRequest { width: 400, height: 300, camera: CameraSpec::LookAt { eye: [0.0, 0.0, 15.0], target: [0.0; 3], fov: 70.0 }, gui_scale: Some(1.0), ..Default::default() };
+		let (_, skipped) = plan_with_skips(&tags, &request.camera.place(None, 400, 300), &request);
+		assert!(skipped.iter().any(|skip| skip.path.ends_with("Me.Humanoid") && skip.reason == "the local character's own"), "{skipped:?}");
+		// a Viewer's limit is the local character's NameDisplayDistance (50: 47 studs off 0.6); a Subject keeps its own
+		let (parts, _) = plan_seen(&scene(glam::Vec3::new(0.0, 0.0, 47.0), humanoid().with_property("NameDisplayDistance", 50.0f32), humanoid(), false, Some(true)), 15.0);
+		assert!(matches!(parts.as_slice(), [(TagPart::Name, opacity)] if near(*opacity, 0.6)), "{parts:?}");
+		let subject = humanoid().with_property("DisplayDistanceType", Enum::from_u32(1)).with_property("NameDisplayDistance", 200.0f32);
+		let (parts, _) = plan_seen(&scene(glam::Vec3::new(0.0, 0.0, 150.0), humanoid(), subject, false, Some(true)), 15.0);
+		assert!(matches!(parts.as_slice(), [(TagPart::Name, opacity)] if near(*opacity, 1.0)), "{parts:?}");
+		// the local character's NameOcclusion decides: OccludeAll hides the name behind the board, NoOcclusion and
+		// EnemyOcclusion show it (the rig's own ignored)
+		for (occlusion, shown) in [(2, false), (0, true), (1, true)] {
+			let mine = humanoid().with_property("NameOcclusion", Enum::from_u32(occlusion));
+			let seen = humanoid().with_property("NameOcclusion", Enum::from_u32(0));
+			let (parts, skipped) = plan_seen(&scene(glam::Vec3::new(0.0, 0.0, 30.0), mine, seen, true, Some(true)), 28.0);
+			assert_eq!(!parts.is_empty(), shown, "NameOcclusion {occlusion}: {parts:?} {skipped:?}");
+		}
+		// the bar fades by HealthDisplayDistance on its own, and shows past the name's distance
+		let (parts, _) = plan_seen(&scene(glam::Vec3::new(0.0, 0.0, 47.0), humanoid().with_property("HealthDisplayDistance", 50.0f32), hurt(), false, Some(true)), 15.0);
+		assert!(matches!(parts.as_slice(), [(TagPart::Name, name), (TagPart::Bar, bar)] if near(*name, 1.0) && near(*bar, 0.6)), "{parts:?}");
+		let (parts, _) = plan_seen(&scene(glam::Vec3::new(0.0, 0.0, 40.0), humanoid().with_property("NameDisplayDistance", 30.0f32), hurt(), false, Some(true)), 15.0);
+		assert!(matches!(parts.as_slice(), [(TagPart::Bar, bar)] if near(*bar, 1.0)), "{parts:?}");
+		let (parts, _) = plan_seen(&scene(glam::Vec3::new(0.0, 0.0, 40.0), humanoid(), hurt(), false, Some(true)), 15.0);
+		assert!(matches!(parts.as_slice(), [(TagPart::NameAndBar, opacity)] if near(*opacity, 1.0)), "{parts:?}");
+		// no character: from the camera, (100 - 95) / 10; no local player at all: as before, (100 - 0.8 - 95) / 10
+		let (parts, _) = plan_seen(&scene(glam::Vec3::new(0.0, 0.0, 300.0), humanoid(), humanoid(), false, Some(false)), 95.0);
+		assert!(matches!(parts.as_slice(), [(TagPart::Name, opacity)] if near(*opacity, 0.5)), "{parts:?}");
+		let (parts, _) = plan_seen(&scene(glam::Vec3::new(0.0, 0.0, 300.0), humanoid(), humanoid(), false, None), 95.0);
+		assert!(matches!(parts.as_slice(), [(TagPart::Name, opacity)] if near(*opacity, 0.42)), "{parts:?}");
+		// a playback's Character sets: Seen is the local character from 0.3 s (its own tag gone), Me again from 0.6
+		let mut document = scene(glam::Vec3::new(0.0, 0.0, 95.0), humanoid(), humanoid(), false, Some(true));
+		let playback: crate::scene::playback::Playback = serde_json::from_value(serde_json::json!({
+			"actions": [
+				{"at": 0.3, "set": {"Character": "Scene.Seen"}, "target": "~Players.Player"},
+				{"at": 0.6, "set": {"Character": "Scene.Me"}, "target": "~Players.Player"}
+			],
+			"play": true
+		}))
+		.unwrap();
+		for (time, shown) in [(0.2, true), (0.45, false), (0.7, true)] {
+			let resolved = playback.resolve_at(&document, time).unwrap();
+			let undo = resolved.apply_state(&mut document).unwrap();
+			let (parts, skipped) = plan_seen(&document, 15.0);
+			assert_eq!(!parts.is_empty(), shown, "at {time}: {parts:?} {skipped:?}");
+			if !shown {
+				assert!(skipped.iter().any(|skip| skip.reason == "the local character's own"), "at {time}: {skipped:?}");
+			}
+			undo.restore(&mut document);
+		}
 	}
 
 	#[test]

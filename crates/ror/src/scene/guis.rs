@@ -251,17 +251,22 @@ pub enum GuiKind {
 /// fixtures/name-tags.luau; notes/render.md "Names over heads"): SourceSans in white with a dark edge, 24,
 /// 18 or 12 pixels by the camera's distance, its line ending two pixels above a point 1.5 studs over the
 /// head's centre, the bar under that point; over the finished image (no light, no post effect, nearer over
-/// farther), fading out over the last tenth of its distance, and not at all while a part a ray can hit
-/// stands between the camera and the head.
+/// farther), fading out over the last tenth of its distance from the [`Viewer`], and not at all while a
+/// part a ray can hit stands between the camera and the head.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NameTag {
 	/// Its head's centre.
 	pub head: Vec3,
 	/// Drawn within this distance (studs): its own NameDisplayDistance with DisplayDistanceType Subject,
-	/// else the viewer's (a client's local character's; here a default Humanoid's 100).
+	/// else the viewer's (without a [`Viewer`], a default Humanoid's 100).
 	pub name_distance: f32,
 	/// The bar within this distance (HealthDisplayDistance, as `name_distance`).
 	pub health_distance: f32,
+	/// DisplayDistanceType Subject: shown within its own distances, whatever the viewer's.
+	pub subject: bool,
+	/// The local player the scene was recorded for ([`viewer`]); `None`: no local player known (a
+	/// model, a place, an older recording or a server's), and the camera stands in for one.
+	pub viewer: Option<Arc<Viewer>>,
 	/// The bar's share, Health / MaxHealth, when its HealthDisplayType shows one (AlwaysOn, or
 	/// DisplayWhenDamaged below MaxHealth).
 	pub health: Option<f32>,
@@ -274,6 +279,55 @@ pub struct NameTag {
 	pub contents: Vec<(Arc<Vec<u8>>, u64)>,
 	/// The parts a ray can hit (CanCollide or CanQuery) in the scene, shared by its name tags.
 	pub occluders: Arc<Vec<Occluder>>,
+}
+
+/// The local player a client draws name tags for (a recording's `~Players`: a root Players holding the
+/// Player, its Character a reference a playback sets over time; [`viewer`]). A client measures each
+/// tag's distances from its character's Head, takes the viewer's NameDisplayDistance and
+/// HealthDisplayDistance for DisplayDistanceType Viewer, hides names behind parts only when its
+/// Humanoid's NameOcclusion is OccludeAll, and never shows its character's own name (0.747,
+/// fixtures/name-tags.luau "viewer"; notes/render.md "Names over heads").
+#[derive(Clone, Debug, PartialEq)]
+pub struct Viewer {
+	/// Its character (`Ref::none()`: no character in the world).
+	pub model: Ref,
+	/// Its character's Head's centre; `None` (no character, or one without a Head): the client
+	/// measures from the camera.
+	pub head: Option<Vec3>,
+	/// Its Humanoid's NameDisplayDistance and HealthDisplayDistance (a default Humanoid's 100 without one).
+	pub name_distance: f32,
+	pub health_distance: f32,
+	/// Its Humanoid's NameOcclusion is OccludeAll (the default): NoOcclusion shows a name through a part,
+	/// and so does EnemyOcclusion, a recorded rig being no enemy player's (teams not measured).
+	pub occludes: bool,
+}
+
+/// The local player's viewer at the document's moment, if the document names one: the first Player in
+/// a root Players (a client's recording keeps it as `~Players`), its Character if drawn in the world.
+pub fn viewer(document: &Document) -> Option<Viewer> {
+	let dom = &document.dom;
+	let players = dom.root().children().iter().copied().find(|&child| dom.get_by_ref(child).is_some_and(|instance| instance.class == "Players"))?;
+	let player = dom.get_by_ref(players)?.children().iter().copied().find(|&child| dom.get_by_ref(child).is_some_and(|instance| instance.class == "Player"))?;
+	let character = props::reference(dom.get_by_ref(player)?, "Character").filter(|&model| beams::drawn(document, model));
+	let holder = character.and_then(|model| dom.get_by_ref(model));
+	let child = |test: &dyn Fn(&Instance) -> bool| holder.and_then(|holder| holder.children().iter().filter_map(|&child| dom.get_by_ref(child)).find(|child| test(child)));
+	let head = child(&|child| child.name == "Head" && props::is_a(child, "BasePart")).and_then(part_box).map(|(centre, _)| centre);
+	let humanoid = child(&|child| child.class == "Humanoid");
+	// Enum.NameOcclusion: NoOcclusion 0, EnemyOcclusion 1, OccludeAll 2
+	let (name_distance, health_distance, occludes) = match humanoid {
+		Some(humanoid) => (props::f32(humanoid, "NameDisplayDistance", 100.0), props::f32(humanoid, "HealthDisplayDistance", 100.0), props::enum_value(humanoid, "NameOcclusion", 2) == 2),
+		None => (100.0, 100.0, true),
+	};
+	Some(Viewer { model: character.unwrap_or_else(Ref::none), head, name_distance, health_distance, occludes })
+}
+
+/// What of a name tag a draw shows ([`NameTag::content`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TagPart {
+	Name,
+	NameAndBar,
+	/// The bar alone (a client shows it within HealthDisplayDistance when the name is past its own).
+	Bar,
 }
 
 /// A part a ray can hit, as a box (a ball as a sphere), and the character model it belongs to.
@@ -304,9 +358,10 @@ impl NameTag {
 		}
 	}
 
-	/// Its opacity at `distance` from the head within `limit`: whole, then fading out over the last tenth
-	/// (fixtures/name-tags.luau: at a limit of 100 the text's white reads 212 / 135 / 54 of 255 at 91 / 94
-	/// / 97 studs, at 50 163 at 46: (limit - 0.8 - distance) / (0.1 · limit)).
+	/// Its opacity at `distance` from the camera within `limit`, with no local player known: whole, then
+	/// fading out over the last tenth (fixtures/name-tags.luau, the client's local character two studs
+	/// behind the camera: at a limit of 100 the text's white reads 212 / 135 / 54 of 255 at 91 / 94 / 97
+	/// studs, at 50 163 at 46: (limit - 0.8 - distance) / (0.1 · limit)).
 	pub fn fade(distance: f32, limit: f32) -> f32 {
 		if limit <= 0.0 {
 			return 0.0;
@@ -314,10 +369,28 @@ impl NameTag {
 		((limit - 0.8 - distance) / (0.1 * limit)).clamp(0.0, 1.0)
 	}
 
-	/// What rur draws at text size `size`, with the bar or not.
-	pub fn content(&self, size: usize, bar: bool) -> Option<&(Arc<Vec<u8>>, u64)> {
-		let per_size = if self.health.is_some() { 2 } else { 1 };
-		self.contents.get(size * per_size + usize::from(bar && self.health.is_some()))
+	/// Its opacity at `distance` from a [`Viewer`]'s Head (or from the camera when the viewer has no
+	/// character) within `limit`: (limit - distance) / (0.1 · limit) (fixtures/name-tags.luau "viewer":
+	/// the local character 88-102 studs from a rig 15 studs before the camera, upright, laid with its head
+	/// towards the rig and away from it: from its Head the three poses agree within 0.02, from its root
+	/// they lie 2.4 studs apart; limits 100 and 50, Subject and HealthDisplayDistance alike; without a
+	/// character the same from the camera at 80-100 studs).
+	pub fn viewer_fade(distance: f32, limit: f32) -> f32 {
+		if limit <= 0.0 {
+			return 0.0;
+		}
+		((limit - distance) / (0.1 * limit)).clamp(0.0, 1.0)
+	}
+
+	/// What rur draws at text size `size`: the name, the name with its bar, or the bar alone.
+	pub fn content(&self, size: usize, part: TagPart) -> Option<&(Arc<Vec<u8>>, u64)> {
+		match (part, self.health.is_some()) {
+			(TagPart::Name, false) => self.contents.get(size),
+			(TagPart::Name, true) => self.contents.get(size * 3),
+			(TagPart::NameAndBar, true) => self.contents.get(size * 3 + 1),
+			(TagPart::Bar, true) => self.contents.get(size * 3 + 2),
+			_ => None,
+		}
 	}
 
 	/// Whether a part a ray can hit (not its own model's) stands between `eye` and the head
@@ -406,31 +479,34 @@ const NAME_LINE_GAP: i32 = 2;
 /// What rur draws of a name tag at a text size: the name in SourceSans, white with a dark edge, its line
 /// ending two pixels above the point over the head, and the health bar from there down (8 pixels: a
 /// health-coloured rim with rounded ends, a dark inside with grey ends, the health's share of it filled
-/// two pixels tall; fixtures/name-tags.luau, the same pixels at every size but its width, 4 x size + 6).
-fn name_content(name: &str, size: f32, health: Option<f32>) -> Result<Vec<u8>, rbx_binary::EncodeError> {
+/// two pixels tall; fixtures/name-tags.luau, the same pixels at every size but its width, 4 x size + 6);
+/// without `text`, the bar alone on the same canvas.
+fn name_content(name: &str, size: f32, health: Option<f32>, text: bool) -> Result<Vec<u8>, rbx_binary::EncodeError> {
 	use rbx_dom_weak::types::{Color3, Enum, Font, FontStyle, FontWeight, UDim, UDim2, Vector2};
 	let canvas = name_canvas(name, size);
 	let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
 	let root = dom.root_ref();
 	let gui = dom.insert(root, InstanceBuilder::new("BillboardGui").with_name("NameTag").with_property("Size", UDim2::new(UDim::new(0.0, canvas[0] as i32), UDim::new(0.0, canvas[1] as i32))));
 	let middle = (canvas[1] / 2.0) as i32;
-	dom.insert(
-		gui,
-		InstanceBuilder::new("TextLabel")
-			.with_name("Name")
-			.with_property("AnchorPoint", Vector2::new(0.5, 1.0))
-			.with_property("Position", UDim2::new(UDim::new(0.5, 0), UDim::new(0.0, middle - NAME_LINE_GAP)))
-			.with_property("Size", UDim2::new(UDim::new(1.0, 0), UDim::new(0.0, (2.0 * size) as i32)))
-			.with_property("BackgroundTransparency", 1.0f32)
-			.with_property("Text", name.to_string())
-			.with_property("FontFace", Font::new("rbxasset://fonts/families/SourceSansPro.json", FontWeight::Regular, FontStyle::Normal))
-			.with_property("TextSize", size)
-			.with_property("TextColor3", Color3::new(1.0, 1.0, 1.0))
-			.with_property("TextStrokeColor3", Color3::new(NAME_STROKE_GREY, NAME_STROKE_GREY, NAME_STROKE_GREY))
-			.with_property("TextStrokeTransparency", NAME_STROKE_TRANSPARENCY)
-			// Enum.TextYAlignment.Bottom
-			.with_property("TextYAlignment", Enum::from_u32(2)),
-	);
+	if text {
+		dom.insert(
+			gui,
+			InstanceBuilder::new("TextLabel")
+				.with_name("Name")
+				.with_property("AnchorPoint", Vector2::new(0.5, 1.0))
+				.with_property("Position", UDim2::new(UDim::new(0.5, 0), UDim::new(0.0, middle - NAME_LINE_GAP)))
+				.with_property("Size", UDim2::new(UDim::new(1.0, 0), UDim::new(0.0, (2.0 * size) as i32)))
+				.with_property("BackgroundTransparency", 1.0f32)
+				.with_property("Text", name.to_string())
+				.with_property("FontFace", Font::new("rbxasset://fonts/families/SourceSansPro.json", FontWeight::Regular, FontStyle::Normal))
+				.with_property("TextSize", size)
+				.with_property("TextColor3", Color3::new(1.0, 1.0, 1.0))
+				.with_property("TextStrokeColor3", Color3::new(NAME_STROKE_GREY, NAME_STROKE_GREY, NAME_STROKE_GREY))
+				.with_property("TextStrokeTransparency", NAME_STROKE_TRANSPARENCY)
+				// Enum.TextYAlignment.Bottom
+				.with_property("TextYAlignment", Enum::from_u32(2)),
+		);
+	}
 	if let Some(share) = health {
 		let width = (4.0 * size + 6.0) as i32;
 		let left = canvas[0] as i32 / 2 - width / 2;
@@ -482,8 +558,10 @@ pub fn name_tag(document: &Document, referent: Ref, instance: &Instance, warning
 	}
 	let head = holder.children().iter().filter_map(|&child| document.dom.get_by_ref(child)).find(|child| child.name == "Head" && props::is_a(child, "BasePart"))?;
 	let (centre, _) = part_box(head)?;
-	// a Viewer is shown within the viewer's distances (a default Humanoid's: no local character here)
-	let (name_distance, health_distance) = if kind == 1 { (props::f32(instance, "NameDisplayDistance", 100.0), props::f32(instance, "HealthDisplayDistance", 100.0)) } else { (100.0, 100.0) };
+	// a Viewer is shown within the viewer's distances (a default Humanoid's without a local player;
+	// render::guis takes the Viewer's own when the scene names one)
+	let subject = kind == 1;
+	let (name_distance, health_distance) = if subject { (props::f32(instance, "NameDisplayDistance", 100.0), props::f32(instance, "HealthDisplayDistance", 100.0)) } else { (100.0, 100.0) };
 	let display = props::string(instance, "DisplayName").filter(|name| !name.is_empty()).unwrap_or_else(|| holder.name.to_string());
 	let max_health = props::f32(instance, "MaxHealth", 100.0);
 	// Health as a file keeps it (a place or model saved by Studio: Health_XML); a recording of play does not
@@ -505,9 +583,10 @@ pub fn name_tag(document: &Document, referent: Ref, instance: &Instance, warning
 	let path = document.path_of(referent);
 	let mut contents = Vec::new();
 	for size in NAME_SIZES {
-		let bars: &[Option<f32>] = if share.is_some() { &[None, share] } else { &[None] };
-		for bar in bars {
-			match name_content(&display, size, *bar) {
+		// the name, then with the bar, then the bar alone ([`NameTag::content`])
+		let parts: &[(Option<f32>, bool)] = if share.is_some() { &[(None, true), (share, true), (share, false)] } else { &[(None, true)] };
+		for &(bar, text) in parts {
+			match name_content(&display, size, bar, text) {
 				Ok(bytes) => {
 					let hash = fnv1a(&bytes);
 					contents.push((Arc::new(bytes), hash));
@@ -523,7 +602,7 @@ pub fn name_tag(document: &Document, referent: Ref, instance: &Instance, warning
 	let (content, base_content_hash) = contents[0].clone();
 	Some(Gui {
 		path,
-		kind: GuiKind::NameTag(NameTag { head: centre, name_distance, health_distance, health: share, model, canvases, contents, occluders: Arc::new(Vec::new()) }),
+		kind: GuiKind::NameTag(NameTag { head: centre, name_distance, health_distance, subject, viewer: None, health: share, model, canvases, contents, occluders: Arc::new(Vec::new()) }),
 		content,
 		base_content_hash,
 		content_hash: base_content_hash,
@@ -1394,7 +1473,7 @@ mod tests {
 		assert!((tag("Plain").head - Vec3::new(0.0, 4.5, 0.0)).length() < 1e-4 && tag("Plain").name_distance == 100.0 && tag("Plain").health.is_none() && tag("Plain").contents.len() == 3);
 		assert_eq!(tag("Own").name_distance, 20.0);
 		assert!(tag("Own").canvases[0][0] > tag("Plain").canvases[0][0], "a longer name, a wider canvas");
-		assert_eq!((tag("Hurt").health, tag("Hurt").contents.len()), (Some(0.5), 6));
+		assert_eq!((tag("Hurt").health, tag("Hurt").contents.len()), (Some(0.5), 9));
 		assert!(tag("Quiet").health.is_none());
 		// text sizes and the fade (24 nearer than 20 studs, 18 nearer than 50, then 12; whole to the last tenth)
 		assert_eq!([19.9, 20.0, 49.9, 50.0].map(super::NameTag::size), [0, 1, 1, 2]);

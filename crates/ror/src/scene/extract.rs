@@ -50,12 +50,15 @@ fn noted(document: &Document, mut scene: Scene) -> Scene {
 			scene.guis.push(gui);
 		}
 	}
-	// what can hide a name tag: the parts a ray hits, read once for all of them
+	// what can hide a name tag: the parts a ray hits, read once for all of them; and whom the tags are
+	// drawn for: the local player a recording names, its character as the document holds it at this moment
 	if scene.guis.iter().any(|gui| matches!(gui.kind, super::guis::GuiKind::NameTag(_))) {
 		let occluders = Arc::new(super::guis::occluders(document, &document.roots));
+		let viewer = super::guis::viewer(document).map(Arc::new);
 		for gui in &mut scene.guis {
 			if let super::guis::GuiKind::NameTag(tag) = &mut gui.kind {
 				tag.occluders = occluders.clone();
+				tag.viewer = viewer.clone();
 			}
 		}
 	}

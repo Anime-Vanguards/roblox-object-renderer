@@ -8,6 +8,14 @@
 -- "f-black-d<N>", "f-white-d10": a long DisplayName on black and before a white wall (the font and its edge).
 -- "b-d<N>": a rig at half health N studs ahead (the bar's sizes); "c-<P>": the bar at P % (AlwaysOn).
 -- "o-...": boards between the camera and the head or the name (which line hides it; transparent; CanQuery off).
+-- "v-...": the local character's view of the tags. Each case makes a rig named Viewer that a client job sets as
+--   Players.LocalPlayer.Character (a client recording keeps it in `~Players`, which ror reads; rendered from this
+--   file alone it is one more rig): "v-fade-<L>-d<N>" its Head N studs behind a rig 15 studs ahead, its
+--   NameDisplayDistance L (the fade by the viewer's distance); "v-size-c<C>-v<N>" a rig C studs ahead, the Viewer's
+--   Head N studs past it (text size by the camera's distance); "v-subject-d<N>" a Subject of NameDisplayDistance 50;
+--   "v-bar-d<N>" a hurt rig, the Viewer's HealthDisplayDistance 50, and "v-baronly-d<N>" its NameDisplayDistance
+--   30 (the bar's own fade, shown past the name's); "v-occ-<Mode>" a board on the camera's line to a rig 30 studs
+--   ahead, the Viewer's NameOcclusion Mode, the rig's own NoOcclusion; "v-own" the Viewer before the camera.
 --
 -- ror render fixtures/name-tags.luau --context '{"Case":"w-d16"}' --size 1644x1116@1 --camera ...
 local ORIGIN = Vector3.new(0, 500, 0)
@@ -102,6 +110,47 @@ Cases["o-transparent-board"] = function()
 end
 Cases["o-cancollide-off"] = function()
 	return { Rig("Ghost", Ahead(30)), Board(Ahead(15, 0, 1.8), Vector3.new(8, 3, 0.2), { CanCollide = false, CanQuery = false }) }
+end
+-- the local character: a rig named Viewer whose Head is `Back` studs behind the head straight ahead at `Distance`
+local function Viewer(Distance: number, Back: number, Props: any?): Model
+	return Rig("Viewer", Ahead(Distance) + Vector3.new(0, 0, Back), Props)
+end
+for _, Limit in { 100, 50 } do
+	for _, Back in (Limit == 100 and { 88, 90, 92, 94, 96, 98, 99, 100, 101, 102 } or { 44, 46, 48, 49, 50, 51 }) do
+		Cases[`v-fade-{Limit}-d{Back}`] = function()
+			return { Rig("Alpha", Ahead(15)), Viewer(15, Back, { NameDisplayDistance = Limit }) }
+		end
+	end
+end
+for _, Pair in { { 10, 60 }, { 30, 60 }, { 60, -10 }, { 30, -10 }, { 60, 200 } } do
+	Cases[`v-size-c{Pair[1]}-v{math.abs(Pair[2])}`] = function()
+		return { Rig("Sized", Ahead(Pair[1])), Viewer(Pair[1], Pair[2]) }
+	end
+end
+for _, Back in { 44, 46, 48, 50, 52 } do
+	Cases[`v-subject-d{Back}`] = function()
+		return { Rig("Subject", Ahead(15), { DisplayDistanceType = Enum.HumanoidDisplayDistanceType.Subject, NameDisplayDistance = 50 }), Viewer(15, Back) }
+	end
+	Cases[`v-bar-d{Back}`] = function()
+		return { Rig("Hurt", Ahead(15), { Health = 50 }), Viewer(15, Back, { HealthDisplayDistance = 50 }) }
+	end
+end
+for _, Back in { 28, 40, 60 } do
+	Cases[`v-baronly-d{Back}`] = function()
+		return { Rig("Hurt", Ahead(15), { Health = 50 }), Viewer(15, Back, { NameDisplayDistance = 30 }) }
+	end
+end
+for _, Mode in { "OccludeAll", "NoOcclusion", "EnemyOcclusion" } do
+	Cases[`v-occ-{Mode}`] = function()
+		return {
+			Rig("Behind", Ahead(30), { NameOcclusion = Enum.NameOcclusion.NoOcclusion }),
+			Viewer(30, 32, { NameOcclusion = (Enum.NameOcclusion :: any)[Mode] }),
+			Board(Ahead(15, 0, 1.8), Vector3.new(8, 3, 0.2)),
+		}
+	end
+end
+Cases["v-own"] = function()
+	return { Rig("Other", Ahead(15, 6)), Viewer(15, 0) }
 end
 
 return function(Context)
