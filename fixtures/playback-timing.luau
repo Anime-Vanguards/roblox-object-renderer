@@ -35,6 +35,10 @@
 -- "alive" (x 8000, seen from -Z): Rate 60 emitters of 0.15-stud squares leaving up at 30 studs a second,
 --   Lifetimes 0.05, 0.1, 0.0667, 0.04, 0.075 and 0.125 s (3, 6, 4, 2.4, 4.5 and 7.5 frames at 60 a second),
 --   `alive-<n>`, running.
+-- "parentout" (x 7000, seen from -Z): Rate 10 emitters of 0.3-stud squares leaving up at 30 studs a second,
+--   switched off in the file: `po-ref` (a job switches it on), `po-out-back` (switched on, then parented
+--   out of the world and back), `po-emit-out` (Rate 0: emitted while out of the world), `po-model` (its
+--   Model `po-holder` parented out and back), and `po-age` (one emitted particle whose height is its age).
 return function(Context)
 	local Root = Instance.new("Model")
 	Root.Name = "TimingProbes"
@@ -260,6 +264,25 @@ return function(Context)
 			local E = Emitter(Anchor(Model, `alive-{Index}-anchor`, Center + Vector3.new((Index - 2) * 2, 0, 0)), `alive-{Index}`, { Size = Constant(0.15), Speed = NumberRange.new(30, 30), Lifetime = NumberRange.new(Life, Life) })
 			E.Rate = 60
 		end
+	end
+
+	-- parentout: emitters a job parents out of the world and back
+	do
+		local Center = Vector3.new(7000, 0, 0)
+		local Model = Group("parentout", Center, { eye = { 7000, 8, -40 }, target = { 7000, 8, 0 }, fov = 40 })
+		Block(Model, "Backdrop", CFrame.new(Center + Vector3.new(0, 0, 30)), Vector3.new(200, 120, 1), Color3.new(0, 0, 0), Enum.Material.Neon)
+		local Column = { Size = Constant(0.3), Speed = NumberRange.new(30, 30), Lifetime = NumberRange.new(5, 5), Rate = 10, Enabled = false }
+		for Index, Name in { "po-ref", "po-out-back", "po-emit-out", "po-model" } do
+			local Holder = Model
+			if Name == "po-model" then
+				Holder = Instance.new("Model")
+				Holder.Name = "po-holder"
+				Holder.Parent = Model
+			end
+			local E = Emitter(Anchor(Holder, `{Name}-anchor`, Center + Vector3.new((Index - 2.5) * 2, 0, 0)), Name, Column)
+			if Name == "po-emit-out" then E.Rate = 0 end
+		end
+		Emitter(Anchor(Model, "po-age-anchor", Center + Vector3.new(-6, 0, 0)), "po-age", { Size = Constant(0.3), Speed = NumberRange.new(30, 30), Lifetime = NumberRange.new(5, 5) })
 	end
 
 	Root.Parent = workspace

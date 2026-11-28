@@ -477,6 +477,67 @@ impl<'d> Paths<'d> {
 	}
 }
 
+/// When each of `instances` is in the world while the playback parents things elsewhere (`parents`, each
+/// instance's (time, new parent; none out of the world) in time order): (time, in the world) from `start`,
+/// a change at every parenting that moves it in or out, for those whose own or an ancestor's parent the
+/// playback sets; the rest are left out.
+fn world_spans(document: &Document, parents: &[(Ref, Vec<(f32, Ref)>)], start: f32, instances: impl Iterator<Item = Ref>) -> Vec<(Ref, Vec<(f32, bool)>)> {
+	if parents.is_empty() {
+		return Vec::new();
+	}
+	let moved: std::collections::HashMap<Ref, &[(f32, Ref)]> = parents.iter().map(|(referent, events)| (*referent, events.as_slice())).collect();
+	let mut times: Vec<f32> = parents.iter().flat_map(|(_, events)| events.iter().map(|&(time, _)| time)).filter(|&time| time > start).collect();
+	times.sort_by(f32::total_cmp);
+	times.dedup();
+	// the parent at `time`: the last one the playback gave at or before it, else the file's
+	let parent_at = |referent: Ref, time: f32| -> Ref {
+		match moved.get(&referent).and_then(|events| events.iter().rev().find(|&&(at, _)| at <= time + 1e-6)) {
+			Some(&(_, parent)) => parent,
+			None => document.dom.get_by_ref(referent).map_or(Ref::none(), |instance| instance.parent()),
+		}
+	};
+	let in_world = |referent: Ref, time: f32| -> bool {
+		let mut current = referent;
+		for _ in 0..4096 {
+			if document.roots.contains(&current) {
+				return true;
+			}
+			current = parent_at(current, time);
+			if current.is_none() {
+				return false;
+			}
+		}
+		false
+	};
+	let mut out = Vec::new();
+	for referent in instances {
+		// only what has the playback's parenting in its line
+		let mut current = referent;
+		let mut touched = false;
+		while current.is_some() {
+			if moved.contains_key(&current) {
+				touched = true;
+				break;
+			}
+			current = document.dom.get_by_ref(current).map_or(Ref::none(), |instance| instance.parent());
+		}
+		if !touched {
+			continue;
+		}
+		let mut spans = vec![(start, in_world(referent, start))];
+		for &time in &times {
+			let inside = in_world(referent, time);
+			if spans.last().is_some_and(|&(_, last)| last != inside) {
+				spans.push((time, inside));
+			}
+		}
+		if spans.len() > 1 {
+			out.push((referent, spans));
+		}
+	}
+	out
+}
+
 fn descendants(document: &Document, referent: Ref) -> Vec<Ref> {
 	let mut list = Vec::new();
 	let mut stack = vec![referent];
@@ -1382,6 +1443,50 @@ impl Timeline {
 			index > 0 && !switches[index - 1].1
 		};
 		self.emits.retain(|burst| !off(burst.at));
+	}
+
+	/// Out of the world (`spans`: (time, in the world) from the start, [`world_spans`]) a Roblox client runs
+	/// nothing of an emitter: taken out, its particles are gone and it emits no more; parented back in it
+	/// starts as one switched on in that frame (its Rate counted from there), and an Emit made while it was
+	/// out leaves then (`fixtures/playback-timing.luau` "parentout", a 0.747 client on its exact frame
+	/// clock: a Rate 10 emitter switched on, parented out after 9 frames and in after 21 showed only the
+	/// particle of its seventh frame back, as its switched-on twin's first; one under a Model parented out
+	/// and back alike; three emitted 3 frames after it was parented out, back in 3 frames later, left in
+	/// that frame). Studio recordings hide what is not there with Enabled, so this decides hand-written
+	/// playbacks.
+	fn in_world(mut self, spans: &[(f32, bool)]) -> Self {
+		let world_at = |t: f32| {
+			let index = spans.partition_point(|(time, _)| *time <= t + 1e-6);
+			index == 0 || spans[index - 1].1
+		};
+		let mut times: Vec<f32> = self.enabled.iter().map(|&(time, _)| time).chain(spans.iter().map(|&(time, _)| time)).collect();
+		times.sort_by(f32::total_cmp);
+		times.dedup();
+		let mut enabled = Vec::new();
+		for time in times {
+			let on = self.enabled_at(time) && world_at(time);
+			if enabled.last().is_none_or(|&(_, last)| last != on) {
+				enabled.push((time, on));
+			}
+		}
+		self.enabled = enabled;
+		// gone with what the frame it leaves in spawned: out of the world it takes no step (a clear keeps its
+		// own frame's births)
+		for pair in spans.windows(2) {
+			if pair[0].1 && !pair[1].1 {
+				self.clears.push(pair[1].0 + 1e-5);
+			}
+		}
+		self.emits = std::mem::take(&mut self.emits)
+			.into_iter()
+			.filter_map(|burst| {
+				if world_at(burst.at) {
+					return Some(burst);
+				}
+				spans.iter().find(|&&(time, inside)| inside && time > burst.at + 1e-6).map(|&(time, _)| Burst::at(time, burst.count))
+			})
+			.collect();
+		self
 	}
 
 	fn last_clear(&self, t: f32) -> Option<f32> {
@@ -2387,7 +2492,7 @@ impl Playback {
 			}
 		}
 		let start = -self.prewarm;
-		let timelines = timelines.into_iter().map(|(referent, timeline)| (referent, timeline.sorted(start))).collect();
+		let mut timelines: std::collections::HashMap<Ref, Timeline> = timelines.into_iter().map(|(referent, timeline)| (referent, timeline.sorted(start))).collect();
 		// every property set, switched or tweened, and every instance parented elsewhere, their events
 		// in time order (an action's before a tween's at the same time)
 		let mut channels: Vec<Channel<'a>> = Vec::new();
@@ -2477,6 +2582,12 @@ impl Playback {
 		}
 		for (_, events) in &mut parents {
 			events.sort_by(|a, b| a.0.total_cmp(&b.0));
+		}
+		// what a Roblox client runs of an emitter the playback takes out of the world and back ([`Timeline::in_world`])
+		for (referent, spans) in world_spans(document, &parents, start, timelines.keys().copied().filter(|&referent| document.dom.get_by_ref(referent).is_some_and(|instance| instance.class == "ParticleEmitter"))) {
+			if let Some(timeline) = timelines.get_mut(&referent) {
+				*timeline = std::mem::take(timeline).in_world(&spans).sorted(start);
+			}
 		}
 		for (_, _, events) in &mut refs {
 			events.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -4944,6 +5055,58 @@ mod tests {
 				drawn.dedup();
 				assert_eq!(&drawn, ages, "Rate {rate} switched on at frame {on}");
 			}
+		}
+	}
+
+	/// What a Roblox client runs of emitters parented out of the world and back (fixtures/playback-timing.luau
+	/// "parentout", on its exact 60-frames-a-second clock, two sessions): Rate 10 emitters switched on at a
+	/// frame and frozen 33 frames later draw these ages in frames. Parented out 9 frames in and back 12
+	/// frames later (the emitter itself or a Model above it), one keeps only what it spawned back in, as if
+	/// switched on then; three emitted while it was out leave when it is back (ror kept emitting out of the
+	/// world and spawned the burst at the call: 5 particles each, a burst 29 frames old).
+	#[test]
+	fn emitters_out_of_the_world_run_nothing() {
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use rbx_dom_weak::InstanceBuilder;
+		use rbx_dom_weak::types::NumberRange;
+		let mut model = ModelBuilder::new("Fx");
+		let part = model.part(&PartSpec { name: "Part".into(), ..PartSpec::default() });
+		let holder = model.child(model.model, InstanceBuilder::new("Model").with_name("Holder"));
+		let held = model.part(&PartSpec { name: "HeldPart".into(), ..PartSpec::default() });
+		model.dom.transfer_within(held, holder);
+		let emitter = |name: &str, rate: f32| InstanceBuilder::new("ParticleEmitter").with_name(name).with_property("Enabled", false).with_property("Rate", rate).with_property("Lifetime", NumberRange::new(5.0, 5.0));
+		for (name, rate) in [("Ref", 10.0), ("Back", 10.0), ("Out", 0.0)] {
+			model.child(part, emitter(name, rate));
+		}
+		model.child(held, emitter("Held", 10.0));
+		let mut document = model.into_document();
+		let on = 120u32;
+		let frame = |index: u32| (on + index) as f32 / 60.0;
+		let act = |at: u32, target: &str| Action { at: frame(at), target: target.into(), ..Default::default() };
+		let actions = vec![
+			Action { enabled: Some(true), ..act(0, "Fx.Part.Ref") },
+			Action { enabled: Some(true), ..act(0, "Fx.Part.Back") },
+			Action { enabled: Some(true), ..act(0, "Fx.Holder.HeldPart.Held") },
+			Action { parent: Some(String::new()), ..act(0, "Fx.Part.Out") },
+			Action { emit: Some(Emit::Count(3)), ..act(3, "Fx.Part.Out") },
+			Action { parent: Some("Fx.Part".into()), ..act(6, "Fx.Part.Out") },
+			Action { parent: Some(String::new()), ..act(9, "Fx.Part.Back") },
+			Action { parent: Some(String::new()), ..act(9, "Fx.Holder") },
+			Action { parent: Some("Fx.Part".into()), ..act(21, "Fx.Part.Back") },
+			Action { parent: Some("Fx".into()), ..act(21, "Fx.Holder") },
+			Action { time_scale: Some(0.0), class: Some("ParticleEmitter".into()), ..act(33, "Fx") },
+		];
+		let playback = Playback { time: frame(40), actions, ..Default::default() };
+		let resolved = playback.resolve(&document).unwrap();
+		let undo = resolved.apply_state(&mut document).unwrap();
+		let mut scene = crate::scene::extract::extract(&document);
+		resolved.apply_history(&document, &mut scene);
+		undo.restore(&mut document);
+		for (name, ages) in [("Ref", vec![1u32, 7, 13, 19, 25]), ("Back", vec![4]), ("Held", vec![4]), ("Out", vec![26, 26, 26])] {
+			let emitter = scene.particles.iter().find(|emitter| emitter.path.ends_with(&format!(".{name}"))).unwrap();
+			let mut drawn: Vec<u32> = emitter.births.as_ref().unwrap().iter().map(|birth| (birth.age * 60.0).round() as u32).collect();
+			drawn.sort_unstable();
+			assert_eq!(drawn, ages, "{name}");
 		}
 	}
 
