@@ -28,6 +28,13 @@
 -- "sheet2" (x 3000, seen from -Z): the same for unblended OneShot sheets, FlipbookStartRandom, Loop and
 --   PingPong at 30 frames a second, and 2 x 2 and 8 x 8 OneShot sheets (`Context.Sheet2Texture`,
 --   `Context.Sheet8Texture`); `sheet2-ref` as `sheet-ref`.
+-- "edges" (x 6000, seen from -Z): unblended Loop, PingPong and Random 4 x 4 sheets at 30 and 60 frames a
+--   second (whole frames at whole frames of age), unblended and cross-faded OneShot sheets living 0.1 and
+--   0.05 s (frozen at exactly their Lifetime), then unblended Loop and PingPong at 40 and 120 frames a
+--   second and a second Random at 60; `edges-ref` as `sheet-ref`.
+-- "alive" (x 8000, seen from -Z): Rate 60 emitters of 0.15-stud squares leaving up at 30 studs a second,
+--   Lifetimes 0.05, 0.1, 0.0667, 0.04, 0.075 and 0.125 s (3, 6, 4, 2.4, 4.5 and 7.5 frames at 60 a second),
+--   `alive-<n>`, running.
 return function(Context)
 	local Root = Instance.new("Model")
 	Root.Name = "TimingProbes"
@@ -203,6 +210,55 @@ return function(Context)
 				local Texture = (Kind == "black" and Context.BlackTexture or Context.WhiteTexture) or SQUARE
 				Emitter(Anchor(Model, `{Kind}-{Index}-anchor`, Center + Vector3.new(X[Index], 7 - (Row - 1) * 12, 0)), `{Kind}-{Index}`, { Size = Constant(Size), Texture = Texture })
 			end
+		end
+	end
+
+	-- edges: unblended sheets at whole frames, and a particle frozen at its Lifetime
+	do
+		local Center = Vector3.new(6000, 0, 0)
+		local Model = Group("edges", Center, { eye = { 6000, 0, -40 }, target = { 6000, 0, 0 }, fov = 40 })
+		Block(Model, "Backdrop", CFrame.new(Center + Vector3.new(0, 0, 30)), Vector3.new(200, 120, 1), Color3.new(0, 0, 0), Enum.Material.Neon)
+		local Grid4 = Context.SheetTexture or SQUARE
+		local Cases = {
+			{ "loop-u-30", 5, "Loop", 30, false },
+			{ "loop-u-60", 5, "Loop", 60, false },
+			{ "pingpong-u-30", 5, "PingPong", 30, false },
+			{ "pingpong-u-60", 5, "PingPong", 60, false },
+			{ "random-u-30", 5, "Random", 30, false },
+			{ "random-u-60", 5, "Random", 60, false },
+			{ "life-u-100", 0.1, "OneShot", 0, false },
+			{ "life-b-100", 0.1, "OneShot", 0, true },
+			{ "life-u-50", 0.05, "OneShot", 0, false },
+			{ "life-b-50", 0.05, "OneShot", 0, true },
+			{ "loop-u-40", 5, "Loop", 40, false },
+			{ "pingpong-u-40", 5, "PingPong", 40, false },
+			{ "loop-u-120", 5, "Loop", 120, false },
+			{ "pingpong-u-120", 5, "PingPong", 120, false },
+			{ "random-u-60b", 5, "Random", 60, false },
+		}
+		for Index, Case in Cases do
+			local Row, Column = (Index - 1) // 6, (Index - 1) % 6
+			Emitter(Anchor(Model, `{Case[1]}-anchor`, Center + Vector3.new((Column - 2.5) * 3.5, 3 - Row * 5, 0)), Case[1], {
+				Size = Constant(1.2),
+				Lifetime = NumberRange.new(Case[2], Case[2]),
+				Texture = Grid4,
+				FlipbookLayout = Enum.ParticleFlipbookLayout.Grid4x4,
+				FlipbookMode = Enum.ParticleFlipbookMode[Case[3]],
+				FlipbookFramerate = NumberRange.new(Case[4], Case[4]),
+				FlipbookBlendFrames = Case[5],
+			})
+		end
+		Emitter(Anchor(Model, "edges-ref-anchor", Center + Vector3.new(-12, -9, 0)), "edges-ref", { Size = Constant(0.4), Speed = NumberRange.new(20, 20), Lifetime = NumberRange.new(5, 5) })
+	end
+
+	-- alive: running Rate 60 emitters whose particles reach their Lifetime on a whole frame
+	do
+		local Center = Vector3.new(8000, 0, 0)
+		local Model = Group("alive", Center, { eye = { 8000, 1, -30 }, target = { 8000, 1, 0 }, fov = 40 })
+		Block(Model, "Backdrop", CFrame.new(Center + Vector3.new(0, 0, 30)), Vector3.new(200, 120, 1), Color3.new(0, 0, 0), Enum.Material.Neon)
+		for Index, Life in { 0.05, 0.1, 0.0667, 0.04, 0.075, 0.125 } do
+			local E = Emitter(Anchor(Model, `alive-{Index}-anchor`, Center + Vector3.new((Index - 2) * 2, 0, 0)), `alive-{Index}`, { Size = Constant(0.15), Speed = NumberRange.new(30, 30), Lifetime = NumberRange.new(Life, Life) })
+			E.Rate = 60
 		end
 	end
 

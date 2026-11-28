@@ -15,7 +15,7 @@ Without a playback timeline, a model renders as authored:
 ## Timed renders (with playback)
 
 With a playback timeline ([playback.md](playback.md)), `ror` simulates emissions, property switches, tweens, and movement up to the requested time:
-- Particles exist at the exact positions, sizes, colors, transparencies, rotations, and flipbook frames produced by their spawn time and age.
+- Particles exist at the exact positions, sizes, colors, transparencies, rotations, and flipbook frames produced by their spawn time and age. A particle shows while its age is under its `Lifetime` (an age that reaches it is gone); unblended `OneShot`, `Loop`, and `PingPong` flipbooks show the frame before at an exact whole frame.
 - Trails follow the attachment path left over prior frames.
 - Beams scroll their texture at `TextureSpeed` starting from the frame they were enabled.
 

@@ -45,8 +45,17 @@ const SLOWEST_ORIENTED: f32 = 1e-4;
 /// 0.38 / 0.40 / 0.43 / 0.5, 200 for floor + 1).
 const RANDOM_PHASE: f32 = 0.38;
 
-/// How far past a whole frame an unblended OneShot flipbook's position must be to show that frame: a
-/// Roblox client shows the frame before at a whole one (render::particles::flipbook).
+/// Seconds within which a particle's age counts as reaching its Lifetime ([`particle`]): f32 frame times
+/// land a few microseconds either side of a whole frame, and a client's 0.0667 s Lifetime ends at 4 frames
+/// (66.667 ms), as if it counted in coarser steps (whole milliseconds would do).
+const AGE_EDGE: f32 = 1e-4;
+
+/// Seconds within which a frozen particle's spawning-clock age still counts as within its Lifetime
+/// ([`particle`]).
+const LIFE_EDGE: f32 = 1e-5;
+
+/// How far past a whole frame an unblended OneShot, Loop or PingPong flipbook's position must be to show
+/// that frame: a Roblox client shows the frame before at a whole one (render::particles::flipbook).
 const FRAME_REACHED: f32 = 1e-4;
 
 /// Soft particles: a particle's opacity fades in over this many times its Size of view depth in front
@@ -385,11 +394,13 @@ fn flipbook(emitter: &ParticleEmitter, age: f32, lifetime: f32, rng: &mut Rng) -
 				(frame, (frame + 1).min(count - 1), 0.0)
 			}
 		}
-		// PingPong: first to last and back
+		// PingPong: first to last and back; unblended, a step reached exactly shows the one before, as a
+		// OneShot's frame and a Loop's do
 		2 => {
 			let period = 2 * (count - 1);
 			let position = start + age * framerate;
-			let step = position.floor() as u32 % period;
+			let reached = if emitter.flipbook_blend_frames { position } else { (position - FRAME_REACHED).max(0.0) };
+			let step = reached.floor() as u32 % period;
 			let frame = if step < count { step } else { period - step };
 			let next = if step + 1 < count { step + 1 } else { period - (step + 1) % period };
 			(frame, next.min(count - 1), position.fract())
@@ -406,10 +417,15 @@ fn flipbook(emitter: &ParticleEmitter, age: f32, lifetime: f32, rng: &mut Rng) -
 			let pick = |n: u64| ((n % count) ^ (n / count % count)) as u32 % count as u32;
 			(pick(step), pick(step + 1), position.fract())
 		}
-		// Loop
+		// Loop; unblended, a frame reached exactly shows the one before (fixtures/playback-timing.luau
+		// "edges", a 0.747 client on its exact 60-frames-a-second clock, two sessions: 4 x 4 sheets at 30,
+		// 40, 60 and 120 frames a second frozen 0-11 frames old show floor(position) off whole positions
+		// and the frame before at whole ones, 15 at 16.0 and 1 at 18.0 at 120; PingPong alike, 15 at 16.0
+		// and 13 at 18.0)
 		_ => {
 			let position = start + age * framerate;
-			let frame = position.floor() as u32 % count;
+			let reached = if emitter.flipbook_blend_frames { position } else { (position - FRAME_REACHED).max(0.0) };
+			let frame = reached.floor() as u32 % count;
 			(frame, (frame + 1) % count, position.fract())
 		}
 	};
@@ -418,10 +434,20 @@ fn flipbook(emitter: &ParticleEmitter, age: f32, lifetime: f32, rng: &mut Rng) -
 
 /// A particle emitted `age` seconds ago by the emitter at `frame` (its part's or attachment's world
 /// CFrame then, the part of `size` then) moving at `inherited` (its share of the emitter's velocity),
-/// or `None` once its lifetime is over (by `lived`, the spawning clock's age, where that is longer).
+/// or `None` once its lifetime is over: its age reaching it, or `lived` (the spawning clock's age, longer
+/// in the frame a TimeScale changes in) past it.
+///
+/// A Roblox client draws a particle while its age is under its Lifetime, an age on it gone: on its exact
+/// 60-frames-a-second clock running Rate 60 emitters of 2.4, 3, 4.5, 6 and 7.5 frames' Lifetime draw ages
+/// 0-2, 0-2, 0-4, 0-5 and 0-7, and one of 0.0667 s (0.03 ms over 4 frames) ages 0-3, so an age within
+/// [`AGE_EDGE`] of the Lifetime counts as on it (`fixtures/playback-timing.luau` "alive"; ror drew the
+/// whole-frame ones a frame longer where f32 frame times came out at or under the Lifetime). Frozen, the
+/// freezing frame's step counts for dying, not ageing, and a spawning clock exactly at the Lifetime keeps
+/// the particle: sheets of 3 and 6 frames' Lifetime frozen 3 and 6 frames after their emission still
+/// draw, 2 and 5 frames old ("edges"; ror dropped the 3-frame one, its lived time a hair over 0.05 s).
 fn particle(emitter: &ParticleEmitter, frame: &glam::Affine3A, size: Vec3, inherited: Vec3, age: f32, lived: f32, rng: &mut Rng) -> Option<Particle> {
 	let lifetime = rng.range(emitter.lifetime);
-	if lifetime <= 0.0 || age.max(lived) > lifetime {
+	if lifetime <= 0.0 || age >= lifetime - AGE_EDGE || lived > lifetime + LIFE_EDGE {
 		return None;
 	}
 	let speed = rng.range(emitter.speed);
@@ -1550,6 +1576,24 @@ mod tests {
 		assert_eq!(flipbook(&looping, 8.75, 100.0, &mut rng).0, 1);
 	}
 
+	/// Unblended, Loop and PingPong sheets show the frame before at a whole frame, as OneShot ones do: a
+	/// Roblox client's 4 x 4 sheets frozen whole frames old on its 60-frames-a-second clock
+	/// (fixtures/playback-timing.luau "edges", two sessions)
+	#[test]
+	fn unblended_loops_show_the_frame_before_at_a_whole_frame() {
+		let mut rng = Rng::new(1, 1);
+		let sheet = |mode: u32, framerate: f32| ParticleEmitter { flipbook_layout: 2, flipbook_mode: mode, flipbook_blend_frames: false, flipbook_framerate: (framerate, framerate), ..emitter() };
+		// (mode, framerate, frames of age, the client's frame); Loop 0, PingPong 2
+		let cases = [(0, 30.0, 1, 0), (0, 30.0, 2, 0), (0, 30.0, 3, 1), (0, 30.0, 4, 1), (0, 40.0, 2, 1), (0, 40.0, 3, 1), (0, 40.0, 9, 5), (0, 40.0, 11, 7), (0, 60.0, 1, 0), (0, 60.0, 8, 7), (0, 120.0, 8, 15), (0, 120.0, 9, 1), (2, 30.0, 4, 1), (2, 60.0, 11, 10), (2, 120.0, 8, 15), (2, 120.0, 9, 13), (2, 120.0, 11, 9)];
+		for (mode, framerate, frames, client) in cases {
+			let (frame, _, blend) = flipbook(&sheet(mode, framerate), frames as f32 / 60.0, 5.0, &mut rng);
+			assert_eq!((frame, blend), (client, 0.0), "mode {mode} at {framerate} frames a second, {frames} frames old");
+		}
+		// cross-faded, a whole frame shows itself
+		let blended = ParticleEmitter { flipbook_blend_frames: true, ..sheet(0, 60.0) };
+		assert_eq!(flipbook(&blended, 8.0 / 60.0, 5.0, &mut rng).0, 8);
+	}
+
 	/// Cross-faded, a OneShot sheet runs to its last frame at the end of the life: 15 · age / Lifetime on
 	/// a 4 x 4 sheet, 3 on a 2 x 2 and 63 on an 8 x 8 (a Roblox client's frames, fixtures/
 	/// playback-timing.luau "sheet" and "sheet2"), not 16, 4 and 64 as unblended sheets keep; unblended,
@@ -1595,9 +1639,11 @@ mod tests {
 
 	#[test]
 	fn rot_speed_turns_by_the_lifetime_left() {
-		// the particle's angle (degrees, counterclockwise on screen) at `age`, for one draw of the emitter
+		// the particle's angle (degrees, counterclockwise on screen) at `age`, for one draw of the emitter; at
+		// its death, just before it (an age on the Lifetime draws nothing)
 		let angle = |emitter: &ParticleEmitter, age: f32, seed: u64| {
 			let mut rng = Rng::new(seed, 1);
+			let age = age.min(emitter.lifetime.0 - 2.0 * AGE_EDGE);
 			particle(emitter, &glam::Affine3A::IDENTITY, Vec3::ZERO, Vec3::ZERO, age, age, &mut rng).expect("alive").rotation
 		};
 		let fixed = |rotation: f32, rot_speed: f32, lifetime: f32| ParticleEmitter { rotation: (rotation, rotation), rot_speed: (rot_speed, rot_speed), lifetime: (lifetime, lifetime), ..emitter() };

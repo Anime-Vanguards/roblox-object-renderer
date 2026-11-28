@@ -4947,6 +4947,55 @@ mod tests {
 		}
 	}
 
+	/// A particle is drawn while its age is under its Lifetime, an age reaching it gone; frozen, a spawning
+	/// clock exactly at the Lifetime keeps it (a Roblox client on its exact 60-frames-a-second clock,
+	/// fixtures/playback-timing.luau "alive" and "edges": running Rate 60 emitters of 3, 4.002, 6, 2.4, 4.5
+	/// and 7.5 frames' Lifetime draw ages 0-2, 0-3, 0-5, 0-2, 0-4 and 0-7; ones emitted and frozen 3 and 6
+	/// frames later draw at 2 and 5 frames old, frozen a frame later none)
+	#[test]
+	fn particles_draw_while_their_age_is_under_their_lifetime() {
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use rbx_dom_weak::InstanceBuilder;
+		use rbx_dom_weak::types::NumberRange;
+		// (name, Lifetime, how many ages a client draws: 0 to this less 1)
+		let lives: [(&str, f32, u32); 6] = [("3", 0.05, 3), ("4", 0.0667, 4), ("6", 0.1, 6), ("2_4", 0.04, 3), ("4_5", 0.075, 5), ("7_5", 0.125, 8)];
+		let mut model = ModelBuilder::new("Fx");
+		let part = model.part(&PartSpec { name: "Part".into(), ..PartSpec::default() });
+		for (name, life, _) in lives {
+			model.child(part, InstanceBuilder::new("ParticleEmitter").with_name(format!("Run{name}")).with_property("Rate", 60.0f32).with_property("Lifetime", NumberRange::new(life, life)));
+			model.child(part, InstanceBuilder::new("ParticleEmitter").with_name(format!("Burst{name}")).with_property("Rate", 0.0f32).with_property("Lifetime", NumberRange::new(life, life)));
+		}
+		let mut document = model.into_document();
+		let frame = |index: u32| index as f32 / 60.0;
+		let drawn = |document: &mut Document, playback: &Playback, name: &str| -> Vec<u32> {
+			let resolved = playback.resolve(document).unwrap();
+			let undo = resolved.apply_state(document).unwrap();
+			let mut scene = crate::scene::extract::extract(document);
+			resolved.apply_history(document, &mut scene);
+			undo.restore(document);
+			let emitter = scene.particles.iter().find(|emitter| emitter.path.ends_with(&format!(".{name}"))).unwrap();
+			let mut ages: Vec<u32> = crate::render::particles::simulate(emitter).iter().map(|particle| (particle.age * 60.0).round() as u32).collect();
+			ages.sort_unstable();
+			ages
+		};
+		let running = Playback { time: frame(600), ..Default::default() };
+		for (name, life, ages) in lives {
+			assert_eq!(drawn(&mut document, &running, &format!("Run{name}")), (0..ages).collect::<Vec<u32>>(), "Rate 60, Lifetime {life}");
+		}
+		// whole-frame Lifetimes frozen on their last frame and on the one after
+		for (name, _, frames) in [lives[0], lives[2]] {
+			let target = format!("Fx.Part.Burst{name}");
+			for (frozen, ages) in [(frames, vec![frames - 1]), (frames + 1, vec![])] {
+				let actions = vec![
+					Action { at: frame(120), target: target.clone(), emit: Some(Emit::Count(1)), ..Default::default() },
+					Action { at: frame(120 + frozen), target: target.clone(), time_scale: Some(0.0), ..Default::default() },
+				];
+				let playback = Playback { time: frame(120 + frozen + 10), actions, ..Default::default() };
+				assert_eq!(drawn(&mut document, &playback, &format!("Burst{name}")), ages, "{frames} frames' Lifetime frozen {frozen} frames after its emission");
+			}
+		}
+	}
+
 	#[test]
 	fn events_wait_for_the_next_frame() {
 		let frames = [0.0, 0.016, 0.033, 0.05];
