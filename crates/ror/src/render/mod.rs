@@ -41,6 +41,8 @@ mod glass_tests;
 #[cfg(test)]
 mod sun_shadow_tests;
 #[cfg(test)]
+mod texture_alpha_tests;
+#[cfg(test)]
 mod post_tests;
 #[cfg(test)]
 mod quality_tests;
@@ -854,7 +856,7 @@ const TEX_DECAL_BIND: u32 = 16777216;
 const TEX_DECAL_UV: u32 = 33554432;
 const TEX_DECAL_DOMINANT: u32 = 67108864;
 const TEX_EMISSIVE_RED: u32 = 134217728;
-const TEX_VERTEX_TINT_MAP: u32 = 268435456;
+const TEX_ALPHA_IGNORED: u32 = 268435456;
 const TEX_GLASS_VERTEX_SKY: u32 = 1073741824;
 
 /// Colour textures land this much darker than their decode (texture-decode; the shader's
@@ -4505,6 +4507,17 @@ impl Renderer {
 			// 0.005 and 0.01 show none of the black panel behind them, 182.3 of 255 as at 0, and occlude
 			// and take the occlusion; from 0.015 they blend, 180.3, and do neither)
 			let transparency = if part.transparency <= crate::scene::OPAQUE_TRANSPARENCY { 0.0 } else { part.transparency };
+			// a MeshPart's or SpecialMesh's own texture (TextureID, TextureContent, TextureId: part_material), not
+			// a SurfaceAppearance's map, a material's pack or a body part's composite
+			let part_texture = part.surface_appearance.is_none() && flags & TEX_COLOR != 0 && flags & (TEX_MATERIAL | TEX_ALPHA_OVERLAY | TEX_ALPHA_TRANSPARENCY | TEX_ALPHA_TINTMASK) == 0;
+			// its alpha is coverage past OPAQUE_TRANSPARENCY alone, there times 1 - Transparency (the shadows'
+			// cut too: shadow_cutout); up to it a Roblox client draws the stored colour under any alpha, alpha 0
+			// included, and Color nowhere (fixtures/texture-alpha.luau in a 0.747 client: (204, 153, 102) at
+			// alpha 0, 64, 128 and 192 in image files, EditableImages and an uploaded face, MeshParts and
+			// SpecialMeshes alike, the texel at Transparency 0 and 0.01, faded by the alpha from 0.02)
+			if part_texture && transparency == 0.0 {
+				flags |= TEX_ALPHA_IGNORED;
+			}
 			// a MeshPart's FileMesh vertex alpha: in a ViewportFrame the image's (render::guis windows); in
 			// the world it scales a transparent part's opacity and does nothing to an opaque one
 			// (vertex-alpha: a map's GlowCard, white with alpha fading out from its middle, is a soft
@@ -4522,7 +4535,7 @@ impl Renderer {
 			}
 			let opacity = if forcefield || kept_glass { 1.0 - part.transparency } else { 1.0 - transparency.clamp(0.0, 1.0) };
 			let emissive = if params.shading == materials::SHADING_NEON { neon_emission(part.color) * neon_share } else { params.emissive };
-			let base = match (&part.surface_appearance, &part.geometry) {
+			let colour = match (&part.surface_appearance, &part.geometry) {
 				_ if black => Vec3::ZERO,
 				(Some(appearance), _) if appearance.alpha_mode != 0 => linear(appearance.color),
 				// a SpecialMesh texture replaces the part colour, tinted by VertexColor decoded like a
@@ -4535,6 +4548,9 @@ impl Renderer {
 				_ if part.body_part.is_some() && part.material == 256 => linear(part.color) * COMPOSITED_ALBEDO,
 				_ => linear(part.color) * albedo,
 			} * box_albedo;
+			// a MeshPart's own texture replaces its colour, its box's too (its vertex colours tint the texture:
+			// mesh.wgsl)
+			let base = if part_texture && part.class == "MeshPart" { Vec3::ONE } else { colour };
 			// SurfaceAppearance.Color tints the colour map in AlphaMode Overlay too, squared like any
 			// colour (a ship model's SA parts: Studio / ror radiance 0.66-0.68 at Color 0.82 (0.672), 0.49-0.53
 			// at 0.71 (0.504))
@@ -4579,11 +4595,10 @@ impl Renderer {
 				Vec3::from(part.cframe.translation)
 			};
 			let mesh_bounds = mesh.bounds;
-			// a SpecialMesh shows through where its texture's alpha does (classic accessories); with an
-			// opaque texture it draws like any part, its triangles depth-tested among themselves (the
-			// classic red cap's raised logo before the patch behind it, drawn later in its mesh)
-			let special_alpha = matches!(part.geometry, Geometry::Special { .. }) && flags & TEX_COLOR != 0 && material.maps[0].as_ref().is_some_and(|texture| texture.has_alpha);
-			let texture_alpha = flags & TEX_ALPHA_TRANSPARENCY != 0 || special_alpha;
+			// a part's own texture's alpha counts only on a part transparent already (TEX_ALPHA_IGNORED); up to
+			// OPAQUE_TRANSPARENCY it draws like any part, a SpecialMesh's triangles depth-tested among themselves
+			// (the classic red cap's raised logo before the patch behind it, drawn later in its mesh)
+			let texture_alpha = flags & TEX_ALPHA_TRANSPARENCY != 0;
 			let transparent = forcefield || opacity < 1.0 || texture_alpha || part.shadow_only;
 			// the sun's and local lights' shadows alike (scene::casts_shadow); a shadow-only part's at any
 			// Transparency
@@ -4593,7 +4608,18 @@ impl Renderer {
 			// Roblox 0.747 client: alpha 65 of 255 casts the full shadow and 64 none, 129 and 128 at
 			// Transparency 0.5, 215 and 214 at 0.7; the sun's and shadowed PointLights' alike, texel by
 			// texel; Overlay and TintMask by Transparency alone)
-			let shadow_cutout = casts && flags & TEX_ALPHA_TRANSPARENCY != 0 && flags & TEX_MATERIAL == 0;
+			// A part's own texture with alpha does the same past OPAQUE_TRANSPARENCY, and up to it casts the part's
+			// shadow whole, a SpecialMesh's too (fixtures/texture-alpha.luau in a 0.747 client: MeshParts and
+			// SpecialMeshes under the tan image at alpha 0 to 255 cast the full shadow at Transparency 0, at 0.3
+			// alpha 0 and 64 none and 128 and 255 the full one, at 0.5 alpha 128 none and 192 the full one; a
+			// checkerboard at 0.5 in squares from the sun and a shadowed PointLight, whole at 0)
+			// (a shadow-only part's whole, as at Transparency 0)
+			let texture_cutout = part_texture && transparency > 0.0 && !part.shadow_only && material.maps[0].as_ref().is_some_and(|texture| texture.has_alpha);
+			// and a MeshPart's vertex alpha past it, times the texture's (TEX_VERTEX_ALPHA; the vertex alpha quad of
+			// fixtures/texture-alpha.luau, cells at alpha 255, 128, 64 and 0: all four cast at Transparency 0, the
+			// first two alone at 0.3)
+			let vertex_cutout = flags & TEX_VERTEX_ALPHA != 0 && !context.viewport && !part.shadow_only && mesh.vertex_alpha;
+			let shadow_cutout = casts && ((flags & TEX_MATERIAL == 0 && (flags & TEX_ALPHA_TRANSPARENCY != 0 || texture_cutout)) || vertex_cutout);
 			out.main = Some((index, draws.len()));
 			draws.push(DrawItem {
 				drawn_bounds: culling::Bounds::new(mesh.drawn, world),
@@ -4610,9 +4636,7 @@ impl Renderer {
 				// 206 on a floor lit at 221 / 231 / 238; at 0.75, 0.8 and up nothing; ForceField the same,
 				// where ror cast its full shadow up to Transparency 1)
 				double_sided: part.double_sided || forcefield,
-				// a SpecialMesh's texture alpha leaves its sun shadow out (not measured: the engine drew the
-				// install's triangle image opaque on a SpecialMesh, alpha and all)
-				casts_shadow: casts && (part.shadow_only || !special_alpha),
+				casts_shadow: casts,
 				// local lights' shadows follow the sun's cut (light-transparency: SmoothPlastic at
 				// Transparency 0.25 and 0.5, Glass at 0 and 0.5 and ForceField at 0 shadow the floor fully,
 				// 0.75, 0.9, 0.98 and Glass at 0.9 not at all; ror cast them all, 9 of 255 too dark there)
@@ -4630,7 +4654,7 @@ impl Renderer {
 				// behind its opaque texels, even what sorts after it: Studio shows none of the NPC aura's
 				// particles inside its legs' clothes, but the sparks pulled out in front of them
 				// (particle-model on a character; particle-occlusion still to be captured)
-				write_depth: !forcefield && opacity >= 1.0 && (flags & TEX_ALPHA_TRANSPARENCY != 0 || special_alpha) && !part.shadow_only,
+				write_depth: !forcefield && opacity >= 1.0 && flags & TEX_ALPHA_TRANSPARENCY != 0 && !part.shadow_only,
 				glass: params.shading == materials::SHADING_GLASS && opacity < 1.0 && !part.shadow_only,
 				decal_order: (0, 0, 0),
 				highlight_only: highlight_only || part.shadow_only,
@@ -6632,18 +6656,11 @@ impl Renderer {
 			material.flags |= TEX_COLOR | TEX_ALPHA_OVERLAY;
 		} else if let Some(texture) = &part.texture {
 			material.key.color = Some(transcode::image_key(texture));
-			// MeshPart textures reveal the part colour where transparent; SpecialMesh textures are
-			// see-through there
+			// a MeshPart's or SpecialMesh's texture replaces its colour, Color showing nowhere (a MeshPart's
+			// vertex colours tint it: TEX_VERTEX_TINT); its alpha is the part's coverage only past
+			// OPAQUE_TRANSPARENCY (TEX_ALPHA_IGNORED, by instance)
 			// TODO(parity): square or sRGB? (no measurable difference on the models tried)
 			material.flags |= TEX_COLOR;
-			if !matches!(part.geometry, Geometry::Special { .. }) {
-				material.flags |= TEX_ALPHA_OVERLAY;
-			}
-			// a FileMesh's vertex colours multiply a MeshPart's TextureID / TextureContent as they do its
-			// colour (mesh.wgsl: a white map leaves them unchanged)
-			if matches!(part.geometry, Geometry::MeshPart { .. }) {
-				material.flags |= TEX_VERTEX_TINT_MAP;
-			}
 		} else if !matches!(part.geometry, Geometry::Special { .. }) {
 			// material textures: the part's MaterialVariant (or the base material's override), else
 			// the built-in material's pack; the colour map's texels sRGB-encoded (PNGs) or gamma 2

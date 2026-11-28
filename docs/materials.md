@@ -29,11 +29,17 @@ How `Part.Color`, mesh vertex colors (`FileMesh` or `EditableMesh` `AddColor`/`S
 | Setup | Resulting albedo |
 |---|---|
 | Untextured `MeshPart` | `Color² * v²` per channel (vertex colors multiply `Color` before gamma-2 decode) |
-| `TextureID` or `TextureContent` | `texel² * 0.971 * v²` (`0.971` is Roblox's color-texture attenuation). `Part.Color` does not show where the texture is opaque; a white texture reveals vertex colors directly. |
+| `TextureID` or `TextureContent` | `texel² * 0.971 * v²` (`0.971` is Roblox's color-texture attenuation). `Part.Color` shows nowhere, under any texture alpha; a white texture reveals vertex colors directly. |
 | `SurfaceAppearance` (`Overlay`) | Vertex colors multiply `Part.Color` in areas revealed by `ColorMap` alpha (or everywhere if `ColorMap` is empty), never the `ColorMap` itself. |
 | `SurfaceAppearance` (`Transparency` or `TintMask`) | Vertex colors have no effect. |
 
 *Verification:* Measured in a Roblox 0.747 client using `fixtures/vertex-colour-maps.luau` under flat ambient light across white and `(204, 153, 102)` `EditableImage`s, a white built-in `TextureID`, two part colors, and `Transparency` 0 / 0.5. `ror` matches within 1/255 on textured/corner-colored quads and within 4/255 on `Overlay` at alpha 0.5.
+
+### Texture alpha on MeshParts and SpecialMeshes
+
+A `MeshPart`'s `TextureID` / `TextureContent` and a `SpecialMesh`'s `TextureId` replace the part's color. Their alpha is not coverage up to `Transparency` 0.01: the part draws opaque, showing the texture's stored color under any alpha (alpha 0 included), and casts its whole shadow. From `Transparency` 0.02 the part's opacity is `(1 - Transparency) * alpha`, times a `MeshPart`'s vertex alpha, and its shadow is cut where that is 0.252 or less, as a `SurfaceAppearance` in `AlphaMode` Transparency cuts it ([rendering.md](rendering.md)). Image files, `EditableImage`s and uploaded images behave alike. A `SpecialMesh`'s `FileMesh` vertex colors and vertex alpha do nothing, textured or not.
+
+*Verification:* Measured in a Roblox 0.747 client (quality level 21) with `fixtures/texture-alpha.luau`: `(204, 153, 102)` images at alpha 0, 64, 128, 192 and 255 as files, `EditableImage`s and an uploaded image on red quads at `Transparency` 0, 0.01, 0.02 and 0.5 before a green wall, under flat light, the sun and shadowed point lights, in two sessions that agree exactly. `ror` matches within 1/255 on every colour reading and on every shadow.
 
 ## Neon
 

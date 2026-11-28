@@ -277,6 +277,7 @@ impl Renderer {
 				drawn: drawn_bounds(&source, &vertices).unwrap_or(bind.drawn),
 				bind: Some(bind.vertex_buffer.clone()),
 				decal_faces: None,
+				vertex_alpha: bind.vertex_alpha,
 				bytes: std::mem::size_of_val(vertices.as_slice()) as u64,
 				proof: proof.clone(),
 			})
@@ -339,6 +340,7 @@ impl Renderer {
 			drawn: drawn_bounds(source, &vertices).unwrap_or(bind.drawn),
 			bind: Some(bind.vertex_buffer.clone()),
 			decal_faces: None,
+			vertex_alpha: bind.vertex_alpha,
 			bytes: bytes.len() as u64,
 			proof,
 		});

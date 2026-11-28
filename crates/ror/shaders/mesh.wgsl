@@ -712,7 +712,7 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 	}
 	// a MeshPart's FileMesh vertex colours multiply its colour before the decode, so its albedo by
 	// their square (mesh-vertex-colors: gray 117 vertices darken lit Plastic to 0.21-0.23, Neon to
-	// 0.044-0.054 = 0.21²); its own colour map's too (TEX_VERTEX_TINT_MAP, below)
+	// 0.044-0.054 = 0.21²); its own colour map's too, which replaces that colour (instance.color white)
 	let vertex_tint = input.color.rgb * input.color.rgb;
 	if ((flags & TEX_VERTEX_TINT) != 0u) {
 		base *= vertex_tint;
@@ -800,20 +800,14 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 	var colour_map = texel.rgb / TEXTURE_ALBEDO_SCALE;
 	if ((flags & TEX_COLOR) != 0u) {
 		if ((flags & TEX_ALPHA_OVERLAY) != 0u) {
-			// the part colour and the tinted map mixed by the map's alpha in Roblox's gamma-2 colour
-			// space, then squared (particle-sa-blend neon-overlay: a dark gray part under the cones'
-			// orange-tinted map, every tenth of alpha within 1 of 255 of Studio's, where the linear mix read
-			// up to 15 over; overlay-light: a light gray part under it tinted dark blue). The vertex
-			// colours tint a MeshPart's TextureID / TextureContent as they tint its colour, so a white
-			// map leaves them as they are; under a SurfaceAppearance in Overlay only the part colour its
-			// map reveals (fixtures/vertex-colour-maps.luau in a Roblox 0.747 client: quads of four vertex
-			// colours under white and (204, 153, 102) EditableImages and a white built-in TextureID within
-			// 1 of 255 of ror's texel² x 0.971 x colour², whatever the part's Color; an Overlay map at alpha
-			// 0.5 as the gamma-2 mix of Color x colour and the map, within 3 %)
-			var map = texel.rgb * instance.tint.rgb;
-			if ((flags & TEX_VERTEX_TINT_MAP) != 0u) {
-				map *= vertex_tint;
-			}
+			// a SurfaceAppearance in AlphaMode Overlay (and a body part's composite): the part colour and
+			// the tinted map mixed by the map's alpha in Roblox's gamma-2 colour space, then squared
+			// (particle-sa-blend neon-overlay: a dark gray part under the cones' orange-tinted map, every
+			// tenth of alpha within 1 of 255 of Studio's, where the linear mix read up to 15 over;
+			// overlay-light: a light gray part under it tinted dark blue). The vertex colours tint only the
+			// part colour the map reveals (fixtures/vertex-colour-maps.luau in a Roblox 0.747 client: an
+			// Overlay map at alpha 0.5 as the gamma-2 mix of Color x colour and the map, within 3 %)
+			let map = texel.rgb * instance.tint.rgb;
 			let mixed = mix(sqrt(base), sqrt(map), texel.a);
 			base = mixed * mixed;
 		} else if ((flags & TEX_ALPHA_TINTMASK) != 0u && (flags & TEX_MATERIAL) != 0u) {
@@ -831,10 +825,16 @@ fn shade_surface(input: VertexOutput, front_facing: bool, occluded: bool, is_dec
 			colour_map = select(stored * stored, srgb_to_linear(stored), (flags & TEX_SRGB) != 0u);
 			base = colour_map * TEXTURE_ALBEDO_SCALE;
 		} else {
+			// a MeshPart's or SpecialMesh's own texture replaces its colour (a MeshPart's vertex colours tint
+			// it as they tint the colour: fixtures/vertex-colour-maps.luau in a Roblox 0.747 client, quads of
+			// four vertex colours under white and (204, 153, 102) EditableImages and a white built-in
+			// TextureID within 1 of 255 of texel² x 0.971 x colour², whatever the part's Color); a
+			// SurfaceAppearance's map in AlphaMode Transparency multiplies the appearance's Color
 			base *= texel.rgb;
 			// a built-in pack's alpha is never coverage (Glass's colour map is 0.002 on average, and
-			// Studio's glass panes show at every Transparency; material-glass)
-			alpha *= select(texel.a, 1.0, (flags & TEX_MATERIAL) != 0u);
+			// Studio's glass panes show at every Transparency; material-glass), nor a part's own texture's up
+			// to OPAQUE_TRANSPARENCY (TEX_ALPHA_IGNORED)
+			alpha *= select(texel.a, 1.0, (flags & (TEX_MATERIAL | TEX_ALPHA_IGNORED)) != 0u);
 		}
 	}
 	if (surface_group != 0u) {
@@ -1559,6 +1559,7 @@ struct ShadowCutoutOutput {
 	@location(0) uv: vec2<f32>,
 	@location(1) @interpolate(flat) instance: u32,
 	@location(2) world: vec3<f32>,
+	@location(3) vertex_alpha: f32,
 }
 
 @vertex
@@ -1569,6 +1570,7 @@ fn vs_shadow_cutout(input: VertexInput, @builtin(instance_index) instance_index:
 	output.uv = input.uv;
 	output.instance = instance_index;
 	output.world = world.xyz;
+	output.vertex_alpha = input.color.a;
 	return output;
 }
 
@@ -1576,7 +1578,9 @@ fn vs_shadow_cutout(input: VertexInput, @builtin(instance_index) instance_index:
 // in AlphaMode Transparency, its colour map's alpha times 1 - Transparency (instance.texture.z), texel by
 // texel, from the sun and from local lights (fixtures/leaf-shadows.luau in a Roblox 0.747 client: alpha
 // 65 of 255 casts the full shadow and 64 none, 81 and 80 at Transparency 0.2, 92 and 91 at 0.3, 129 and
-// 128 at 0.5, 215 and 214 at 0.7: one cut at 0.252 of opacity, where Transparency alone cuts at 0.748)
+// 128 at 0.5, 215 and 214 at 0.7: one cut at 0.252 of opacity, where Transparency alone cuts at 0.748);
+// a MeshPart's or SpecialMesh's own texture the same past scene::OPAQUE_TRANSPARENCY, and there a MeshPart's
+// vertex alpha multiplies in (TEX_VERTEX_ALPHA), its material pack's alpha never (fixtures/texture-alpha.luau)
 const SHADOW_CUT_OPACITY: f32 = 0.252;
 
 // The cut reads the colour map's alpha two levels finer than the shadow map's texels pick (as far as level
@@ -1594,7 +1598,9 @@ fn fs_shadow_cutout(input: ShadowCutoutOutput) {
 	}
 	let dx = dpdx(input.uv) * SHADOW_CUT_SHARPEN;
 	let dy = dpdy(input.uv) * SHADOW_CUT_SHARPEN;
-	let alpha = studio_mips(color_map, material_info.sizes[0].xy, input.uv, dx, dy).a;
+	let flags = instances[input.instance].flags.y;
+	let map = select(studio_mips(color_map, material_info.sizes[0].xy, input.uv, dx, dy).a, 1.0, (flags & TEX_MATERIAL) != 0u);
+	let alpha = map * select(1.0, input.vertex_alpha, (flags & TEX_VERTEX_ALPHA) != 0u);
 	if (alpha * instances[input.instance].texture.z <= SHADOW_CUT_OPACITY) {
 		discard;
 	}

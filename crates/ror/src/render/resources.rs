@@ -46,6 +46,9 @@ pub struct GpuMesh {
 	/// The triangles of its finest level a decal on each box face may draw on ([`DecalFaces`]; `None`
 	/// on a posed copy, whose decals draw on every triangle)
 	pub decal_faces: Option<Arc<DecalFaces>>,
+	/// Some vertex's alpha is under 1 (a FileMesh's or an EditableMesh's colours): a transparent MeshPart's
+	/// shadows are cut by it (`fs_shadow_cutout`)
+	pub vertex_alpha: bool,
 	pub bytes: u64,
 	/// Local-file stamp provenance for this mesh.
 	pub proof: StampProof,
@@ -177,6 +180,7 @@ impl GpuMesh {
 			drawn: mesh.bounds,
 			bind: None,
 			decal_faces: DecalFaces::of(mesh),
+			vertex_alpha: mesh.vertices.iter().any(|vertex| vertex.color[3] < 255),
 			bytes,
 			proof: StampProof::Remote,
 		}
