@@ -797,9 +797,9 @@ fn transcodes_are_requested_and_cached_apart_from_the_image() {
 			return Reply::status(400);
 		}
 		// packs 0 and 1 of the image transcode exist, nothing else yet
-		let pack = if query.contains(&query_escape(&Transcode::Image.priority_list(0))) {
+		let pack = if query.contains(&query_escape(&Transcode::Image.priority_list(0, crate::TranscodeTarget::Desktop))) {
 			0
-		} else if query.contains(&query_escape(&Transcode::Image.priority_list(1))) {
+		} else if query.contains(&query_escape(&Transcode::Image.priority_list(1, crate::TranscodeTarget::Desktop))) {
 			1
 		} else {
 			return Reply::json(r#"{"errors":[{"code":406,"message":"Asset content representation is being generated","customErrorCode":21}]}"#);
@@ -833,7 +833,7 @@ fn transcodes_are_requested_and_cached_apart_from_the_image() {
 	assert!(matches!(third.fetch_transcode("rbxassetid://5", Transcode::PackColor, 0), Err(AssetError::Http { status: 406, .. })));
 	assert_eq!(ad.requests().len(), requests);
 	// Expired after being made for an hour: asked once more without waiting, then remembered as long again
-	let key = Transcode::PackColor.cache_key(&crate::uri::ContentId::parse("rbxassetid://5").unwrap().canonical(), 0);
+	let key = Transcode::PackColor.cache_key(&crate::uri::ContentId::parse("rbxassetid://5").unwrap().canonical(), 0, crate::TranscodeTarget::Desktop);
 	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
 	third.inner.disk.write_refusal(&key, &crate::cache::Refusal { status: 406, until: now - 1, reason: None, since: Some(now - 3600) }).unwrap();
 	let fourth = assets(AssetConfig::new(&state), endpoints(&ad, &cdn), false);
@@ -954,6 +954,36 @@ fn warm_takes_an_images_upload_without_a_transcode() {
 	let report = a.warm(&[crate::Download::Transcode("rbxassetid://9".into(), Transcode::Image)], &|_| 0);
 	assert_eq!(report.downloaded, 1);
 	assert_eq!(a.fetch("rbxassetid://9").unwrap().source, Source::DiskCache);
+}
+
+#[test]
+fn phone_transcodes_are_asked_for_and_cached_apart() {
+	let cdn = MockServer::start(|r| match r.path.as_str() {
+		"/desktop" => Reply::bytes(KTX2),
+		"/phone" => Reply::bytes(b"\xabKTX 20\xbb\r\n\x1a\nphone transcode"),
+		_ => Reply::status(404),
+	});
+	let (desktop, phone) = (cdn.url("/desktop"), cdn.url("/phone"));
+	let ad = MockServer::start(move |r| {
+		let query = r.path.split_once('?').map_or("", |(_, query)| query);
+		let named = |target| query.contains(&crate::transcode::query_escape(&Transcode::PackColor.priority_list(0, target)));
+		let location = if named(crate::TranscodeTarget::Desktop) {
+			&desktop
+		} else if named(crate::TranscodeTarget::Phone) {
+			&phone
+		} else {
+			return Reply::status(400);
+		};
+		Reply::json(&format!(r#"{{"location":"{location}","contentRepresentationSpecifier":{{"format":"ktx2"}}}}"#))
+	});
+	let state = temp_state("phone-transcodes");
+	let on_desktop = assets(AssetConfig::new(&state), endpoints(&ad, &cdn), false);
+	let on_phone = assets(AssetConfig { transcode_target: crate::TranscodeTarget::Phone, ..AssetConfig::new(&state) }, endpoints(&ad, &cdn), false);
+	assert_eq!(on_desktop.fetch_transcode("rbxassetid://5", Transcode::PackColor, 0).unwrap().bytes, KTX2);
+	let fetched = on_phone.fetch_transcode("rbxassetid://5", Transcode::PackColor, 0).unwrap();
+	assert_eq!((fetched.bytes.as_slice(), fetched.source), (&b"\xabKTX 20\xbb\r\n\x1a\nphone transcode"[..], Source::Network), "not the desktop's from the shared state dir");
+	assert!(on_phone.inner.disk.paths("rbxassetid://5#ktx2/7rdo/CEA=").0.is_file());
+	assert!(ad.requests().iter().any(|r| r.path.contains(&crate::transcode::query_escape(&Transcode::PackColor.priority_list(0, crate::TranscodeTarget::Phone)))));
 }
 
 #[test]
@@ -1309,7 +1339,7 @@ fn the_keys_route_keeps_the_transcode_query() {
 		let Some((path, query)) = r.path.split_once('?') else {
 			return Reply::status(400);
 		};
-		let named = query == format!("contentRepresentationPriorityList={}&doNotFallbackToBaselineRepresentation=true", query_escape(&Transcode::Image.priority_list(0)));
+		let named = query == format!("contentRepresentationPriorityList={}&doNotFallbackToBaselineRepresentation=true", query_escape(&Transcode::Image.priority_list(0, crate::TranscodeTarget::Desktop)));
 		if path == format!("{}/version/2", key_path("6")) && named && r.header("x-api-key") == Some(TEST_KEY) {
 			Reply::json(&format!(r#"{{"location":"{ktx_url}","contentRepresentationSpecifier":{{"format":"ktx2","majorVersion":"7rdo"}}}}"#))
 		} else {

@@ -63,7 +63,7 @@ use serde::{Deserialize, Serialize};
 
 pub use sniff::sniff_kind;
 pub use stamp::{FileSnapshot, FileStamp};
-pub use transcode::Transcode;
+pub use transcode::{Transcode, TranscodeTarget};
 pub use uri::{ContentId, Thumbnail, ThumbnailKind};
 pub use warm::{BATCH, Download, WarmReport};
 
@@ -122,6 +122,9 @@ pub struct AssetConfig {
 	/// so a fresh state dir downloads only what no state dir of the user has. `None` (the default): this
 	/// state dir and `shared` alone.
 	pub store: Option<PathBuf>,
+	/// The GPU formats [`Assets::fetch_transcode`] and [`Assets::warm`] ask texture transcodes for:
+	/// a desktop's BC1 / BC3 (the default) or a phone's ETC2. Each is cached under its own keys.
+	pub transcode_target: TranscodeTarget,
 }
 
 impl AssetConfig {
@@ -140,6 +143,7 @@ impl AssetConfig {
 			assetdelivery_headers: Vec::new(),
 			shared: Vec::new(),
 			store: None,
+			transcode_target: TranscodeTarget::Desktop,
 		}
 	}
 }
@@ -632,7 +636,8 @@ impl Assets {
 	/// `pack_N` keys (`ror_image::ktx2_pack_table`); `ror_image::join_packs` joins them. Each pack is
 	/// cached under its own key, apart from the uploaded image. Errors with
 	/// [`AssetError::NoTranscode`] for content that is not an asset id; a transcode that is still
-	/// being made (assetdelivery's 406) is waited for a few seconds, then reported as HTTP 406.
+	/// being made (assetdelivery's 406) is waited for a few seconds, then reported as HTTP 406. The
+	/// transcode is the one made for [`AssetConfig::transcode_target`].
 	pub fn fetch_transcode(&self, uri: &str, transcode: Transcode, pack: u32) -> Result<Arc<Fetched>, AssetError> {
 		let id = ContentId::parse(uri)?;
 		let ContentId::Asset { id: asset, version } = id else {
@@ -641,7 +646,7 @@ impl Assets {
 		if pack >= transcode::MAX_PACKS {
 			return Err(AssetError::NoTranscode(format!("{uri} pack {pack}")));
 		}
-		let key = transcode.cache_key(&id.canonical(), pack);
+		let key = transcode.cache_key(&id.canonical(), pack, self.inner.config.transcode_target);
 		self.fetch_keyed(&key, uri, None, || {
 			self.load_disk_or_network(&key, uri, || {
 				// one still being made when last asked is asked once more, not waited for again
@@ -864,7 +869,7 @@ impl Assets {
 	/// [`Assets::find_location`], the same query on each; while the transcode is being made, retried after
 	/// 0.5, 1, 2 and 4 s), then the CDN location without a credential. Returns (KTX2 bytes, CDN host).
 	fn download_transcode(&self, id: u64, version: Option<u64>, transcode: Transcode, pack: u32, uri: &str, waits: &[u64]) -> Result<(Vec<u8>, String), AssetError> {
-		let location = self.find_location(id, version, Some(&transcode_query(transcode, pack)), uri, waits)?;
+		let location = self.find_location(id, version, Some(&transcode_query(transcode, pack, self.inner.config.transcode_target)), uri, waits)?;
 		let reply = self.get(&location, None, "*/*", uri)?;
 		if reply.status != 200 {
 			return Err(http(uri, reply.status, None));
@@ -1054,9 +1059,9 @@ fn route_url(base: &str, id: u64, version: Option<u64>, query: Option<&str>) -> 
 	}
 }
 
-/// The query naming a transcode's pack, without falling back to the uploaded image.
-fn transcode_query(transcode: Transcode, pack: u32) -> String {
-	format!("contentRepresentationPriorityList={}&doNotFallbackToBaselineRepresentation=true", transcode::query_escape(&transcode.priority_list(pack)))
+/// The query naming a transcode's pack made for `target`, without falling back to the uploaded image.
+fn transcode_query(transcode: Transcode, pack: u32, target: TranscodeTarget) -> String {
+	format!("contentRepresentationPriorityList={}&doNotFallbackToBaselineRepresentation=true", transcode::query_escape(&transcode.priority_list(pack, target)))
 }
 
 /// A refusal's reason, but for a message from the API key's route that could echo the key

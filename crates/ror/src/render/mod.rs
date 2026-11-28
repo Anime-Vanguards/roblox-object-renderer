@@ -83,7 +83,7 @@ pub mod texture_pack;
 pub mod trails;
 mod transcode;
 mod voxel_field;
-pub use transcode::{downloads, transcode_packs};
+pub use transcode::{downloads, transcode_packs, transcode_target};
 
 use std::collections::HashMap;
 use std::ops::Range;

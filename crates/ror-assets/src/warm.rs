@@ -150,6 +150,7 @@ impl Assets {
 		if self.offline {
 			return report;
 		}
+		let target = self.inner.config.transcode_target;
 		let mut seen = HashSet::new();
 		let mut round = Vec::new();
 		for download in downloads {
@@ -165,14 +166,14 @@ impl Assets {
 			match transcode {
 				None => self.consider(item(canonical.clone(), Kind::Plain), &mut seen, &mut round, &mut report),
 				Some(transcode) => {
-					let first = transcode.cache_key(&canonical, 0);
+					let first = transcode.cache_key(&canonical, 0, target);
 					// a cached pack 0 tells which packs must follow
 					match self.on_disk(&first).then(|| self.inner.disk.read(&first)).flatten() {
 						Some(bytes) => {
 							seen.insert(first);
 							report.cached += 1;
 							for pack in 1..packs(&bytes).min(MAX_PACKS) {
-								self.consider(item(transcode.cache_key(&canonical, pack), Kind::Pack(transcode, pack)), &mut seen, &mut round, &mut report);
+								self.consider(item(transcode.cache_key(&canonical, pack, target), Kind::Pack(transcode, pack)), &mut seen, &mut round, &mut report);
 							}
 						}
 						None => self.consider(item(first, Kind::Pack(transcode, 0)), &mut seen, &mut round, &mut report),
@@ -190,7 +191,7 @@ impl Assets {
 				match (item.kind, outcome) {
 					(Kind::Pack(transcode, 0), Outcome::Downloaded { packs }) => {
 						for pack in 1..packs.min(MAX_PACKS) {
-							let follow = Item { key: transcode.cache_key(&item.canonical, pack), kind: Kind::Pack(transcode, pack), ..item.clone() };
+							let follow = Item { key: transcode.cache_key(&item.canonical, pack, target), kind: Kind::Pack(transcode, pack), ..item.clone() };
 							self.consider(follow, &mut seen, &mut next, &mut report);
 						}
 					}
@@ -318,7 +319,7 @@ impl Assets {
 	fn locate_with_key(&self, item: &Item, key: &Credential) -> Place {
 		let located = match item.kind {
 			Kind::Plain => self.asset_location(&self.key_url(item.id, item.version, None), Some(key), &item.uri),
-			Kind::Pack(transcode, pack) => self.transcode_location(&self.key_url(item.id, item.version, Some(&transcode_query(transcode, pack))), Some(key), &item.uri),
+			Kind::Pack(transcode, pack) => self.transcode_location(&self.key_url(item.id, item.version, Some(&transcode_query(transcode, pack, self.inner.config.transcode_target))), Some(key), &item.uri),
 		};
 		match located {
 			Ok(Located::Url(location)) => Place::Url(location),
@@ -337,7 +338,7 @@ impl Assets {
 			.map(|(index, item)| {
 				let representation = match item.kind {
 					Kind::Plain => None,
-					Kind::Pack(transcode, pack) => Some(transcode.priority_list(pack)),
+					Kind::Pack(transcode, pack) => Some(transcode.priority_list(pack, self.inner.config.transcode_target)),
 				};
 				BatchRequest {
 					request_id: index.to_string(),

@@ -15,7 +15,11 @@
 //!   roughness, `AIA=` colour pack 1, `AQA=` colour pack 3.
 //!
 //! Pack 0 holds the smallest levels and lists every pack (`pack_N = "first level,count"`). A transcode
-//! that does not exist yet answers `406` ("being generated"): assetdelivery starts making it.
+//! that does not exist yet answers `406` ("being generated"): assetdelivery starts making it, one
+//! fidelity at a time (each pack is made when it is first asked for).
+//!
+//! Phones draw ETC2 transcodes instead ([`TranscodeTarget::Phone`]): an image's fidelity with `0x20`
+//! in its fifth byte, a layer's with option `0x08` (notes/assets.md "Phone transcodes").
 
 /// Which transcode of an asset to fetch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -33,6 +37,24 @@ pub enum Transcode {
 	PackMetalnessRoughness,
 }
 
+/// Which GPU formats a transcode is made for: a client asks for the ones its GPU takes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TranscodeTarget {
+	/// BC1 / BC3 (BC3 with alpha; a layer's normal map as DXT5nm): what Studio and the desktop clients
+	/// draw.
+	#[default]
+	Desktop,
+	/// ETC2 RGB (vkFormat 147) or RGBA (151, with alpha), every layer included, at the desktop
+	/// transcode's sizes: what phones (GPUs without BC formats) draw.
+	Phone,
+}
+
+/// The fifth byte's bit of an image fidelity asking for ETC2 (`/////CE=` pack 0); `0x10` asks for
+/// ETC2 resized to powers of two, which no client was seen asking for.
+const IMAGE_ETC2: u8 = 0x20;
+/// A layer fidelity's option bit asking for ETC2 (`CEA=` colour pack 0).
+const LAYER_ETC2: u8 = 0x08;
+
 /// The representation's format and version (`FStringTextureTranscode7Version` in Studio's settings).
 pub const FORMAT: &str = "ktx2";
 pub const VERSION: &str = "7rdo";
@@ -41,28 +63,34 @@ pub const VERSION: &str = "7rdo";
 pub const MAX_PACKS: u32 = 7;
 
 impl Transcode {
-	/// The fidelity of `pack` (0: the smallest levels) of this transcode, base64 as sent.
+	/// The fidelity of `pack` (0: the smallest levels) of this transcode for a desktop, base64 as sent.
 	pub fn fidelity(self, pack: u32) -> String {
+		self.fidelity_for(pack, TranscodeTarget::Desktop)
+	}
+
+	/// The fidelity of `pack` of this transcode made for `target`, base64 as sent.
+	pub fn fidelity_for(self, pack: u32, target: TranscodeTarget) -> String {
 		let next = pack.min(MAX_PACKS - 1) as u8 + 1;
+		let phone = target == TranscodeTarget::Phone;
 		let layer = match self {
-			Transcode::Image => return base64(&[0xff, 0xff, 0xff, 0xfc, next]),
+			Transcode::Image => return base64(&[0xff, 0xff, 0xff, 0xfc, next | if phone { IMAGE_ETC2 } else { 0 }]),
 			Transcode::PackColor => 0u8,
 			Transcode::PackNormal => 1,
 			Transcode::PackMetalnessRoughness => 2,
 		};
-		base64(&[(layer << 5) | (next >> 2), (next & 3) << 6])
+		base64(&[(layer << 5) | if phone { LAYER_ETC2 } else { 0 } | (next >> 2), (next & 3) << 6])
 	}
 
 	/// `contentRepresentationPriorityList` naming `pack` of this transcode only.
-	pub(crate) fn priority_list(self, pack: u32) -> String {
-		let json = format!(r#"[{{"format":"{FORMAT}","majorVersion":"{VERSION}","fidelity":"{}"}}]"#, self.fidelity(pack));
+	pub(crate) fn priority_list(self, pack: u32, target: TranscodeTarget) -> String {
+		let json = format!(r#"[{{"format":"{FORMAT}","majorVersion":"{VERSION}","fidelity":"{}"}}]"#, self.fidelity_for(pack, target));
 		base64(json.as_bytes())
 	}
 
-	/// The cache key of `pack` of this transcode of the content with canonical URI `canonical`: never
-	/// the uploaded image's key.
-	pub(crate) fn cache_key(self, canonical: &str, pack: u32) -> String {
-		format!("{canonical}#{FORMAT}/{VERSION}/{}", self.fidelity(pack))
+	/// The cache key of `pack` of this transcode (made for `target`) of the content with canonical URI
+	/// `canonical`: never the uploaded image's key.
+	pub(crate) fn cache_key(self, canonical: &str, pack: u32, target: TranscodeTarget) -> String {
+		format!("{canonical}#{FORMAT}/{VERSION}/{}", self.fidelity_for(pack, target))
 	}
 }
 
@@ -110,8 +138,23 @@ mod tests {
 	}
 
 	#[test]
+	fn phone_fidelities_ask_for_etc2() {
+		// what assetdelivery had for every texture of three close-up models before this was asked
+		// (phones had asked for them), each ETC2: images vkFormat 147 / 151, layers 147
+		let phone = TranscodeTarget::Phone;
+		assert_eq!(Transcode::Image.fidelity_for(0, phone), "/////CE=");
+		assert_eq!(Transcode::Image.fidelity_for(1, phone), "/////CI=");
+		assert_eq!(Transcode::PackColor.fidelity_for(0, phone), "CEA=");
+		assert_eq!(Transcode::PackNormal.fidelity_for(0, phone), "KEA=");
+		assert_eq!(Transcode::PackMetalnessRoughness.fidelity_for(0, phone), "SEA=");
+		assert_eq!(Transcode::PackColor.fidelity_for(3, phone), "CQA=");
+		assert_eq!(Transcode::Image.fidelity_for(2, TranscodeTarget::Desktop), Transcode::Image.fidelity(2));
+		assert_ne!(Transcode::Image.cache_key("rbxassetid://5", 0, phone), Transcode::Image.cache_key("rbxassetid://5", 0, TranscodeTarget::Desktop));
+	}
+
+	#[test]
 	fn priority_list_is_base64_json() {
-		assert_eq!(Transcode::Image.priority_list(0), "W3siZm9ybWF0Ijoia3R4MiIsIm1ham9yVmVyc2lvbiI6IjdyZG8iLCJmaWRlbGl0eSI6Ii8vLy8vQUU9In1d");
+		assert_eq!(Transcode::Image.priority_list(0, TranscodeTarget::Desktop), "W3siZm9ybWF0Ijoia3R4MiIsIm1ham9yVmVyc2lvbiI6IjdyZG8iLCJmaWRlbGl0eSI6Ii8vLy8vQUU9In1d");
 		assert_eq!(query_escape("a+b/c="), "a%2Bb%2Fc%3D");
 		assert_eq!(base64(b"ab"), "YWI=");
 		assert_eq!(base64(b"a"), "YQ==");
@@ -120,9 +163,10 @@ mod tests {
 
 	#[test]
 	fn cache_keys_differ_from_the_image() {
-		let key = Transcode::PackColor.cache_key("rbxassetid://5", 1);
+		let desktop = TranscodeTarget::Desktop;
+		let key = Transcode::PackColor.cache_key("rbxassetid://5", 1, desktop);
 		assert_eq!(key, "rbxassetid://5#ktx2/7rdo/AIA=");
-		assert_ne!(key, Transcode::PackColor.cache_key("rbxassetid://5", 0));
-		assert_ne!(Transcode::Image.cache_key("rbxassetid://5", 0), Transcode::PackColor.cache_key("rbxassetid://5", 0));
+		assert_ne!(key, Transcode::PackColor.cache_key("rbxassetid://5", 0, desktop));
+		assert_ne!(Transcode::Image.cache_key("rbxassetid://5", 0, desktop), Transcode::PackColor.cache_key("rbxassetid://5", 0, desktop));
 	}
 }

@@ -1,9 +1,11 @@
-//! KTX2: BC1-BC5/BC7 and 8-bit uncompressed vkFormats; supercompression none, zstd and zlib; the
+//! KTX2: BC1-BC5/BC7, ETC2 / EAC (decoded to RGBA8) and 8-bit uncompressed vkFormats; supercompression
+//! none, zstd and zlib; the
 //! level index decides where each level is (Roblox writes both smallest-first and largest-first
 //! files); the DFD and key/value data give sRGB / premultiplied information.
 
 use std::cell::RefCell;
 
+use crate::etc::{self, Etc};
 use crate::pixel::{self, Uncompressed};
 use crate::{Container, Image, ImageError, PixelFormat, layout};
 
@@ -24,6 +26,8 @@ fn unsupported(detail: impl Into<String>) -> ImageError {
 enum Source {
 	Block(PixelFormat),
 	Raw(Uncompressed),
+	/// ETC2 / EAC blocks, decoded to RGBA8 here
+	Etc(Etc),
 }
 
 struct VkFormat {
@@ -36,6 +40,7 @@ struct VkFormat {
 fn vk_format(vk: u32) -> Result<VkFormat, ImageError> {
 	let b = |format, srgb, opaque| VkFormat { source: Source::Block(format), srgb, opaque };
 	let r = |format: Uncompressed, srgb| VkFormat { source: Source::Raw(format), srgb, opaque: !format.has_alpha() };
+	let e = |kind: Etc, srgb| VkFormat { source: Source::Etc(kind), srgb, opaque: kind.opaque() };
 	Ok(match vk {
 		131 => b(PixelFormat::Bc1, false, true),
 		132 => b(PixelFormat::Bc1, true, true),
@@ -49,6 +54,14 @@ fn vk_format(vk: u32) -> Result<VkFormat, ImageError> {
 		141 => b(PixelFormat::Bc5, false, true),
 		145 => b(PixelFormat::Bc7, false, false),
 		146 => b(PixelFormat::Bc7, true, false),
+		147 => e(Etc::Rgb, false),
+		148 => e(Etc::Rgb, true),
+		149 => e(Etc::RgbPunchThrough, false),
+		150 => e(Etc::RgbPunchThrough, true),
+		151 => e(Etc::Rgba, false),
+		152 => e(Etc::Rgba, true),
+		153 => e(Etc::R11, false),
+		155 => e(Etc::Rg11, false),
 		37 => r(Uncompressed::Rgba8, false),
 		43 => r(Uncompressed::Rgba8, true),
 		44 => r(Uncompressed::Bgra8, false),
@@ -63,6 +76,8 @@ fn vk_format(vk: u32) -> Result<VkFormat, ImageError> {
 		22 => r(Uncompressed::Rg8, true),
 		140 | 142 => return Err(unsupported(format!("signed BC4/BC5 (vkFormat {vk})"))),
 		143 | 144 => return Err(unsupported(format!("BC6H (vkFormat {vk})"))),
+		154 | 156 => return Err(unsupported(format!("signed EAC (vkFormat {vk})"))),
+		157..=184 => return Err(unsupported(format!("ASTC (vkFormat {vk})"))),
 		0 => return Err(unsupported("vkFormat 0 (Basis Universal / undefined)")),
 		other => return Err(unsupported(format!("vkFormat {other}"))),
 	})
@@ -212,6 +227,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Image, ImageError> {
 		let slice_bytes = match format.source {
 			Source::Block(f) => layout::block_surface_bytes(f, w, h),
 			Source::Raw(raw) => (w as usize).checked_mul(h as usize).and_then(|n| n.checked_mul(raw.bytes_per_pixel())),
+			Source::Etc(kind) => (w.div_ceil(4) as usize).checked_mul(h.div_ceil(4) as usize).and_then(|n| n.checked_mul(kind.block_bytes())),
 		};
 		let expected = slice_bytes
 			.and_then(|s| s.checked_mul(d as usize))
@@ -249,6 +265,10 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Image, ImageError> {
 				pixel::convert_into(raw, &data, &mut out);
 				out
 			}
+			Source::Etc(kind) => {
+				let slice = expected / (d as usize * layers as usize).max(1);
+				data.chunks(slice.max(1)).flat_map(|blocks| etc::to_rgba8(kind, blocks, w, h)).collect()
+			}
 		};
 		levels.push(level_data);
 	}
@@ -271,7 +291,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Image, ImageError> {
 
 	let pixel_format = match format.source {
 		Source::Block(f) => f,
-		Source::Raw(_) => PixelFormat::Rgba8,
+		Source::Raw(_) | Source::Etc(_) => PixelFormat::Rgba8,
 	};
 	let dxt5nm = pixel_format == PixelFormat::Bc3 && srgb == Some(false) && levels.first().is_some_and(|l| is_dxt5nm(l));
 	// A DXT5nm normal map keeps X in alpha: not opacity
@@ -279,7 +299,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Image, ImageError> {
 		&& !dxt5nm
 		&& match format.source {
 			Source::Block(f) => crate::bc::levels_transparent(f, &levels, (width, height, depth), true),
-			Source::Raw(_) => levels.iter().any(|l| pixel::any_transparent_rgba8(l)),
+			Source::Raw(_) | Source::Etc(_) => levels.iter().any(|l| pixel::any_transparent_rgba8(l)),
 		};
 
 	Ok(Image {
@@ -477,6 +497,27 @@ pub(crate) mod tests {
 			assert_eq!(image.srgb, Some(true));
 			assert_eq!(image.meta("avgAlpha"), Some("255"));
 		}
+	}
+
+	#[test]
+	fn phone_transcodes_decode_to_rgba8() {
+		// a phone's transcodes: ETC2 RGB (147) for an opaque image or a layer, ETC2 RGBA (151) with
+		// alpha; zstd, two levels. A block of grey 8 / 8 (136) with modifier +2 everywhere
+		let grey = [0x88u8, 0x88, 0x88, 0, 0, 0, 0, 0];
+		let levels = vec![grey.repeat(4), grey.to_vec()];
+		let image = crate::decode(&build(147, 8, 8, &levels, 2, false, &[("colorSpace", "Gamma2RGB")])).unwrap();
+		assert_eq!((image.format, image.levels.len(), image.has_alpha, image.srgb), (PixelFormat::Rgba8, 2, false, Some(true)));
+		assert!(image.levels[0].chunks(4).all(|texel| texel == [138, 138, 138, 255]));
+		assert_eq!(image.levels[1].len(), 4 * 4 * 4);
+		// an EAC alpha block of 128 (multiplier 0) before the colour block
+		let mut block = vec![128u8, 0, 0, 0, 0, 0, 0, 0];
+		block.extend_from_slice(&grey);
+		let image = crate::decode(&build(151, 4, 4, &[block], 0, false, &[("colorSpace", "Linear")])).unwrap();
+		assert!(image.has_alpha);
+		assert_eq!(&image.levels[0][..4], &[138, 138, 138, 128]);
+		// ASTC is named, not decoded
+		let astc = crate::decode(&build(157, 4, 4, &[vec![0; 16]], 0, false, &[]));
+		assert!(matches!(astc, Err(ImageError::Unsupported { .. })), "{astc:?}");
 	}
 
 	#[test]

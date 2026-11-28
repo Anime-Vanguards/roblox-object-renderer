@@ -12,19 +12,37 @@
 //!   with the emissive mask in blue (notes/materials.md "Transcodes").
 
 use anyhow::{Result, anyhow};
-use ror_assets::Transcode;
+use ror_assets::{Transcode, TranscodeTarget};
 
 use super::resources::TextureUse;
 use super::{MaterialKey, Renderer};
 use crate::scene::{Geometry, Scene};
 
-/// Material texture keys of a TexturePack's layers: `ror-transcode:<layer>:<pack URI>`.
+/// Material texture keys of a TexturePack's layers: `ror-transcode:<layer>:<pack URI>`, a phone's
+/// `ror-transcode:<layer>@phone:<pack URI>`.
 const LAYER_PREFIX: &str = "ror-transcode:";
+const PHONE: &str = "@phone";
 
-/// `ROR_TRANSCODES=0` draws the uploaded images instead (the path before transcodes, for comparisons).
+/// `ROR_TRANSCODES`: unset, the transcodes a desktop draws; `0` the uploaded images instead (the path
+/// before transcodes, for comparisons); `phone` the transcodes a phone draws (ETC2, decoded on the CPU).
+fn setting() -> Option<TranscodeTarget> {
+	static SETTING: std::sync::OnceLock<Option<TranscodeTarget>> = std::sync::OnceLock::new();
+	*SETTING.get_or_init(|| match std::env::var("ROR_TRANSCODES").map(|value| value.trim().to_ascii_lowercase()) {
+		Ok(value) if value == "0" => None,
+		Ok(value) if value == "phone" => Some(TranscodeTarget::Phone),
+		_ => Some(TranscodeTarget::Desktop),
+	})
+}
+
+/// Whether transcodes are drawn at all (`ROR_TRANSCODES=0`: no).
 pub(super) fn enabled() -> bool {
-	static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-	*ON.get_or_init(|| std::env::var("ROR_TRANSCODES").map_or(true, |value| value.trim() != "0"))
+	setting().is_some()
+}
+
+/// The GPU formats the transcodes drawn are made for (`ROR_TRANSCODES=phone`: a phone's ETC2), as
+/// ror's asset fetching asks for them (`output::asset_config`).
+pub fn transcode_target() -> TranscodeTarget {
+	setting().unwrap_or_default()
 }
 
 fn layer_name(layer: Transcode) -> &'static str {
@@ -36,9 +54,10 @@ fn layer_name(layer: Transcode) -> &'static str {
 	}
 }
 
-/// The material texture key of a TexturePack's layer.
+/// The material texture key of a TexturePack's layer (a phone's apart: their texture files differ).
 pub(super) fn layer_key(layer: Transcode, pack: &str) -> String {
-	format!("{LAYER_PREFIX}{}:{pack}", layer_name(layer))
+	let phone = if transcode_target() == TranscodeTarget::Phone { PHONE } else { "" };
+	format!("{LAYER_PREFIX}{}{phone}:{pack}", layer_name(layer))
 }
 
 /// The texture key of an image asset drawn as Studio draws it: its `Image` transcode (the upload
@@ -56,6 +75,7 @@ pub(super) fn image_key(uri: &str) -> String {
 /// (layer, pack URI) of a [`layer_key`].
 pub(super) fn parse_layer_key(key: &str) -> Option<(Transcode, &str)> {
 	let (name, pack) = key.strip_prefix(LAYER_PREFIX)?.split_once(':')?;
+	let name = name.strip_suffix(PHONE).unwrap_or(name);
 	let layer = [Transcode::Image, Transcode::PackColor, Transcode::PackNormal, Transcode::PackMetalnessRoughness].into_iter().find(|&layer| layer_name(layer) == name)?;
 	Some((layer, pack))
 }
@@ -217,6 +237,8 @@ mod tests {
 
 	#[test]
 	fn layer_keys_round_trip() {
+		// a phone's layers' keys (ROR_TRANSCODES=phone) read the same
+		assert_eq!(parse_layer_key("ror-transcode:normal@phone:rbxassetid://1"), Some((Transcode::PackNormal, "rbxassetid://1")));
 		for layer in [Transcode::Image, Transcode::PackColor, Transcode::PackNormal, Transcode::PackMetalnessRoughness] {
 			let key = layer_key(layer, "rbxassetid://123456789");
 			assert_eq!(parse_layer_key(&key), Some((layer, "rbxassetid://123456789")));

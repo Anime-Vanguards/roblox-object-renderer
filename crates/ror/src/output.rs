@@ -362,7 +362,7 @@ pub fn other_state_dirs() -> &'static [PathBuf] {
 /// The asset resolver's settings for `state_dir`: its downloads shared with `ROR_SHARED_STATE_DIRS`'
 /// and the content store's.
 pub fn asset_config(state_dir: PathBuf, offline: bool) -> ror_assets::AssetConfig {
-	ror_assets::AssetConfig { offline, repo_dir: checkout_dir(), shared: shared_state_dirs(), store: store_dir(), ..ror_assets::AssetConfig::new(state_dir) }
+	ror_assets::AssetConfig { offline, repo_dir: checkout_dir(), shared: shared_state_dirs(), store: store_dir(), transcode_target: crate::render::transcode_target(), ..ror_assets::AssetConfig::new(state_dir) }
 }
 
 /// A state dir's file `name` (what one learnt about this machine: the GPU its services start on, its

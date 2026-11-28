@@ -27,6 +27,7 @@
 mod bc;
 mod dds;
 mod encode;
+mod etc;
 mod ktx2;
 mod layout;
 mod mips;
